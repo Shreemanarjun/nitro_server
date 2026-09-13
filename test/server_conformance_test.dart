@@ -323,6 +323,33 @@ void main() {
         expect(decoded['x-dup'], ['a', 'b']);
       }, skip: skipReason);
 
+      // Regression: the parsed head ends before the terminal CRLF of its last
+      // header line, so that line has no line ending. It used to be dropped —
+      // hiding a trailing `Connection: close` or `Content-Length`.
+      test('the last header line is parsed, not dropped', () async {
+        final raw = await _raw(
+          port,
+          ascii.encode(
+            'GET /headers HTTP/1.1\r\nHost: x\r\nConnection: close\r\nX-Last: yes\r\n\r\n',
+          ),
+        );
+        expect(_statusOf(raw), 200);
+        final decoded = jsonDecode(utf8.decode(_bodyOf(raw)));
+        expect(decoded['x-last'], ['yes']);
+      }, skip: skipReason);
+
+      test('Connection: close as the last header still closes', () async {
+        final raw = await _raw(
+          port,
+          ascii.encode(
+            'GET /headers HTTP/1.1\r\nHost: x\r\nX-Last: yes\r\nConnection: close\r\n\r\n',
+          ),
+        );
+        expect(_headerOf(raw, 'connection'), 'close');
+        // _raw returns only at EOF: reaching here proves the close.
+        expect(_statusOf(raw), 200);
+      }, skip: skipReason);
+
       test('every response carries an exact content-length', () async {
         final raw = await _raw(
           port,

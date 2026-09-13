@@ -4,7 +4,6 @@
 // the bridge with the right wire values.
 import 'dart:isolate';
 import 'dart:typed_data';
-
 import 'package:flutter_test/flutter_test.dart';
 import 'package:nitro_server/nitro_server.dart';
 import 'package:nitro_server/src/internal/instance_keys.dart';

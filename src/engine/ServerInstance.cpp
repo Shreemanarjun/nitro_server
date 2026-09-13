@@ -102,17 +102,26 @@ ParsedHead parseHead(const std::string& raw, size_t headEnd) {
   p.method = parseMethod(requestLine.substr(0, sp1), p.customMethod);
   p.target = requestLine.substr(sp1 + 1, sp2 - sp1 - 1);
   p.version = trim(requestLine.substr(sp2 + 1));
+  // The head slice excludes the terminal \r\n\r\n, so the LAST header line
+  // has no line ending — a loop that requires one silently drops it (which
+  // used to hide `Connection: close` and a trailing Content-Length).
   size_t pos = lineEnd + 2;
-  while (pos < head.size()) {
+  while (pos <= head.size()) {
     size_t eol = head.find("\r\n", pos);
-    if (eol == std::string::npos) break;
-    if (eol == pos) break;
-    const std::string line = head.substr(pos, eol - pos);
+    std::string line;
+    if (eol == std::string::npos) {
+      line = head.substr(pos);
+      pos = head.size() + 1;
+    } else {
+      if (eol == pos) break;
+      line = head.substr(pos, eol - pos);
+      pos = eol + 2;
+    }
+    if (line.empty()) break;
     size_t colon = line.find(':');
     if (colon == std::string::npos) return p;
     p.headers.push_back(
         {trim(line.substr(0, colon)), trim(line.substr(colon + 1))});
-    pos = eol + 2;
   }
   p.ok = true;
   return p;

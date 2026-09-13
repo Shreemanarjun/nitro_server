@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Shell(cmake -S src -B build/tests -DNITRO_SERVER_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release >/tmp/nitro_cmake.log 2>&1 && cmake --build build/tests --parallel >/tmp/nitro_build.log 2>&1 && ctest --test-dir build/tests --output-on-failure 2>&1 | tail -40)",
+      "Shell(cmake:*)",
+      "Shell(ctest:*)",
+      "Shell(ls build/tests/nitro_server_tests/CTestTestfile.cmake 2>/dev/null; echo \"=== run binary ===\"; ./build/tests/nitro_server_tests/nitro_server_engine_tests --gtest_brief=1 2>&1 | tail -30)"
+    ],
+    "deny": [],
+    "defaultMode": "default"
+  }
+}

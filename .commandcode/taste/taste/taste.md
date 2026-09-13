@@ -1,0 +1,15 @@
+# Taste
+- Builds Flutter plugins as Nitro modules (react-native-nitro-modules) using the nitrogen CLI for codegen, with a C++ HybridObject layer bridged to Dart. Confidence: 0.9
+- Maintains their own Nitro toolchain documentation site (https://nitro.shreeman.dev, with an llms.txt index) and expects it to be fetched and consulted as a reference when working on Nitro plugins. Confidence: 0.8
+- Target platforms are macOS, Linux, Windows, iOS, Android; drop web rather than fake support when the platform genuinely can't do it (e.g. raw socket binding in browsers). Confidence: 0.85
+- Prefers one CMakeLists.txt with platform guards over separate per-platform build files. Confidence: 0.8
+- Vendors minimal dependencies: submodule only the core library needed, skip optional addons; choose dependencies that cross-compile easily for mobile (e.g. LibreSSL over OpenSSL for iOS/Android). Confidence: 0.75
+- Works from phased implementation plans with an explicit "scope lock" before writing code, and a build order that proves the riskiest primitive (e.g. a callback bridge) standalone before wiring layers on top of it. Confidence: 0.8
+- Validates risky mechanics (threading, FFI callbacks, TLS) with a standalone script or per-platform sanity check before integrating into the full system, to isolate failure sources. Confidence: 0.8
+- Prefers the simple architecture for v1 and defers optimizations (e.g. multithreaded blocking handler before async coroutines); correctness and reasoning simplicity first. Confidence: 0.75
+- Anticipates failure modes up front and designs guards for them: deadlock guards, per-thread resources instead of shared locks, configurable limits with sane defaults (per-route timeouts, body-size caps with streaming fallback) rather than global hardcoded values. Confidence: 0.75
+- Documents platform constraints loudly (e.g. foreground-only lifecycle) instead of letting things fail silently. Confidence: 0.8
+- Performance is a first-class requirement: zero-copy native↔Dart buffer passing, and benchmarks that measure the real cost (Dart↔native round-trip under load), not the library's raw numbers. Confidence: 0.85
+- Reports benchmarks honestly and narrowly — frame claims to exactly what was measured, no "always fastest" claims. Confidence: 0.85
+- Holds a high test-coverage bar: integration tests across every supported platform, including concurrency/deadlock, timeout, and TLS-handshake cases (references a sibling plugin's 134 integration tests across 5 platforms as the standard). Confidence: 0.85
+- Wants per-platform examples/demos when platform behavior differs, not one generic example that would mislead. Confidence: 0.7

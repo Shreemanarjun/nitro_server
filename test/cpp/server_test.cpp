@@ -10,6 +10,8 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <deque>
@@ -68,6 +70,37 @@ std::string bodyOf(const std::string& response) {
   return response.substr(sep + 4);
 }
 
+/// Case-insensitive response header lookup; returns the trimmed value or "".
+std::string headerOf(const std::string& response, const std::string& name) {
+  const size_t sep = response.find("\r\n\r\n");
+  const std::string head =
+      sep == std::string::npos ? response : response.substr(0, sep);
+  size_t pos = head.find("\r\n");
+  if (pos == std::string::npos) return "";
+  pos += 2;
+  while (pos < head.size()) {
+    const size_t eol = head.find("\r\n", pos);
+    const std::string line =
+        eol == std::string::npos ? head.substr(pos) : head.substr(pos, eol - pos);
+    const size_t colon = line.find(':');
+    if (colon != std::string::npos) {
+      std::string key = line.substr(0, colon);
+      std::transform(key.begin(), key.end(), key.begin(),
+                     [](unsigned char c) { return (char)std::tolower(c); });
+      if (key == name) {
+        const std::string value = line.substr(colon + 1);
+        const size_t b = value.find_first_not_of(" \t");
+        if (b == std::string::npos) return "";
+        const size_t e = value.find_last_not_of(" \t");
+        return value.substr(b, e - b + 1);
+      }
+    }
+    if (eol == std::string::npos) break;
+    pos = eol + 2;
+  }
+  return "";
+}
+
 /// Records dispatch; a pump loop (the test's stand-in for the Dart runner)
 /// answers everything queued. Payloads are never acked here — stop()'s
 /// abortAll reaps them, exactly like a runner that goes away.
@@ -83,6 +116,7 @@ class RecordingEmitter : public Emitter {
     std::string query;
     std::string routePattern;
     std::vector<RouteParam> params;
+    std::vector<Header> headers;
     std::string body;
   };
 
@@ -96,7 +130,7 @@ class RecordingEmitter : public Emitter {
 
   void emitHead(int64_t requestId, Method method,
                 const std::string& /*customMethod*/, const std::string& path,
-                const std::string& query, const std::vector<Header>&,
+                const std::string& query, const std::vector<Header>& headers,
                 int64_t, bool hasBody, const std::string& routePattern,
                 const std::vector<RouteParam>& params) override {
     std::lock_guard<std::mutex> lk(mutex_);
@@ -107,6 +141,7 @@ class RecordingEmitter : public Emitter {
     s.query = query;
     s.routePattern = routePattern;
     s.params = params;
+    s.headers = headers;
     if (!hasBody) {
       auto [status, body] = answer_(method, path, "");
       jobs_.push_back({requestId, status, body});
@@ -299,6 +334,81 @@ TEST(ServerTest, ParamsReachTheEmitter) {
   EXPECT_EQ(seen.params[0].name, "id");
   EXPECT_EQ(seen.params[0].value, "42");
   EXPECT_EQ(seen.query, "verbose=true");
+}
+
+// ── Last-header regression ───────────────────────────────────────────────────
+// The head slice passed to parseHead ends BEFORE the terminal CRLF of the last
+// header line, so that line carries no line ending. A parser that required one
+// silently dropped it — which hid a trailing `Connection: close` (keeping dead
+// connections alive until the idle timeout) and a trailing `Content-Length`
+// (losing the body entirely).
+
+TEST(ServerTest, LastHeaderWithoutTrailingCrlfIsParsed) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "ok");
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "/hello", -1).kind,
+            ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd,
+          "GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n"
+          "X-Last: yes\r\n\r\n");
+  EXPECT_EQ(statusOf(readAll(fd)), 200);
+  close(fd);
+
+  ASSERT_TRUE(f.waitForSeen(1));
+  const auto seen = f.emitter.seen();
+  ASSERT_FALSE(seen.empty());
+  bool sawLast = false;
+  for (const auto& h : seen[0].headers) {
+    if (h.name == "X-Last" && h.value == "yes") sawLast = true;
+  }
+  EXPECT_TRUE(sawLast);
+}
+
+TEST(ServerTest, LastHeaderContentLengthIsParsed) {
+  Fixture f([](Method, const std::string&, const std::string& body) {
+    return std::make_pair(200, "n=" + std::to_string(body.size()));
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Post, "", "/echo", -1).kind,
+            ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd,
+          "POST /echo HTTP/1.1\r\nHost: x\r\nConnection: close\r\n"
+          "Content-Length: 5\r\n\r\nhello");
+  const std::string res = readAll(fd);
+  close(fd);
+
+  EXPECT_EQ(statusOf(res), 200);
+  EXPECT_EQ(bodyOf(res), "n=5");
+  ASSERT_TRUE(f.waitForSeen(1));
+  EXPECT_EQ(f.emitter.seen()[0].body, "hello");
+}
+
+TEST(ServerTest, LastHeaderConnectionCloseClosesTheConnection) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "ok");
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "/hello", -1).kind,
+            ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd,
+          "GET /hello HTTP/1.1\r\nHost: x\r\nX-Last: yes\r\n"
+          "Connection: close\r\n\r\n");
+  const std::string res = readAll(fd);
+  close(fd);
+
+  EXPECT_EQ(statusOf(res), 200);
+  EXPECT_EQ(headerOf(res, "connection"), "close");
 }
 
 TEST(ServerTest, PostBodyIsStreamedToTheEmitter) {

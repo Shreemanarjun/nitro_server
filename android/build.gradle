@@ -1,8 +1,11 @@
 plugins {
     id "com.android.library"
-    // Flutter's build infrastructure applies KGP automatically (built-in Kotlin).
-    // Do NOT add "org.jetbrains.kotlin.android" here — it triggers a deprecation
-    // warning and will break in future Flutter versions.
+    // No Kotlin plugin: nitro_server has no JVM code. The Nitro spec declares
+    // `AndroidNativeImpl.cpp`, so Android talks to the engine through
+    // dart:ffi and never through JNI. Flutter's build infrastructure would
+    // apply KGP automatically anyway — adding "org.jetbrains.kotlin.android"
+    // here triggers a deprecation warning and will break in future Flutter
+    // versions.
     // See: https://docs.flutter.dev/release/breaking-changes/migrate-to-built-in-kotlin
 }
 

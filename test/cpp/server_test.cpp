@@ -1,0 +1,489 @@
+// ServerInstance tests over real loopback sockets with a recording emitter.
+// No Dart involved: a pump thread answers every request the way the Dart
+// runner would, so these exercise parse → route → emit → wait → respond →
+// serialize end to end.
+#include <gtest/gtest.h>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <deque>
+#include <functional>
+#include <map>
+#include <mutex>
+#include <string>
+#include <thread>
+
+#include "engine/ServerInstance.h"
+
+using namespace nitroserver;
+
+namespace {
+
+int connectTo(int port) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons((uint16_t)port);
+  inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+  if (connect(fd, (sockaddr*)&addr, sizeof(addr)) != 0) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+std::string readAll(int fd) {
+  std::string out;
+  char buf[4096];
+  ssize_t n;
+  while ((n = recv(fd, buf, sizeof(buf), 0)) > 0) out.append(buf, (size_t)n);
+  return out;
+}
+
+void sendStr(int fd, const std::string& s) {
+  size_t sent = 0;
+  while (sent < s.size()) {
+    ssize_t n = send(fd, s.data() + sent, s.size() - sent, 0);
+    if (n <= 0) break;
+    sent += (size_t)n;
+  }
+}
+
+int statusOf(const std::string& response) {
+  // "HTTP/1.1 200 OK\r\n..."
+  const size_t sp = response.find(' ');
+  if (sp == std::string::npos) return -1;
+  return std::stoi(response.substr(sp + 1, 3));
+}
+
+std::string bodyOf(const std::string& response) {
+  const size_t sep = response.find("\r\n\r\n");
+  if (sep == std::string::npos) return "";
+  return response.substr(sep + 4);
+}
+
+/// Records dispatch; a pump loop (the test's stand-in for the Dart runner)
+/// answers everything queued. Payloads are never acked here — stop()'s
+/// abortAll reaps them, exactly like a runner that goes away.
+class RecordingEmitter : public Emitter {
+ public:
+  using Answer = std::function<std::pair<int, std::string>(
+      Method, const std::string& path, const std::string& body)>;
+
+  struct Seen {
+    int64_t requestId = 0;
+    Method method = Method::Get;
+    std::string path;
+    std::string query;
+    std::string routePattern;
+    std::vector<RouteParam> params;
+    std::string body;
+  };
+
+  struct Job {
+    int64_t requestId;
+    int status;
+    std::string body;
+  };
+
+  explicit RecordingEmitter(Answer answer) : answer_(std::move(answer)) {}
+
+  void emitHead(int64_t requestId, Method method,
+                const std::string& /*customMethod*/, const std::string& path,
+                const std::string& query, const std::vector<Header>&,
+                int64_t, bool hasBody, const std::string& routePattern,
+                const std::vector<RouteParam>& params) override {
+    std::lock_guard<std::mutex> lk(mutex_);
+    Seen& s = partial_[requestId];
+    s.requestId = requestId;
+    s.method = method;
+    s.path = path;
+    s.query = query;
+    s.routePattern = routePattern;
+    s.params = params;
+    if (!hasBody) {
+      auto [status, body] = answer_(method, path, "");
+      jobs_.push_back({requestId, status, body});
+      seen_.push_back(s);
+      partial_.erase(requestId);
+    }
+  }
+
+  void emitBodyData(int64_t requestId, uint8_t* payload, size_t n) override {
+    std::lock_guard<std::mutex> lk(mutex_);
+    auto it = partial_.find(requestId);
+    if (it != partial_.end()) it->second.body.append((const char*)payload, n);
+  }
+
+  void emitBodyEnd(int64_t requestId) override {
+    std::lock_guard<std::mutex> lk(mutex_);
+    auto it = partial_.find(requestId);
+    if (it == partial_.end()) return;
+    Seen s = it->second;
+    partial_.erase(it);
+    auto [status, body] = answer_(s.method, s.path, s.body);
+    jobs_.push_back({requestId, status, body});
+    seen_.push_back(s);
+  }
+
+  void emitBodyError(int64_t requestId, uint8_t*, size_t,
+                     ErrorKind) override {
+    std::lock_guard<std::mutex> lk(mutex_);
+    // Terminal for the body: drop the partial so no answer is queued. The
+    // engine already answered directly.
+    partial_.erase(requestId);
+  }
+
+  void emitEvent(ServerEventKind kind, int64_t requestId,
+                 const std::string& message) override {
+    std::lock_guard<std::mutex> lk(mutex_);
+    events_.push_back({(int64_t)kind, requestId, message});
+  }
+
+  bool takeJob(Job& out) {
+    std::lock_guard<std::mutex> lk(mutex_);
+    if (jobs_.empty()) return false;
+    out = jobs_.front();
+    jobs_.pop_front();
+    return true;
+  }
+
+  std::vector<Seen> seen() {
+    std::lock_guard<std::mutex> lk(mutex_);
+    return seen_;
+  }
+
+  std::vector<std::tuple<int64_t, int64_t, std::string>> events() {
+    std::lock_guard<std::mutex> lk(mutex_);
+    return events_;
+  }
+
+ private:
+  Answer answer_;
+  std::mutex mutex_;
+  std::map<int64_t, Seen> partial_;
+  std::vector<Seen> seen_;
+  std::deque<Job> jobs_;
+  std::vector<std::tuple<int64_t, int64_t, std::string>> events_;
+};
+
+struct Fixture {
+  RecordingEmitter emitter;
+  std::shared_ptr<ServerInstance> server;
+  std::thread pump;
+  std::atomic<bool> pumping{true};
+
+  explicit Fixture(RecordingEmitter::Answer answer)
+      : emitter(std::move(answer)),
+        server(std::make_shared<ServerInstance>()) {
+    server->setEmitter(&emitter);
+    pump = std::thread([this] {
+      while (pumping.load()) {
+        RecordingEmitter::Job job{0, 0, ""};
+        if (emitter.takeJob(job)) {
+          std::vector<uint8_t> bytes(job.body.begin(), job.body.end());
+          server->respond(job.requestId, job.status,
+                          {{"Content-Type", "text/plain"}}, bytes.data(),
+                          bytes.size());
+        } else {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+      }
+    });
+  }
+
+  ~Fixture() {
+    pumping.store(false);
+    if (pump.joinable()) pump.join();
+    server->stop();
+  }
+
+  int64_t startOnEphemeral() {
+    ServerConfig cfg;
+    cfg.port = 0;
+    cfg.defaultTimeoutMs = 5000;
+    server->configure(cfg);
+    StatusResult r = server->start();
+    EXPECT_EQ((int64_t)r.kind, (int64_t)ErrorKind::None);
+    return server->boundPort();
+  }
+
+  bool waitForSeen(size_t n, int64_t timeoutMs = 5000) {
+    const auto end =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    while (emitter.seen().size() < n) {
+      if (std::chrono::steady_clock::now() > end) return false;
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return true;
+  }
+};
+
+TEST(ServerTest, ServesARegisteredRoute) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "hello");
+  });
+  EXPECT_TRUE(f.server
+                  ->registerRoute(Method::Get, "", "/hello", -1)
+                  .kind == ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+  ASSERT_GT(port, 0);
+
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+  const std::string res = readAll(fd);
+  close(fd);
+
+  EXPECT_EQ(statusOf(res), 200);
+  EXPECT_EQ(bodyOf(res), "hello");
+  EXPECT_TRUE(f.waitForSeen(1));
+  EXPECT_EQ(f.emitter.seen()[0].path, "/hello");
+}
+
+TEST(ServerTest, UnroutedPathIs404WithoutDispatch) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "unreachable");
+  });
+  const int64_t port = f.startOnEphemeral();
+
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "GET /nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+  EXPECT_EQ(statusOf(readAll(fd)), 404);
+  close(fd);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_TRUE(f.emitter.seen().empty());
+}
+
+TEST(ServerTest, MalformedRequestIs400) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "unreachable");
+  });
+  const int64_t port = f.startOnEphemeral();
+
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "GARBAGE\r\n\r\n");
+  EXPECT_EQ(statusOf(readAll(fd)), 400);
+  close(fd);
+}
+
+TEST(ServerTest, ParamsReachTheEmitter) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "ok");
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "/users/:id", -1).kind,
+            ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd,
+          "GET /users/42?verbose=true HTTP/1.1\r\nHost: x\r\n"
+          "Connection: close\r\n\r\n");
+  EXPECT_EQ(statusOf(readAll(fd)), 200);
+  close(fd);
+
+  ASSERT_TRUE(f.waitForSeen(1));
+  const auto seen = f.emitter.seen()[0];
+  EXPECT_EQ(seen.routePattern, "/users/:id");
+  ASSERT_EQ(seen.params.size(), 1u);
+  EXPECT_EQ(seen.params[0].name, "id");
+  EXPECT_EQ(seen.params[0].value, "42");
+  EXPECT_EQ(seen.query, "verbose=true");
+}
+
+TEST(ServerTest, PostBodyIsStreamedToTheEmitter) {
+  Fixture f([](Method, const std::string&, const std::string& body) {
+    return std::make_pair(200, "n=" + std::to_string(body.size()));
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Post, "", "/echo", -1).kind,
+            ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+
+  const std::string payload(100000, 'a');
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: " +
+                  std::to_string(payload.size()) +
+                  "\r\nConnection: close\r\n\r\n" + payload);
+  const std::string res = readAll(fd);
+  close(fd);
+
+  EXPECT_EQ(statusOf(res), 200);
+  EXPECT_EQ(bodyOf(res), "n=100000");
+  ASSERT_TRUE(f.waitForSeen(1));
+  EXPECT_EQ(f.emitter.seen()[0].body.size(), 100000u);
+}
+
+TEST(ServerTest, OversizeBodyIs413WithoutDispatch) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "unreachable");
+  });
+  ServerConfig cfg;
+  cfg.port = 0;
+  cfg.maxBodyBytes = 100;
+  f.server->configure(cfg);
+  EXPECT_EQ(f.server->registerRoute(Method::Post, "", "/up", -1).kind,
+            ErrorKind::None);
+  ASSERT_EQ((int64_t)f.server->start().kind, (int64_t)ErrorKind::None);
+  const int64_t port = f.server->boundPort();
+
+  const std::string payload(1000, 'b');
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: " +
+                  std::to_string(payload.size()) +
+                  "\r\nConnection: close\r\n\r\n" + payload);
+  EXPECT_EQ(statusOf(readAll(fd)), 413);
+  close(fd);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_TRUE(f.emitter.seen().empty());
+}
+
+TEST(ServerTest, RouteTimeoutAnswers408AndEmitsEvent) {
+  // No pump answers here: create the server without the answering pump by
+  // registering a route with a tiny timeout and never responding.
+  RecordingEmitter emitter([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "too late");
+  });
+  auto server = std::make_shared<ServerInstance>();
+  server->setEmitter(&emitter);
+  EXPECT_EQ(server->registerRoute(Method::Get, "", "/slow", 150).kind,
+            ErrorKind::None);
+  ServerConfig cfg;
+  cfg.port = 0;
+  server->configure(cfg);
+  ASSERT_EQ((int64_t)server->start().kind, (int64_t)ErrorKind::None);
+  const int64_t port = server->boundPort();
+
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "GET /slow HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+  const std::string res = readAll(fd);
+  close(fd);
+
+  EXPECT_EQ(statusOf(res), 408);
+  // The timeout event arrived.
+  bool found = false;
+  for (int i = 0; i < 200 && !found; i++) {
+    for (const auto& e : emitter.events()) {
+      if (std::get<0>(e) == (int64_t)ServerEventKind::HandlerTimeout) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  EXPECT_TRUE(found);
+
+  // A late respond is a no-op, never a second answer or a crash.
+  server->respond(1, 200, {}, nullptr, 0);
+  server->stop();
+}
+
+TEST(ServerTest, ConcurrentConnectionsDoNotDeadlock) {
+  Fixture f([](Method, const std::string& path, const std::string&) {
+    return std::make_pair(200, "got " + path);
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "/u/:id", -1).kind,
+            ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+
+  constexpr int kConns = 32;
+  std::vector<std::string> results(kConns);
+  std::vector<std::thread> clients;
+  for (int i = 0; i < kConns; i++) {
+    clients.emplace_back([&, i] {
+      const int fd = connectTo((int)port);
+      if (fd < 0) {
+        results[i] = "CONNECT-FAIL";
+        return;
+      }
+      sendStr(fd, "GET /u/" + std::to_string(i) +
+                      " HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+      results[i] = readAll(fd);
+      close(fd);
+    });
+  }
+  for (auto& t : clients) t.join();
+
+  for (int i = 0; i < kConns; i++) {
+    EXPECT_EQ(statusOf(results[i]), 200) << "connection " << i;
+    EXPECT_EQ(bodyOf(results[i]), "got /u/" + std::to_string(i))
+        << "connection " << i;
+  }
+}
+
+TEST(ServerTest, SecondBindOnSamePortFails) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "x");
+  });
+  const int64_t port = f.startOnEphemeral();
+
+  auto second = std::make_shared<ServerInstance>();
+  RecordingEmitter other([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "x");
+  });
+  second->setEmitter(&other);
+  ServerConfig cfg;
+  cfg.port = port;
+  second->configure(cfg);
+  EXPECT_EQ(second->start().kind, ErrorKind::BindFailed);
+}
+
+TEST(ServerTest, TlsConfigIsRefused) {
+  auto server = std::make_shared<ServerInstance>();
+  RecordingEmitter emitter([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "x");
+  });
+  server->setEmitter(&emitter);
+  ServerConfig cfg;
+  cfg.port = 0;
+  cfg.tlsRequested = true;
+  server->configure(cfg);
+  StatusResult r = server->start();
+  EXPECT_EQ(r.kind, ErrorKind::TlsError);
+}
+
+TEST(ServerTest, StopWakesParkedConnections) {
+  RecordingEmitter emitter([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "never");
+  });
+  auto server = std::make_shared<ServerInstance>();
+  server->setEmitter(&emitter);
+  // Long timeout, never answered: without the stop-wake this would hang the
+  // test for the full 30 s.
+  EXPECT_EQ(server->registerRoute(Method::Get, "", "/park", 30000).kind,
+            ErrorKind::None);
+  ServerConfig cfg;
+  cfg.port = 0;
+  server->configure(cfg);
+  ASSERT_EQ((int64_t)server->start().kind, (int64_t)ErrorKind::None);
+  const int64_t port = server->boundPort();
+
+  std::string res;
+  std::thread client([&] {
+    const int fd = connectTo((int)port);
+    if (fd < 0) return;
+    sendStr(fd, "GET /park HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    res = readAll(fd);
+    close(fd);
+  });
+  // Let the connection park, then stop: the client must get a 503 promptly.
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  server->stop();
+  client.join();
+  EXPECT_EQ(statusOf(res), 503);
+}
+
+}  // namespace

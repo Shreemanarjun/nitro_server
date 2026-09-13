@@ -109,6 +109,35 @@ class PendingTable {
     if (log.orphaned && log.acked == log.nextSeq) payloads_.erase(it);
   }
 
+  /// Wakes every parked connection with a 503, then drops all entries and
+  /// frees every payload log. Called by stop().
+  ///
+  /// Safety: connection threads hold their own shared_ptr to the request, so
+  /// waking then erasing cannot destroy an object a thread is parked on. Late
+  /// `respond`/`ack` calls find nothing and are defined no-ops. Dart-side
+  /// decodes are serialized with this on the isolate thread (both arrive as
+  /// FFI calls or stream events on the same thread), so no decode can
+  /// straddle the free.
+  void abortAll() {
+    std::lock_guard<std::mutex> lk(mutex_);
+    for (auto& kv : table_) {
+      auto& req = kv.second;
+      std::lock_guard<std::mutex> rlk(req->mutex);
+      if (!req->answered) {
+        req->answered = true;
+        req->status = 503;
+        req->headers = {{"Content-Type", "text/plain"}};
+        static const char kMsg[] = "server stopped";
+        req->body.assign(kMsg, kMsg + sizeof(kMsg) - 1);
+        req->cv.notify_one();
+      }
+    }
+    table_.clear();
+    for (auto& kv : payloads_)
+      for (auto& p : kv.second.payloads) std::free(p.second);
+    payloads_.clear();
+  }
+
   void clear() {
     std::lock_guard<std::mutex> lk(mutex_);
     table_.clear();

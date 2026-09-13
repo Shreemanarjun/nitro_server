@@ -255,14 +255,10 @@ void ServerInstance::stop() {
     std::lock_guard<std::mutex> lk(acceptMutex_);
     if (acceptThread_.joinable()) acceptThread_.join();
   }
-  // Wake every parked connection with 503 so no thread outlives the stop.
-  // Threads hold a shared_ptr to this, so joining is unnecessary and would
-  // risk hanging the Dart isolate on a slow handler.
-  std::vector<std::shared_ptr<PendingRequest>> parked;
-  // Fail-safe: snapshot via repeated find is racy; instead answer through a
-  // generation sweep is overkill — connection threads exit on their own once
-  // answered or timed out, and stop() only needs the accept loop gone.
-  (void)parked;
+  // Wake every parked connection with 503 so no thread outlives the stop by
+  // more than a socket write. Threads hold a shared_ptr to this, so joining
+  // is unnecessary and would risk hanging the Dart isolate on a slow handler.
+  pending_.abortAll();
   boundPort_.store(0);
   lockedEmitter()->emitEvent(ServerEventKind::Stopped, 0, "stopped");
 }

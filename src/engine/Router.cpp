@@ -59,8 +59,9 @@ bool Router::add(const RouteEntry& route) {
       auto it = node->statik.find(s);
       if (it == node->statik.end()) {
         auto fresh = std::make_unique<Node>();
-        node = fresh.get();
+        Node* child = fresh.get();
         node->statik.emplace(s, std::move(fresh));
+        node = child;
       } else {
         node = it->second.get();
       }

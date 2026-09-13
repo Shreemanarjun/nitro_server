@@ -18,6 +18,7 @@ if(NOT "${_NITRO_CFG}" MATCHES "^(DEBUG|RELEASE|RELWITHDEBINFO|MINSIZEREL|)$")
 endif()
 
 set(NITRO_NATIVE "${CMAKE_CURRENT_SOURCE_DIR}/native")
+# NITRO_LINK_SPEC_CHECKSUM 17d3452c0c777a88
 set(GENERATED_CPP "${CMAKE_CURRENT_SOURCE_DIR}/../lib/src/generated/cpp")
 
 add_library(nitro_server SHARED
@@ -26,6 +27,9 @@ add_library(nitro_server SHARED
   "dart_api_dl.c"
 )
 
+if(NOT ANDROID)
+  target_sources(nitro_server PRIVATE "HybridNitroServer.cpp")
+endif()
 target_include_directories(nitro_server PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}"
   "${GENERATED_CPP}"

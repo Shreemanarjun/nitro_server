@@ -344,6 +344,67 @@ void main() {
     });
   });
 
+  group('middleware', () {
+    test('accessLog formats method, path, status and latency', () async {
+      final lines = <String>[];
+      runner.use(accessLog(sink: lines.add));
+      runner.addRoute(
+        HttpMethod.get,
+        '',
+        '/logged',
+        null,
+        (_) async => ResponseContext.text('ok'),
+      );
+      await Future<void>.delayed(Duration.zero);
+
+      final response = await driveRequest(
+        fake,
+        requestId: 50,
+        path: '/logged',
+        routePattern: '/logged',
+      );
+      expect(response.status, 200);
+      expect(lines.single, matches(r'"GET /logged" 200 \d+ms'));
+    });
+
+    test('accessLog records 500s for throwing handlers', () async {
+      final lines = <String>[];
+      runner.use(accessLog(sink: lines.add));
+      runner.addRoute(HttpMethod.get, '', '/blogged', null, (_) async {
+        throw StateError('nope');
+      });
+      await Future<void>.delayed(Duration.zero);
+
+      await driveRequest(
+        fake,
+        requestId: 51,
+        path: '/blogged',
+        routePattern: '/blogged',
+      );
+      expect(lines.single, matches(r'"/blogged" 500 \d+ms'));
+    });
+
+    test('middleware applies to routes registered before use()', () async {
+      var wrapped = false;
+      runner.addRoute(HttpMethod.get, '', '/pre', null, (_) async {
+        return const ResponseContext();
+      });
+      runner.use((request, next) async {
+        wrapped = true;
+        return next(request);
+      });
+      await Future<void>.delayed(Duration.zero);
+
+      await driveRequest(
+        fake,
+        requestId: 52,
+        path: '/pre',
+        routePattern: '/pre',
+      );
+      expect(wrapped, isTrue);
+    });
+  });
+
   group('lifecycle edges', () {
     test('close is idempotent', () async {
       await addGet('/');

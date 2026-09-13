@@ -511,6 +511,142 @@ void main() {
       }, skip: skipReason);
     });
 
+    group('keep-alive (RFC 9112 §9)', () {
+      /// Incremental framed reader: one socket, many responses.
+      Future<List<Uint8List>> readResponses(Socket socket, int count) async {
+        final buffer = <int>[];
+        final responses = <Uint8List>[];
+        final done = Completer<void>();
+        socket.listen(
+          buffer.addAll,
+          onDone: done.complete,
+          onError: done.completeError,
+        );
+        int headEnd(List<int> bytes) {
+          for (var i = 0; i + 3 < bytes.length; i++) {
+            if (bytes[i] == 13 &&
+                bytes[i + 1] == 10 &&
+                bytes[i + 2] == 13 &&
+                bytes[i + 3] == 10) {
+              return i;
+            }
+          }
+          return -1;
+        }
+
+        while (responses.length < count) {
+          int end = headEnd(buffer);
+          while (end < 0) {
+            await Future<void>.delayed(const Duration(milliseconds: 5));
+            if (done.isCompleted) {
+              throw StateError('connection closed mid-response');
+            }
+            end = headEnd(buffer);
+          }
+          final head = ascii.decode(buffer.sublist(0, end));
+          var contentLength = 0;
+          for (final line in head.split('\r\n').skip(1)) {
+            final colon = line.indexOf(':');
+            if (colon > 0 &&
+                line.substring(0, colon).trim().toLowerCase() ==
+                    'content-length') {
+              contentLength = int.parse(line.substring(colon + 1).trim());
+            }
+          }
+          final total = end + 4 + contentLength;
+          while (buffer.length < total) {
+            await Future<void>.delayed(const Duration(milliseconds: 5));
+            if (done.isCompleted && buffer.length < total) {
+              throw StateError('connection closed mid-body');
+            }
+          }
+          responses.add(Uint8List.fromList(buffer.sublist(0, total)));
+          buffer.removeRange(0, total);
+        }
+        return responses;
+      }
+
+      test('sequential requests share one connection', () async {
+        final socket = await Socket.connect('127.0.0.1', port);
+        try {
+          socket.add(
+            ascii.encode('GET /methods HTTP/1.1\r\nHost: x\r\n\r\n'),
+          );
+          socket.add(
+            ascii.encode('GET /binary/16 HTTP/1.1\r\nHost: x\r\n\r\n'),
+          );
+          final responses = await readResponses(socket, 2).timeout(
+            const Duration(seconds: 10),
+          );
+          expect(_statusOf(responses[0]), 200);
+          expect(_headerOf(responses[0], 'connection'), 'keep-alive');
+          expect(_statusOf(responses[1]), 200);
+          expect(_bodyOf(responses[1]), orderedEquals(_patternBytes(16)));
+        } finally {
+          socket.destroy();
+        }
+      }, skip: skipReason);
+
+      test('pipelined requests get ordered responses', () async {
+        final socket = await Socket.connect('127.0.0.1', port);
+        try {
+          // Both heads in one segment: the engine must not mistake the
+          // second head for the first request's body.
+          socket.add(
+            ascii.encode(
+              'GET /methods HTTP/1.1\r\nHost: x\r\n\r\n'
+              'GET /methods HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n',
+            ),
+          );
+          final responses = await readResponses(socket, 2).timeout(
+            const Duration(seconds: 10),
+          );
+          expect(_statusOf(responses[0]), 200);
+          expect(_headerOf(responses[0], 'connection'), 'keep-alive');
+          expect(_statusOf(responses[1]), 200);
+          expect(_headerOf(responses[1], 'connection'), 'close');
+        } finally {
+          socket.destroy();
+        }
+      }, skip: skipReason);
+
+      test('POST echo keeps framing across requests', () async {
+        final socket = await Socket.connect('127.0.0.1', port);
+        try {
+          final payload = List<int>.generate(5000, (i) => i & 0xff);
+          socket.add(
+            ascii.encode(
+              'POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: ${payload.length}\r\n\r\n',
+            ),
+          );
+          socket.add(payload);
+          socket.add(
+            ascii.encode('GET /methods HTTP/1.1\r\nHost: x\r\n\r\n'),
+          );
+          final responses = await readResponses(socket, 2).timeout(
+            const Duration(seconds: 10),
+          );
+          expect(_statusOf(responses[0]), 200);
+          expect(
+            jsonDecode(utf8.decode(_bodyOf(responses[0])))['length'],
+            5000,
+          );
+          expect(_statusOf(responses[1]), 200);
+        } finally {
+          socket.destroy();
+        }
+      }, skip: skipReason);
+
+      test('HTTP/1.0 closes unless asked to keep', () async {
+        final raw = await _raw(
+          port,
+          ascii.encode('GET /methods HTTP/1.0\r\nHost: x\r\n\r\n'),
+        );
+        expect(_statusOf(raw), 200);
+        expect(_headerOf(raw, 'connection'), 'close');
+      }, skip: skipReason);
+    });
+
     group('routing', () {
       test('wildcard captures deep paths', () async {
         final body = await _clientBody(port, 'GET', '/wild/a/b/c');

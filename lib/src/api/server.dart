@@ -83,6 +83,11 @@ class NitroServer {
     );
   }
 
+  /// Appends [middleware] to the chain (outermost first). See [Middleware].
+  Future<void> use(Middleware middleware) async {
+    _runner.use(middleware);
+  }
+
   /// Removes a registration. Unknown routes throw [RouteNotFoundException].
   Future<void> unroute(
     HttpMethod method,

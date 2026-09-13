@@ -20,6 +20,7 @@
 // which searches images already loaded into the process — so opening the dylib
 // here is what makes the plugin visible to the generated bindings.
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 import 'dart:ffi';
@@ -377,6 +378,114 @@ void main() {
       expect((await _get(server!.port, '/slow')).status, 408);
       await Future<void>.delayed(const Duration(milliseconds: 100));
       expect(timeouts, hasLength(1));
+    }, skip: skipReason);
+
+    test('a shared client reuses keep-alive connections', () async {
+      server = await NitroServer.bind();
+      await server!.route(
+        HttpMethod.get,
+        '/r',
+        (_) async => ResponseContext.text('reused'),
+      );
+
+      // One client, sequential requests: HttpClient pools the keep-alive
+      // connection transparently. Failure here means the framing is off.
+      final client = HttpClient();
+      addTearDown(() => client.close(force: true));
+      for (var i = 0; i < 10; i++) {
+        final request = await client.getUrl(
+          Uri.parse('http://127.0.0.1:${server!.port}/r'),
+        );
+        final response = await request.close();
+        final body = await response.transform(utf8.decoder).join();
+        expect(response.statusCode, 200);
+        expect(body, 'reused');
+      }
+    }, skip: skipReason);
+
+    test('idle keep-alive connections close after the timeout', () async {
+      server = await NitroServer.bind(
+        const ServerConfig(keepAliveTimeout: Duration(milliseconds: 250)),
+      );
+      await server!.route(
+        HttpMethod.get,
+        '/h',
+        (_) async => ResponseContext.text('hi'),
+      );
+
+      final socket = await Socket.connect('127.0.0.1', server!.port);
+      addTearDown(() => socket.destroy());
+      socket.add(ascii.encode('GET /h HTTP/1.1\r\nHost: x\r\n\r\n'));
+      // Drain the one framed response; the socket must then go quiet…
+      final first = await socket.first.timeout(const Duration(seconds: 5));
+      expect(ascii.decode(first), contains('200'));
+      // …and the server must close it after the idle deadline, not hold it
+      // forever and leak the worker.
+      await socket.done.timeout(
+        const Duration(seconds: 5),
+        onTimeout: () => throw StateError('idle connection never closed'),
+      );
+    }, skip: skipReason);
+
+    test('maxRequestsPerConnection forces a fresh connection', () async {
+      server = await NitroServer.bind(
+        const ServerConfig(maxRequestsPerConnection: 2),
+      );
+      await server!.route(
+        HttpMethod.get,
+        '/m',
+        (_) async => ResponseContext.text('m'),
+      );
+
+      final socket = await Socket.connect('127.0.0.1', server!.port);
+      addTearDown(() => socket.destroy());
+      final received = BytesBuilder(copy: false);
+      final done = Completer<void>();
+      socket.listen(
+        received.add,
+        onDone: done.complete,
+        onError: done.completeError,
+      );
+      socket.add(ascii.encode('GET /m HTTP/1.1\r\nHost: x\r\n\r\n'));
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      socket.add(ascii.encode('GET /m HTTP/1.1\r\nHost: x\r\n\r\n'));
+      await done.future.timeout(const Duration(seconds: 5));
+
+      final text = ascii.decode(received.toBytes());
+      // First response stays alive, second closes: exactly two statuses.
+      expect('HTTP/1.1'.allMatches(text).length, 2);
+      expect(text, contains('Connection: keep-alive'));
+      expect(text, contains('Connection: close'));
+    }, skip: skipReason);
+
+    test('middleware wraps handlers in registration order', () async {
+      server = await NitroServer.bind();
+      final order = <String>[];
+      await server!.use((request, next) async {
+        order.add('outer-before');
+        final response = await next(request);
+        order.add('outer-after');
+        return response;
+      });
+      await server!.use((request, next) async {
+        order.add('inner-before');
+        final response = await next(request);
+        order.add('inner-after');
+        return response;
+      });
+      await server!.route(
+        HttpMethod.get,
+        '/w',
+        (_) async => ResponseContext.text('w'),
+      );
+
+      expect((await _get(server!.port, '/w')).body, 'w');
+      expect(order, [
+        'outer-before',
+        'inner-before',
+        'inner-after',
+        'outer-after',
+      ]);
     }, skip: skipReason);
 
     test('a second bind on the same port fails to bind', () async {

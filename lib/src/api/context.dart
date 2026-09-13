@@ -35,18 +35,52 @@ class ServerConfig {
     this.backlog = 128,
     this.maxBodyBytes = 10 * 1024 * 1024,
     this.defaultTimeout = const Duration(seconds: 30),
+    this.keepAliveTimeout = const Duration(seconds: 5),
+    this.maxRequestsPerConnection = 100,
+    this.workerThreads = 0,
     this.tls = const TlsConfig(),
   })  : assert(port >= 0 && port <= 65535, 'port out of range: $port'),
         assert(backlog > 0, 'backlog must be positive'),
-        assert(maxBodyBytes > 0, 'maxBodyBytes must be positive');
+        assert(maxBodyBytes > 0, 'maxBodyBytes must be positive'),
+        assert(maxRequestsPerConnection >= 0, 'maxRequestsPerConnection must be non-negative'),
+        assert(workerThreads >= 0, 'workerThreads must be non-negative');
 
   final String host;
   final int port;
   final int backlog;
   final int maxBodyBytes;
   final Duration defaultTimeout;
+
+  /// Idle deadline between requests on one keep-alive connection.
+  /// [Duration.zero] disables keep-alive: every response closes.
+  final Duration keepAliveTimeout;
+
+  /// Requests served per connection before a forced close. `0` means
+  /// unbounded (the idle timeout still applies).
+  final int maxRequestsPerConnection;
+
+  /// Native worker threads serving connections. `0` means one per CPU core.
+  final int workerThreads;
   final TlsConfig tls;
 }
+
+/// Wraps a [RequestHandler]: logging, auth, CORS, compression — anything that
+/// should run around many routes without editing each one.
+///
+/// ```dart
+/// await server.use((request, next) async {
+///   final started = DateTime.now();
+///   try {
+///     return await next(request);
+///   } finally {
+///     print('${request.path} took ${DateTime.now().difference(started)}');
+///   }
+/// });
+/// ```
+typedef Middleware = Future<ResponseContext> Function(
+  RequestContext request,
+  RequestHandler next,
+);
 
 /// One accepted request, delivered to a [RequestHandler].
 class RequestContext {

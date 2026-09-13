@@ -59,6 +59,7 @@ class ServerRunner {
   /// their head — so native memory is freed promptly and exactly once.
   final _acked = <int, int>{};
   final _handlers = <String, RequestHandler>{};
+  final _middlewares = <Middleware>[];
   final _events = StreamController<ServerEvent>.broadcast();
 
   StreamSubscription<RawIncomingRequest>? _heads;
@@ -114,6 +115,12 @@ class ServerRunner {
     _handlers[handlerKey(method, customToken, pattern)] = handler;
   }
 
+  /// Appends [middleware] to the chain. Order is registration order: the
+  /// first `use` is the outermost wrapper. Applies to routes registered
+  /// before AND after — the chain is resolved at dispatch, not at
+  /// registration.
+  void use(Middleware middleware) => _middlewares.add(middleware);
+
   void removeRoute(HttpMethod method, String customToken, String pattern) {
     final token = method == HttpMethod.custom ? customToken : method.token;
     final status = _native.unregisterRoute(token, pattern);
@@ -132,6 +139,9 @@ class ServerRunner {
         backlog: config.backlog,
         maxBodyBytes: config.maxBodyBytes,
         defaultTimeoutMs: config.defaultTimeout.inMilliseconds,
+        keepAliveTimeoutMs: config.keepAliveTimeout.inMilliseconds,
+        maxRequestsPerConn: config.maxRequestsPerConnection,
+        workerThreads: config.workerThreads,
         tls: RawTlsConfig(
           certPem: config.tls.certPem,
           keyPem: config.tls.keyPem,
@@ -282,6 +292,10 @@ class ServerRunner {
       _pending.remove(head.requestId);
       return;
     }
+    final piped = _middlewares.reversed.fold<RequestHandler>(
+      handler,
+      (next, middleware) => (request) => middleware(request, next),
+    );
     final context = RequestContext(
       method: method,
       customMethod: custom,
@@ -295,7 +309,7 @@ class ServerRunner {
       routePattern: head.routePattern,
       body: pending.body.toBytes(),
     );
-    Future(() => handler(context)).then(
+    Future(() => piped(context)).then(
       (response) {
         _answer(head.requestId, response);
         _pending.remove(head.requestId);

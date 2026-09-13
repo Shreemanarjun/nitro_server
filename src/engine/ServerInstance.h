@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// ServerInstance — one bound server: config, router, accept loop.
+// ServerInstance — one bound server: config, router, accept loop, workers.
 //
 // Transport note: this is a minimal multithreaded blocking-IO HTTP/1.1
 // transport with the same shape as oat++'s HttpConnectionHandler (accept →
@@ -9,11 +9,16 @@
 // translation unit for an oat++-backed one keeps them untouched.
 //
 // Concurrency contract (mirrors the spec header):
-//   connection thread: parse → route → emit head → stream body → park on the
-//     request's OWN condition variable until respond() or the ROUTE's timeout.
+//   worker: parse → route → emit head → stream body → park on the request's
+//     OWN condition variable until respond() or the ROUTE's timeout.
 //   Dart isolate: never blocks; answers with respond(requestId, ...).
-// No two connections ever wait on the same primitive, and the Dart thread
-// never waits at all — that is the whole deadlock story.
+// No two requests ever wait on the same primitive, and the Dart thread never
+// waits at all — that is the whole deadlock story.
+//
+// Keep-alive: a connection serves up to maxRequestsPerConn requests back to
+// back, gated by the idle timeout. Only clean request/response cycles stay
+// alive — any error, timeout or truncated body closes, because resuming a
+// connection whose framing is in doubt is how desync bugs are born.
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma once
 
@@ -22,6 +27,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -38,6 +44,9 @@ struct ServerConfig {
   int64_t backlog = 128;
   int64_t maxBodyBytes = 10 * 1024 * 1024;
   int64_t defaultTimeoutMs = 30000;
+  int64_t keepAliveTimeoutMs = 5000;
+  int64_t maxRequestsPerConn = 100;
+  int64_t workerThreads = 0;  // <= 0 means one per CPU core.
   bool tlsRequested = false;
 };
 
@@ -92,8 +101,7 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   void stop();
 
   /// Deep-copies headers/body synchronously (bridge memory dies on return)
-  /// and wakes the parked connection thread. Unknown/already-answered ids
-  /// are no-ops.
+  /// and wakes the parked worker. Unknown/already-answered ids are no-ops.
   void respond(int64_t requestId, int64_t status,
                const std::vector<Header>& headers, const uint8_t* body,
                size_t bodyLen);
@@ -102,17 +110,20 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   bool running() const { return running_.load(); }
   int64_t boundPort() const { return boundPort_.load(); }
 
-  /// Test seam: blocks until no connection thread is active (or timeout).
+  /// Test seam: blocks until no connection is active (or timeout).
   bool waitForDrainForTesting(int64_t timeoutMs);
 
  private:
+  /// One iteration of a connection: exactly one request/response cycle.
+  /// Returns true when the connection may serve another request.
+  bool serveOne(int fd, std::string& carry, int64_t& served);
+
   void acceptLoop();
+  void workerLoop();
   void handleConnection(int fd);
-  /// Emits an error chunk (tracked, so the runner's ack frees it) followed by
-  /// the end marker for a request whose body will never complete.
-  void emitTerminalError(int64_t requestId, const std::string& message,
-                         ErrorKind kind);
   static bool sendAll(int fd, const uint8_t* data, size_t n);
+
+  /// Fast error path. Always closes: errors never keep alive (see header).
   void answerDirectly(int fd, Method method, int64_t status,
                       const std::string& body);
 
@@ -120,6 +131,11 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   /// unbound. The single-subscriber invariant guarantees a real sink from
   /// the first subscribe, which always precedes start().
   Emitter* lockedEmitter();
+
+  /// Emits an error chunk (tracked, so the runner's ack frees it) followed by
+  /// the end marker for a request whose body will never complete.
+  void emitTerminalError(int64_t requestId, const std::string& message,
+                         ErrorKind kind);
 
   Emitter* emitter_ = nullptr;
   std::mutex emitterMutex_;
@@ -132,6 +148,18 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   int listenFd_ = -1;
   std::thread acceptThread_;
   std::mutex acceptMutex_;
+
+  // Worker pool: bounded queue, fixed workers. The queue bound is the
+  // listen backlog — beyond it the engine refuses fast rather than letting
+  // the accept loop outrun the workers.
+  std::vector<std::thread> workers_;
+  std::mutex queueMutex_;
+  std::condition_variable queueCv_;
+  std::vector<int> queue_;
+
+  // Live connections, so stop() can wake idle keep-alive reads.
+  std::mutex activeMutex_;
+  std::set<int> activeFds_;
 
   PendingTable pending_;
   std::atomic<int64_t> inFlight_{0};

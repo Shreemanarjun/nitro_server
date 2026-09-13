@@ -13,6 +13,7 @@ using socklen_t = int;
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -25,9 +26,6 @@ using Fd = SOCKET;
 constexpr Fd kBadFd = INVALID_SOCKET;
 int closeFd(Fd fd) { return closesocket(fd); }
 void shutdownRdwr(Fd fd) { shutdown(fd, SD_BOTH); }
-bool wouldBlock() {
-  return WSAGetLastError() == WSAEWOULDBLOCK;
-}
 struct WinsockEnv {
   WinsockEnv() {
     WSADATA d;
@@ -62,25 +60,30 @@ std::string trim(const std::string& s) {
   return s.substr(b, e - b + 1);
 }
 
-bool readHead(Fd fd, std::string& out) {
-  char buf[4096];
-  while (out.size() < kMaxHeadBytes) {
+/// Reads until a full head is buffered, honouring the per-connection receive
+/// timeout (idle deadline between keep-alive requests, header deadline on the
+/// first). Surplus bytes after the head stay in [buf] for the body reader and
+/// the next pipelined request. Returns false on EOF, timeout or oversize.
+bool readHead(Fd fd, std::string& buf) {
+  char tmp[4096];
+  while (buf.size() < kMaxHeadBytes) {
+    if (buf.find("\r\n\r\n") != std::string::npos) return true;
 #ifdef _WIN32
-    int n = recv(fd, buf, sizeof(buf), 0);
+    int n = recv(fd, tmp, sizeof(tmp), 0);
 #else
-    ssize_t n = recv(fd, buf, sizeof(buf), 0);
+    ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
 #endif
     if (n <= 0) return false;
-    out.append(buf, (size_t)n);
-    if (out.find("\r\n\r\n") != std::string::npos) return true;
+    buf.append(tmp, (size_t)n);
   }
-  return false;
+  return buf.find("\r\n\r\n") != std::string::npos;
 }
 
 struct ParsedHead {
   Method method = Method::Get;
   std::string customMethod;
   std::string target;
+  std::string version;
   std::vector<Header> headers;
   bool ok = false;
 };
@@ -98,6 +101,7 @@ ParsedHead parseHead(const std::string& raw, size_t headEnd) {
   if (sp1 == std::string::npos || sp2 == std::string::npos) return p;
   p.method = parseMethod(requestLine.substr(0, sp1), p.customMethod);
   p.target = requestLine.substr(sp1 + 1, sp2 - sp1 - 1);
+  p.version = trim(requestLine.substr(sp2 + 1));
   size_t pos = lineEnd + 2;
   while (pos < head.size()) {
     size_t eol = head.find("\r\n", pos);
@@ -119,6 +123,20 @@ const Header* findHeader(const std::vector<Header>& hs, const char* name) {
   for (const auto& h : hs)
     if (lower(h.name) == want) return &h;
   return nullptr;
+}
+
+/// HTTP/1.1 keeps alive unless asked to close; 1.0 closes unless asked to
+/// keep. Anything else (including a missing version) closes — a client that
+/// cannot name its protocol does not get connection reuse.
+bool clientWantsKeepAlive(const ParsedHead& head) {
+  const bool is11 = head.version == "HTTP/1.1";
+  const bool is10 = head.version == "HTTP/1.0";
+  if (!is11 && !is10) return false;
+  const Header* conn = findHeader(head.headers, "connection");
+  const std::string value = conn ? lower(conn->value) : "";
+  if (value.find("close") != std::string::npos) return false;
+  if (is11) return true;
+  return value.find("keep-alive") != std::string::npos;
 }
 
 }  // namespace
@@ -203,6 +221,11 @@ StatusResult ServerInstance::start() {
   }
   int one = 1;
   setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&one, sizeof(one));
+#ifndef _WIN32
+  // SO_REUSEPORT: instant rebind on restart, and the socket is ready for a
+  // multi-acceptor layout when the pool grows one.
+  setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, (const char*)&one, sizeof(one));
+#endif
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_port = htons((uint16_t)cfg.port);
@@ -234,13 +257,22 @@ StatusResult ServerInstance::start() {
     boundPort_.store(cfg.port);
   }
   listenFd_ = (int)fd;
+
+  unsigned workers = cfg.workerThreads > 0 ? (unsigned)cfg.workerThreads
+                                           : std::thread::hardware_concurrency();
+  if (workers == 0) workers = 4;
   {
-    std::lock_guard<std::mutex> lk(acceptMutex_);
     auto self = shared_from_this();
+    std::lock_guard<std::mutex> lk(acceptMutex_);
     acceptThread_ = std::thread([self]() { self->acceptLoop(); });
+    for (unsigned i = 0; i < workers; i++) {
+      workers_.emplace_back([self]() { self->workerLoop(); });
+    }
   }
   lockedEmitter()->emitEvent(ServerEventKind::Started, 0,
-                     "listening on port " + std::to_string(boundPort_.load()));
+                             "listening on port " +
+                                 std::to_string(boundPort_.load()) + " with " +
+                                 std::to_string(workers) + " workers");
   return {ErrorKind::None, "", boundPort_.load()};
 }
 
@@ -255,10 +287,23 @@ void ServerInstance::stop() {
     std::lock_guard<std::mutex> lk(acceptMutex_);
     if (acceptThread_.joinable()) acceptThread_.join();
   }
-  // Wake every parked connection with 503 so no thread outlives the stop by
-  // more than a socket write. Threads hold a shared_ptr to this, so joining
-  // is unnecessary and would risk hanging the Dart isolate on a slow handler.
+  // Wake parked workers with 503, then shut every live socket so idle
+  // keep-alive reads fail fast instead of lingering to their deadline.
   pending_.abortAll();
+  {
+    std::lock_guard<std::mutex> lk(activeMutex_);
+    for (int fd : activeFds_) shutdownRdwr((Fd)fd);
+  }
+  queueCv_.notify_all();
+  for (auto& w : workers_) {
+    if (w.joinable()) w.join();
+  }
+  workers_.clear();
+  {
+    std::lock_guard<std::mutex> lk(queueMutex_);
+    for (int fd : queue_) closeFd((Fd)fd);
+    queue_.clear();
+  }
   boundPort_.store(0);
   lockedEmitter()->emitEvent(ServerEventKind::Stopped, 0, "stopped");
 }
@@ -291,20 +336,12 @@ bool ServerInstance::waitForDrainForTesting(int64_t timeoutMs) {
   return true;
 }
 
-void ServerInstance::emitTerminalError(int64_t requestId,
-                                        const std::string& message,
-                                        ErrorKind kind) {
-  uint8_t* payload = nullptr;
-  if (!message.empty()) {
-    payload = (uint8_t*)std::malloc(message.size());
-    if (payload) memcpy(payload, message.data(), message.size());
-  }
-  if (payload) pending_.trackPayload(requestId, payload);
-  lockedEmitter()->emitBodyError(requestId, payload, message.size(), kind);
-  lockedEmitter()->emitBodyEnd(requestId);
-}
-
 void ServerInstance::acceptLoop() {
+  int64_t maxQueued;
+  {
+    std::lock_guard<std::mutex> lk(configMutex_);
+    maxQueued = config_.backlog > 0 ? config_.backlog : 128;
+  }
   while (running_.load()) {
     sockaddr_in peer{};
     socklen_t len = sizeof(peer);
@@ -314,12 +351,31 @@ void ServerInstance::acceptLoop() {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
       continue;
     }
-    inFlight_++;
-    auto self = shared_from_this();
-    std::thread([self, fd]() {
-      self->handleConnection((int)fd);
-      self->inFlight_--;
-    }).detach();
+    {
+      std::lock_guard<std::mutex> lk(queueMutex_);
+      if ((int64_t)queue_.size() >= maxQueued) {
+        // Refuse fast: a accept loop that outruns its workers must shed load
+        // at the door, not queue it until every client times out.
+        closeFd(fd);
+        continue;
+      }
+      queue_.push_back((int)fd);
+    }
+    queueCv_.notify_one();
+  }
+}
+
+void ServerInstance::workerLoop() {
+  while (true) {
+    int fd = -1;
+    {
+      std::unique_lock<std::mutex> lk(queueMutex_);
+      queueCv_.wait(lk, [&] { return !queue_.empty() || !running_.load(); });
+      if (queue_.empty()) return;  // Stop was requested and nothing is queued.
+      fd = queue_.back();
+      queue_.pop_back();
+    }
+    handleConnection(fd);
   }
 }
 
@@ -349,21 +405,77 @@ void ServerInstance::answerDirectly(int fd, Method method, int64_t status,
     sendAll(fd, (const uint8_t*)body.data(), body.size());
 }
 
+void ServerInstance::emitTerminalError(int64_t requestId,
+                                        const std::string& message,
+                                        ErrorKind kind) {
+  uint8_t* payload = nullptr;
+  if (!message.empty()) {
+    payload = (uint8_t*)std::malloc(message.size());
+    if (payload) memcpy(payload, message.data(), message.size());
+  }
+  if (payload) pending_.trackPayload(requestId, payload);
+  lockedEmitter()->emitBodyError(requestId, payload, message.size(), kind);
+  lockedEmitter()->emitBodyEnd(requestId);
+}
+
 void ServerInstance::handleConnection(int fd) {
   const Fd sock = (Fd)fd;
-  std::string raw;
-  if (!readHead(sock, raw)) {
-    closeFd(sock);
-    return;
+  {
+    std::lock_guard<std::mutex> lk(activeMutex_);
+    activeFds_.insert(fd);
   }
-  const size_t headEnd = raw.find("\r\n\r\n");
+  inFlight_++;
+
+  ServerConfig cfg;
+  {
+    std::lock_guard<std::mutex> lk(configMutex_);
+    cfg = config_;
+  }
+  // The receive timeout doubles as the keep-alive idle deadline and the
+  // first-byte header deadline. Zero disables keep-alive below; the initial
+  // read still needs a bound, so floor it at the route default.
+  const int64_t idleMs =
+      cfg.keepAliveTimeoutMs > 0 ? cfg.keepAliveTimeoutMs : 5000;
+#ifdef _WIN32
+  DWORD tv = (DWORD)idleMs;
+  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+#else
+  struct timeval tv{};
+  tv.tv_sec = (time_t)(idleMs / 1000);
+  tv.tv_usec = (suseconds_t)((idleMs % 1000) * 1000);
+  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+  int one = 1;
+  setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
+
+  std::string carry;
+  int64_t served = 0;
+  while (running_.load()) {
+    if (!serveOne(fd, carry, served)) break;
+    if (cfg.keepAliveTimeoutMs <= 0) break;
+    if (cfg.maxRequestsPerConn > 0 && served >= cfg.maxRequestsPerConn) break;
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(activeMutex_);
+    activeFds_.erase(fd);
+  }
+  closeFd(sock);
+  inFlight_--;
+}
+
+bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served) {
+  const Fd sock = (Fd)fd;
+  if (!readHead(sock, carry)) return false;  // EOF, idle timeout, or oversize.
+  const size_t headEnd = carry.find("\r\n\r\n");
   size_t bodyStart = headEnd + 4;
-  ParsedHead head = parseHead(raw, headEnd);
+  ParsedHead head = parseHead(carry, headEnd);
   if (!head.ok) {
     answerDirectly(fd, Method::Get, 400, "bad request");
-    closeFd(sock);
-    return;
+    return false;
   }
+  const bool keepPeer =
+      clientWantsKeepAlive(head) && running_.load();
 
   std::string path = head.target;
   std::string query;
@@ -382,12 +494,8 @@ void ServerInstance::handleConnection(int fd) {
     m = router_.match(head.method, head.customMethod, path);
   }
   if (!m.matched) {
-    // Drain nothing: close fast. The client already sent (or is sending) the
-    // body; RST on close is the standard price of a 404 and keeps the bridge
-    // free of bookkeeping for unrouted traffic.
     answerDirectly(fd, head.method, 404, "not found");
-    closeFd(sock);
-    return;
+    return false;
   }
 
   const int64_t timeoutMs =
@@ -418,8 +526,7 @@ void ServerInstance::handleConnection(int fd) {
   if (contentLength < 0) {
     answerDirectly(fd, head.method, 400, "bad content-length");
     pending_.erase(requestId);
-    closeFd(sock);
-    return;
+    return false;
   }
   const bool hasBody = chunked || contentLength > 0;
   if (!chunked && contentLength > cfg.maxBodyBytes) {
@@ -427,17 +534,16 @@ void ServerInstance::handleConnection(int fd) {
                       ErrorKind::RequestTooLarge);
     answerDirectly(fd, head.method, 413, "content too large");
     pending_.erase(requestId);
-    closeFd(sock);
-    return;
+    return false;
   }
 
-  lockedEmitter()->emitHead(requestId, head.method, head.customMethod, path, query,
-                    head.headers, chunked ? -1 : contentLength, hasBody,
-                    m.route.pattern, m.params);
+  lockedEmitter()->emitHead(requestId, head.method, head.customMethod, path,
+                            query, head.headers, chunked ? -1 : contentLength,
+                            hasBody, m.route.pattern, m.params);
 
-  // Stream the body. Already-buffered bytes first, then the socket.
+  // Stream the body. Already-buffered bytes first, then the socket. Anything
+  // left in `carry` past the body belongs to the next pipelined request.
   int64_t remaining = contentLength;
-  size_t buffered = raw.size() - bodyStart;
   bool tooLarge = false;
   int64_t received = 0;
   auto emitBytes = [&](const uint8_t* data, size_t n) {
@@ -457,12 +563,10 @@ void ServerInstance::handleConnection(int fd) {
   };
 
   if (chunked) {
-    // De-chunk: parse hex sizes out of the buffered + streamed bytes.
-    std::string stream = raw.substr(bodyStart);
-    size_t pos = 0;
+    size_t pos = bodyStart;
     bool done = false;
     auto fill = [&](size_t need) -> bool {
-      while (stream.size() - pos < need) {
+      while (carry.size() - pos < need) {
         char buf[4096];
 #ifdef _WIN32
         int n = recv(sock, buf, sizeof(buf), 0);
@@ -470,20 +574,20 @@ void ServerInstance::handleConnection(int fd) {
         ssize_t n = recv(sock, buf, sizeof(buf), 0);
 #endif
         if (n <= 0) return false;
-        stream.append(buf, (size_t)n);
-        if (stream.size() > (size_t)cfg.maxBodyBytes + 1024) return false;
+        carry.append(buf, (size_t)n);
+        if (carry.size() > (size_t)cfg.maxBodyBytes + 1024) return false;
       }
       return true;
     };
     while (!done) {
       size_t eol = std::string::npos;
       while (true) {
-        eol = stream.find("\r\n", pos);
+        eol = carry.find("\r\n", pos);
         if (eol != std::string::npos) break;
-        if (!fill((stream.size() - pos) + 1)) break;
+        if (!fill((carry.size() - pos) + 1)) break;
       }
       if (eol == std::string::npos) break;
-      long chunkSize = strtol(stream.c_str() + pos, nullptr, 16);
+      long chunkSize = strtol(carry.c_str() + pos, nullptr, 16);
       pos = eol + 2;
       if (chunkSize == 0) {
         done = true;
@@ -494,7 +598,7 @@ void ServerInstance::handleConnection(int fd) {
         break;
       }
       if (!fill((size_t)chunkSize + 2)) break;
-      emitBytes((const uint8_t*)stream.data() + pos, (size_t)chunkSize);
+      emitBytes((const uint8_t*)carry.data() + pos, (size_t)chunkSize);
       received += chunkSize;
       pos += (size_t)chunkSize + 2;  // Skip trailing CRLF.
     }
@@ -503,15 +607,18 @@ void ServerInstance::handleConnection(int fd) {
                         ErrorKind::BadRequest);
       answerDirectly(fd, head.method, 400, "truncated body");
       pending_.erase(requestId);
-      closeFd(sock);
-      return;
+      return false;
     }
+    carry.erase(0, pos);
   } else if (hasBody) {
+    size_t buffered = carry.size() - bodyStart;
     if (buffered > 0) {
-      const size_t take = (size_t)std::min<int64_t>((int64_t)buffered, remaining);
-      emitBytes((const uint8_t*)raw.data() + bodyStart, take);
+      const size_t take =
+          (size_t)std::min<int64_t>((int64_t)buffered, remaining);
+      emitBytes((const uint8_t*)carry.data() + bodyStart, take);
       remaining -= (int64_t)take;
       received += (int64_t)take;
+      bodyStart += take;
     }
     char buf[4096];
     while (remaining > 0 && !tooLarge) {
@@ -530,9 +637,11 @@ void ServerInstance::handleConnection(int fd) {
       emitTerminalError(requestId, "truncated body", ErrorKind::BadRequest);
       answerDirectly(fd, head.method, 400, "truncated body");
       pending_.erase(requestId);
-      closeFd(sock);
-      return;
+      return false;
     }
+    carry.erase(0, bodyStart + (size_t)(contentLength - remaining));
+  } else {
+    carry.erase(0, bodyStart);
   }
 
   if (tooLarge) {
@@ -540,13 +649,12 @@ void ServerInstance::handleConnection(int fd) {
                       ErrorKind::RequestTooLarge);
     answerDirectly(fd, head.method, 413, "content too large");
     pending_.erase(requestId);
-    closeFd(sock);
-    return;
+    return false;
   }
   lockedEmitter()->emitBodyEnd(requestId);
 
   // Park until Dart answers or the ROUTE's timeout fires. Per-request mutex:
-  // concurrent connections never touch each other here.
+  // concurrent requests never touch each other here.
   bool expired = false;
   {
     std::unique_lock<std::mutex> lk(req->mutex);
@@ -567,23 +675,36 @@ void ServerInstance::handleConnection(int fd) {
   }
   if (expired) {
     lockedEmitter()->emitEvent(ServerEventKind::HandlerTimeout, requestId,
-                       "handler exceeded " + std::to_string(timeoutMs) + "ms");
+                               "handler exceeded " +
+                                   std::to_string(timeoutMs) + "ms");
   }
 
+  // Only a clean cycle keeps alive: the framing past this point is exact, so
+  // whatever `carry` holds is the next request, not debris.
+  const bool keepAlive = keepPeer && !expired &&
+                         cfg.keepAliveTimeoutMs > 0 && running_.load();
   std::string head_out = "HTTP/1.1 " + std::to_string(req->status) + " " +
                          reasonPhrase(req->status) + "\r\n";
   for (const auto& h : req->headers) {
     if (lower(h.name) == "content-length") continue;  // We are authoritative.
+    if (lower(h.name) == "connection") continue;      // We are authoritative.
     head_out += h.name + ": " + h.value + "\r\n";
   }
-  head_out += "Content-Length: " + std::to_string(req->body.size()) +
-              "\r\nConnection: close\r\n\r\n";
-  sendAll(fd, (const uint8_t*)head_out.data(), head_out.size());
-  if (head.method != Method::Head && !req->body.empty())
+  head_out += "Content-Length: " + std::to_string(req->body.size()) + "\r\n";
+  if (keepAlive) {
+    head_out += "Connection: keep-alive\r\nKeep-Alive: timeout=" +
+                std::to_string(cfg.keepAliveTimeoutMs / 1000) + "\r\n\r\n";
+  } else {
+    head_out += "Connection: close\r\n\r\n";
+  }
+  const bool sent =
+      sendAll(fd, (const uint8_t*)head_out.data(), head_out.size());
+  if (sent && head.method != Method::Head && !req->body.empty())
     sendAll(fd, req->body.data(), req->body.size());
 
   pending_.erase(requestId);
-  closeFd(sock);
+  served++;
+  return keepAlive && sent;
 }
 
 }  // namespace nitroserver

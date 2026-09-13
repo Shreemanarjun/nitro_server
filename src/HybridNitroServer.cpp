@@ -154,6 +154,9 @@ class HybridNitroServerImpl final : public HybridNitroServerNative {
     cfg.backlog = raw.backlog;
     cfg.maxBodyBytes = raw.maxBodyBytes;
     cfg.defaultTimeoutMs = raw.defaultTimeoutMs;
+    cfg.keepAliveTimeoutMs = raw.keepAliveTimeoutMs;
+    cfg.maxRequestsPerConn = raw.maxRequestsPerConn;
+    cfg.workerThreads = raw.workerThreads;
     cfg.tlsRequested = !raw.tls.certPem.empty() || !raw.tls.keyPem.empty() ||
                        !raw.tls.certFile.empty() || !raw.tls.keyFile.empty();
     server_->configure(cfg);

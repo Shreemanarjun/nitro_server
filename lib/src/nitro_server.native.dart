@@ -139,6 +139,19 @@ class RawServerConfig {
   final int backlog;
   final int maxBodyBytes;
   final int defaultTimeoutMs;
+
+  /// Idle deadline between pipelined requests on one connection. `0`
+  /// disables keep-alive: every response closes (v1 behavior).
+  final int keepAliveTimeoutMs;
+
+  /// Requests served per connection before a forced close. `<= 0` means
+  /// unbounded (the idle timeout still applies).
+  final int maxRequestsPerConn;
+
+  /// Worker threads serving connections. `<= 0` means one per CPU core.
+  /// Accepted-but-unclaimed connections queue up to `backlog`; beyond that
+  /// the engine refuses immediately instead of starving the accept loop.
+  final int workerThreads;
   final RawTlsConfig tls;
 
   const RawServerConfig({
@@ -147,6 +160,9 @@ class RawServerConfig {
     this.backlog = 128,
     this.maxBodyBytes = 10485760,
     this.defaultTimeoutMs = 30000,
+    this.keepAliveTimeoutMs = 5000,
+    this.maxRequestsPerConn = 100,
+    this.workerThreads = 0,
     this.tls = const RawTlsConfig(),
   });
 }

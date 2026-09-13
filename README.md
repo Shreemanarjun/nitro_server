@@ -63,11 +63,34 @@ dropped, never sent twice. A throwing handler is a 500; the server survives.
 - **Desktop:** no constraints — the reference platform for testing.
 - **Web:** unsupported. Browsers cannot bind raw sockets; there is no shim.
 
+## Dart-only mode
+
+The package has no Flutter SDK dependency: `dart pub get`, `dart test` and
+`dart run` all work. Flutter apps keep working unchanged — the `ffiPlugin`
+metadata still gets the native library built and bundled automatically.
+
+Dart CLI programs build the library with cmake and open it once at startup:
+
+```dart
+import 'package:nitro_server/nitro_server.dart';
+
+void main() async {
+  loadNitroServerNative(); // opens build/lib/libnitro_server.{dylib,so,dll}
+  final server = await NitroServer.bind();
+  await server.get('/hello', (_) async => ResponseContext.text('hi 👋'));
+  print('listening on http://127.0.0.1:${server.port}');
+}
+```
+
+`NITRO_SERVER_DYLIB` (or an explicit `path:` argument) overrides the search,
+which defaults to the conventional cmake outputs (`build/lib/<name>`,
+`build/<name>`).
+
 ## How it compares
 
-For Dart servers the realistic alternatives are `dart:io HttpServer` (stdlib),
-`shelf`/`shelf_io` (which sits on `dart:io`), and framework servers like
-Alfred. Dimensions that actually differ:
+For Dart servers the realistic alternatives are `dart:io HttpServer` (stdlib)
+and `shelf`/`shelf_io` (which sits on `dart:io`). Dimensions that actually
+differ:
 
 | dimension | `dart:io` / shelf | `nitro_server` |
 | --------- | ----------------- | -------------- |
@@ -77,30 +100,33 @@ Alfred. Dimensions that actually differ:
 | request size cap | manual content-length accounting | `maxBodyBytes` enforced while streaming (413 + no dispatch) |
 | upload streaming | `Stream<List<int>>` on the event loop | zero-copy chunk stream with ack-based release |
 | TLS | `SecurityContext` (mature) | **not yet** — non-empty TLS config fails honestly with `ServerTlsException` |
-| keep-alive | yes | no (v1 closes every connection; see below) |
+| keep-alive | yes | yes (`keepAliveTimeout`, `maxRequestsPerConnection`); `Duration.zero` disables per server |
 | web | n/a (server) | unsupported |
 
-Measured, not claimed — same routes, same driver, interleaved A/B (see
+Measured, not claimed — same routes, same driver, interleaved A/B/C (see
 [`benchmark/`](benchmark/) for methodology and how to re-run):
 
 ```
 | case                 | mean µs | p50 µs | p99 µs | req/s @32 |
-| dart:io /hello       |     215 |    198 |    564 |      7780 |
-| nitro   /hello       |     176 |    160 |    401 |     10233 |
-| dart:io POST /echo 4k|     200 |    185 |    424 |      6888 |
-| nitro   POST /echo 4k|     205 |    190 |    465 |      8696 |
+| dart:io /hello       |     176 |    160 |    404 |      8474 |
+| shelf   /hello       |     255 |    182 |    410 |      7371 |
+| nitro   /hello       |     157 |    145 |    338 |     10474 |
+| dart:io POST /echo 4k|     210 |    195 |    443 |      7562 |
+| shelf   POST /echo 4k|     211 |    194 |    430 |      5506 |
+| nitro   POST /echo 4k|     181 |    168 |    345 |      9471 |
 ```
 
 Read narrowly: the native accept loop shaves scheduling latency and scales
-small-route throughput ~1.3× on loopback; on a 4 KB echo both sides are socket
-copy and land at parity. Keep-alive would change the picture in `dart:io`'s
-favor for tiny routes — that is exactly why the table says what was measured
-(`Connection: close` both sides) instead of crowning a winner. Run
+small-route throughput ~1.2–1.4× on loopback, while `shelf` pays its
+framework layers against raw `dart:io`; on a 4 KB echo all sides are closer
+because the socket copy dominates. Keep-alive would change the picture for
+everyone — that is exactly why the table says what was measured
+(`Connection: close` all sides) instead of crowning a winner. Run
 `dart run benchmark/compare.dart` on your hardware before quoting anything.
 
 ## Limits (v1, stated plainly)
 
-- HTTP/1.1 only; responses always close the connection.
+- HTTP/1.1 only.
 - No TLS yet (`supportsTls() == false`; tracked for the `oatpp-libressl` phase).
 - Bodies capped by `maxBodyBytes` (default 10 MB); above it the engine answers
   413 without dispatching.
@@ -119,8 +145,8 @@ regeneration is not a no-op.
 cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release
 cmake --build build/lib --parallel
 
-# Dart: 102 tests, 100% line floor enforced
-flutter test
+# Dart: unit + e2e suites, no Flutter SDK needed (100% line floor enforced)
+dart test
 bash tool/coverage.sh
 
 # C++: 36 tests (router, pending table, wire, loopback server)

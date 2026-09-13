@@ -2,7 +2,7 @@
 // No native library needed: everything here runs against fakes and pure data.
 import 'dart:typed_data';
 
-import 'package:flutter_test/flutter_test.dart';
+import 'package:test/test.dart';
 import 'package:nitro_server/nitro_server.dart';
 import 'package:nitro_server/src/internal/raw_mapping.dart';
 import 'package:nitro_server/src/nitro_server.native.dart';

@@ -1,6 +1,7 @@
 /// Request/response types for route handlers.
 library;
 
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'http_method.dart';
@@ -135,10 +136,14 @@ class ResponseContext {
     Map<String, String> headers = const {},
     String contentType = 'text/plain; charset=utf-8',
   }) {
+    // UTF-8, not `text.codeUnits` (UTF-16): non-ASCII text such as emoji must
+    // survive the wire. (`utf8.encode` returns the bytes directly, no extra
+    // copy on either side of this call.)
+    final encoded = utf8.encode(text);
     return ResponseContext(
       status: status,
       headers: {'content-type': contentType, ...headers},
-      body: Uint8List.fromList(text.codeUnits),
+      body: encoded,
     );
   }
 

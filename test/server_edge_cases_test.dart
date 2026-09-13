@@ -5,7 +5,7 @@
 // its "why" gets deleted the first time someone confuses it with redundancy.
 import 'dart:typed_data';
 
-import 'package:flutter_test/flutter_test.dart';
+import 'package:test/test.dart';
 import 'package:nitro_server/nitro_server.dart';
 import 'package:nitro_server/src/internal/server_runner.dart';
 import 'package:nitro_server/src/nitro_server.native.dart';
@@ -339,8 +339,11 @@ void main() {
     });
 
     test('ResponseContext rejects out-of-range statuses', () {
-      expect(() => ResponseContext(status: 99), throwsAssertionError);
-      expect(() => ResponseContext(status: 1000), throwsAssertionError);
+      expect(() => ResponseContext(status: 99), throwsA(isA<AssertionError>()));
+      expect(
+        () => ResponseContext(status: 1000),
+        throwsA(isA<AssertionError>()),
+      );
     });
   });
 

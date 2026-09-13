@@ -4,6 +4,10 @@
 # lib/src/generated) is excluded — it is verified by `nitrogen generate`
 # being a no-op in CI, not by line hits.
 #
+# The suite is pure `package:test`, so `dart test` is the primary runner
+# (no Flutter SDK needed beyond resolving the `nitro` bridge dependency).
+# `flutter test` still works as a fallback since Flutter bundles the Dart SDK.
+#
 # Usage: bash tool/coverage.sh [FLOOR=100] [--html]
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -17,7 +21,11 @@ for arg in "$@"; do
   esac
 done
 
-flutter test --coverage
+if command -v dart >/dev/null 2>&1; then
+  dart test --coverage=coverage
+else
+  flutter test --coverage
+fi
 lcov --remove coverage/lcov.info \
   '*/nitro_server.g.dart' '*/generated/*' \
   -o coverage/lcov.filtered.info >/dev/null

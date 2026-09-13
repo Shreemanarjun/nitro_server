@@ -552,6 +552,9 @@ bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served) {
 
   // Stream the body. Already-buffered bytes first, then the socket. Anything
   // left in `carry` past the body belongs to the next pipelined request.
+  // The sink is loaded once: `lockedEmitter()` takes a mutex, and per-chunk
+  // locking showed up on large-upload profiles.
+  Emitter* emitter = lockedEmitter();
   int64_t remaining = contentLength;
   bool tooLarge = false;
   int64_t received = 0;
@@ -566,7 +569,7 @@ bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served) {
       }
       memcpy(payload, data + off, take);
       pending_.trackPayload(requestId, payload);
-      lockedEmitter()->emitBodyData(requestId, payload, take);
+      emitter->emitBodyData(requestId, payload, take);
       off += take;
     }
   };
@@ -695,8 +698,11 @@ bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served) {
   std::string head_out = "HTTP/1.1 " + std::to_string(req->status) + " " +
                          reasonPhrase(req->status) + "\r\n";
   for (const auto& h : req->headers) {
-    if (lower(h.name) == "content-length") continue;  // We are authoritative.
-    if (lower(h.name) == "connection") continue;      // We are authoritative.
+    // One lowering per header: the pre-change code lowered each name twice
+    // (once per comparison below), allocating two throwaway strings.
+    const std::string lowered = lower(h.name);
+    if (lowered == "content-length") continue;  // We are authoritative.
+    if (lowered == "connection") continue;      // We are authoritative.
     head_out += h.name + ": " + h.value + "\r\n";
   }
   head_out += "Content-Length: " + std::to_string(req->body.size()) + "\r\n";
@@ -706,10 +712,20 @@ bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served) {
   } else {
     head_out += "Connection: close\r\n\r\n";
   }
-  const bool sent =
-      sendAll(fd, (const uint8_t*)head_out.data(), head_out.size());
-  if (sent && head.method != Method::Head && !req->body.empty())
-    sendAll(fd, req->body.data(), req->body.size());
+  const bool isHead = head.method == Method::Head;
+  bool sent;
+  // Small bodies ride in the same send() as the headers: the hello-world case
+  // was two syscalls (header ~100 B, body ~12 B). Above 128 KiB the copy
+  // costs more than the syscall, so large bodies keep the two-send path.
+  static constexpr size_t kCoalesceLimit = 128 * 1024;
+  if (!isHead && !req->body.empty() && req->body.size() <= kCoalesceLimit) {
+    head_out.append((const char*)req->body.data(), req->body.size());
+    sent = sendAll(fd, (const uint8_t*)head_out.data(), head_out.size());
+  } else {
+    sent = sendAll(fd, (const uint8_t*)head_out.data(), head_out.size());
+    if (sent && !isHead && !req->body.empty())
+      sent = sendAll(fd, req->body.data(), req->body.size());
+  }
 
   pending_.erase(requestId);
   served++;

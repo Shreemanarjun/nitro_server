@@ -12,7 +12,7 @@
 //   cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release
 //   cmake --build build/lib --parallel
 //
-// and skips itself when that artifact is absent, so `flutter test` still
+// and skips itself when that artifact is absent, so `dart test` still
 // passes on a machine that has not built native code. `NITRO_SERVER_DYLIB`
 // overrides the path.
 //
@@ -26,27 +26,15 @@ import 'dart:typed_data';
 import 'dart:ffi';
 import 'dart:io';
 
-import 'package:flutter_test/flutter_test.dart';
+import 'package:test/test.dart';
 import 'package:nitro_server/nitro_server.dart';
 import 'package:nitro_server/src/internal/instance_keys.dart';
 import 'package:nitro_server/src/internal/native_attach.dart';
 import 'package:nitro_server/src/nitro_server.native.dart';
 
 String? _locateLibrary() {
-  final override = Platform.environment['NITRO_SERVER_DYLIB'];
-  if (override != null && File(override).existsSync()) return override;
-
-  final names = <String>[
-    if (Platform.isMacOS) 'libnitro_server.dylib',
-    if (Platform.isLinux) 'libnitro_server.so',
-    if (Platform.isWindows) 'nitro_server.dll',
-  ];
-  const roots = <String>['build/lib', 'build'];
-  for (final root in roots) {
-    for (final name in names) {
-      final candidate = File('$root/$name');
-      if (candidate.existsSync()) return candidate.absolute.path;
-    }
+  for (final candidate in nitroServerLibraryCandidates()) {
+    if (File(candidate).existsSync()) return File(candidate).absolute.path;
   }
   return null;
 }

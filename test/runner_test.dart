@@ -4,7 +4,7 @@
 // per-chunk ack accounting, event re-broadcast, register failure mapping.
 import 'dart:typed_data';
 
-import 'package:flutter_test/flutter_test.dart';
+import 'package:test/test.dart';
 import 'package:nitro_server/nitro_server.dart';
 import 'package:nitro_server/src/internal/server_runner.dart';
 import 'package:nitro_server/src/nitro_server.native.dart';

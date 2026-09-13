@@ -45,11 +45,37 @@ class _Pending {
   bool dispatched = false;
 }
 
+/// Shared empty body for head-only requests: every GET without a body would
+/// otherwise allocate its own zero-length buffer on dispatch.
+final Uint8List _emptyBody = Uint8List(0);
+
+/// Lowercases an HTTP header name, fast-pathing the already-lowercase case
+/// (the engine preserves client casing, and most clients send lowercase).
+String _lowerHeaderName(String name) {
+  for (var i = 0; i < name.length; i++) {
+    final unit = name.codeUnitAt(i);
+    if (unit >= 0x41 && unit <= 0x5A) return name.toLowerCase();
+  }
+  return name;
+}
+
 class ServerRunner {
   ServerRunner(this._native);
 
   final NitroServerNative _native;
   final _pending = <int, _Pending>{};
+
+  /// Recently answered request ids, insertion-ordered and bounded.
+  ///
+  /// A duplicate head for an id that already dispatched must never dispatch
+  /// again — the engine assigns each id once, so a repeat is a stale resend.
+  /// The in-flight [_pending] entry alone cannot guarantee that: stream
+  /// delivery can land the duplicate *after* the answer removed the entry
+  /// (broadcast delivery runs queued continuations first), so the guard has
+  /// to outlive the request. Unbounded growth is not an option (ids are
+  /// process-monotonic), hence the same 1024-entry bound as [_boundEarly]:
+  /// duplicates arrive back-to-back, never a thousand requests later.
+  final _completed = <int>{};
   final _early = <int, List<Uint8List>>{};
   final _earlyErrors = <int, String>{};
   final _earlyComplete = <int>{};
@@ -73,6 +99,14 @@ class ServerRunner {
 
   /// Test seam: ids with an unfinished request.
   Set<int> get pendingIdsForTesting => {..._pending.keys};
+
+  /// Marks [requestId] answered: drops the in-flight entry and records the
+  /// id so a stale duplicate head can never dispatch again.
+  void _complete(int requestId) {
+    _pending.remove(requestId);
+    _completed.add(requestId);
+    if (_completed.length > 1024) _completed.remove(_completed.first);
+  }
 
   void _ensureListening() {
     if (_listening) return;
@@ -188,7 +222,10 @@ class ServerRunner {
 
   void _onHead(RawIncomingRequest head) {
     if (_closed) return;
-    if (_pending.containsKey(head.requestId)) return;
+    if (_pending.containsKey(head.requestId) ||
+        _completed.contains(head.requestId)) {
+      return;
+    }
     final pending = _pending[head.requestId] = _Pending(head);
     final early = _early.remove(head.requestId);
     if (early != null) {
@@ -279,23 +316,33 @@ class ServerRunner {
       // The engine already answered directly (413, truncated body) and
       // reaped the request. Running the handler would answer into the void —
       // `respond` would no-op — so drop it here instead.
-      _pending.remove(head.requestId);
+      _complete(head.requestId);
       return;
     }
     final (method, custom) = httpMethodOf(head.method, head.customMethod);
     // Method-specific registrations win; `HttpMethod.all` is the fallback —
     // mirroring the native router's precedence (specific beats All).
-    final handler = _handlers[handlerKey(method, custom, head.routePattern)] ??
+    // The fallback key is only built on a miss, so the hit path allocates
+    // a single key string.
+    var handler = _handlers[handlerKey(method, custom, head.routePattern)];
+    handler ??=
         _handlers[handlerKey(HttpMethod.all, '', head.routePattern)];
     if (handler == null) {
       _answer(head.requestId, const ResponseContext(status: 404));
-      _pending.remove(head.requestId);
+      _complete(head.requestId);
       return;
     }
-    final piped = _middlewares.reversed.fold<RequestHandler>(
-      handler,
-      (next, middleware) => (request) => middleware(request, next),
-    );
+    // The common case (no middleware) skips the fold entirely: `reversed`
+    // allocates a lazy iterable on every request otherwise.
+    final RequestHandler piped;
+    if (_middlewares.isEmpty) {
+      piped = handler;
+    } else {
+      piped = _middlewares.reversed.fold<RequestHandler>(
+        handler,
+        (next, middleware) => (request) => middleware(request, next),
+      );
+    }
     final context = RequestContext(
       method: method,
       customMethod: custom,
@@ -307,19 +354,35 @@ class ServerRunner {
       headers: _foldHeaders(head.headers),
       params: {for (final p in head.params) p.name: p.value},
       routePattern: head.routePattern,
-      body: pending.body.toBytes(),
+      // GET-style heads carry no body: share one empty buffer instead of
+      // allocating per request.
+      body: pending.body.isEmpty ? _emptyBody : pending.body.toBytes(),
     );
-    Future(() => piped(context)).then(
+    // Invoke inline rather than via `Future(() => ...)`: that constructor
+    // costs an extra event-loop turn per request. A synchronously-throwing
+    // handler is still a 500, caught here instead of by the future.
+    Future<ResponseContext> future;
+    try {
+      future = piped(context);
+    } catch (error) {
+      _answer(
+        head.requestId,
+        ResponseContext.text('handler error: $error', status: 500),
+      );
+      _complete(head.requestId);
+      return;
+    }
+    future.then(
       (response) {
         _answer(head.requestId, response);
-        _pending.remove(head.requestId);
+        _complete(head.requestId);
       },
       onError: (Object error) {
         _answer(
           head.requestId,
           ResponseContext.text('handler error: $error', status: 500),
         );
-        _pending.remove(head.requestId);
+        _complete(head.requestId);
       },
     );
   }
@@ -327,7 +390,7 @@ class ServerRunner {
   static Map<String, List<String>> _foldHeaders(List<RawHeader> headers) {
     final out = <String, List<String>>{};
     for (final header in headers) {
-      (out[header.name.toLowerCase()] ??= []).add(header.value);
+      (out[_lowerHeaderName(header.name)] ??= []).add(header.value);
     }
     return out;
   }

@@ -4,7 +4,11 @@
       "Shell(cmake -S src -B build/tests -DNITRO_SERVER_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release >/tmp/nitro_cmake.log 2>&1 && cmake --build build/tests --parallel >/tmp/nitro_build.log 2>&1 && ctest --test-dir build/tests --output-on-failure 2>&1 | tail -40)",
       "Shell(cmake:*)",
       "Shell(ctest:*)",
-      "Shell(ls build/tests/nitro_server_tests/CTestTestfile.cmake 2>/dev/null; echo \"=== run binary ===\"; ./build/tests/nitro_server_tests/nitro_server_engine_tests --gtest_brief=1 2>&1 | tail -30)"
+      "Shell(ls build/tests/nitro_server_tests/CTestTestfile.cmake 2>/dev/null; echo \"=== run binary ===\"; ./build/tests/nitro_server_tests/nitro_server_engine_tests --gtest_brief=1 2>&1 | tail -30)",
+      "Shell(./build/tests/nitro_server_tests/nitro_server_engine_tests:*)",
+      "Shell(ls -d ~/.pub-cache/hosted/pub.dev/nitro-* ~/.pub-cache/hosted/pub.dev/nitro_annotations-* 2>/dev/null; echo ---; for d in ~/.pub-cache/hosted/pub.dev/nitro-*/; do echo \"== $d\"; sed -n '1,60p' \"$d/pubspec.yaml\" 2>/dev/null; done)",
+      "Shell(python3 -c import json;d=json.load(open('.dart_tool/package_config.json'));[print(p['name'],'->',p['rootUri']) for p in d['packages'] if p['name'].startswith('nitro')])",
+      "Shell(dart --version 2>&1; echo \"=== which ===\"; which -a dart flutter 2>&1; echo \"=== pub get (dry) ===\"; dart pub get --offline 2>&1 | tail -15)"
     ],
     "deny": [],
     "defaultMode": "default"

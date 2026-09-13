@@ -1,13 +1,359 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// nitro_server — Nitro bridge surface (transport types only).
+//
+// Nothing in this file is exported from `package:nitro_server`. Every type is
+// `Raw*`-prefixed and belongs to the wire, not to users; the hand-written
+// public API in `lib/src/api/` is the only supported surface.
+//
+// THREE INVARIANTS LIVE HERE. Breaking any of them produces data corruption
+// that only shows up under concurrency. They are the same three as
+// `nitro_http`, because the failure modes are identical.
+//
+// 1. STREAMS ARE MODULE-GLOBAL BROADCAST, NOT PER-INSTANCE.
+//    The generated C++ bridge keeps a file-level static port registry per
+//    stream *name* and ignores the instance id when registering. Therefore
+//    `incomingRequests`, `bodyChunks` and `serverEvents` must have EXACTLY ONE
+//    internal subscriber each, held by `ServerRunner`, which demultiplexes on
+//    the `requestId` tag. A second subscription anywhere duplicates delivery
+//    and double-frees zero-copy payloads.
+//
+// 2. ERRORS RIDE INSIDE THE RESULT RECORD, NOT AS EXCEPTIONS.
+//    `@NitroResult` cannot combine with `@nitroNativeAsync` (validator E015),
+//    and the bare native-async failure path can only post `kNull`. So every
+//    fallible call returns a `RawServerStatus` envelope — `errorKind`,
+//    `errorMessage`, `boundPort`. `errorKind == none` means the call
+//    succeeded. `HybridException` is reserved for programming errors (bad
+//    instance key, malformed blob).
+//
+// 3. PARAMETER MEMORY DIES WHEN THE CALL RETURNS.
+//    Nitro releases the parameter arena as soon as the registering call
+//    returns. The bridge MUST deep-copy the config blob, the route pattern and
+//    the response body synchronously.
+//
+// There are no callbacks in this spec, on purpose: function-typed parameters
+// are backed by one `NativeCallable` slot per (method, parameter), so two
+// concurrent connections would clobber each other's callback. Request
+// dispatch travels on the `incomingRequests`/`bodyChunks` streams instead, and
+// the handler answers with `respond`, addressed by `requestId`. The native
+// connection thread blocks on a per-request condition variable — never on a
+// shared bridge lock — until `respond` arrives or the route's own timeout
+// fires. That is the whole deadlock story: the Dart isolate never blocks, and
+// no two connections ever wait on the same primitive.
+// ─────────────────────────────────────────────────────────────────────────────
+
 import 'package:nitro/nitro.dart';
 
 part 'nitro_server.g.dart';
 
-@NitroModule(ios: NativeImpl.swift, android: NativeImpl.kotlin, macos: NativeImpl.swift, windows: NativeImpl.cpp, linux: NativeImpl.cpp)
-abstract class NitroServer extends HybridObject {
-  static final NitroServer instance = _NitroServerImpl();
+// ── Enumerations ─────────────────────────────────────────────────────────────
 
-  double add(double a, double b);
+@HybridEnum()
+enum RawServerMethod {
+  get,
+  head,
+  post,
+  put,
+  delete,
+  patch,
+  options,
+  trace,
+  all,
+  custom,
+}
 
-  @nitroAsync
-  Future<String> getGreeting(String name);
+/// Deliberately fine-grained: each case maps to exactly one Dart exception
+/// type or one field on it, so the mapping table in `raw_mapping.dart` is
+/// total and exhaustively testable.
+@HybridEnum()
+enum RawServerErrorKind {
+  none,
+  alreadyRunning,
+  notRunning,
+  bindFailed,
+  tlsError,
+  routeNotFound,
+  handlerTimeout,
+  requestTooLarge,
+  responseTooLarge,
+  io,
+  badRequest,
+  unknown,
+}
+
+/// Chunk kinds for the `bodyChunks` stream. Mirrors `nitro_http`'s `RawChunk`:
+/// no `String` fields on the hot path, error text rides in the payload.
+@HybridEnum()
+enum RawBodyKind { data, end, error }
+
+@HybridEnum()
+enum RawServerEventKind { started, stopped, handlerTimeout, clientError, notice }
+
+// ── Configuration records ────────────────────────────────────────────────────
+//
+// Fields are non-nullable with sentinel conventions (`-1` = inherit from the
+// server default, `''` = unset). A nullable primitive inside a record costs a
+// tag byte and an extra branch in the C++ reader, for no benefit at this
+// layer.
+
+/// Headers travel as an ordered list of pairs, never a `Map`. A map would lose
+/// duplicate headers and header order, both of which HTTP servers must echo.
+@HybridRecord()
+class RawHeader {
+  final String name;
+  final String value;
+
+  const RawHeader({required this.name, required this.value});
+}
+
+/// A route parameter captured from a `:param` segment, e.g. `:id` → `42`.
+@HybridRecord()
+class RawRouteParam {
+  final String name;
+  final String value;
+
+  const RawRouteParam({required this.name, required this.value});
+}
+
+/// TLS identity. All four fields empty means plain HTTP. PEM strings win over
+/// file paths when both are set; mixing a cert from one source with a key
+/// from the other is a `tlsError`.
+@HybridRecord()
+class RawTlsConfig {
+  final String certPem;
+  final String keyPem;
+  final String certFile;
+  final String keyFile;
+
+  const RawTlsConfig({
+    this.certPem = '',
+    this.keyPem = '',
+    this.certFile = '',
+    this.keyFile = '',
+  });
+}
+
+@HybridRecord()
+class RawServerConfig {
+  final String host;
+  final int port;
+  final int backlog;
+  final int maxBodyBytes;
+  final int defaultTimeoutMs;
+  final RawTlsConfig tls;
+
+  const RawServerConfig({
+    this.host = '127.0.0.1',
+    this.port = 0,
+    this.backlog = 128,
+    this.maxBodyBytes = 10485760,
+    this.defaultTimeoutMs = 30000,
+    this.tls = const RawTlsConfig(),
+  });
+}
+
+/// A route registration. `pattern` uses `:param` segments
+/// (`/users/:id`) and an optional trailing `*` wildcard. `timeoutMs` is the
+/// per-route handler deadline; `-1` inherits `RawServerConfig.defaultTimeoutMs`.
+@HybridRecord()
+class RawRouteConfig {
+  final RawServerMethod method;
+  final String customMethod;
+  final String pattern;
+  final int timeoutMs;
+
+  const RawRouteConfig({
+    this.method = RawServerMethod.get,
+    this.customMethod = '',
+    required this.pattern,
+    this.timeoutMs = -1,
+  });
+}
+
+/// The fallible-call envelope (invariant 2). `boundPort` carries the OS-assigned
+/// port out of `start()` when the config asked for port 0.
+@HybridRecord()
+class RawServerStatus {
+  final RawServerErrorKind errorKind;
+  final String errorMessage;
+  final int boundPort;
+
+  const RawServerStatus({
+    this.errorKind = RawServerErrorKind.none,
+    this.errorMessage = '',
+    this.boundPort = 0,
+  });
+}
+
+/// One accepted request: head only. The body, if any, follows on `bodyChunks`
+/// tagged with the same `requestId`. `params` holds the `:param` captures from
+/// the matched route, `routePattern` the pattern that matched.
+@HybridRecord()
+class RawIncomingRequest {
+  final int requestId;
+  final RawServerMethod method;
+  final String customMethod;
+  final String path;
+  final String query;
+  final List<RawHeader> headers;
+  final int contentLength;
+  final bool hasBody;
+  final String routePattern;
+  final List<RawRouteParam> params;
+
+  const RawIncomingRequest({
+    required this.requestId,
+    this.method = RawServerMethod.get,
+    this.customMethod = '',
+    required this.path,
+    this.query = '',
+    this.headers = const [],
+    this.contentLength = 0,
+    this.hasBody = false,
+    this.routePattern = '',
+    this.params = const [],
+  });
+}
+
+@HybridRecord()
+class RawServerEvent {
+  final int kind;
+  final int requestId;
+  final String message;
+
+  const RawServerEvent({
+    required this.kind,
+    this.requestId = 0,
+    this.message = '',
+  });
+}
+
+// ── Zero-copy stream structs ─────────────────────────────────────────────────
+//
+// The hot path: potentially thousands per second. They carry NO String fields —
+// each would cost a `strdup` per emit — so error text rides in the byte payload
+// with a discriminating `kind`.
+
+@HybridStruct(zeroCopy: ['bytes'])
+class RawBodyChunk {
+  /// data: body bytes · end: empty · error: UTF-8 message.
+  final Uint8List bytes;
+  final int requestId;
+
+  /// [RawBodyKind] index.
+  final int kind;
+
+  /// error: [RawServerErrorKind] index · end: 0.
+  final int aux;
+
+  const RawBodyChunk({
+    required this.bytes,
+    required this.requestId,
+    required this.kind,
+    required this.aux,
+  });
+}
+
+// ── The module ───────────────────────────────────────────────────────────────
+//
+// ONE spec class, because each `*.native.dart` spec produces its own shared
+// library — two spec files could not share an accept loop, a router or a
+// pending-request table without cross-dylib symbol wiring on five platforms.
+// Role separation therefore rides on the multi-instance factory key:
+//
+//   'engine'      process-wide singleton: capabilities, global reset
+//   's:<id>'      one server: accept loop, router, pending-request table
+//
+// `cSymbolPrefix` pins the C namespace to `nitro_server_` even though the class
+// is `NitroServerNative`, so the public API is free to use `NitroServer`.
+
+@NitroModule(
+  ios: AppleNativeImpl.cpp,
+  macos: AppleNativeImpl.cpp,
+  android: AndroidNativeImpl.cpp,
+  // Generic `NativeImpl.cpp` (not the platform-specific markers) keeps Windows
+  // and Linux sharing the single `src/HybridNitroServer.cpp` translation unit
+  // rather than each getting its own copy to drift apart.
+  windows: NativeImpl.cpp,
+  linux: NativeImpl.cpp,
+  cSymbolPrefix: 'nitro_server',
+  lib: 'nitro_server',
+)
+abstract class NitroServerNative extends HybridObject {
+  /// Process-wide singleton: capability queries, global reset.
+  static final NitroServerNative engine = _NitroServerNativeImpl('engine');
+
+  /// Role-typed instance. Keys: `engine` | `s:<serverId>`.
+  static NitroServerNative forKey(String key) => _NitroServerNativeImpl(key);
+
+  // ── Capabilities (valid on any instance) ───────────────────────────────────
+
+  /// e.g. `nitro_server/0.0.1 http/1.1 threads`.
+  String engineVersion();
+
+  bool supportsTls();
+
+  /// Hot-restart recovery: stop every server, join every thread, drop every
+  /// pending request. The Dart layer calls this once at startup.
+  void resetNative();
+
+  // ── Server role: 's:<serverId>' ────────────────────────────────────────────
+
+  /// Synchronous by design — there is no reason to make users `await` a server
+  /// constructor when configuration is a sub-microsecond FFI call.
+  void configureServer(RawServerConfig config);
+
+  RawServerStatus registerRoute(RawRouteConfig route);
+
+  /// [method] is the uppercase token (`GET`, `POST`, …) or `*` for
+  /// `RawServerMethod.all`. String-typed (not the enum) so custom-method
+  /// routes round-trip their token.
+  RawServerStatus unregisterRoute(String method, String pattern);
+
+  /// Binds and starts the accept loop. `boundPort` in the returned status is
+  /// the actual port (== config port unless the config asked for 0).
+  RawServerStatus start();
+
+  void stop();
+
+  /// Answers a pending request. Fire-and-forget: the connection thread is
+  /// parked on its own condition variable and wakes when this lands. Answering
+  /// an unknown or already-answered `requestId` is a no-op, never an error —
+  /// the timeout path may have answered first.
+  void respond(
+    int requestId,
+    int status,
+    List<RawHeader> headers,
+    @zeroCopy Uint8List body,
+  );
+
+  /// Zero-copy payload release, in one sub-microsecond call.
+  ///
+  /// [ackedChunks] is the cumulative number of `bodyChunks` the runner has
+  /// copied out of native memory for [requestId]. It exists because
+  /// `nitro_server_release_RawBodyChunk` frees only the struct shell: the
+  /// zero-copy payload stays native-owned with no other completion signal.
+  /// Native frees every payload with sequence `< ackedChunks`, so the ack is
+  /// what makes the zero-copy path leak-free *and* use-after-free-free.
+  /// Passing a value the runner has not actually copied is memory corruption.
+  /// (Same protocol as `nitro_http`'s `grantCredit` ack half.)
+  void ackBody(int requestId, int ackedChunks);
+
+  // ── Module-global streams — EXACTLY ONE internal subscriber each ───────────
+  //
+  // See invariant 1 in the file header. `Backpressure.block` is forbidden here:
+  // it blocks the emitting thread, which is a connection thread parked with a
+  // client on the other end of the socket, and stalling it stalls that client.
+  // `bufferDrop` provably never drops a head or an event because heads and
+  // events are small and bounded per request; body bytes backpressure through
+  // the TCP window instead, since a connection thread that cannot emit simply
+  // stops reading.
+
+  @NitroStream(backpressure: Backpressure.bufferDrop)
+  Stream<RawIncomingRequest> get incomingRequests;
+
+  @NitroStream(backpressure: Backpressure.bufferDrop)
+  Stream<RawBodyChunk> get bodyChunks;
+
+  @NitroStream(backpressure: Backpressure.bufferDrop)
+  Stream<RawServerEvent> get serverEvents;
 }

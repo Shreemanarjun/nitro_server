@@ -273,7 +273,10 @@ class ServerRunner {
       return;
     }
     final (method, custom) = httpMethodOf(head.method, head.customMethod);
-    final handler = _handlers[handlerKey(method, custom, head.routePattern)];
+    // Method-specific registrations win; `HttpMethod.all` is the fallback —
+    // mirroring the native router's precedence (specific beats All).
+    final handler = _handlers[handlerKey(method, custom, head.routePattern)] ??
+        _handlers[handlerKey(HttpMethod.all, '', head.routePattern)];
     if (handler == null) {
       _answer(head.requestId, const ResponseContext(status: 404));
       _pending.remove(head.requestId);

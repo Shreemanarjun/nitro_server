@@ -20,8 +20,8 @@
 // which searches images already loaded into the process — so opening the dylib
 // here is what makes the plugin visible to the generated bindings.
 
-import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 import 'dart:ffi';
 import 'dart:io';
 
@@ -29,6 +29,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:nitro_server/nitro_server.dart';
 import 'package:nitro_server/src/internal/instance_keys.dart';
 import 'package:nitro_server/src/internal/native_attach.dart';
+import 'package:nitro_server/src/nitro_server.native.dart';
 
 String? _locateLibrary() {
   final override = Platform.environment['NITRO_SERVER_DYLIB'];
@@ -83,6 +84,33 @@ Future<({int status, String body, HttpHeaders headers})> _get(
   }
 }
 
+/// [_get] for binary bodies: no UTF-8 decode, exact bytes back.
+Future<({int status, Uint8List body})> _getBytes(
+  int port,
+  String path, {
+  String method = 'GET',
+  List<int>? body,
+}) async {
+  final client = HttpClient();
+  try {
+    final request = await client.openUrl(
+      method,
+      Uri.parse('http://127.0.0.1:$port$path'),
+    );
+    if (body != null) request.add(body);
+    final response = await request.close().timeout(
+      const Duration(seconds: 15),
+    );
+    final builder = await response.fold<BytesBuilder>(
+      BytesBuilder(),
+      (b, d) => b..add(d),
+    );
+    return (status: response.statusCode, body: builder.toBytes());
+  } finally {
+    client.close(force: true);
+  }
+}
+
 void main() {
   final libraryPath = _locateLibrary();
   final skipReason = libraryPath == null
@@ -108,6 +136,14 @@ void main() {
       await server?.close();
       server = null;
     });
+
+    test('reports engine capabilities', () async {
+      expect(
+        NitroServerNative.engine.engineVersion(),
+        contains('nitro_server'),
+      );
+      expect(NitroServerNative.engine.supportsTls(), isFalse);
+    }, skip: skipReason);
 
     test('starts on an ephemeral port and stops', () async {
       server = await NitroServer.bind();
@@ -179,14 +215,14 @@ void main() {
       });
 
       final payload = List<int>.generate(200000, (i) => i & 0xff);
-      final res = await _get(
+      final res = await _getBytes(
         server!.port,
         '/echo',
         method: 'POST',
         body: payload,
       );
       expect(res.status, 200);
-      expect(res.body.codeUnits, orderedEquals(payload));
+      expect(res.body, orderedEquals(payload));
     }, skip: skipReason);
 
     test('query string and headers reach the handler', () async {

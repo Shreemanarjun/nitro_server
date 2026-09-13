@@ -23,12 +23,13 @@ class FakeNitroServerNative extends NitroServerNative {
   /// Failures to return per operation, keyed by pattern/token. Empty means
   /// success.
   final registerFailures = <String, RawServerStatus>{};
+  final unregisterFailures = <String, RawServerStatus>{};
   RawServerStatus startResult = const RawServerStatus(
     errorKind: RawServerErrorKind.none,
     boundPort: 8080,
   );
 
-  final responded = <_Response>[];
+  final responded = <DrivenResponse>[];
   final acked = <(int, int)>[];
   var configureCalls = 0;
   var startCalls = 0;
@@ -69,7 +70,8 @@ class FakeNitroServerNative extends NitroServerNative {
   @override
   RawServerStatus unregisterRoute(String method, String pattern) {
     unregistered.add((method, pattern));
-    return const RawServerStatus(errorKind: RawServerErrorKind.none);
+    return unregisterFailures[pattern] ??
+        const RawServerStatus(errorKind: RawServerErrorKind.none);
   }
 
   @override
@@ -89,7 +91,7 @@ class FakeNitroServerNative extends NitroServerNative {
     Uint8List body,
   ) {
     responded.add(
-      _Response(
+      DrivenResponse(
         requestId: requestId,
         status: status,
         headers: {for (final h in headers) h.name: h.value},
@@ -110,8 +112,8 @@ class FakeNitroServerNative extends NitroServerNative {
   }
 }
 
-class _Response {
-  _Response({
+class DrivenResponse {
+  DrivenResponse({
     required this.requestId,
     required this.status,
     required this.headers,
@@ -169,7 +171,7 @@ RawBodyChunk fakeEnd(int requestId) {
 
 /// Drives one request through [runner]'s fake: emits the head (with an
 /// optional body) and completes when the fake records the response.
-Future<_Response> driveRequest(
+Future<DrivenResponse> driveRequest(
   FakeNitroServerNative fake, {
   required int requestId,
   RawServerMethod method = RawServerMethod.get,

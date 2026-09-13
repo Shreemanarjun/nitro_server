@@ -147,6 +147,62 @@ void main() {
       expect(seen!.headers['x-token'], ['abc', 'def']);
     });
 
+    test('an all-method registration answers every method', () async {
+      runner.addRoute(
+        HttpMethod.all,
+        '',
+        '/any',
+        null,
+        (request) async => ResponseContext.text('m=${request.method.name}'),
+      );
+      await Future<void>.delayed(Duration.zero);
+
+      for (final method in [RawServerMethod.get, RawServerMethod.post]) {
+        fake.heads.add(
+          fakeHead(
+            requestId: method.index + 20,
+            method: method,
+            path: '/any',
+            routePattern: '/any',
+          ),
+        );
+      }
+      for (var i = 0; i < 200; i++) {
+        if (fake.responded.length >= 2) break;
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+      expect(
+        fake.responded.map((r) => String.fromCharCodes(r.body)),
+        containsAll(['m=get', 'm=post']),
+      );
+    });
+
+    test('a specific registration beats an all-method one', () async {
+      runner.addRoute(
+        HttpMethod.all,
+        '',
+        '/both',
+        null,
+        (_) async => ResponseContext.text('all'),
+      );
+      runner.addRoute(
+        HttpMethod.get,
+        '',
+        '/both',
+        null,
+        (_) async => ResponseContext.text('specific'),
+      );
+      await Future<void>.delayed(Duration.zero);
+
+      final response = await driveRequest(
+        fake,
+        requestId: 30,
+        path: '/both',
+        routePattern: '/both',
+      );
+      expect(String.fromCharCodes(response.body), 'specific');
+    });
+
     test('an unregistered route pattern answers 404', () async {
       await addEcho('/');
       final response = await driveRequest(

@@ -455,6 +455,42 @@ TEST(ServerTest, TlsConfigIsRefused) {
   EXPECT_EQ(r.kind, ErrorKind::TlsError);
 }
 
+TEST(ServerTest, StartStopCyclesLeaveNoResidue) {
+  // Leak soak: repeated bind/serve/stop cycles with bodies in flight. LSan
+  // renders the verdict at exit — any tracked payload, pending entry or
+  // thread resource left behind fails the run.
+  for (int cycle = 0; cycle < 5; cycle++) {
+    RecordingEmitter emitter(
+        [](Method, const std::string&, const std::string& body) {
+          return std::make_pair(200, "n=" + std::to_string(body.size()));
+        });
+    auto server = std::make_shared<ServerInstance>();
+    server->setEmitter(&emitter);
+    EXPECT_EQ(server->registerRoute(Method::Post, "", "/soak", -1).kind,
+              ErrorKind::None);
+    ServerConfig cfg;
+    cfg.port = 0;
+    server->configure(cfg);
+    ASSERT_EQ((int64_t)server->start().kind, (int64_t)ErrorKind::None);
+    const int64_t port = server->boundPort();
+
+    for (int i = 0; i < 40; i++) {
+      const int fd = connectTo((int)port);
+      ASSERT_GE(fd, 0) << "cycle " << cycle << " conn " << i;
+      const std::string payload(8192, (char)('a' + (i % 26)));
+      sendStr(fd, "POST /soak HTTP/1.1\r\nHost: x\r\nContent-Length: " +
+                      std::to_string(payload.size()) +
+                      "\r\nConnection: close\r\n\r\n" + payload);
+      const std::string res = readAll(fd);
+      close(fd);
+      EXPECT_EQ(statusOf(res), 200) << "cycle " << cycle << " conn " << i;
+      EXPECT_EQ(bodyOf(res), "n=8192") << "cycle " << cycle << " conn " << i;
+    }
+    server->stop();
+    EXPECT_TRUE(server->waitForDrainForTesting(5000));
+  }
+}
+
 TEST(ServerTest, StopWakesParkedConnections) {
   RecordingEmitter emitter([](Method, const std::string&, const std::string&) {
     return std::make_pair(200, "never");

@@ -27,6 +27,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:benchmark_harness/benchmark_harness.dart';
 import 'package:nitro_server/nitro_server.dart';
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as shelf_io;
@@ -180,25 +181,62 @@ Map<String, double> _summarize(List<int> samplesUs) {
   return {'mean': mean, 'p50': pct(0.5), 'p99': pct(0.99)};
 }
 
-Future<void> _phase(
+/// One benchmark case driven by `package:benchmark_harness`.
+///
+/// The harness owns the sequential-latency loop: unmeasured `setup()` builds
+/// one `HttpClient`, a 100 ms warmup settles JIT + pools, then `exercise()`
+/// runs one request per iteration for ~2 s and the harness reports the
+/// standardized per-request mean. We record the same iterations to derive
+/// p50/p99, so every column comes from one identical sample set — no double
+/// measurement.
+class _RequestBenchmark extends AsyncBenchmarkBase {
+  _RequestBenchmark(super.name, this.port, this.op);
+
+  final int port;
+  final Future<int> Function(HttpClient, int) op;
+  late final HttpClient client;
+  final samplesUs = <int>[];
+  bool _record = false;
+
+  @override
+  Future<void> setup() async {
+    client = HttpClient();
+  }
+
+  @override
+  Future<void> exercise() async {
+    _record = true;
+    await run();
+    _record = false;
+  }
+
+  @override
+  Future<void> run() async {
+    final us = await op(client, port);
+    if (_record) samplesUs.add(us);
+  }
+
+  @override
+  Future<void> teardown() async {
+    client.close(force: true);
+  }
+}
+
+Future<String> _phase(
   String label,
   int port,
   Future<int> Function(HttpClient, int) op, {
-  required int sequential,
   required int concurrency,
   required int concurrentTotal,
 }) async {
-  // Sequential latency.
-  var client = HttpClient();
-  final latencies = <int>[];
-  for (var i = 0; i < sequential; i++) {
-    latencies.add(await op(client, port));
-  }
-  client.close(force: true);
-  final lat = _summarize(latencies);
+  // Sequential latency, harnessed (`measure()` runs setup → 100 ms warmup →
+  // ~2 s exercise → teardown; the client lives in setup/teardown, unmeasured).
+  final benchmark = _RequestBenchmark(label, port, op);
+  final meanUs = await benchmark.measure();
+  final lat = _summarize(benchmark.samplesUs);
 
-  // Concurrent throughput.
-  client = HttpClient()..maxConnectionsPerHost = concurrency * 2;
+  // Concurrent throughput (custom sweep: the harness is single-shot only).
+  final client = HttpClient()..maxConnectionsPerHost = concurrency * 2;
   final stopwatch = Stopwatch()..start();
   var remaining = concurrentTotal;
   await Future.wait([
@@ -214,29 +252,16 @@ Future<void> _phase(
   client.close(force: true);
   final rps = concurrentTotal / stopwatch.elapsedMicroseconds * 1e6;
 
-  print(
-    '| $label | ${lat['mean']!.toStringAsFixed(0)} | '
-    '${lat['p50']!.toStringAsFixed(0)} | ${lat['p99']!.toStringAsFixed(0)} | '
-    '${rps.toStringAsFixed(0)} |',
-  );
-}
-
-/// Unmeasured warmup: JIT-compiles the handlers and settles the client pools
-/// so round one is not a compiler benchmark.
-Future<void> _warmup(
-  int port,
-  Future<int> Function(HttpClient, int) op,
-) async {
-  final client = HttpClient();
-  for (var i = 0; i < 200; i++) {
-    await op(client, port);
-  }
-  client.close(force: true);
+  // Standard harness line, then the table row.
+  print('$label(RunTime): ${meanUs.toStringAsFixed(4)} us. '
+      '(n=${benchmark.samplesUs.length})');
+  return '| $label | ${meanUs.toStringAsFixed(0)} | '
+      '${lat['p50']!.toStringAsFixed(0)} | ${lat['p99']!.toStringAsFixed(0)} | '
+      '${rps.toStringAsFixed(0)} |';
 }
 
 Future<void> main(List<String> args) async {
   final quick = args.contains('--quick');
-  final sequential = quick ? 100 : 500;
   const concurrency = 32;
   final concurrentTotal = quick ? 800 : 4000;
   final rounds = quick ? 1 : 2;
@@ -247,8 +272,9 @@ Future<void> main(List<String> args) async {
   print('nitro_server vs shelf vs dart:io HttpServer — same routes, same driver');
   print('(native library: $loadedFrom${quick ? '; --quick' : ''})');
   print('');
-  print('| case | mean µs | p50 µs | p99 µs | req/s @32 |');
-  print('| ---- | ------- | ------ | ------ | --------- |');
+  print('Latency via package:benchmark_harness (AsyncBenchmarkBase, ~2 s '
+      'exercise per case); throughput via a custom $concurrency-worker sweep.');
+  print('');
 
   final dartServer = await _startDartServer();
   final shelfServer = await _startShelfServer();
@@ -266,29 +292,25 @@ Future<void> main(List<String> args) async {
     ('nitro   POST /echo 4k', _postEcho, nitroServer.port),
   ];
 
-  for (final (_, op, port) in cases) {
-    await _warmup(port, op);
-  }
-
   // Interleaved A/B/C so machine drift cannot favor one side.
   for (var round = 0; round < rounds; round++) {
+    print('| case | mean µs | p50 µs | p99 µs | req/s @32 |');
+    print('| ---- | ------- | ------ | ------ | --------- |');
     for (final (label, op, port) in cases) {
-      await _phase(
+      print(await _phase(
         label,
         port,
         op,
-        sequential: sequential,
         concurrency: concurrency,
         concurrentTotal: concurrentTotal,
-      );
+      ));
     }
+    print('');
   }
 
   await dartServer.close(force: true);
   await shelfServer.close(force: true);
   await nitroServer.close();
-  print('');
-  print('Sequential: $sequential requests on one client (latency). '
-      'Concurrent: $concurrentTotal requests across $concurrency workers '
-      '(throughput). Warmup: 200 unmeasured requests per case.');
+  print('Concurrent: $concurrentTotal requests across $concurrency workers '
+      '(throughput). Sequential latency: harness 2 s exercise per case.');
 }

@@ -108,12 +108,12 @@ Measured, not claimed — same routes, same driver, interleaved A/B/C (see
 
 ```
 | case                 | mean µs | p50 µs | p99 µs | req/s @32 |
-| dart:io /hello       |     176 |    160 |    404 |      8474 |
-| shelf   /hello       |     255 |    182 |    410 |      7371 |
-| nitro   /hello       |     157 |    145 |    338 |     10474 |
-| dart:io POST /echo 4k|     210 |    195 |    443 |      7562 |
-| shelf   POST /echo 4k|     211 |    194 |    430 |      5506 |
-| nitro   POST /echo 4k|     181 |    168 |    345 |      9471 |
+| dart:io /hello       |     186 |    162 |    398 |      7868 |
+| shelf   /hello       |     208 |    184 |    424 |      7328 |
+| nitro   /hello       |     171 |    151 |    350 |      9967 |
+| dart:io POST /echo 4k|     206 |    182 |    387 |      7072 |
+| shelf   POST /echo 4k|     227 |    199 |    446 |      6545 |
+| nitro   POST /echo 4k|     186 |    166 |    366 |      9798 |
 ```
 
 Read narrowly: the native accept loop shaves scheduling latency and scales

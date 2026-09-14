@@ -815,7 +815,29 @@ bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served) {
       long chunkSize = strtol(carry.c_str() + pos, nullptr, 16);
       pos = eol + 2;
       if (chunkSize == 0) {
-        done = true;
+        // Terminal "0" line consumed — but a chunked body ends with an
+        // optional trailer section plus a final CRLF ("0\r\n\r\n" with no
+        // trailers). Consume through the terminating empty line so `carry`
+        // starts clean for the next pipelined request: leaving even "\r\n"
+        // behind makes the next head parse see an empty request line (400).
+        // Bounded by fill()'s maxBodyBytes cap, like everything else here.
+        bool trailersOk = false;
+        while (true) {
+          size_t eol2 = std::string::npos;
+          while (true) {
+            eol2 = carry.find("\r\n", pos);
+            if (eol2 != std::string::npos) break;
+            if (!fill((carry.size() - pos) + 1)) break;
+          }
+          if (eol2 == std::string::npos) break;
+          if (eol2 == pos) {
+            pos += 2;
+            trailersOk = true;
+            break;
+          }
+          pos = eol2 + 2;  // Skip one trailer line (values unused).
+        }
+        done = trailersOk;
         break;
       }
       if (chunkSize < 0 || received + chunkSize > cfg.maxBodyBytes) {
@@ -864,7 +886,12 @@ bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served) {
       pending_.erase(requestId);
       return false;
     }
-    carry.erase(0, bodyStart + (size_t)(contentLength - remaining));
+    // Reaching here means remaining == 0, so exactly head + contentLength
+    // bytes were consumed. Note `bodyStart` already advanced past the
+    // buffered share — erasing `bodyStart + contentLength` would count those
+    // bytes twice and eat the next pipelined request's head (every
+    // keep-alive POST whose body coalesces with its head).
+    carry.erase(0, (headEnd + 4) + (size_t)contentLength);
   } else {
     carry.erase(0, bodyStart);
   }

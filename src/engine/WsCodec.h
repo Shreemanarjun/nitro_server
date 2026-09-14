@@ -137,6 +137,7 @@ inline bool isControl(int opcode) { return opcode >= 0x8; }
 /// the mask key, so the payload starts at `data + headerSize`.
 struct FrameHeader {
   bool fin = false;
+  bool rsv1 = false;  // permessage-deflate: first frame of a compressed message.
   int opcode = -1;
   bool masked = false;
   uint64_t length = 0;
@@ -148,11 +149,15 @@ struct FrameHeader {
 /// are buffered (caller reads more) or the frame is malformed: nonzero RSV
 /// (no extensions negotiated), unknown opcode, control frame fragmented or
 /// over 125 bytes, or a 64-bit length with the top bit set.
-inline bool parseHeader(const uint8_t* data, size_t n, FrameHeader& out) {
+/// [allowRsv1] admits RSV1 on data frames (a negotiated permessage-deflate
+/// session); RSV2/3 are always an error, as is RSV1 on control frames.
+inline bool parseHeader(const uint8_t* data, size_t n, FrameHeader& out,
+                        bool allowRsv1 = false) {
   if (n < 2) return false;
   const uint8_t b0 = data[0], b1 = data[1];
-  if (b0 & 0x70) return false;  // RSV1-3: no extensions, ever.
+  if (b0 & 0x30) return false;
   const int opcode = b0 & 0x0f;
+  if ((b0 & 0x40) && (!allowRsv1 || isControl(opcode))) return false;
   if (opcode != 0x0 && opcode != 0x1 && opcode != 0x2 && opcode != 0x8 &&
       opcode != 0x9 && opcode != 0xA) {
     return false;
@@ -177,6 +182,7 @@ inline bool parseHeader(const uint8_t* data, size_t n, FrameHeader& out) {
   }
   FrameHeader h;
   h.fin = (b0 & 0x80) != 0;
+  h.rsv1 = (b0 & 0x40) != 0;
   h.opcode = opcode;
   h.masked = masked;
   h.length = length;

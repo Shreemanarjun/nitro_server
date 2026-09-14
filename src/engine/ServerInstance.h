@@ -60,6 +60,9 @@ struct ServerConfig {
   int64_t maxConnections = 0;      // <= 0: unlimited.
   int64_t maxConnectionsPerIp = 0;  // <= 0: unlimited.
   int64_t headerTimeoutMs = 0;      // <= 0: the idle timeout applies.
+  int64_t writeTimeoutMs = 30000;   // <= 0: 30 s.
+  int64_t wsMaxBufferBytes = 1 << 20;  // <= 0: 1 MiB.
+  bool wsCompression = true;
   bool tlsRequested = false;
 };
 
@@ -150,7 +153,8 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   void configure(const ServerConfig& config);
   StatusResult registerRoute(Method method, const std::string& customMethod,
                              const std::string& pattern, int64_t timeoutMs,
-                             bool isWebSocket = false, bool streamBody = false);
+                             bool isWebSocket = false, bool streamBody = false,
+                             int64_t maxBodyBytes = -1);
   StatusResult unregisterRoute(Method method, const std::string& customMethod,
                                const std::string& pattern);
   StatusResult start();
@@ -191,14 +195,17 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
 
   // ── WebSocket sessions ─────────────────────────────────────────────────
   //
-  // The connection id is the upgraded request's id. Sends are synchronous
-  // socket writes under [wsSendMutex_], so bridge memory is never retained.
-  // Unknown or reaped ids are no-ops.
+  // The connection id is the upgraded request's id. A send writes what the
+  // socket takes right now on the calling thread and queues the rest for
+  // the session's loop thread, so bridge memory is never retained and the
+  // Dart isolate never blocks on a slow peer. Unknown or reaped ids are
+  // no-ops.
 
-  /// Sends one message frame (`binary` selects opcode 2 over 1).
-  void wsSend(int64_t connectionId, const uint8_t* payload, size_t n,
-              bool binary);
-  /// Sends a close frame, shuts the socket down and reaps the session.
+  /// Sends one message frame (`binary` selects opcode 2 over 1;
+  /// `compressed` sets RSV1). Returns the bytes still queued, or -1.
+  int64_t wsSend(int64_t connectionId, const uint8_t* payload, size_t n,
+                 bool binary, bool compressed);
+  /// Queues a close frame, then the loop shuts the socket down and reaps.
   void wsClose(int64_t connectionId, int code);
 
   bool running() const { return running_.load(); }
@@ -254,22 +261,34 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
                 const uint8_t* a, size_t an, const uint8_t* b, size_t bn,
                 const uint8_t* c, size_t cn, bool completes);
 
+  struct WsConn;
+
   /// Upgrades a matched WebSocket route: validates the RFC 6455 handshake,
-  /// answers 101 and runs the frame loop until close/error/stop. Always
-  /// returns false — upgraded connections never serve HTTP again.
-  bool serveUpgrade(int fd, const std::string& carry, size_t bodyStart,
-                    const ParsedHead& head, const MatchResult& m,
-                    const ServerConfig& cfg, const std::string& path,
-                    const std::string& query);
+  /// negotiates permessage-deflate, answers 101 and runs the frame loop
+  /// until close/error/stop. Always returns false — upgraded connections
+  /// never serve HTTP again.
+  bool serveUpgrade(int fd, const Wake& wake, const std::string& carry,
+                    size_t bodyStart, const ParsedHead& head,
+                    const MatchResult& m, const ServerConfig& cfg,
+                    const std::string& path, const std::string& query);
 
-  /// The frame loop: reads client frames, emits decoded messages, auto-pongs.
-  /// Ends with an opcode-8 emit (peer code, or 1006 on failure) and reaps.
-  void wsLoop(int fd, int64_t connectionId, int64_t maxMessageBytes,
-              Emitter* emitter);
+  /// The frame loop on a non-blocking socket: parses complete frames from
+  /// its buffer, emits messages, answers pings, flushes queued sends and
+  /// enforces the write deadline. Ends with an opcode-8 emit (peer code,
+  /// 1009 on overflow, 1006 on failure).
+  void wsLoop(int fd, const Wake& wake, const std::shared_ptr<WsConn>& conn,
+              int64_t connectionId, int64_t maxMessageBytes,
+              int64_t writeTimeoutMs);
 
-  /// Sends one server frame under [wsSendMutex_]. Synchronous: bridge memory
-  /// is never retained, so no copy is needed.
-  bool wsSendFrame(int fd, int opcode, const uint8_t* payload, size_t n);
+  /// Writes [n] bytes now if nothing is queued and the socket takes them,
+  /// queues the rest and pokes the loop. Any thread. Returns the queue
+  /// size after the call, or -1 (closing, failed, or over the cap).
+  int64_t wsQueueWrite(const std::shared_ptr<WsConn>& conn,
+                       const uint8_t* data, size_t n);
+
+  /// Loop thread: drains the queue as far as the socket allows. False on a
+  /// write error.
+  bool wsFlush(const std::shared_ptr<WsConn>& conn);
 
   /// Tracks a malloc-owned WS payload and emits it (freed by the runner's
   /// cumulative ack on the connection id, or by stop()/loop-exit reap).
@@ -357,15 +376,22 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
 
   // Live WebSocket connections by connection id. Entries are erased on
   // loop exit and on wsClose; either order is safe (erase is idempotent).
+  // Every field past `emitter` is guarded by `mutex`.
   struct WsConn {
     int fd = -1;
     Emitter* emitter = nullptr;  // the runner that owns the session
+    int wakeFd = -1;             // the loop's wake pipe (write end)
+    bool deflate = false;        // permessage-deflate negotiated
+    int64_t maxBuffer = 0;
+    std::mutex mutex;
+    std::string outbound;   // queued bytes, in order
+    bool flushing = false;  // the loop holds a chunk of `outbound` mid-write
+    bool closing = false;   // local close queued: flush, then shut down
+    bool overflow = false;  // queue exceeded maxBuffer: close with 1009
+    bool failed = false;    // a write failed: drop
   };
   std::mutex wsMutex_;
-  std::unordered_map<int64_t, WsConn> ws_;
-  // Serializes every socket write that races the frame loop: wsSend/wsClose
-  // from the Dart thread against the loop's own pongs and close echoes.
-  std::mutex wsSendMutex_;
+  std::unordered_map<int64_t, std::shared_ptr<WsConn>> ws_;
 
   PendingTable pending_;
   std::atomic<int64_t> inFlight_{0};

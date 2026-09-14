@@ -170,6 +170,17 @@ class RawServerConfig {
   /// Deadline for a new connection's first request head (slow-loris guard).
   /// `<= 0` means the keep-alive idle timeout applies instead.
   final int headerTimeoutMs;
+
+  /// Deadline for a socket write that makes no progress (a peer that stops
+  /// reading); the connection is dropped past it. `<= 0` means 30 s.
+  final int writeTimeoutMs;
+
+  /// Unsent bytes a WebSocket session may hold before the engine closes it
+  /// with 1009. `<= 0` means 1 MiB.
+  final int wsMaxBufferBytes;
+
+  /// Negotiate `permessage-deflate` (RFC 7692) when a client offers it.
+  final bool wsCompression;
   final RawTlsConfig tls;
 
   const RawServerConfig({
@@ -184,6 +195,9 @@ class RawServerConfig {
     this.maxConnections = 0,
     this.maxConnectionsPerIp = 0,
     this.headerTimeoutMs = 0,
+    this.writeTimeoutMs = 30000,
+    this.wsMaxBufferBytes = 1048576,
+    this.wsCompression = true,
     this.tls = const RawTlsConfig(),
   });
 }
@@ -206,6 +220,9 @@ class RawRouteConfig {
   final bool isWebSocket;
   final bool streamBody;
 
+  /// Per-route request body cap; `-1` inherits `RawServerConfig.maxBodyBytes`.
+  final int maxBodyBytes;
+
   const RawRouteConfig({
     this.method = RawServerMethod.get,
     this.customMethod = '',
@@ -213,6 +230,7 @@ class RawRouteConfig {
     this.timeoutMs = -1,
     this.isWebSocket = false,
     this.streamBody = false,
+    this.maxBodyBytes = -1,
   });
 }
 
@@ -317,7 +335,8 @@ class RawWsMessage {
   /// 1 = text · 2 = binary · 8 = close.
   final int kind;
 
-  /// Close code on kind 8, else 0.
+  /// Close code on kind 8; on kinds 1 and 2, `1` when the payload is a
+  /// raw-deflate stream (`permessage-deflate`, no context takeover).
   final int aux;
 
   const RawWsMessage({
@@ -465,9 +484,19 @@ abstract class NitroServerNative extends HybridObject {
   // failure, stop()) always ends with an opcode-8 message so Dart can reap
   // deterministically. Unknown or reaped ids are no-ops everywhere.
 
-  /// Sends one message frame. Fire-and-forget; `binary` selects opcode 2
-  /// over opcode 1. Server frames are never masked (RFC 6455 §5.3).
-  void wsSend(int connectionId, @zeroCopy Uint8List payload, bool binary);
+  /// Sends one message frame; `binary` selects opcode 2 over opcode 1 and
+  /// `compressed` marks a `permessage-deflate` payload (RSV1). Writes as
+  /// much as the socket takes on the calling thread and queues the rest;
+  /// returns the bytes still queued after this call (`0` = on the wire),
+  /// or `-1` for an unknown or closing session. Server frames are never
+  /// masked (RFC 6455 §5.3). A queue past `wsMaxBufferBytes` closes the
+  /// session with 1009.
+  int wsSend(
+    int connectionId,
+    @zeroCopy Uint8List payload,
+    bool binary,
+    bool compressed,
+  );
 
   /// Completes the closing handshake with [code] and reaps the session.
   void wsClose(int connectionId, int code);

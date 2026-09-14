@@ -177,6 +177,9 @@ class HybridNitroServerImpl final : public HybridNitroServerNative {
     cfg.maxConnections = raw.maxConnections;
     cfg.maxConnectionsPerIp = raw.maxConnectionsPerIp;
     cfg.headerTimeoutMs = raw.headerTimeoutMs;
+    cfg.writeTimeoutMs = raw.writeTimeoutMs;
+    cfg.wsMaxBufferBytes = raw.wsMaxBufferBytes;
+    cfg.wsCompression = raw.wsCompression;
     cfg.tlsRequested = !raw.tls.certPem.empty() || !raw.tls.keyPem.empty() ||
                        !raw.tls.certFile.empty() || !raw.tls.keyFile.empty();
     server_->configure(cfg);
@@ -186,7 +189,8 @@ class HybridNitroServerImpl final : public HybridNitroServerNative {
     const RawRouteConfig raw = RawRouteConfig::fromNative(route);
     return toStatus(server_->registerRoute(
         static_cast<Method>(raw.method), raw.customMethod, raw.pattern,
-        raw.timeoutMs, raw.isWebSocket, raw.streamBody)).toNativeBuffer();
+        raw.timeoutMs, raw.isWebSocket, raw.streamBody,
+        raw.maxBodyBytes)).toNativeBuffer();
   }
 
   NitroCppBuffer unregisterRoute(const std::string& method,
@@ -254,11 +258,12 @@ class HybridNitroServerImpl final : public HybridNitroServerNative {
     server_->sendStreamChunk(requestId, chunk, chunk_length, last);
   }
 
-  void wsSend(int64_t connectionId, const uint8_t* payload,
-              size_t payload_length, bool binary) override {
-    // Synchronous socket write in the engine call: nothing is retained, so
-    // no copy is needed — the arena outlives the call.
-    server_->wsSend(connectionId, payload, payload_length, binary);
+  int64_t wsSend(int64_t connectionId, const uint8_t* payload,
+                 size_t payload_length, bool binary, bool compressed) override {
+    // Whatever the socket does not take right now is copied into the
+    // session's queue inside the call: nothing outlives the arena.
+    return server_->wsSend(connectionId, payload, payload_length, binary,
+                           compressed);
   }
 
   void wsClose(int64_t connectionId, int64_t code) override {

@@ -12,6 +12,27 @@ RouteEntry route(Method m, const std::string& pattern, int64_t timeout = -1) {
   return RouteEntry{m, "", pattern, timeout};
 }
 
+TEST(RouterTest, HeadFallsBackToGetThenAll) {
+  Router r;
+  ASSERT_TRUE(r.add({Method::Get, "", "/g", -1}));
+  ASSERT_TRUE(r.add({Method::All, "", "/a", -1}));
+  ASSERT_TRUE(r.add({Method::Get, "", "/both", -1}));
+  ASSERT_TRUE(r.add({Method::Head, "", "/both", 7}));
+  // A HEAD on a GET-only pattern matches the GET route.
+  auto m = r.match(Method::Head, "", "/g");
+  EXPECT_TRUE(m.matched);
+  EXPECT_EQ(m.route.method, Method::Get);
+  // An explicit HEAD route wins over the GET one.
+  m = r.match(Method::Head, "", "/both");
+  EXPECT_TRUE(m.matched);
+  EXPECT_EQ(m.route.method, Method::Head);
+  EXPECT_EQ(m.route.timeoutMs, 7);
+  // The All fallback still applies when neither exists.
+  EXPECT_TRUE(r.match(Method::Head, "", "/a").matched);
+  // Other methods never fall back to GET.
+  EXPECT_FALSE(r.match(Method::Post, "", "/g").matched);
+}
+
 TEST(RouterTest, RejectsMalformedPatterns) {
   Router r;
   EXPECT_FALSE(r.add(route(Method::Get, "")));

@@ -13,6 +13,7 @@ import '../internal/server_runner.dart';
 import 'context.dart';
 import 'event.dart';
 import 'http_method.dart';
+import 'metrics.dart';
 import 'native_loader.dart';
 import 'route_group.dart';
 import 'ws.dart';
@@ -139,6 +140,10 @@ class NitroServer {
   /// Engine health and lifecycle observations. Broadcast.
   Stream<ServerEvent> get events => _runner.events;
 
+  /// Request counts and latency quantiles per route, for this isolate's
+  /// runner (each helper isolate keeps its own).
+  ServerMetrics get metrics => _runner.metrics;
+
   /// Registers [handler] for [method] + [pattern]. Returns `this`, so
   /// registrations chain: `await server.get(...)` and
   /// `(await server.get(...)).post(...)` both work.
@@ -147,7 +152,9 @@ class NitroServer {
   /// optional trailing `*` wildcard. Static segments win over `:param`, which
   /// wins over `*`. [timeout] bounds the handler; a null timeout inherits
   /// [ServerConfig.defaultTimeout]. [middleware] wraps this route only,
-  /// inside the server-global chain (see [use]).
+  /// inside the server-global chain (see [use]). With [streamBody] the
+  /// handler runs as soon as the head is in and reads the body from
+  /// [RequestContext.bodyStream] — for uploads too large to assemble.
   Future<NitroServer> route(
     HttpMethod method,
     String pattern,
@@ -155,6 +162,7 @@ class NitroServer {
     Duration? timeout,
     String customMethod = '',
     List<Middleware>? middleware,
+    bool streamBody = false,
   }) async {
     _requirePattern(pattern);
     if (method == HttpMethod.custom && customMethod.isEmpty) {
@@ -171,6 +179,7 @@ class NitroServer {
       timeout,
       handler,
       middleware ?? const [],
+      streamBody,
     );
     return this;
   }
@@ -228,12 +237,14 @@ class NitroServer {
     RequestHandler handler, {
     Duration? timeout,
     List<Middleware>? middleware,
+    bool streamBody = false,
   }) => route(
     HttpMethod.post,
     pattern,
     handler,
     timeout: timeout,
     middleware: middleware,
+    streamBody: streamBody,
   );
 
   Future<NitroServer> put(
@@ -241,12 +252,14 @@ class NitroServer {
     RequestHandler handler, {
     Duration? timeout,
     List<Middleware>? middleware,
+    bool streamBody = false,
   }) => route(
     HttpMethod.put,
     pattern,
     handler,
     timeout: timeout,
     middleware: middleware,
+    streamBody: streamBody,
   );
 
   Future<NitroServer> delete(
@@ -267,12 +280,14 @@ class NitroServer {
     RequestHandler handler, {
     Duration? timeout,
     List<Middleware>? middleware,
+    bool streamBody = false,
   }) => route(
     HttpMethod.patch,
     pattern,
     handler,
     timeout: timeout,
     middleware: middleware,
+    streamBody: streamBody,
   );
 
   Future<NitroServer> options(
@@ -334,8 +349,12 @@ class NitroServer {
     _runner.errorHandler = handler;
   }
 
-  /// Stops accepting and answers every parked request with 503. Idempotent.
-  Future<void> close() async {
+  /// Stops the server. Without [drain] it stops now: parked requests get
+  /// a 503. With [drain] it first closes the listener, answers everything
+  /// already accepted (each answer says `Connection: close`) and waits up
+  /// to that long for in-flight requests to finish, then stops. Idempotent.
+  Future<void> close({Duration? drain}) async {
+    if (drain != null) await _runner.drain(drain);
     await _runner.close();
     // The engine is stopped: helpers have nothing left to answer.
     final helpers = _helpers;

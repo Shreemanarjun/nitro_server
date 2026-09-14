@@ -132,14 +132,16 @@ final class FastCalls {
   bool _disposed = false;
 
   /// Answers [requestId]. Same contract as the generated `respond`.
+  /// [setCookies] are sent as one `set-cookie` header each.
   void respond(
     int requestId,
     int status,
     Map<String, String> headers,
-    Uint8List body,
-  ) {
+    Uint8List body, [
+    List<String> setCookies = const [],
+  ]) {
     if (_disposed) return;
-    _encodeHeaders(headers);
+    _encodeHeaders(headers, setCookies);
     _stageBody(body);
     _respond(
       _instanceId,
@@ -154,9 +156,14 @@ final class FastCalls {
   }
 
   /// Same contract as the generated `startStream`.
-  void startStream(int requestId, int status, Map<String, String> headers) {
+  void startStream(
+    int requestId,
+    int status,
+    Map<String, String> headers, [
+    List<String> setCookies = const [],
+  ]) {
     if (_disposed) return;
-    _encodeHeaders(headers);
+    _encodeHeaders(headers, setCookies);
     _startStream(_instanceId, requestId, status, _headers, _err);
     _check();
   }
@@ -187,21 +194,29 @@ final class FastCalls {
     if (bytes.isNotEmpty) _bodyView.setRange(0, bytes.length, bytes);
   }
 
-  void _encodeHeaders(Map<String, String> headers) {
-    final need = headerListBytes(headers);
+  void _encodeHeaders(Map<String, String> headers, List<String> setCookies) {
+    final need = headerListBytes(headers, setCookies);
     if (need > _headerCap) _growHeaders(need);
-    encodeHeaderList(headers, _headerView, _headerData);
+    encodeHeaderList(headers, _headerView, _headerData, setCookies);
   }
 
-  /// Upper bound on the encoded size of [headers]: 3 bytes per UTF-16 unit
-  /// (the UTF-8 worst case) plus the fixed framing.
-  static int headerListBytes(Map<String, String> headers) {
-    var need = 8 + 8 * headers.length;
+  /// Upper bound on the encoded size of [headers] plus [setCookies]: 3 bytes
+  /// per UTF-16 unit (the UTF-8 worst case) plus the fixed framing.
+  static int headerListBytes(
+    Map<String, String> headers, [
+    List<String> setCookies = const [],
+  ]) {
+    var need = 8 + 8 * (headers.length + setCookies.length);
     for (final entry in headers.entries) {
       need += 8 + 3 * (entry.key.length + entry.value.length);
     }
+    for (final cookie in setCookies) {
+      need += 8 + 3 * (_setCookie.length + cookie.length);
+    }
     return need;
   }
+
+  static const _setCookie = 'set-cookie';
 
   /// Encodes [headers] as an indexed `List<RawHeader>` argument into [view]
   /// (which must hold [headerListBytes]): `[i32 payloadLen][i32 count]
@@ -213,9 +228,10 @@ final class FastCalls {
   static int encodeHeaderList(
     Map<String, String> headers,
     Uint8List view,
-    ByteData data,
-  ) {
-    final count = headers.length;
+    ByteData data, [
+    List<String> setCookies = const [],
+  ]) {
+    final count = headers.length + setCookies.length;
     data.setInt32(4, count, Endian.little);
     var pos = 8 + 8 * count;
     var i = 0;
@@ -223,6 +239,12 @@ final class FastCalls {
       data.setInt64(8 + 8 * i, pos - 4, Endian.little);
       pos = _putString(pos, entry.key, view, data);
       pos = _putString(pos, entry.value, view, data);
+      i++;
+    }
+    for (final cookie in setCookies) {
+      data.setInt64(8 + 8 * i, pos - 4, Endian.little);
+      pos = _putString(pos, _setCookie, view, data);
+      pos = _putString(pos, cookie, view, data);
       i++;
     }
     data.setInt32(0, pos - 4, Endian.little);

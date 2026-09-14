@@ -14,6 +14,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -787,6 +788,300 @@ TEST(ServerTest, RequestsAreDealtRoundRobinAcrossEmitters) {
   EXPECT_TRUE(bodies == "ababab" || bodies == "bababa") << bodies;
   server->removeEmitter(&a);
   EXPECT_EQ(server->emitterCountForTesting(), 1u);
+  server->stop();
+}
+
+TEST(ServerTest, MaxConnectionsRefusesAtTheDoor) {
+  RecordingEmitter emitter([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "never");
+  });
+  auto server = std::make_shared<ServerInstance>();
+  server->setEmitter(&emitter);
+  EXPECT_EQ(server->registerRoute(Method::Get, "", "/park", 30000).kind,
+            ErrorKind::None);
+  ServerConfig cfg;
+  cfg.port = 0;
+  cfg.maxConnections = 2;
+  server->configure(cfg);
+  ASSERT_EQ((int64_t)server->start().kind, (int64_t)ErrorKind::None);
+  const int port = (int)server->boundPort();
+  // Two parked connections fill the cap; the third is closed unanswered.
+  const int a = connectTo(port), b = connectTo(port);
+  ASSERT_GE(a, 0);
+  ASSERT_GE(b, 0);
+  sendStr(a, "GET /park HTTP/1.1\r\nHost: x\r\n\r\n");
+  sendStr(b, "GET /park HTTP/1.1\r\nHost: x\r\n\r\n");
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  const int c = connectTo(port);
+  ASSERT_GE(c, 0);
+  sendStr(c, "GET /park HTTP/1.1\r\nHost: x\r\n\r\n");
+  EXPECT_EQ(readAll(c), "");  // EOF: refused, no bytes.
+  close(c);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_EQ(emitter.seen().size(), 2u);
+  server->stop();
+  close(a);
+  close(b);
+}
+
+TEST(ServerTest, MaxConnectionsPerIpRefusesTheSamePeer) {
+  RecordingEmitter emitter([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "never");
+  });
+  auto server = std::make_shared<ServerInstance>();
+  server->setEmitter(&emitter);
+  EXPECT_EQ(server->registerRoute(Method::Get, "", "/park", 30000).kind,
+            ErrorKind::None);
+  ServerConfig cfg;
+  cfg.port = 0;
+  cfg.maxConnectionsPerIp = 1;
+  server->configure(cfg);
+  ASSERT_EQ((int64_t)server->start().kind, (int64_t)ErrorKind::None);
+  const int port = (int)server->boundPort();
+  const int a = connectTo(port);
+  ASSERT_GE(a, 0);
+  sendStr(a, "GET /park HTTP/1.1\r\nHost: x\r\n\r\n");
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  const int b = connectTo(port);
+  ASSERT_GE(b, 0);
+  sendStr(b, "GET /park HTTP/1.1\r\nHost: x\r\n\r\n");
+  EXPECT_EQ(readAll(b), "");
+  close(b);
+  // Closing the first frees the slot for the next.
+  close(a);
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  const int c = connectTo(port);
+  ASSERT_GE(c, 0);
+  sendStr(c, "GET /park HTTP/1.1\r\nHost: x\r\n\r\n");
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_EQ(emitter.seen().size(), 2u);
+  server->stop();
+  close(c);
+}
+
+TEST(ServerTest, HeaderTimeoutClosesASilentConnection) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "ok");
+  });
+  ServerConfig cfg;
+  cfg.port = 0;
+  cfg.headerTimeoutMs = 100;
+  cfg.keepAliveTimeoutMs = 5000;
+  f.server->configure(cfg);
+  ASSERT_EQ((int64_t)f.server->start().kind, (int64_t)ErrorKind::None);
+  const int fd = connectTo((int)f.server->boundPort());
+  ASSERT_GE(fd, 0);
+  const auto t0 = std::chrono::steady_clock::now();
+  EXPECT_EQ(readAll(fd), "");  // Nothing sent: closed at the deadline.
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0)
+                      .count();
+  EXPECT_GE(ms, 80);
+  EXPECT_LT(ms, 2000);
+  close(fd);
+}
+
+TEST(ServerTest, DrainStopsAcceptingAndClosesAfterAnswers) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "ok");
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "/x", -1).kind,
+            ErrorKind::None);
+  const int port = (int)f.startOnEphemeral();
+  // A keep-alive connection the engine has already accepted keeps being
+  // served through the drain, but its next answer says close. (A
+  // connection still in the kernel backlog at drain time is reset with the
+  // listener — hence the first exchange before draining.)
+  const int fd = connectTo(port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "GET /x HTTP/1.1\r\nHost: x\r\n\r\n");
+  const std::string first = readHttpHead(fd);
+  EXPECT_EQ(statusOf(first), 200);
+  EXPECT_EQ(headerOf(first, "connection"), "keep-alive");
+  f.server->beginDrain();
+  f.server->beginDrain();  // Idempotent.
+  sendStr(fd, "GET /x HTTP/1.1\r\nHost: x\r\n\r\n");
+  const std::string res = readAll(fd);
+  EXPECT_EQ(statusOf(res), 200);
+  EXPECT_EQ(headerOf(res, "connection"), "close");
+  close(fd);
+  EXPECT_EQ(f.server->inFlightRequests(), 0);
+  // New connections are refused.
+  EXPECT_LT(connectTo(port), 0);
+}
+
+TEST(ServerTest, InFlightRequestsCountsParkedAnswers) {
+  RecordingEmitter emitter([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "never");
+  });
+  auto server = std::make_shared<ServerInstance>();
+  server->setEmitter(&emitter);
+  EXPECT_EQ(server->registerRoute(Method::Get, "", "/park", 30000).kind,
+            ErrorKind::None);
+  ServerConfig cfg;
+  cfg.port = 0;
+  server->configure(cfg);
+  ASSERT_EQ((int64_t)server->start().kind, (int64_t)ErrorKind::None);
+  const int fd = connectTo((int)server->boundPort());
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "GET /park HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+  bool seen = false;
+  for (int i = 0; i < 200 && !seen; i++) {
+    seen = !emitter.seen().empty();
+    if (!seen) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_TRUE(seen);
+  EXPECT_EQ(server->inFlightRequests(), 1);
+  const int64_t id = emitter.seen()[0].requestId;
+  const char* body = "done";
+  server->respond(id, 200, {}, (const uint8_t*)body, 4);
+  EXPECT_EQ(bodyOf(readAll(fd)), "done");
+  close(fd);
+  for (int i = 0; i < 200 && server->inFlightRequests() != 0; i++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_EQ(server->inFlightRequests(), 0);
+  server->stop();
+}
+
+/// Writes [bytes] to a fresh temp file and returns its path.
+std::string tempFileWith(const std::string& bytes) {
+  char name[] = "/tmp/nitro_server_file_XXXXXX";
+  const int fd = mkstemp(name);
+  EXPECT_GE(fd, 0);
+  EXPECT_EQ(write(fd, bytes.data(), bytes.size()), (ssize_t)bytes.size());
+  close(fd);
+  return name;
+}
+
+TEST(ServerTest, RespondFileSendsBytesRangesAndHeadOnly) {
+  RecordingEmitter emitter([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "unused");
+  });
+  auto server = std::make_shared<ServerInstance>();
+  server->setEmitter(&emitter);
+  EXPECT_EQ(server->registerRoute(Method::All, "", "/f", -1).kind,
+            ErrorKind::None);
+  ServerConfig cfg;
+  cfg.port = 0;
+  server->configure(cfg);
+  ASSERT_EQ((int64_t)server->start().kind, (int64_t)ErrorKind::None);
+  const int port = (int)server->boundPort();
+  // Larger than any socket buffer, so the worker's sendfile loop must
+  // handle partial writes.
+  std::string content(3 * 1024 * 1024, 'x');
+  for (size_t i = 0; i < content.size(); i += 4096) content[i] = 'y';
+  const std::string path = tempFileWith(content);
+
+  auto ask = [&](const std::string& method, auto answer) -> std::string {
+    const size_t before = emitter.seen().size();
+    const int fd = connectTo(port);
+    EXPECT_GE(fd, 0);
+    sendStr(fd, method + " /f HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    int64_t id = 0;
+    for (int i = 0; i < 1000 && id == 0; i++) {
+      auto seen = emitter.seen();
+      if (seen.size() > before) id = seen.back().requestId;
+      if (id == 0) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_NE(id, 0);
+    answer(id);
+    const std::string res = readAll(fd);
+    close(fd);
+    return res;
+  };
+
+  // Whole file.
+  std::string res = ask("GET", [&](int64_t id) {
+    server->respondFile(id, 200, {{"Content-Type", "text/plain"}}, path, 0, -1);
+  });
+  EXPECT_EQ(statusOf(res), 200);
+  EXPECT_EQ(headerOf(res, "content-length"), std::to_string(content.size()));
+  EXPECT_EQ(bodyOf(res), content);
+  // A range.
+  res = ask("GET", [&](int64_t id) {
+    server->respondFile(id, 206, {}, path, 4096, 10);
+  });
+  EXPECT_EQ(statusOf(res), 206);
+  EXPECT_EQ(bodyOf(res), content.substr(4096, 10));
+  // HEAD: length of the body, no bytes.
+  res = ask("HEAD", [&](int64_t id) {
+    server->respondFile(id, 200, {}, path, 0, -1);
+  });
+  EXPECT_EQ(headerOf(res, "content-length"), std::to_string(content.size()));
+  EXPECT_EQ(bodyOf(res), "");
+  // Missing file: 404, the connection still answers.
+  res = ask("GET", [&](int64_t id) {
+    server->respondFile(id, 200, {}, path + ".missing", 0, -1);
+  });
+  EXPECT_EQ(statusOf(res), 404);
+  // An offset past the end is a 404 too, never a negative length.
+  res = ask("GET", [&](int64_t id) {
+    server->respondFile(id, 200, {}, path, (int64_t)content.size() + 1, -1);
+  });
+  EXPECT_EQ(statusOf(res), 404);
+  unlink(path.c_str());
+  server->stop();
+}
+
+TEST(ServerTest, StreamBodyRouteEmitsHeadBeforeChunks) {
+  // Order of emits is what the runner relies on to stream: head (not
+  // complete), data, end — never the inline chunk-then-complete-head form.
+  struct OrderEmitter : RecordingEmitter {
+    using RecordingEmitter::RecordingEmitter;
+    std::vector<std::string> order;
+    std::mutex m;
+    void emitHead(int64_t id, Method method, const std::string& c,
+                  const std::string& p, const std::string& q,
+                  const std::vector<Header>& h, int64_t cl, bool hasBody,
+                  bool complete, const std::string& rp,
+                  const std::vector<RouteParam>& params) override {
+      { std::lock_guard<std::mutex> lk(m); order.push_back(complete ? "head-complete" : "head"); }
+      RecordingEmitter::emitHead(id, method, c, p, q, h, cl, hasBody, complete, rp, params);
+    }
+    void emitBodyData(int64_t id, uint8_t* payload, size_t n) override {
+      { std::lock_guard<std::mutex> lk(m); order.push_back("data"); }
+      RecordingEmitter::emitBodyData(id, payload, n);
+    }
+    void emitBodyEnd(int64_t id) override {
+      { std::lock_guard<std::mutex> lk(m); order.push_back("end"); }
+      RecordingEmitter::emitBodyEnd(id);
+    }
+  };
+  OrderEmitter emitter([](Method, const std::string&, const std::string& body) {
+    return std::make_pair(200, "n=" + std::to_string(body.size()));
+  });
+  auto server = std::make_shared<ServerInstance>();
+  server->setEmitter(&emitter);
+  EXPECT_EQ(server->registerRoute(Method::Post, "", "/up", -1, false, true).kind,
+            ErrorKind::None);
+  ServerConfig cfg;
+  cfg.port = 0;
+  server->configure(cfg);
+  ASSERT_EQ((int64_t)server->start().kind, (int64_t)ErrorKind::None);
+  std::atomic<bool> pumping{true};
+  std::thread pump([&] {
+    while (pumping.load()) {
+      RecordingEmitter::Job job{0, 0, ""};
+      if (emitter.takeJob(job)) {
+        std::vector<uint8_t> bytes(job.body.begin(), job.body.end());
+        server->respond(job.requestId, job.status, {}, bytes.data(), bytes.size());
+      } else {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }
+  });
+  const int fd = connectTo((int)server->boundPort());
+  ASSERT_GE(fd, 0);
+  const std::string payload(100, 'b');  // Small: inline without streamBody.
+  sendStr(fd, "POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n"
+              "Connection: close\r\n\r\n" + payload);
+  EXPECT_EQ(bodyOf(readAll(fd)), "n=100");
+  close(fd);
+  pumping.store(false);
+  pump.join();
+  std::lock_guard<std::mutex> lk(emitter.m);
+  EXPECT_EQ(emitter.order, (std::vector<std::string>{"head", "data", "end"}));
   server->stop();
 }
 

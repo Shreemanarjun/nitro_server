@@ -35,6 +35,30 @@ client, and a Dart-only mode with no Flutter SDK dependency.
 * Header parsing over `string_view`, allocation-free case-insensitive
   compares, route matching without per-branch vector copies.
 
+### Features
+
+* Streaming uploads: `streamBody: true` on a route runs the handler when
+  the head is in and delivers the body on `RequestContext.bodyStream`,
+  releasing native memory chunk by chunk.
+* File answers: `ResponseContext.file` sends a file (or a byte range) from
+  a native worker with `sendfile`; `staticFiles(dir)` adds content types,
+  `etag`/`last-modified`, 304 for conditional requests, 206/416 for byte
+  ranges, index pages and traversal protection.
+* Graceful shutdown: `close(drain:)` stops accepting, marks answers
+  `Connection: close` and waits for in-flight requests.
+* Accept-time limits: `maxConnections`, `maxConnectionsPerIp` and a
+  `headerTimeout` for silent connections, enforced natively.
+* `compress()` gzip middleware, negotiated on `Accept-Encoding` and content
+  type.
+* `server.metrics`: per-route request and 5xx counts with latency
+  p50/p90/p99 from a fixed histogram.
+* Cookies (`request.cookies`, `SetCookie`, `withCookie`; several
+  `set-cookie` headers per answer) and `request.multipart()` for
+  `multipart/form-data`.
+* `WsMessage` is sealed (`WsText`, `WsBinary`); the `text`/`binary`
+  factories and accessors are unchanged.
+* HEAD requests fall back to the GET route, in the router and the runner.
+
 ### Dart API
 
 * `RequestContext.jsonMap()`, `jsonList()` and `jsonAs<T>()`: typed JSON
@@ -60,5 +84,8 @@ client, and a Dart-only mode with no Flutter SDK dependency.
   nitro and dart:io N isolates, `/work` measures handler CPU. Flags and
   results are in `benchmark/README.md`; the measured history is in
   `PERFORMANCE_PLAN.md`.
+* `/file` case: a 64 KiB static file, `File.openRead` on the Dart sides
+  versus native `sendfile` on nitro.
 * `tool/coverage.sh` converts `dart test --coverage` output to lcov before
-  gating; it used to read a stale file.
+  gating and honours `coverage:ignore` markers; it used to read a stale file
+  and mis-parse the percentage, so the gate never actually enforced 100%.

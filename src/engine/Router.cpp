@@ -109,6 +109,12 @@ const RouteEntry* Router::pickEntry(const Node* node, Method method,
   if (!node) return nullptr;
   auto it = node->entries.find(methodKey(method, custom));
   if (it != node->entries.end()) return &it->second;
+  // HEAD is GET without the body (RFC 9110 §9.3.2): a GET route serves it
+  // when no HEAD route exists; the engine drops the body bytes.
+  if (method == Method::Head) {
+    auto get = node->entries.find(methodKey(Method::Get, ""));
+    if (get != node->entries.end()) return &get->second;
+  }
   if (method != Method::All && method != Method::Custom) {
     auto all = node->entries.find(methodKey(Method::All, ""));
     if (all != node->entries.end()) return &all->second;
@@ -123,12 +129,18 @@ MatchResult Router::match(Method method, const std::string& customMethod,
 
   const std::string mkey = methodKey(method, customMethod);
   const std::string akey = methodKey(Method::All, "");
+  const std::string gkey = methodKey(Method::Get, "");
   const bool allowAll =
       (method != Method::All && method != Method::Custom);
+  const bool headFallsToGet = method == Method::Head;
   auto pick = [&](const Node* node) -> const RouteEntry* {
     if (!node) return nullptr;
     auto it = node->entries.find(mkey);
     if (it != node->entries.end()) return &it->second;
+    if (headFallsToGet) {
+      auto get = node->entries.find(gkey);
+      if (get != node->entries.end()) return &get->second;
+    }
     if (allowAll) {
       auto all = node->entries.find(akey);
       if (all != node->entries.end()) return &all->second;

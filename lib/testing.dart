@@ -30,6 +30,7 @@ library;
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'nitro_server.dart';
@@ -428,13 +429,45 @@ class _InMemoryNative extends NitroServerNative {
     return const RawServerStatus(errorKind: RawServerErrorKind.none);
   }
 
-  // The client never binds.
+  // The client never binds, drains or counts wire state.
   // coverage:ignore-start
   @override
   RawServerStatus start() {
     return const RawServerStatus(errorKind: RawServerErrorKind.none);
   }
+
+  @override
+  void beginDrain() {}
+
+  @override
+  int inFlightRequests() => 0;
   // coverage:ignore-end
+
+  /// File answers are read here and delivered as plain bodies — the engine
+  /// would `sendfile` them; the bytes a test sees are the same.
+  @override
+  void respondFile(
+    int requestId,
+    int status,
+    List<RawHeader> headers,
+    String path,
+    int offset,
+    int length,
+  ) {
+    final file = File(path);
+    if (!file.existsSync() || offset < 0 || offset > file.lengthSync()) {
+      respond(requestId, 404, const [
+        RawHeader(name: 'content-type', value: 'text/plain'),
+      ], Uint8List.fromList(utf8.encode('not found')));
+      return;
+    }
+    final size = file.lengthSync();
+    final end = length < 0 ? size : (offset + length).clamp(offset, size);
+    final bytes = file.openSync()..setPositionSync(offset);
+    final body = bytes.readSync(end - offset);
+    bytes.closeSync();
+    respond(requestId, status, headers, body);
+  }
 
   @override
   void stop() {}

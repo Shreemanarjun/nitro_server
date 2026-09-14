@@ -58,6 +58,7 @@ class RouteGroup {
     Duration? timeout,
     String customMethod = '',
     List<Middleware>? middleware,
+    bool streamBody = false,
   }) async {
     await server.route(
       method,
@@ -66,6 +67,7 @@ class RouteGroup {
       timeout: timeout,
       customMethod: customMethod,
       middleware: [..._middleware, ...?middleware],
+      streamBody: streamBody,
     );
     return this;
   }
@@ -115,12 +117,14 @@ class RouteGroup {
     RequestHandler handler, {
     Duration? timeout,
     List<Middleware>? middleware,
+    bool streamBody = false,
   }) => route(
     HttpMethod.post,
     pattern,
     handler,
     timeout: timeout,
     middleware: middleware,
+    streamBody: streamBody,
   );
 
   Future<RouteGroup> put(
@@ -128,12 +132,14 @@ class RouteGroup {
     RequestHandler handler, {
     Duration? timeout,
     List<Middleware>? middleware,
+    bool streamBody = false,
   }) => route(
     HttpMethod.put,
     pattern,
     handler,
     timeout: timeout,
     middleware: middleware,
+    streamBody: streamBody,
   );
 
   Future<RouteGroup> delete(
@@ -154,12 +160,14 @@ class RouteGroup {
     RequestHandler handler, {
     Duration? timeout,
     List<Middleware>? middleware,
+    bool streamBody = false,
   }) => route(
     HttpMethod.patch,
     pattern,
     handler,
     timeout: timeout,
     middleware: middleware,
+    streamBody: streamBody,
   );
 
   Future<RouteGroup> options(

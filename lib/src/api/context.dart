@@ -6,6 +6,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'http_method.dart';
+import 'multipart.dart';
 
 /// Identity for server TLS. Empty means plain HTTP; any field set requires a
 /// build with TLS support, otherwise `start()` throws [ServerTlsException].
@@ -44,9 +45,17 @@ class ServerConfig {
     this.maxRequestsPerConnection = 100,
     this.workerThreads = 0,
     this.isolates = 1,
+    this.maxConnections = 0,
+    this.maxConnectionsPerIp = 0,
+    this.headerTimeout = Duration.zero,
     this.tls = const TlsConfig(),
   }) : assert(port >= 0 && port <= 65535, 'port out of range: $port'),
        assert(isolates >= 0, 'isolates must be non-negative'),
+       assert(maxConnections >= 0, 'maxConnections must be non-negative'),
+       assert(
+         maxConnectionsPerIp >= 0,
+         'maxConnectionsPerIp must be non-negative',
+       ),
        assert(backlog > 0, 'backlog must be positive'),
        assert(maxBodyBytes > 0, 'maxBodyBytes must be positive'),
        assert(
@@ -81,11 +90,24 @@ class ServerConfig {
   /// `setup` function passed to [NitroServer.bind], which runs once per
   /// isolate. `0` picks a size from the CPU count (half the cores, 1–8).
   final int isolates;
+
+  /// Live connections accepted at once; further ones are closed at the
+  /// door, before a worker is spent on them. `0` means unlimited.
+  final int maxConnections;
+
+  /// Live connections per peer address; further ones from that address are
+  /// closed at the door. `0` means unlimited.
+  final int maxConnectionsPerIp;
+
+  /// Deadline for a new connection's first request head, the slow-loris
+  /// guard. [Duration.zero] means the keep-alive idle timeout applies.
+  final Duration headerTimeout;
   final TlsConfig tls;
 
   /// A copy with any of [host], [port], [backlog], [maxBodyBytes],
   /// [defaultTimeout], [keepAliveTimeout], [maxRequestsPerConnection],
-  /// [workerThreads], [isolates] or [tls] replaced.
+  /// [workerThreads], [isolates], [maxConnections], [maxConnectionsPerIp],
+  /// [headerTimeout] or [tls] replaced.
   ServerConfig copyWith({
     String? host,
     int? port,
@@ -96,6 +118,9 @@ class ServerConfig {
     int? maxRequestsPerConnection,
     int? workerThreads,
     int? isolates,
+    int? maxConnections,
+    int? maxConnectionsPerIp,
+    Duration? headerTimeout,
     TlsConfig? tls,
   }) {
     return ServerConfig(
@@ -109,6 +134,9 @@ class ServerConfig {
           maxRequestsPerConnection ?? this.maxRequestsPerConnection,
       workerThreads: workerThreads ?? this.workerThreads,
       isolates: isolates ?? this.isolates,
+      maxConnections: maxConnections ?? this.maxConnections,
+      maxConnectionsPerIp: maxConnectionsPerIp ?? this.maxConnectionsPerIp,
+      headerTimeout: headerTimeout ?? this.headerTimeout,
       tls: tls ?? this.tls,
     );
   }
@@ -145,6 +173,7 @@ class RequestContext {
     required this.params,
     required this.routePattern,
     required this.body,
+    this.bodyStream,
   });
 
   final HttpMethod method;
@@ -155,7 +184,16 @@ class RequestContext {
   final Map<String, List<String>> headers;
   final Map<String, String> params;
   final String routePattern;
+
+  /// The assembled body. Empty on a route registered with `streamBody`,
+  /// where the bytes arrive on [bodyStream] instead.
   final Uint8List body;
+
+  /// The body as it arrives, for routes registered with `streamBody: true`;
+  /// null everywhere else. The handler runs as soon as the head is in, and
+  /// the stream ends when the last byte has been read (or errors when the
+  /// upload was cut short or exceeded `maxBodyBytes`).
+  final Stream<Uint8List>? bodyStream;
 
   /// First value of [name], or null. Header names are lowercase.
   String? header(String name) {
@@ -171,6 +209,29 @@ class RequestContext {
 
   /// The body decoded as UTF-8 text.
   String text() => utf8.decode(body);
+
+  /// Request cookies from the `cookie` header, by name. Values are returned
+  /// as sent (cookie values are not percent-decoded by the protocol).
+  Map<String, String> get cookies {
+    final raw = header('cookie');
+    if (raw == null || raw.isEmpty) return const {};
+    final out = <String, String>{};
+    for (final pair in raw.split(';')) {
+      final eq = pair.indexOf('=');
+      if (eq <= 0) continue;
+      out[pair.substring(0, eq).trim()] = pair.substring(eq + 1).trim();
+    }
+    return out;
+  }
+
+  /// The `multipart/form-data` parts of the body, in order. Throws
+  /// [FormatException] when the request is not multipart or the body is
+  /// malformed. Fields have no [MultipartPart.filename]; uploads do.
+  List<MultipartPart> multipart() {
+    final type = header('content-type');
+    if (type == null) throw const FormatException('no content-type header');
+    return parseMultipart(body, type);
+  }
 
   /// The body decoded as JSON (`jsonDecode` of [text]). Untyped by nature;
   /// prefer [jsonMap], [jsonList] or [jsonAs] to get a checked type back.
@@ -209,16 +270,39 @@ class ResponseContext {
     this.body,
     this.bodyStream,
     this.streamBufferSize = 0,
+    this.filePath,
+    this.fileOffset = 0,
+    this.fileLength = -1,
+    this.cookies = const [],
   }) : assert(status >= 100 && status <= 599, 'status out of range: $status'),
        assert(
-         body == null || bodyStream == null,
-         'body and bodyStream are mutually exclusive',
+         (body == null ? 0 : 1) +
+                 (bodyStream == null ? 0 : 1) +
+                 (filePath == null ? 0 : 1) <=
+             1,
+         'body, bodyStream and filePath are mutually exclusive',
        ),
-       assert(streamBufferSize >= 0, 'streamBufferSize < 0: $streamBufferSize');
+       assert(streamBufferSize >= 0, 'streamBufferSize < 0: $streamBufferSize'),
+       assert(fileOffset >= 0, 'fileOffset < 0: $fileOffset');
 
   final int status;
   final Map<String, String> headers;
   final Uint8List? body;
+
+  /// Cookies to set, each sent as its own `set-cookie` header (a header
+  /// map cannot hold several).
+  final List<SetCookie> cookies;
+
+  /// A file to send as the body (see [ResponseContext.file]). The engine
+  /// sends it from a native worker with `sendfile`, so the bytes never
+  /// enter the Dart heap. Null for every other answer.
+  final String? filePath;
+
+  /// First byte of [filePath] to send.
+  final int fileOffset;
+
+  /// Bytes of [filePath] to send from [fileOffset]; `-1` means to the end.
+  final int fileLength;
 
   /// Chunked body source. Null for one-shot answers. Empty chunks are
   /// skipped on the wire (a `0`-chunk would terminate the body); closing
@@ -239,6 +323,45 @@ class ResponseContext {
 
   /// True when this answer streams ([bodyStream] != null).
   bool get isStream => bodyStream != null;
+
+  /// This answer plus [cookie] (see [cookies]).
+  ResponseContext withCookie(SetCookie cookie) => ResponseContext(
+    status: status,
+    headers: headers,
+    body: body,
+    bodyStream: bodyStream,
+    streamBufferSize: streamBufferSize,
+    filePath: filePath,
+    fileOffset: fileOffset,
+    fileLength: fileLength,
+    cookies: [...cookies, cookie],
+  );
+
+  /// True when this answer is a file ([filePath] != null).
+  bool get isFile => filePath != null;
+
+  /// Answers with the bytes of the file at [path], sent by the native
+  /// worker (`sendfile` on macOS and Linux) — the file never crosses into
+  /// Dart. A missing or unreadable file answers 404. [offset] and [length]
+  /// select a byte range (`length` `-1` means to the end); the caller sets
+  /// the matching status and `content-range` — [staticFiles] does all of
+  /// that for a directory.
+  factory ResponseContext.file(
+    String path, {
+    int status = 200,
+    Map<String, String> headers = const {},
+    String contentType = 'application/octet-stream',
+    int offset = 0,
+    int length = -1,
+  }) {
+    return ResponseContext(
+      status: status,
+      headers: {'content-type': contentType, ...headers},
+      filePath: path,
+      fileOffset: offset,
+      fileLength: length,
+    );
+  }
 
   factory ResponseContext.text(
     String text, {
@@ -395,3 +518,85 @@ typedef NotFoundHandler =
 /// to the default 500 text body.
 typedef ErrorHandler =
     FutureOr<ResponseContext> Function(Object error, RequestContext request);
+
+/// `SameSite` policy of a [SetCookie].
+enum SameSite { strict, lax, none }
+
+/// One `set-cookie` header, built from typed attributes.
+class SetCookie {
+  const SetCookie(
+    this.name,
+    this.value, {
+    this.maxAge,
+    this.expires,
+    this.domain,
+    this.path = '/',
+    this.secure = false,
+    this.httpOnly = false,
+    this.sameSite,
+  });
+
+  final String name;
+  final String value;
+  final Duration? maxAge;
+  final DateTime? expires;
+  final String? domain;
+  final String path;
+  final bool secure;
+  final bool httpOnly;
+  final SameSite? sameSite;
+
+  /// The header value, e.g. `id=42; Path=/; Max-Age=3600; HttpOnly`.
+  String toHeaderValue() {
+    final out = StringBuffer('$name=$value');
+    if (expires case final expires?) {
+      out.write('; Expires=${_httpDate(expires)}');
+    }
+    if (maxAge case final maxAge?) out.write('; Max-Age=${maxAge.inSeconds}');
+    if (domain case final domain?) out.write('; Domain=$domain');
+    out.write('; Path=$path');
+    if (secure) out.write('; Secure');
+    if (httpOnly) out.write('; HttpOnly');
+    if (sameSite case final sameSite?) {
+      out.write('; SameSite=${_sameSiteNames[sameSite]}');
+    }
+    return out.toString();
+  }
+
+  static const _sameSiteNames = {
+    SameSite.strict: 'Strict',
+    SameSite.lax: 'Lax',
+    SameSite.none: 'None',
+  };
+
+  @override
+  String toString() => 'SetCookie(${toHeaderValue()})';
+}
+
+const _weekdays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+const _months = [
+  'Jan',
+  'Feb',
+  'Mar',
+  'Apr',
+  'May',
+  'Jun',
+  'Jul',
+  'Aug',
+  'Sep',
+  'Oct',
+  'Nov',
+  'Dec',
+];
+
+/// RFC 9110 IMF-fixdate, e.g. `Sun, 06 Nov 1994 08:49:37 GMT`.
+String _httpDate(DateTime time) {
+  final utc = time.toUtc();
+  String two(int n) => n.toString().padLeft(2, '0');
+  return '${_weekdays[utc.weekday - 1]}, ${two(utc.day)} '
+      '${_months[utc.month - 1]} ${utc.year} '
+      '${two(utc.hour)}:${two(utc.minute)}:${two(utc.second)} GMT';
+}
+
+/// RFC 9110 IMF-fixdate formatting, shared with [staticFiles].
+String httpDate(DateTime time) => _httpDate(time);

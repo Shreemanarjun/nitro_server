@@ -279,6 +279,8 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   void acceptLoop();
   void workerLoop(Wake wake);
   void handleConnection(int fd, const Wake& wake);
+  /// Drops the per-peer accounting of a closed fd (caller holds activeMutex_).
+  void releasePeerLocked(int fd);
   /// Adds one detached worker (caller holds queueMutex_). Returns false
   /// when no wake pipe could be made.
   bool spawnWorkerLocked();

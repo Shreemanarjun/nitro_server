@@ -204,10 +204,10 @@ Future<({int opcode, Uint8List payload})> _readWsFrame(
   return (opcode: opcode, payload: payload);
 }
 
-/// A setup that only fails off the main isolate: bind must surface it.
+/// A setup that fails only in helper isolates (named `nitro_server:…` by
+/// the server): bind must surface it.
 Future<void> _helperOnlyThrow(NitroServer server) async {
-  if (Isolate.current.debugName != 'main' &&
-      !(Isolate.current.debugName ?? '').endsWith('_test.dart')) {
+  if ((Isolate.current.debugName ?? '').startsWith('nitro_server:')) {
     throw StateError('helper setup failed on purpose');
   }
 }
@@ -369,14 +369,19 @@ void main() {
       skip: skipReason,
     );
 
-    test('a helper failing after another started closes the survivor',
-        () async {
-      await expectLater(
-        NitroServer.bind(const ServerConfig(isolates: 3), _secondHelperThrows)
-            .timeout(const Duration(seconds: 10)),
-        throwsA(isA<StateError>()),
-      );
-    }, skip: skipReason);
+    test(
+      'a helper failing after another started closes the survivor',
+      () async {
+        await expectLater(
+          NitroServer.bind(
+            const ServerConfig(isolates: 3),
+            _secondHelperThrows,
+          ).timeout(const Duration(seconds: 10)),
+          throwsA(isA<StateError>()),
+        );
+      },
+      skip: skipReason,
+    );
 
     test('the main isolate reconciles native state on attach', () async {
       // `ensureNativeAttached` resets the engine only from the isolate named
@@ -395,6 +400,216 @@ void main() {
         NitroServer.bind(const ServerConfig(isolates: 2)),
         throwsArgumentError,
       );
+    }, skip: skipReason);
+
+    test(
+      'close(drain:) finishes accepted work and refuses new connections',
+      () async {
+        server = await NitroServer.bind();
+        final gate = Completer<void>();
+        await server!.get('/slow', (_) async {
+          await gate.future;
+          return ResponseContext.text('done');
+        });
+        final port = server!.port;
+        final pending = _get(port, '/slow');
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+        final closing = server!.close(drain: const Duration(seconds: 5));
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+        // Draining: the listener is gone, the in-flight request still lands.
+        await expectLater(_get(port, '/slow'), throwsA(isA<Exception>()));
+        gate.complete();
+        expect((await pending).body, 'done');
+        await closing;
+        server = null;
+      },
+      skip: skipReason,
+    );
+
+    test('connection limits and the header deadline are enforced', () async {
+      server = await NitroServer.bind(
+        const ServerConfig(
+          maxConnections: 2,
+          maxConnectionsPerIp: 2,
+          headerTimeout: Duration(milliseconds: 200),
+        ),
+      );
+      final port = server!.port;
+      // Two silent connections hold the cap; a third is closed at once.
+      final a = await Socket.connect('127.0.0.1', port);
+      final b = await Socket.connect('127.0.0.1', port);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final c = await Socket.connect('127.0.0.1', port);
+      expect(await c.fold<int>(0, (n, d) => n + d.length), 0);
+      // The silent ones are cut at the header deadline, freeing the cap.
+      await a.drain<void>().timeout(const Duration(seconds: 2));
+      await b.drain<void>().timeout(const Duration(seconds: 2));
+      a.destroy();
+      b.destroy();
+      c.destroy();
+      await server!.get('/ok', (_) => ResponseContext.text('ok'));
+      expect((await _get(port, '/ok')).body, 'ok');
+    }, skip: skipReason);
+
+    test('streamBody routes read the upload as it arrives', () async {
+      server = await NitroServer.bind();
+      await server!.post('/up', streamBody: true, (request) async {
+        expect(request.body, isEmpty);
+        var bytes = 0;
+        var chunks = 0;
+        var hash = 0x811c9dc5;
+        await for (final chunk in request.bodyStream!) {
+          chunks++;
+          bytes += chunk.length;
+          for (final b in chunk) {
+            hash ^= b;
+            hash = (hash * 0x01000193) & 0xffffffff;
+          }
+        }
+        return ResponseContext.jsonBody({
+          'bytes': bytes,
+          'chunks': chunks,
+          'hash': hash,
+        });
+      });
+      final payload = Uint8List.fromList(
+        List.generate(3 * 1024 * 1024, (i) => i & 0xff),
+      );
+      var expected = 0x811c9dc5;
+      for (final b in payload) {
+        expected ^= b;
+        expected = (expected * 0x01000193) & 0xffffffff;
+      }
+      final res = await _get(
+        server!.port,
+        '/up',
+        method: 'POST',
+        body: payload,
+      );
+      expect(res.status, 200);
+      final json = jsonDecode(res.body) as Map<String, Object?>;
+      expect(json['bytes'], payload.length);
+      expect(json['hash'], expected);
+      expect(json['chunks'], greaterThan(1));
+      // A small streamed body works the same way (never the inline form).
+      final small = await _get(
+        server!.port,
+        '/up',
+        method: 'POST',
+        body: [1, 2, 3],
+      );
+      expect((jsonDecode(small.body) as Map)['bytes'], 3);
+    }, skip: skipReason);
+
+    test(
+      'a streamBody handler answering early still drains the wire',
+      () async {
+        server = await NitroServer.bind();
+        await server!.post('/first', streamBody: true, (request) async {
+          final first = await request.bodyStream!.first;
+          return ResponseContext.text('got ${first.length} early');
+        });
+        final res = await _get(
+          server!.port,
+          '/first',
+          method: 'POST',
+          body: List.filled(200 * 1024, 7),
+        );
+        expect(res.status, 200);
+        expect(res.body, startsWith('got '));
+      },
+      skip: skipReason,
+    );
+
+    test(
+      'file answers are sent natively, ranges through staticFiles',
+      () async {
+        final dir = Directory.systemTemp.createTempSync('nitro_e2e_files');
+        addTearDown(() => dir.deleteSync(recursive: true));
+        final content = Uint8List.fromList(
+          List.generate(2 * 1024 * 1024 + 123, (i) => (i * 7) & 0xff),
+        );
+        File('${dir.path}/big.bin').writeAsBytesSync(content);
+        server = await NitroServer.bind();
+        await server!.get('/static/*', staticFiles(dir.path));
+        await server!.get(
+          '/direct',
+          (_) => ResponseContext.file('${dir.path}/big.bin'),
+        );
+        final whole = await _getBytes(server!.port, '/static/big.bin');
+        expect(whole.status, 200);
+        expect(whole.body, content);
+        final direct = await _getBytes(server!.port, '/direct');
+        expect(direct.body.length, content.length);
+        final head = await _get(server!.port, '/direct', method: 'HEAD');
+        expect(head.headers.contentLength, content.length);
+        expect(head.body, isEmpty);
+        final client = HttpClient();
+        try {
+          final req = await client.getUrl(
+            Uri.parse('http://127.0.0.1:${server!.port}/static/big.bin'),
+          );
+          req.headers.set('range', 'bytes=1000-1009');
+          final res = await req.close();
+          expect(res.statusCode, 206);
+          expect(
+            res.headers.value('content-range'),
+            'bytes 1000-1009/${content.length}',
+          );
+          final bytes = await res.fold<BytesBuilder>(
+            BytesBuilder(),
+            (b, d) => b..add(d),
+          );
+          expect(bytes.toBytes(), content.sublist(1000, 1010));
+        } finally {
+          client.close(force: true);
+        }
+        expect((await _get(server!.port, '/static/nope')).status, 404);
+      },
+      skip: skipReason,
+    );
+
+    test('several cookies ride as separate set-cookie headers', () async {
+      server = await NitroServer.bind();
+      await server!.get(
+        '/login',
+        (r) => ResponseContext.text('cookies: ${r.cookies}')
+            .withCookie(const SetCookie('sid', 'abc', httpOnly: true))
+            .withCookie(
+              const SetCookie('theme', 'dark', maxAge: Duration(days: 1)),
+            ),
+      );
+      await server!.get(
+        '/stream',
+        (_) => ResponseContext(
+          bodyStream: Stream.value(Uint8List.fromList([1])),
+          cookies: const [SetCookie('s', '1')],
+        ),
+      );
+      final res = await _get(
+        server!.port,
+        '/login',
+        headers: {'cookie': 'a=1; b=2'},
+      );
+      expect(res.body, 'cookies: {a: 1, b: 2}');
+      expect(res.headers['set-cookie'], [
+        'sid=abc; Path=/; HttpOnly',
+        'theme=dark; Max-Age=86400; Path=/',
+      ]);
+      final streamed = await _get(server!.port, '/stream');
+      expect(streamed.headers['set-cookie'], ['s=1; Path=/']);
+    }, skip: skipReason);
+
+    test('metrics count real requests', () async {
+      server = await NitroServer.bind();
+      await server!.get('/m', (_) => ResponseContext.text('m'));
+      for (var i = 0; i < 3; i++) {
+        await _get(server!.port, '/m');
+      }
+      final metrics = server!.metrics;
+      expect(metrics.requests, 3);
+      expect(metrics.byRoute['/m']!.latency.count, 3);
+      expect(metrics.byRoute['/m']!.latency.maxUs, greaterThan(0));
     }, skip: skipReason);
 
     test('matches a literal route and echoes the method', () async {

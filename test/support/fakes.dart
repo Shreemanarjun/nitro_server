@@ -111,6 +111,40 @@ class FakeNitroServerNative extends NitroServerNative {
     acked.add((requestId, ackedChunks));
   }
 
+  /// Drain seams: [drained] records `beginDrain`, [inFlight] is what
+  /// `inFlightRequests` reports (tests script it counting down).
+  var drained = false;
+  int inFlight = 0;
+
+  @override
+  void beginDrain() {
+    drained = true;
+  }
+
+  @override
+  int inFlightRequests() => inFlight > 0 ? inFlight-- : 0;
+
+  /// File answers by request id: (status, headers, path, offset, length).
+  final filesResponded = <int, (int, Map<String, String>, String, int, int)>{};
+
+  @override
+  void respondFile(
+    int requestId,
+    int status,
+    List<RawHeader> headers,
+    String path,
+    int offset,
+    int length,
+  ) {
+    filesResponded[requestId] = (
+      status,
+      {for (final h in headers) h.name: h.value},
+      path,
+      offset,
+      length,
+    );
+  }
+
   /// Ids whose `startStream` throws, standing in for an engine that already
   /// answered (timeout won) and rejected the bridge call.
   final startStreamFailures = <int>{};

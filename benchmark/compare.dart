@@ -82,6 +82,17 @@ Uint8List _workBody() => Uint8List.fromList(
 );
 final Uint8List _workExpected = _workBody();
 
+/// `/file`: a 64 KiB static file. dart:io and shelf stream it through the
+/// isolate (`File.openRead`); nitro answers `ResponseContext.file`, which
+/// the native worker sends with `sendfile` — the bytes never enter Dart.
+final File _staticFile = () {
+  final dir = Directory.systemTemp.createTempSync('nitro_bench_file');
+  final file = File('${dir.path}/asset.bin')
+    ..writeAsBytesSync(List<int>.generate(64 * 1024, (i) => (i * 31) & 0xff));
+  return file;
+}();
+final Uint8List _fileExpected = _staticFile.readAsBytesSync();
+
 final Uint8List _echoPayload = Uint8List.fromList(
   List<int>.generate(4096, (i) => i & 0xff),
 );
@@ -242,6 +253,10 @@ Future<HttpServer> _startDartServer({int port = 0, bool shared = false}) async {
           response.headers.contentType = ContentType.json;
           response.contentLength = body.length;
           response.add(body);
+        } else if (request.method == 'GET' && path == '/file') {
+          response.headers.contentType = ContentType.binary;
+          response.contentLength = _fileExpected.length;
+          await response.addStream(_staticFile.openRead());
         } else if (_routes.containsKey(path)) {
           final body = _routes[path]!;
           response.contentLength = body.length;
@@ -298,6 +313,15 @@ Response _shelfHandler(Request request) {
     body = _routes['/hello'];
   } else if (request.method == 'GET' && path == '/work') {
     body = _workBody();
+  } else if (request.method == 'GET' && path == '/file') {
+    return Response.ok(
+      _staticFile.openRead(),
+      headers: {
+        'connection': _connHeader(),
+        'content-type': 'application/octet-stream',
+        'content-length': '${_fileExpected.length}',
+      },
+    );
   } else {
     body = _routes[path];
   }
@@ -380,6 +404,7 @@ ServerSetup _nitroSetup(bool batchEvents) {
       (_) =>
           ResponseContext.bytes(_workBody(), contentType: 'application/json'),
     );
+    await server.get('/file', (_) => ResponseContext.file(_staticFile.path));
     await server.get(
       '/events',
       (_) => ResponseContext.stream(
@@ -611,6 +636,7 @@ final Map<String, _Op> _ops = {
   '/q?a=1&b=two': (c, p) => _getExpect(c, p, '/q?a=1&b=two', _queryExpected),
   '/mw': (c, p) => _getExpect(c, p, '/mw', _routes['/hello']!),
   '/work': (c, p) => _getExpect(c, p, '/work', _workExpected),
+  '/file': (c, p) => _getExpect(c, p, '/file', _fileExpected),
   'POST /echo 4k': _postEcho,
   'POST /echo 1m': (c, p) => _postEchoSized(c, p, _bigPayload),
   'GET /events': _getEvents,
@@ -650,6 +676,7 @@ Future<({double meanUs, List<int> samplesUs})> _sequential(
     '/q?a=1&b=two' => get('/q?a=1&b=two', _queryExpected),
     '/mw' => get('/mw', _routes['/hello']!),
     '/work' => get('/work', _workExpected),
+    '/file' => get('/file', _fileExpected),
     'POST /echo 4k' => (
       request: [
         ...ascii.encode(

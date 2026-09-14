@@ -10,6 +10,9 @@
 #include <string_view>
 
 #ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#include <sys/stat.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
@@ -22,8 +25,12 @@ using ssize_t = long long;
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/sendfile.h>
+#endif
 #endif
 
 namespace nitroserver {
@@ -235,6 +242,52 @@ ssize_t peekOne(Fd fd) {
 }
 ssize_t readWake(Fd fd, void* buf, size_t n) { return ::read(fd, buf, n); }
 #endif
+
+/// Opens [path] read-only; returns the descriptor and its size, or -1/-1.
+int openFileReadOnly(const std::string& path, int64_t& size) {
+#ifdef _WIN32
+  const int f = _open(path.c_str(), _O_RDONLY | _O_BINARY);
+  if (f < 0) return -1;
+  struct _stat64 st{};
+  if (_fstat64(f, &st) != 0 || (st.st_mode & _S_IFREG) == 0) {
+    _close(f);
+    return -1;
+  }
+  size = (int64_t)st.st_size;
+  return f;
+#else
+  const int f = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (f < 0) return -1;
+  struct stat st{};
+  if (fstat(f, &st) != 0 || !S_ISREG(st.st_mode)) {
+    ::close(f);
+    return -1;
+  }
+  size = (int64_t)st.st_size;
+  return f;
+#endif
+}
+
+void closeFile(int f) {
+#ifdef _WIN32
+  _close(f);
+#else
+  ::close(f);
+#endif
+}
+
+/// Peer address as text (v4 dotted, v6 hex; v4-mapped shows as ::ffff:…).
+std::string peerAddress(const sockaddr_storage& peer) {
+  char buf[INET6_ADDRSTRLEN] = {0};
+  if (peer.ss_family == AF_INET6) {
+    inet_ntop(AF_INET6, &((const sockaddr_in6*)&peer)->sin6_addr, buf,
+              sizeof(buf));
+  } else {
+    inet_ntop(AF_INET, &((const sockaddr_in*)&peer)->sin_addr, buf,
+              sizeof(buf));
+  }
+  return buf;
+}
 
 /// Wakes a parked worker: one byte, never blocks. A full pipe already holds
 /// a pending wake, so a dropped byte changes nothing.
@@ -519,9 +572,10 @@ StatusResult ServerInstance::registerRoute(Method method,
                                            const std::string& customMethod,
                                            const std::string& pattern,
                                            int64_t timeoutMs,
-                                           bool isWebSocket) {
+                                           bool isWebSocket, bool streamBody) {
   std::unique_lock lk(configMutex_);
-  RouteEntry e{method, customMethod, pattern, timeoutMs, isWebSocket};
+  RouteEntry e{method, customMethod, pattern, timeoutMs, isWebSocket,
+               streamBody};
   if (!router_.add(e)) {
     return {ErrorKind::BadRequest,
             "invalid route pattern (want '/a/:b' with optional trailing '/*'): " +
@@ -548,6 +602,7 @@ StatusResult ServerInstance::start() {
     std::shared_lock lk(configMutex_);
     cfg = config_;
   }
+  draining_.store(false);
   if (running_.exchange(true)) {
     // start() on a running server: report the live port, not the config.
     return {ErrorKind::AlreadyRunning, "server is already running",
@@ -693,8 +748,77 @@ void ServerInstance::stop() {
     for (int fd : queue_) closeFd((Fd)fd);
     queue_.clear();
   }
+  {
+    std::lock_guard<std::mutex> lk(activeMutex_);
+    peerOf_.clear();
+    perPeer_.clear();
+    liveConnections_.store(0);
+  }
   boundPort_.store(0);
+  draining_.store(false);
   broadcastEvent(ServerEventKind::Stopped, 0, "stopped");
+}
+
+void ServerInstance::beginDrain() {
+  if (!running_.load() || draining_.exchange(true)) return;
+  // Closing the listener ends the accept loop; workers keep serving what
+  // was accepted, and every answer from now on says `Connection: close`.
+  if (listenFd_ != -1) {
+    shutdownRdwr((Fd)listenFd_);
+    closeFd((Fd)listenFd_);
+    listenFd_ = -1;
+  }
+  std::lock_guard<std::mutex> lk(acceptMutex_);
+  if (acceptThread_.joinable()) acceptThread_.join();
+}
+
+int64_t ServerInstance::inFlightRequests() { return (int64_t)pending_.size(); }
+
+void ServerInstance::respondFile(int64_t requestId, int64_t status,
+                                 const std::vector<Header>& headers,
+                                 const std::string& path, int64_t offset,
+                                 int64_t length) {
+  auto req = pending_.find(requestId);
+  if (!req) return;  // Unknown or already reaped: no-op by design.
+  int64_t size = -1;
+  int file = openFileReadOnly(path, size);
+  if (file < 0 || offset < 0 || offset > size) {
+    if (file >= 0) closeFile(file);
+    static const char kMsg[] = "not found";
+    respond(requestId, 404, {{"Content-Type", "text/plain"}},
+            (const uint8_t*)kMsg, sizeof(kMsg) - 1);
+    return;
+  }
+  const int64_t remaining =
+      length < 0 ? size - offset : std::min<int64_t>(length, size - offset);
+  std::string head;
+  int wakeFd = -1;
+  {
+    std::lock_guard<std::mutex> lk(req->mutex);
+    if (req->answered) {  // The timeout path won: late answer drops.
+      closeFile(file);
+      return;
+    }
+    req->answered = true;
+    req->status = status;
+    head = buildHead(status, headers, false, remaining, req->keepAlive,
+                     req->keepAliveSecs);
+    if (req->isHead || remaining == 0) {
+      closeFile(file);
+      file = -1;
+    } else {
+      req->fileFd = file;
+      req->fileOffset = offset;
+      req->fileRemaining = remaining;
+    }
+    req->writing = true;
+    wakeFd = req->wakeFd;
+  }
+  const bool headOnly = file < 0;
+  writeNow(req, (const uint8_t*)head.data(), head.size(), nullptr, 0, nullptr,
+           0, headOnly);
+  // The worker sends the file body: always wake it for that.
+  if (!headOnly) poke((Fd)wakeFd);
 }
 
 // ── Direct-write answer path ────────────────────────────────────────────────
@@ -866,28 +990,48 @@ bool ServerInstance::waitForDrainForTesting(int64_t timeoutMs) {
 }
 
 void ServerInstance::acceptLoop() {
-  int64_t maxQueued;
+  int64_t maxQueued, maxConn, maxPerIp;
   {
     std::shared_lock lk(configMutex_);
     maxQueued = config_.backlog > 0 ? config_.backlog : 128;
+    maxConn = config_.maxConnections;
+    maxPerIp = config_.maxConnectionsPerIp;
   }
-  while (running_.load()) {
+  while (running_.load() && !draining_.load()) {
     sockaddr_storage peer{};
     socklen_t len = sizeof(peer);
     Fd fd = accept((Fd)listenFd_, (sockaddr*)&peer, &len);
     if (fd == kBadFd) {
-      if (running_.load())
+      if (running_.load() && !draining_.load())
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
       continue;
     }
     setNoSigPipe(fd);
     setNonBlocking(fd, true);
+    // Limits at the door: cheaper than any later stage, and the only place
+    // a per-peer cap can be enforced before a worker is spent on it.
+    {
+      std::lock_guard<std::mutex> lk(activeMutex_);
+      const std::string ip = peerAddress(peer);
+      const auto it = perPeer_.find(ip);
+      const int64_t fromPeer = it == perPeer_.end() ? 0 : it->second;
+      if ((maxConn > 0 && liveConnections_.load() >= maxConn) ||
+          (maxPerIp > 0 && fromPeer >= maxPerIp)) {
+        closeFd(fd);
+        continue;
+      }
+      perPeer_[ip] = fromPeer + 1;
+      peerOf_[(int)fd] = ip;
+      liveConnections_++;
+    }
     {
       std::lock_guard<std::mutex> lk(queueMutex_);
       if ((int64_t)queue_.size() >= maxQueued) {
         // Refuse fast: a accept loop that outruns its workers must shed load
         // at the door, not queue it until every client times out.
         closeFd(fd);
+        std::lock_guard<std::mutex> alk(activeMutex_);
+        releasePeerLocked((int)fd);
         continue;
       }
       queue_.push_back((int)fd);
@@ -1050,9 +1194,19 @@ void ServerInstance::handleConnection(int fd, const Wake& wake) {
   {
     std::lock_guard<std::mutex> lk(activeMutex_);
     activeFds_.erase(fd);
+    releasePeerLocked(fd);
   }
   closeFd(sock);
   inFlight_--;
+}
+
+void ServerInstance::releasePeerLocked(int fd) {
+  const auto it = peerOf_.find(fd);
+  if (it == peerOf_.end()) return;
+  const auto count = perPeer_.find(it->second);
+  if (count != perPeer_.end() && --count->second <= 0) perPeer_.erase(count);
+  peerOf_.erase(it);
+  liveConnections_--;
 }
 
 bool ServerInstance::flushTail(int fd, const std::shared_ptr<PendingRequest>& req,
@@ -1087,6 +1241,72 @@ bool ServerInstance::flushTail(int fd, const std::shared_ptr<PendingRequest>& re
   }
 }
 
+bool ServerInstance::sendFile(int fd, const std::shared_ptr<PendingRequest>& req,
+                              int64_t stallMs) {
+  int file;
+  int64_t off, remaining;
+  {
+    std::lock_guard<std::mutex> lk(req->mutex);
+    file = req->fileFd;
+    off = req->fileOffset;
+    remaining = req->fileRemaining;
+    req->flushing = true;
+  }
+  bool ok = true;
+  while (remaining > 0 && ok) {
+#if defined(__APPLE__)
+    off_t len = (off_t)remaining;
+    const int r = ::sendfile(file, fd, (off_t)off, &len, nullptr, 0);
+    off += len;
+    remaining -= len;
+    if (r < 0 && errno == EINTR) continue;
+    if (r < 0 && !wouldBlock()) {
+      ok = false;
+    } else if (remaining > 0 && (r < 0 || len == 0)) {
+      if (pollFd((Fd)fd, POLLOUT, (int)std::min<int64_t>(stallMs, INT32_MAX)) <= 0) ok = false;
+    }
+#elif defined(__linux__)
+    off_t o = (off_t)off;
+    const ssize_t n = ::sendfile(fd, file, &o, (size_t)std::min<int64_t>(remaining, 1 << 20));
+    if (n > 0) {
+      off += n;
+      remaining -= n;
+    } else if (n < 0 && (errno == EINTR)) {
+      continue;
+    } else if (n < 0 && wouldBlock()) {
+      if (pollFd((Fd)fd, POLLOUT, (int)std::min<int64_t>(stallMs, INT32_MAX)) <= 0) ok = false;
+    } else {
+      ok = false;
+    }
+#else
+    // No sendfile: read a block and send it.
+    static thread_local std::vector<uint8_t> buf(64 * 1024);
+    const size_t want = (size_t)std::min<int64_t>((int64_t)buf.size(), remaining);
+#ifdef _WIN32
+    if (_lseeki64(file, off, SEEK_SET) < 0) { ok = false; break; }
+    const int n = _read(file, buf.data(), (unsigned)want);
+#else
+    const ssize_t n = pread(file, buf.data(), want, (off_t)off);
+#endif
+    if (n <= 0) { ok = false; break; }
+    if (!sendAll(fd, buf.data(), (size_t)n, stallMs)) { ok = false; break; }
+    off += n;
+    remaining -= n;
+#endif
+  }
+  closeFile(file);
+  {
+    std::lock_guard<std::mutex> lk(req->mutex);
+    req->fileFd = -1;
+    req->fileRemaining = 0;
+    req->flushing = false;
+    if (!ok) req->failed = true;
+    req->done = true;
+    req->doneAt = std::chrono::steady_clock::now();
+  }
+  return ok;
+}
+
 bool ServerInstance::awaitAnswer(int fd, const Wake& wake,
                                  const std::shared_ptr<PendingRequest>& req,
                                  int64_t requestId, int64_t timeoutMs,
@@ -1106,6 +1326,7 @@ bool ServerInstance::awaitAnswer(int fd, const Wake& wake,
     bool ownedByWorker = false;
     bool keepAlive = false;
     bool hasTail = false;
+    bool hasFile = false;
     int64_t waitMs = 0;
     {
       std::lock_guard<std::mutex> lk(req->mutex);
@@ -1117,6 +1338,8 @@ bool ServerInstance::awaitAnswer(int fd, const Wake& wake,
         ownedByWorker = true;
       } else if (!req->tail.empty() && !req->writing) {
         hasTail = true;
+      } else if (req->fileFd >= 0 && !req->writing) {
+        hasFile = true;
       } else if (req->answered && req->streamStarted && req->streamDead) {
         // stop() killed the stream mid-way: nothing more will come.
         req->done = true;
@@ -1140,7 +1363,7 @@ bool ServerInstance::awaitAnswer(int fd, const Wake& wake,
         // Answered by Dart, write in flight or tail queued: it wakes us.
         waitMs = idleMs;
       }
-      if (!finished && !ownedByWorker && !hasTail && pendingInput) {
+      if (!finished && !ownedByWorker && !hasTail && !hasFile && pendingInput) {
         // Bytes (or EOF) arrived while the answer is in flight: nothing to
         // do with them until the wire is clean — ask for an explicit wake.
         req->workerWaiting = true;
@@ -1172,6 +1395,10 @@ bool ServerInstance::awaitAnswer(int fd, const Wake& wake,
     }
     if (hasTail) {
       flushTail(fd, req, idleMs);
+      continue;
+    }
+    if (hasFile) {
+      sendFile(fd, req, idleMs);
       continue;
     }
     // ── Park ───────────────────────────────────────────────────────────
@@ -1233,7 +1460,11 @@ bool ServerInstance::serveOne(int fd, const Wake& wake, std::string& carry,
   const Fd sock = (Fd)fd;
   const int64_t idleMs =
       cfg.keepAliveTimeoutMs > 0 ? cfg.keepAliveTimeoutMs : 5000;
-  if (!readHead(sock, carry, idleMs)) return false;  // EOF, idle, oversize.
+  // A fresh connection gets the header deadline (slow-loris guard); a
+  // keep-alive connection between requests gets the idle timeout.
+  const int64_t headMs =
+      served == 0 && cfg.headerTimeoutMs > 0 ? cfg.headerTimeoutMs : idleMs;
+  if (!readHead(sock, carry, headMs)) return false;  // EOF, idle, oversize.
   const size_t headEnd = carry.find("\r\n\r\n");
   size_t bodyStart = headEnd + 4;
   ParsedHead head = parseHead(carry, headEnd);
@@ -1303,7 +1534,8 @@ bool ServerInstance::serveOne(int fd, const Wake& wake, std::string& carry,
   req->fd = fd;
   req->wakeFd = wake.w;
   req->isHead = head.method == Method::Head;
-  req->keepAlive = keepPeer && cfg.keepAliveTimeoutMs > 0 && underBudget;
+  req->keepAlive = keepPeer && cfg.keepAliveTimeoutMs > 0 && underBudget &&
+                   !draining_.load();
   req->keepAliveSecs = (cfg.keepAliveTimeoutMs + 999) / 1000;
 
   // 100-continue handshake before the client sends a body.
@@ -1341,8 +1573,9 @@ bool ServerInstance::serveOne(int fd, const Wake& wake, std::string& carry,
   // Small bodies (the common POST) are read in full first, so Dart gets one
   // chunk then one COMPLETE head — two port messages and a single head
   // decode instead of head + chunk + end marker.
-  const bool inlineBody =
-      hasBody && !chunked && (size_t)contentLength <= kInlineBodyBytes;
+  const bool inlineBody = hasBody && !chunked &&
+                          (size_t)contentLength <= kInlineBodyBytes &&
+                          !m.route.streamBody;
   if (!inlineBody) {
     emitter->emitHead(requestId, head.method, head.customMethod, path,
                       query, head.headers, chunked ? -1 : contentLength,

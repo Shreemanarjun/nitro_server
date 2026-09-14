@@ -1,6 +1,9 @@
 /// Built-in middleware.
 library;
 
+import 'dart:io' show gzip;
+import 'dart:typed_data';
+
 import 'context.dart';
 import 'http_method.dart';
 
@@ -73,4 +76,63 @@ Middleware cors({
       body: response.body,
     );
   };
+}
+
+/// Content types worth compressing: text and the structured-text formats.
+/// Images, video and archives are already compressed.
+const _compressibleTypes = {
+  'text/',
+  'application/json',
+  'application/javascript',
+  'application/xml',
+  'application/xhtml+xml',
+  'application/rss+xml',
+  'application/atom+xml',
+  'application/wasm',
+  'image/svg+xml',
+};
+
+/// gzip response compression, negotiated per request: applies when the
+/// client sends `Accept-Encoding: gzip`, the answer is a one-shot body of
+/// at least [minBytes] with a compressible `content-type` (text, JSON,
+/// JavaScript, XML, SVG, WASM by default; [contentTypes] overrides, matched
+/// by prefix) and no `content-encoding` yet. Streams and file answers pass
+/// through untouched. Compressed answers carry `content-encoding: gzip`
+/// and `vary: accept-encoding`.
+///
+/// The codec is `dart:io`'s zlib, run on the isolate: cheap for the bodies
+/// this applies to, and still far less than the bytes it saves on the wire.
+Middleware compress({
+  int minBytes = 1024,
+  Set<String> contentTypes = _compressibleTypes,
+}) {
+  return (request, next) async {
+    final response = await next(request);
+    final body = response.body;
+    if (body == null || body.length < minBytes) return response;
+    final accept = request.header('accept-encoding') ?? '';
+    if (!accept.toLowerCase().contains('gzip')) return response;
+    final headers = response.headers;
+    final type = _headerValue(headers, 'content-type') ?? '';
+    if (_headerValue(headers, 'content-encoding') != null) return response;
+    if (!contentTypes.any(type.toLowerCase().startsWith)) return response;
+    final encoded = Uint8List.fromList(gzip.encode(body));
+    return ResponseContext(
+      status: response.status,
+      headers: {
+        ...headers,
+        'content-encoding': 'gzip',
+        'vary': 'accept-encoding',
+      },
+      body: encoded,
+    );
+  };
+}
+
+/// Case-insensitive lookup in a response header map.
+String? _headerValue(Map<String, String> headers, String name) {
+  for (final entry in headers.entries) {
+    if (entry.key.toLowerCase() == name) return entry.value;
+  }
+  return null;
 }

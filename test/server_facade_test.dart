@@ -370,6 +370,25 @@ void main() {
   });
 
   group('runner seams', () {
+    test(
+      'close(drain:) drains until in-flight reaches zero, then stops',
+      () async {
+        fake.inFlight = 3;
+        await server.close(drain: const Duration(seconds: 2));
+        expect(fake.drained, isTrue);
+        expect(fake.inFlight, 0);
+        expect(fake.stopCalls, 1);
+      },
+    );
+
+    test('a drain past its deadline still stops', () async {
+      fake.inFlight = 1 << 30;
+      final started = DateTime.now();
+      await server.close(drain: const Duration(milliseconds: 30));
+      expect(DateTime.now().difference(started).inMilliseconds, lessThan(2000));
+      expect(fake.stopCalls, 1);
+    });
+
     test('stop delegates to native', () async {
       final runner = ServerRunner(fake);
       addTearDown(runner.close);

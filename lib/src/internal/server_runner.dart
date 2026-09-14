@@ -27,6 +27,7 @@ import 'dart:typed_data';
 import '../api/context.dart';
 import '../api/event.dart';
 import '../api/http_method.dart';
+import '../api/metrics.dart';
 import '../api/ws.dart';
 import '../nitro_server.native.dart';
 import 'fast_calls.dart';
@@ -44,11 +45,14 @@ String _tokenOf(HttpMethod method, String customToken) =>
 /// global → group/route-local → handler. Both are computed at registration
 /// and refreshed on every `use()`, so dispatch never composes per request.
 class _RouteEntry {
-  _RouteEntry(this.handler, this.routeComposer, this.piped);
+  _RouteEntry(this.handler, this.routeComposer, this.piped, this.streamBody);
 
   final RequestHandler handler;
   final HandlerComposer routeComposer;
   RequestHandler piped;
+
+  /// Dispatch on the head and stream the body to the handler.
+  final bool streamBody;
 }
 
 /// The middleware chain as a handler transformer: composes every registered
@@ -64,6 +68,13 @@ class _Pending {
   String? error;
   bool complete = false;
   bool dispatched = false;
+
+  /// Runner clock reading at dispatch, for the latency metric.
+  int startedUs = 0;
+
+  /// Set once a `streamBody` handler is running: chunks go here instead of
+  /// [body], and are acked as they are copied rather than at completion.
+  StreamController<Uint8List>? stream;
 }
 
 /// Shared empty body for head-only requests: every GET without a body would
@@ -106,6 +117,22 @@ class ServerRunner {
   /// answer. Bound on [start], released on [close].
   FastCalls? _fast;
   final _pending = <int, _Pending>{};
+
+  /// Per-route metrics, keyed by pattern (`*unmatched*` for not-found).
+  final _metrics = <String, MetricsAccumulator>{};
+  final _clock = Stopwatch()..start();
+  int _answered = 0;
+  int _errors = 0;
+
+  /// A snapshot of the counters and latency quantiles so far.
+  ServerMetrics get metrics => ServerMetrics(
+    requests: _answered,
+    errors: _errors,
+    inFlight: _pending.length,
+    byRoute: {
+      for (final entry in _metrics.entries) entry.key: entry.value.snapshot(),
+    },
+  );
 
   /// Recently answered request ids, insertion-ordered and bounded.
   ///
@@ -211,6 +238,8 @@ class ServerRunner {
   /// id so a stale duplicate head can never dispatch again, and sends the
   /// deferred cumulative body ack (one FFI crossing instead of one per chunk).
   void _complete(int requestId) {
+    // A streaming handler that answered early: nothing more can be read.
+    _pending[requestId]?.stream?.close();
     _pending.remove(requestId);
     _completed.add(requestId);
     if (_completed.length > 1024) _completed.remove(_completed.first);
@@ -241,6 +270,7 @@ class ServerRunner {
     Duration? timeout,
     RequestHandler handler, [
     List<Middleware> middleware = const [],
+    bool streamBody = false,
   ]) {
     _ensureListening();
     final (rawMethod, rawCustom) = rawMethodOf(method, customToken);
@@ -251,6 +281,7 @@ class ServerRunner {
         pattern: pattern,
         // -1 inherits the server default (see RawRouteConfig).
         timeoutMs: timeout?.inMilliseconds ?? -1,
+        streamBody: streamBody,
       ),
     );
     throwIfFailed(status, operation: 'registerRoute($pattern)');
@@ -261,6 +292,7 @@ class ServerRunner {
       handler,
       routeComposer,
       _compose(routeComposer(handler)),
+      streamBody,
     );
     final token = _tokenOf(method, customToken);
     (_routes[token] ??= {})[pattern] = entry;
@@ -338,6 +370,9 @@ class ServerRunner {
         keepAliveTimeoutMs: config.keepAliveTimeout.inMilliseconds,
         maxRequestsPerConn: config.maxRequestsPerConnection,
         workerThreads: config.workerThreads,
+        maxConnections: config.maxConnections,
+        maxConnectionsPerIp: config.maxConnectionsPerIp,
+        headerTimeoutMs: config.headerTimeout.inMilliseconds,
         tls: RawTlsConfig(
           certPem: config.tls.certPem,
           keyPem: config.tls.keyPem,
@@ -352,6 +387,22 @@ class ServerRunner {
 
   void stop() {
     _native.stop();
+  }
+
+  /// Graceful shutdown: stops accepting, marks every further answer
+  /// `Connection: close`, and waits until no request is in flight or
+  /// [deadline] passes. The caller then closes.
+  Future<void> drain(Duration deadline) async {
+    if (_closed) return;
+    try {
+      _native.beginDrain();
+    } catch (_) {
+      return; // Never started: nothing to drain.
+    }
+    final end = DateTime.now().add(deadline);
+    while (_native.inFlightRequests() > 0 && DateTime.now().isBefore(end)) {
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+    }
   }
 
   /// Readies a runner that will not call [start] — a helper isolate behind
@@ -431,7 +482,37 @@ class ServerRunner {
         _earlyComplete.remove(requestId)) {
       pending.complete = true;
       _dispatch(pending);
+    } else if (_entryFor(head)?.streamBody ?? false) {
+      // Head first, body later: the handler runs now and reads the body
+      // from a stream. Bytes that beat the head go out first.
+      final controller = StreamController<Uint8List>();
+      pending.stream = controller;
+      if (pending.body.isNotEmpty) controller.add(pending.body.takeBytes());
+      _ackNow(requestId);
+      _dispatch(pending);
     }
+  }
+
+  /// The registered entry a head resolves to: the method-specific
+  /// registration, else the GET registration for a HEAD (the engine strips
+  /// the body), else the `*` fallback, else null.
+  _RouteEntry? _entryFor(RawIncomingRequest head) {
+    final (method, custom) = httpMethodOf(head.method, head.customMethod);
+    final pattern = head.routePattern;
+    final byMethod = _routes[_tokenOf(method, custom)]?[pattern];
+    if (byMethod != null) return byMethod;
+    if (method == HttpMethod.head) {
+      final get = _routes['GET']?[pattern];
+      if (get != null) return get;
+    }
+    return _routes['*']?[pattern];
+  }
+
+  /// Streaming bodies release native memory chunk by chunk: a long upload
+  /// must not hold every payload until the handler finishes.
+  void _ackNow(int requestId) {
+    final acked = _acked[requestId];
+    if (acked != null && acked > 0) _native.ackBody(requestId, acked);
   }
 
   void _onChunk(RawBodyChunk chunk) {
@@ -452,6 +533,9 @@ class ServerRunner {
         if (pending == null) {
           (_early[chunk.requestId] ??= []).add(copy);
           _boundEarly();
+        } else if (pending.stream case final stream?) {
+          stream.add(copy);
+          _ackNow(chunk.requestId);
         } else if (!pending.complete) {
           pending.body.add(copy);
         }
@@ -462,6 +546,11 @@ class ServerRunner {
         if (pending == null) {
           _earlyErrors[chunk.requestId] = message;
           _boundEarly();
+        } else if (pending.stream case final stream?) {
+          // The engine already answered (413/400): the handler's stream
+          // fails and its answer, if any, is a no-op.
+          stream.addError(StateError(message));
+          _ackNow(chunk.requestId);
         } else if (!pending.complete) {
           pending.error = message;
         }
@@ -473,6 +562,9 @@ class ServerRunner {
         if (pending == null) {
           _earlyComplete.add(chunk.requestId);
           _boundEarly();
+        } else if (pending.stream case final stream?) {
+          pending.complete = true;
+          stream.close();
         } else if (!pending.complete) {
           pending.complete = true;
           _dispatch(pending);
@@ -510,6 +602,7 @@ class ServerRunner {
   void _dispatch(_Pending pending) {
     if (pending.dispatched) return;
     pending.dispatched = true;
+    pending.startedUs = _clock.elapsedMicroseconds;
     final head = pending.head;
     if (pending.error != null) {
       // The engine already answered directly (413, truncated body) and
@@ -519,12 +612,10 @@ class ServerRunner {
       return;
     }
     final (method, custom) = httpMethodOf(head.method, head.customMethod);
-    // Method-specific registrations win; `HttpMethod.all` (`*`) is the
-    // fallback — mirroring the native router's precedence (specific beats
-    // All). Two-level lookup: no key string is built on any path.
-    final byPattern = _routes[_tokenOf(method, custom)];
-    final entry =
-        byPattern?[head.routePattern] ?? _routes['*']?[head.routePattern];
+    // Method-specific registrations win, HEAD falls back to GET, and
+    // `HttpMethod.all` (`*`) is the last resort — mirroring the native
+    // router's precedence. Two-level lookup: no key string is built.
+    final entry = _entryFor(head);
     // The context is built before the branch: both the handler and the
     // not-found fallback receive it.
     final context = RequestContext(
@@ -544,6 +635,7 @@ class ServerRunner {
       // GET-style heads carry no body: share one empty buffer instead of
       // allocating per request.
       body: pending.body.isEmpty ? _emptyBody : pending.body.toBytes(),
+      bodyStream: pending.stream?.stream,
     );
     if (entry == null) {
       final wsHandler = _wsHandlers[head.routePattern];
@@ -592,11 +684,49 @@ class ServerRunner {
   /// `respond`; stream bodies open a chunked stream instead. Fallbacks share
   /// this path, so a custom error page may stream too.
   void _deliver(int requestId, ResponseContext response) {
+    _record(requestId, response.status);
     if (response.bodyStream != null) {
       _answerStream(requestId, response);
+    } else if (response.filePath case final path?) {
+      _answerFile(requestId, response, path);
+      _complete(requestId);
     } else {
       _answer(requestId, response);
       _complete(requestId);
+    }
+  }
+
+  /// Counts one answer against its route (dispatch to answer, in µs).
+  void _record(int requestId, int status) {
+    final pending = _pending[requestId];
+    if (pending == null) return;
+    final pattern =
+        pending.head.routePattern.isEmpty ||
+            _entryFor(pending.head) == null &&
+                !_wsHandlers.containsKey(pending.head.routePattern)
+        ? '*unmatched*'
+        : pending.head.routePattern;
+    final acc = _metrics[pattern] ??= MetricsAccumulator(pattern);
+    acc.record(_clock.elapsedMicroseconds - pending.startedUs, status);
+    _answered++;
+    if (status >= 500) _errors++;
+  }
+
+  /// A file answer: the engine writes the head now and sends the bytes
+  /// from a native worker. Rare enough to ride the generated binding.
+  void _answerFile(int requestId, ResponseContext response, String path) {
+    if (_closed) return;
+    try {
+      _native.respondFile(
+        requestId,
+        response.status,
+        _rawHeaders(response),
+        path,
+        response.fileOffset,
+        response.fileLength,
+      );
+    } catch (_) {
+      // Already answered (timeout won) or the server went away.
     }
   }
 
@@ -641,6 +771,7 @@ class ServerRunner {
           response.status,
           response.headers,
           response.bodyBytes,
+          _setCookies(response),
         );
       } else {
         _native.respond(
@@ -657,14 +788,24 @@ class ServerRunner {
   }
 
   /// Headerless answers (the common small-response case) share one canonical
-  /// empty list instead of allocating a fresh growable one.
+  /// empty list instead of allocating a fresh growable one. Cookies ride as
+  /// one `set-cookie` header each.
   static List<RawHeader> _rawHeaders(ResponseContext response) {
-    if (response.headers.isEmpty) return const <RawHeader>[];
+    if (response.headers.isEmpty && response.cookies.isEmpty) {
+      return const <RawHeader>[];
+    }
     return [
       for (final entry in response.headers.entries)
         RawHeader(name: entry.key, value: entry.value),
+      for (final cookie in response.cookies)
+        RawHeader(name: 'set-cookie', value: cookie.toHeaderValue()),
     ];
   }
+
+  static List<String> _setCookies(ResponseContext response) =>
+      response.cookies.isEmpty
+      ? const []
+      : [for (final c in response.cookies) c.toHeaderValue()];
 
   /// Opens a chunked stream and forwards the body into it. Completion —
   /// clean end or stream error — sends the terminal chunk and marks the id
@@ -676,7 +817,12 @@ class ServerRunner {
     try {
       final fast = _fast;
       if (fast != null) {
-        fast.startStream(requestId, response.status, response.headers);
+        fast.startStream(
+          requestId,
+          response.status,
+          response.headers,
+          _setCookies(response),
+        );
       } else {
         _native.startStream(requestId, response.status, _rawHeaders(response));
       }

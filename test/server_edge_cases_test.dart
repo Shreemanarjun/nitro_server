@@ -1010,6 +1010,76 @@ void main() {
   });
 
   group('streams', () {
+    test(
+      'a streamBody route streams chunks, acks each, and errors the stream',
+      () async {
+        String? seen;
+        final done = Completer<void>();
+        runner.addRoute(
+          HttpMethod.post,
+          '',
+          '/up',
+          null,
+          (request) async {
+            expect(request.body, isEmpty);
+            final got = <int>[];
+            try {
+              await for (final chunk in request.bodyStream!) {
+                got.addAll(chunk);
+              }
+            } on StateError catch (e) {
+              seen = 'error after ${got.length}: ${e.message}';
+              done.complete();
+              return ResponseContext.text(seen!, status: 413);
+            }
+            return ResponseContext.text('complete ${got.length}');
+          },
+          const [],
+          true,
+        );
+        await Future<void>.delayed(Duration.zero);
+        // A chunk that beats its head is handed over first.
+        fake.chunks.add(fakeData(700, [9]));
+        fake.heads.add(
+          fakeHead(
+            requestId: 700,
+            method: RawServerMethod.post,
+            path: '/up',
+            routePattern: '/up',
+            hasBody: true,
+            contentLength: 20,
+          ),
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        fake.chunks.add(fakeData(700, [1, 2, 3]));
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        // Streamed bodies release native memory as they go, not at the end.
+        expect(fake.acked.where((a) => a.$1 == 700), isNotEmpty);
+        fake.chunks.add(
+          RawBodyChunk(
+            bytes: Uint8List.fromList(utf8.encode('body exceeds maxBodyBytes')),
+            requestId: 700,
+            kind: RawBodyKind.error.index,
+            aux: RawServerErrorKind.requestTooLarge.index,
+          ),
+        );
+        fake.chunks.add(fakeEnd(700));
+        await done.future.timeout(const Duration(seconds: 5));
+        expect(seen, 'error after 4: body exceeds maxBodyBytes');
+        for (
+          var i = 0;
+          i < 100 && runner.pendingIdsForTesting.contains(700);
+          i++
+        ) {
+          await Future<void>.delayed(const Duration(milliseconds: 5));
+        }
+        expect(
+          fake.responded.where((r) => r.requestId == 700).single.status,
+          413,
+        );
+      },
+    );
+
     test('status, headers and chunks ride startStream in order', () async {
       final controller = StreamController<Uint8List>();
       runner.addRoute(HttpMethod.get, '', '/ev', null, (_) async {

@@ -7,25 +7,57 @@ import 'dart:typed_data';
 
 import 'context.dart';
 
-/// One decoded WebSocket message.
-class WsMessage {
+/// One decoded WebSocket message: a [WsText] or a [WsBinary]. Sealed, so
+/// a `switch` over it is exhaustive; the [text]/[bytes] accessors remain
+/// for code that checks [isText] instead.
+sealed class WsMessage {
+  const WsMessage();
+
   /// A text message (opcode 1). The engine validates UTF-8 on receipt.
-  const WsMessage.text(this.text) : bytes = null;
+  const factory WsMessage.text(String text) = WsText;
 
   /// A binary message (opcode 2).
-  const WsMessage.binary(this.bytes) : text = null;
+  const factory WsMessage.binary(Uint8List bytes) = WsBinary;
 
   /// Text payload, null for binary messages.
-  final String? text;
+  String? get text;
 
   /// Binary payload, null for text messages.
-  final Uint8List? bytes;
+  Uint8List? get bytes;
 
   /// True for text messages.
-  bool get isText => text != null;
+  bool get isText => this is WsText;
 
   /// True for binary messages.
-  bool get isBinary => bytes != null;
+  bool get isBinary => this is WsBinary;
+}
+
+/// A text message (opcode 1).
+final class WsText extends WsMessage {
+  const WsText(this.text);
+
+  @override
+  final String text;
+
+  @override
+  Uint8List? get bytes => null;
+
+  @override
+  String toString() => 'WsText($text)';
+}
+
+/// A binary message (opcode 2).
+final class WsBinary extends WsMessage {
+  const WsBinary(this.bytes);
+
+  @override
+  final Uint8List bytes;
+
+  @override
+  String? get text => null;
+
+  @override
+  String toString() => 'WsBinary(${bytes.length} bytes)';
 }
 
 /// A live server-side WebSocket session: the upgraded socket.

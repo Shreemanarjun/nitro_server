@@ -53,6 +53,11 @@ Three causes, isolated one at a time:
 | ref | dart:io, same run as D | 33,680 | 886 / 1,316 | 19,827 | 27,060 |
 | E | auto-scaling pool (floor = cores, grows on demand, retires idle) | 52,758 / 52,077 (two runs) | 571 / 1,230 | — | — |
 | E′ | same engine, pool pinned at 8 (`--workers 8`) | 3,128 | 184 / 433 | — | — |
+| F | sync handlers answered inline (no Future) | 60,792 / 46,300 / 57,809 (`--raw`, three runs) | 506–566 / 1,046–1,543 | — | — |
+
+Step F is within run-to-run noise on this box, as expected at a ceiling
+the isolate does not set; it stays because it removes a Future and a
+microtask per request for handlers that return directly.
 
 Step E keeps D's throughput while a quiet server holds `cores` threads
 instead of 64. E′ is the control: a pool smaller than the live connections
@@ -153,6 +158,19 @@ the cores (1–8). dart:io's equivalent is `HttpServer.bind(shared: true)`
 per isolate, which the benchmark now gives it under `--isolates N` so the
 comparison stays fair.
 
+### 3.2a Static files without the isolate (done: `ResponseContext.file`)
+
+A 64 KiB file, keep-alive, 32 connections:
+
+| driver | nitro req/s | dart:io req/s | shelf req/s | nitro seq p50 | dart:io seq p50 |
+|--------|------------:|--------------:|------------:|--------------:|----------------:|
+| `HttpClient` | 14,089 | 11,508 | 10,075 | 138 µs | 213 µs |
+| `--raw` | 24,627 | 11,827 | 10,865 | 139 µs | 180 µs |
+
+dart:io streams the file through the isolate (`File.openRead` → socket);
+nitro's worker calls `sendfile`, so the answer costs the isolate one head
+write. `staticFiles()` builds ETag, 304 and ranges on top.
+
 ### 3.3 Reactor instead of thread-per-connection — beyond ~500 live connections
 
 Parked threads are cheap until they are not: 10k idle keep-alive
@@ -183,8 +201,9 @@ POST 4k sequential row (target: below dart:io's 131 µs).
 * `Router::match` copies the `RouteEntry` (two strings) per hit; return a
   pointer into the trie under the shared lock.
 
-Out of scope for performance but on the roadmap: native TLS, HTTP/2,
-WebSocket compression.
+Still open after the feature pass: 3.1 (lazy decode), 3.3 (reactor), 3.4
+(request-side copies), native TLS and HTTP/2, WebSocket permessage-deflate
+and a send-side backpressure signal.
 
 ## 4. Type safety of the public API
 

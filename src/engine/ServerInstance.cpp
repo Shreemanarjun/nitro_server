@@ -33,8 +33,97 @@ using ssize_t = long long;
 #endif
 #endif
 
+#ifdef NITRO_SERVER_TLS
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#include <cerrno>
+#endif
+
 namespace nitroserver {
 namespace {
+
+#ifdef NITRO_SERVER_TLS
+// fd -> SSL*. Consulted by recvSome/writeSome so the existing I/O funnels
+// transparently carry TLS. All SSL calls for one fd run on its worker
+// thread (the Dart isolate hands its answer to the worker for TLS), so an
+// SSL object is never touched concurrently; only this map is shared, and it
+// is mutated on accept/close. The atomic count gates the plain-HTTP path to
+// zero overhead when no TLS connection exists.
+struct TlsSockets {
+  std::mutex m;
+  std::unordered_map<int, SSL*> map;
+  std::atomic<int> count{0};
+  void add(int fd, SSL* s) {
+    std::lock_guard<std::mutex> l(m);
+    map[fd] = s;
+    count.fetch_add(1, std::memory_order_relaxed);
+  }
+  SSL* get(int fd) {
+    if (count.load(std::memory_order_relaxed) == 0) return nullptr;
+    std::lock_guard<std::mutex> l(m);
+    auto it = map.find(fd);
+    return it == map.end() ? nullptr : it->second;
+  }
+  SSL* take(int fd) {
+    std::lock_guard<std::mutex> l(m);
+    auto it = map.find(fd);
+    if (it == map.end()) return nullptr;
+    SSL* s = it->second;
+    map.erase(it);
+    count.fetch_sub(1, std::memory_order_relaxed);
+    return s;
+  }
+};
+TlsSockets g_tls;
+
+// SSL_read mapped to the recv contract: >0 bytes, 0 clean close, -1 with
+// errno EWOULDBLOCK for a retry (poll), any other -1 is a hard error.
+// ponytail: WANT_WRITE mid-read (renegotiation) is treated as a retry on
+// POLLIN; we run TLS 1.2+ with renegotiation disabled, so it does not occur.
+ssize_t tlsRead(SSL* ssl, void* buf, size_t n) {
+  ERR_clear_error();
+  const int r = SSL_read(ssl, buf, (int)std::min<size_t>(n, 0x7fffffff));
+  if (r > 0) return r;
+  const int e = SSL_get_error(ssl, r);
+  if (e == SSL_ERROR_ZERO_RETURN) return 0;
+  if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
+    errno = EWOULDBLOCK;
+    return -1;
+  }
+  errno = ECONNRESET;
+  return -1;
+}
+
+// SSL_write mapped to the writeSome contract: writes one non-empty segment,
+// returns bytes written (partial allowed via SSL_MODE_ENABLE_PARTIAL_WRITE),
+// 0 when it would block (caller polls POLLOUT and retries), -1 on error.
+ssize_t tlsWrite(SSL* ssl, const uint8_t* const* bufs, const size_t* lens,
+                 int n) {
+  for (int i = 0; i < n; i++) {
+    if (lens[i] == 0) continue;
+    ERR_clear_error();
+    const int r = SSL_write(ssl, bufs[i], (int)std::min<size_t>(lens[i], 0x7fffffff));
+    if (r > 0) return r;
+    const int e = SSL_get_error(ssl, r);
+    if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) return 0;
+    return -1;
+  }
+  return 0;
+}
+
+// ALPN: offer http/1.1 only (the engine speaks HTTP/1.1). A client that
+// insists on something else fails the negotiation, which is correct.
+int tlsAlpnSelect(SSL*, const unsigned char** out, unsigned char* outlen,
+                  const unsigned char* in, unsigned int inlen, void*) {
+  static const unsigned char kProto[] = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+  if (SSL_select_next_proto((unsigned char**)out, outlen, kProto, sizeof(kProto),
+                            in, inlen) != OPENSSL_NPN_NEGOTIATED) {
+    return SSL_TLSEXT_ERR_NOACK;  // No overlap: proceed without ALPN.
+  }
+  return SSL_TLSEXT_ERR_OK;
+}
+#endif  // NITRO_SERVER_TLS
+
 
 #ifdef _WIN32
 using Fd = SOCKET;
@@ -208,6 +297,9 @@ bool pollTwo(Fd fd, Fd wake, int timeoutMs, bool& outFd, bool& outWake,
 #endif
 ssize_t writeSome(Fd fd, const uint8_t* const* bufs, const size_t* lens,
                   int n) {
+#ifdef NITRO_SERVER_TLS
+  if (SSL* ssl = g_tls.get((int)fd)) return tlsWrite(ssl, bufs, lens, n);
+#endif
   struct iovec iov[3];
   int m = 0;
   for (int i = 0; i < n; i++) {
@@ -237,7 +329,12 @@ bool makeWake(Fd& r, Fd& w) {
   return true;
 }
 void closeWake(Fd fd) { ::close(fd); }
-ssize_t recvSome(Fd fd, void* buf, size_t n) { return recv(fd, buf, n, 0); }
+ssize_t recvSome(Fd fd, void* buf, size_t n) {
+#ifdef NITRO_SERVER_TLS
+  if (SSL* ssl = g_tls.get((int)fd)) return tlsRead(ssl, buf, n);
+#endif
+  return recv(fd, buf, n, 0);
+}
 ssize_t peekOne(Fd fd) {
   char b;
   return recv(fd, &b, 1, MSG_PEEK);
@@ -627,6 +724,116 @@ StatusResult ServerInstance::unregisterRoute(Method method,
   return {};
 }
 
+#ifdef NITRO_SERVER_TLS
+// Builds the server SSL_CTX from the configured identity. PEM strings win
+// over file paths; cert and key may come from different sources as long as
+// they match. Returns a TlsError with the OpenSSL reason on any failure.
+StatusResult ServerInstance::setupTls(const ServerConfig& cfg) {
+  auto fail = [](const std::string& what) -> StatusResult {
+    char buf[256] = {0};
+    const unsigned long e = ERR_get_error();
+    if (e) ERR_error_string_n(e, buf, sizeof(buf));
+    return {ErrorKind::TlsError,
+            e ? what + ": " + buf : what, 0};
+  };
+  SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
+  if (!ctx) return fail("SSL_CTX_new failed");
+  SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+  SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE |
+                            SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER |
+                            SSL_MODE_AUTO_RETRY);
+  SSL_CTX_set_options(ctx, SSL_OP_NO_RENEGOTIATION);
+  SSL_CTX_set_alpn_select_cb(ctx, tlsAlpnSelect, nullptr);
+
+  // Certificate (chain).
+  if (!cfg.tlsCertPem.empty()) {
+    BIO* bio = BIO_new_mem_buf(cfg.tlsCertPem.data(), (int)cfg.tlsCertPem.size());
+    X509* leaf = PEM_read_bio_X509_AUX(bio, nullptr, nullptr, nullptr);
+    if (!leaf || SSL_CTX_use_certificate(ctx, leaf) != 1) {
+      if (leaf) X509_free(leaf);
+      BIO_free(bio);
+      SSL_CTX_free(ctx);
+      return fail("invalid TLS certificate PEM");
+    }
+    X509_free(leaf);
+    SSL_CTX_clear_chain_certs(ctx);
+    X509* ca;
+    while ((ca = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr)) != nullptr) {
+      if (SSL_CTX_add0_chain_cert(ctx, ca) != 1) X509_free(ca);
+    }
+    BIO_free(bio);
+  } else if (!cfg.tlsCertFile.empty()) {
+    if (SSL_CTX_use_certificate_chain_file(ctx, cfg.tlsCertFile.c_str()) != 1) {
+      SSL_CTX_free(ctx);
+      return fail("cannot load TLS certificate file");
+    }
+  } else {
+    SSL_CTX_free(ctx);
+    return {ErrorKind::TlsError, "TLS requested without a certificate", 0};
+  }
+
+  // Private key.
+  if (!cfg.tlsKeyPem.empty()) {
+    BIO* bio = BIO_new_mem_buf(cfg.tlsKeyPem.data(), (int)cfg.tlsKeyPem.size());
+    EVP_PKEY* key = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
+    BIO_free(bio);
+    if (!key || SSL_CTX_use_PrivateKey(ctx, key) != 1) {
+      if (key) EVP_PKEY_free(key);
+      SSL_CTX_free(ctx);
+      return fail("invalid TLS private key PEM");
+    }
+    EVP_PKEY_free(key);
+  } else if (!cfg.tlsKeyFile.empty()) {
+    if (SSL_CTX_use_PrivateKey_file(ctx, cfg.tlsKeyFile.c_str(), SSL_FILETYPE_PEM) != 1) {
+      SSL_CTX_free(ctx);
+      return fail("cannot load TLS private key file");
+    }
+  } else {
+    SSL_CTX_free(ctx);
+    return {ErrorKind::TlsError, "TLS requested without a private key", 0};
+  }
+
+  if (SSL_CTX_check_private_key(ctx) != 1) {
+    SSL_CTX_free(ctx);
+    return {ErrorKind::TlsError, "TLS certificate and private key do not match",
+            0};
+  }
+  if (sslCtx_) SSL_CTX_free((SSL_CTX*)sslCtx_);
+  sslCtx_ = ctx;
+  return {};
+}
+
+// Drives SSL_accept on a non-blocking socket, polling for the direction it
+// wants until the handshake completes or [timeoutMs] elapses.
+bool ServerInstance::tlsHandshake(int fd, void* sslv, int64_t timeoutMs) {
+  SSL* ssl = (SSL*)sslv;
+  const int64_t budget = timeoutMs > 0 ? timeoutMs : 10000;
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(budget);
+  while (running_.load()) {
+    ERR_clear_error();
+    const int r = SSL_accept(ssl);
+    if (r == 1) return true;
+    const int e = SSL_get_error(ssl, r);
+    short want;
+    if (e == SSL_ERROR_WANT_READ) {
+      want = POLLIN;
+    } else if (e == SSL_ERROR_WANT_WRITE) {
+      want = POLLOUT;
+    } else {
+      return false;
+    }
+    const int64_t left = (int64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline - std::chrono::steady_clock::now()).count();
+    if (left <= 0) return false;
+    if (pollFd((Fd)fd, want, (int)std::min<int64_t>(left, INT32_MAX)) <= 0) {
+      return false;
+    }
+  }
+  return false;
+}
+#endif  // NITRO_SERVER_TLS
+
 StatusResult ServerInstance::start() {
   ensureSockets();
   ServerConfig cfg;
@@ -641,11 +848,20 @@ StatusResult ServerInstance::start() {
             boundPort_.load()};
   }
   if (cfg.tlsRequested) {
+#ifndef NITRO_SERVER_TLS
     running_.store(false);
     return {ErrorKind::TlsError,
             "TLS is not enabled in this build (supportsTls() == false); "
-            "pass an empty RawTlsConfig for plain HTTP",
+            "pass an empty RawTlsConfig for plain HTTP, or rebuild with "
+            "OpenSSL available to cmake",
             0};
+#else
+    const StatusResult tls = setupTls(cfg);
+    if (tls.kind != ErrorKind::None) {
+      running_.store(false);
+      return tls;
+    }
+#endif
   }
 
   // IPv6 when the host is a v6 literal (contains ':'). Binding "::" is
@@ -798,6 +1014,13 @@ void ServerInstance::stop() {
   }
   boundPort_.store(0);
   draining_.store(false);
+#ifdef NITRO_SERVER_TLS
+  // Workers have exited: no SSL object references the context any more.
+  if (sslCtx_) {
+    SSL_CTX_free((SSL_CTX*)sslCtx_);
+    sslCtx_ = nullptr;
+  }
+#endif
   broadcastEvent(ServerEventKind::Stopped, 0, "stopped");
 }
 
@@ -876,6 +1099,28 @@ void ServerInstance::writeNow(const std::shared_ptr<PendingRequest>& req,
                               const uint8_t* a, size_t an, const uint8_t* b,
                               size_t bn, const uint8_t* c, size_t cn,
                               bool completes) {
+#ifdef NITRO_SERVER_TLS
+  if (g_tls.get((int)req->fd)) {
+    // TLS: the worker owns the SSL object. Hand the whole answer to it via
+    // the tail and poke it; the Dart thread never calls SSL_write (an SSL
+    // object cannot be used from two threads at once).
+    int wakeFd;
+    {
+      std::lock_guard<std::mutex> lk(req->mutex);
+      req->writing = false;
+      wakeFd = req->wakeFd;
+      const uint8_t* src[3] = {a, b, c};
+      const size_t slen[3] = {an, bn, cn};
+      for (int i = 0; i < 3; i++) {
+        if (slen[i] > 0) req->tail.insert(req->tail.end(), src[i], src[i] + slen[i]);
+      }
+      if (completes && req->streamStarted) req->streamDone = true;
+      req->cv.notify_one();
+    }
+    poke((Fd)wakeFd);
+    return;
+  }
+#endif
   // Caller set `writing` under the lock. Write as much as the socket takes
   // without blocking, then reconcile under the lock.
   const uint8_t* bufs[3] = {a, b, c};
@@ -1232,9 +1477,43 @@ void ServerInstance::handleConnection(int fd, const Wake& wake) {
   int one = 1;
   setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
 
+#ifdef NITRO_SERVER_TLS
+  // TLS terminates on this worker: create the session, register it so the
+  // I/O funnels use SSL, and complete the handshake before any request is
+  // read. All SSL calls for this fd stay on this thread.
+  SSL* ssl = nullptr;
+  if (sslCtx_) {
+    ssl = SSL_new((SSL_CTX*)sslCtx_);
+    if (ssl) {
+      SSL_set_fd(ssl, fd);
+      g_tls.add(fd, ssl);
+    }
+    const int64_t hsMs = cfg.headerTimeoutMs > 0 ? cfg.headerTimeoutMs
+                                                  : (cfg.keepAliveTimeoutMs > 0
+                                                         ? cfg.keepAliveTimeoutMs
+                                                         : 5000);
+    if (!ssl || !tlsHandshake(fd, ssl, hsMs)) {
+      if (ssl) {
+        g_tls.take(fd);
+        SSL_free(ssl);
+      }
+      {
+        std::lock_guard<std::mutex> lk(activeMutex_);
+        activeFds_.erase(fd);
+        releasePeerLocked(fd);
+      }
+      closeFd(sock);
+      inFlight_--;
+      return;
+    }
+  }
+#endif
+
   std::string carry;
   int64_t served = 0;
   while (running_.load()) {
+    // A TLS session's SSL object lives on this worker; yielding the fd to
+    // another worker would re-handshake it. TLS connections stay pinned.
     // Starvation guard: when this fd has no buffered bytes but other
     // connections already wait, blocking in the keep-alive read pins a
     // worker while work starves. Yielding parks the fd at the queue front
@@ -1242,7 +1521,11 @@ void ServerInstance::handleConnection(int fd, const Wake& wake) {
     // Skipped when `carry` holds bytes: those were already consumed from
     // the socket, so only serveOne can see them — yielding would orphan
     // them into a hang.
-    if (carry.empty() && yieldToQueued(fd)) {
+    bool pinned = false;
+#ifdef NITRO_SERVER_TLS
+    pinned = ssl != nullptr;
+#endif
+    if (!pinned && carry.empty() && yieldToQueued(fd)) {
       inFlight_--;
       return;
     }
@@ -1251,6 +1534,13 @@ void ServerInstance::handleConnection(int fd, const Wake& wake) {
     if (cfg.maxRequestsPerConn > 0 && served >= cfg.maxRequestsPerConn) break;
   }
 
+#ifdef NITRO_SERVER_TLS
+  if (ssl) {
+    SSL_shutdown(ssl);
+    g_tls.take(fd);
+    SSL_free(ssl);
+  }
+#endif
   {
     std::lock_guard<std::mutex> lk(activeMutex_);
     activeFds_.erase(fd);
@@ -1278,8 +1568,10 @@ bool ServerInstance::flushTail(int fd, const std::shared_ptr<PendingRequest>& re
       if (req->tail.empty()) {
         req->flushing = false;
         // Complete once nothing is pending and the answer has no more to
-        // say: one-shot answers always, streams after their terminal.
-        if (!req->streamStarted || req->streamDone) {
+        // say: one-shot answers always, streams after their terminal. A
+        // queued file (its head just flushed) is not done — the worker's
+        // sendFile pass sends the body and marks it done.
+        if ((!req->streamStarted || req->streamDone) && req->fileFd < 0) {
           req->done = true;
           req->doneAt = std::chrono::steady_clock::now();
         }
@@ -1313,7 +1605,30 @@ bool ServerInstance::sendFile(int fd, const std::shared_ptr<PendingRequest>& req
     req->flushing = true;
   }
   bool ok = true;
+#if defined(NITRO_SERVER_TLS) && !defined(_WIN32)
+  const bool tls = g_tls.get((int)fd) != nullptr;
+#endif
   while (remaining > 0 && ok) {
+#if defined(NITRO_SERVER_TLS) && !defined(_WIN32)
+    if (tls) {
+      // sendfile cannot traverse the TLS record layer: read a block and
+      // SSL_write it (via sendAll -> writeSome -> the TLS route).
+      static thread_local std::vector<uint8_t> tbuf(64 * 1024);
+      const size_t want = (size_t)std::min<int64_t>((int64_t)tbuf.size(), remaining);
+      const ssize_t n = pread(file, tbuf.data(), want, (off_t)off);
+      if (n <= 0) {
+        ok = false;
+        break;
+      }
+      if (!sendAll(fd, tbuf.data(), (size_t)n, stallMs)) {
+        ok = false;
+        break;
+      }
+      off += n;
+      remaining -= n;
+      continue;
+    }
+#endif
 #if defined(__APPLE__)
     off_t len = (off_t)remaining;
     const int r = ::sendfile(file, fd, (off_t)off, &len, nullptr, 0);

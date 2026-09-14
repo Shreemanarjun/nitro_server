@@ -55,6 +55,11 @@ await server.close();
 | `server.metrics` | per-route request and 5xx counts, latency p50/p90/p99 |
 | `server.close({drain})` | stops; with `drain:` stops accepting, closes idle connections and waits up to `drain` for in-flight requests |
 
+TLS: pass `ServerConfig(tls: TlsConfig(certPem: ..., keyPem: ...))` (or
+`certFile`/`keyFile`). Requires a native build with OpenSSL available to
+cmake; otherwise `bind` throws `ServerTlsException`. HTTP/1.1 over TLS,
+ALPN `http/1.1`, `wss://` WebSockets included.
+
 `RequestContext`: `method`, `path`, `query`, `queryParameters`, `headers`,
 `cookies`, `params`, `body`, `bodyStream` (with `streamBody: true`),
 `text()`, `jsonMap()`, `jsonList()`, `jsonAs<T>()`, `multipart()`.
@@ -217,7 +222,7 @@ measures the client's ephemeral-port budget):
 
 ## Limits
 
-- HTTP/1.1 only. No TLS.
+- HTTP/1.1 only (no HTTP/2).
 - One native thread per live connection: suited to hundreds of concurrent
   connections, not thousands.
 - `close(drain:)` resets connections still in the kernel backlog only if

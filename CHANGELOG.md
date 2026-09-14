@@ -63,7 +63,11 @@ Initial release.
   and unpack on first access; `queryParameters` parses on first access.
 * Heads combine per isolate (`RawIncomingBatch`): heads that arrive while
   the previous bridge post is in flight cross as one message.
-* `sendfile` for file answers.
+* `sendfile` for file answers (read + `SSL_write` fallback under TLS).
+* TLS via OpenSSL when built with it (`ServerConfig.tls`): HTTP/1.1 and
+  `wss://` over TLS 1.2+, ALPN `http/1.1`, PEM strings or files, cert/key
+  validated at `start()`. TLS I/O is confined to the worker thread; the
+  non-TLS direct-write path is unchanged.
 
 ### Tooling
 

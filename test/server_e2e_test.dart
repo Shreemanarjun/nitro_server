@@ -33,6 +33,8 @@ import 'package:nitro_server/src/internal/instance_keys.dart';
 import 'package:nitro_server/src/internal/native_attach.dart';
 import 'package:nitro_server/src/nitro_server.native.dart';
 
+import 'support/tls_cert.dart';
+
 String? _locateLibrary() {
   for (final candidate in nitroServerLibraryCandidates()) {
     if (File(candidate).existsSync()) return File(candidate).absolute.path;
@@ -268,7 +270,49 @@ void main() {
         NitroServerNative.engine.engineVersion(),
         contains('nitro_server'),
       );
-      expect(NitroServerNative.engine.supportsTls(), isFalse);
+      expect(NitroServerNative.engine.supportsTls(), isTrue);
+    }, skip: skipReason);
+
+    test('serves HTTPS with a PEM cert over a real TLS socket', () async {
+      server = await NitroServer.bind(
+        const ServerConfig(
+          tls: TlsConfig(certPem: testCertPem, keyPem: testKeyPem),
+        ),
+      );
+      await server!.get('/secure', (_) => ResponseContext.text('over tls'));
+      await server!.post('/echo', (r) async => ResponseContext.bytes(r.body));
+
+      final client = HttpClient()
+        ..badCertificateCallback = (cert, host, port) => true;
+      final get = await client.getUrl(
+        Uri.parse('https://127.0.0.1:${server!.port}/secure'),
+      );
+      final getRes = await get.close();
+      expect(getRes.statusCode, 200);
+      expect(await getRes.transform(utf8.decoder).join(), 'over tls');
+
+      final post = await client.postUrl(
+        Uri.parse('https://127.0.0.1:${server!.port}/echo'),
+      );
+      post.add(utf8.encode('ping'));
+      final postRes = await post.close();
+      expect(await postRes.transform(utf8.decoder).join(), 'ping');
+      client.close(force: true);
+    }, skip: skipReason);
+
+    test('a TLS config with a mismatched key fails to start', () async {
+      await expectLater(
+        NitroServer.bind(
+          const ServerConfig(
+            tls: TlsConfig(
+              certPem: testCertPem,
+              keyPem:
+                  '-----BEGIN PRIVATE KEY-----\nnope\n-----END PRIVATE KEY-----\n',
+            ),
+          ),
+        ),
+        throwsA(isA<ServerTlsException>()),
+      );
     }, skip: skipReason);
 
     test('starts on an ephemeral port and stops', () async {

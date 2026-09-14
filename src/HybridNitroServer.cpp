@@ -169,7 +169,13 @@ class HybridNitroServerImpl final : public HybridNitroServerNative {
     return "nitro_server/0.0.1 http/1.1 threads";
   }
 
-  bool supportsTls() override { return false; }
+  bool supportsTls() override {
+#ifdef NITRO_SERVER_TLS
+    return true;
+#else
+    return false;
+#endif
+  }
 
   void resetNative() override { EngineRegistry::resetAll(); }
 
@@ -194,6 +200,10 @@ class HybridNitroServerImpl final : public HybridNitroServerNative {
     cfg.wsCompression = raw.wsCompression;
     cfg.tlsRequested = !raw.tls.certPem.empty() || !raw.tls.keyPem.empty() ||
                        !raw.tls.certFile.empty() || !raw.tls.keyFile.empty();
+    cfg.tlsCertPem = raw.tls.certPem;
+    cfg.tlsKeyPem = raw.tls.keyPem;
+    cfg.tlsCertFile = raw.tls.certFile;
+    cfg.tlsKeyFile = raw.tls.keyFile;
     server_->configure(cfg);
   }
 

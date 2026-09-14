@@ -25,6 +25,13 @@
 
 #include "engine/ServerInstance.h"
 
+#ifdef NITRO_SERVER_TLS
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+
+#include "tls_test_cert.h"
+#endif
+
 using namespace nitroserver;
 
 namespace {
@@ -2259,5 +2266,266 @@ TEST(ServerTest, StreamEndsWithAnEmptyLastChunk) {
   EXPECT_EQ(dechunk(bodyOf(res)), "ab");
   server->stop();
 }
+
+#ifdef NITRO_SERVER_TLS
+// ── TLS ───────────────────────────────────────────────────────────────────
+
+// A blocking OpenSSL client for the tests: connect, handshake, then plain
+// SSL_read/SSL_write with a receive timeout so a hung server fails the test
+// instead of wedging it.
+struct TlsClient {
+  SSL_CTX* ctx = nullptr;
+  SSL* ssl = nullptr;
+  int fd = -1;
+
+  bool open(int port, const char* alpn = nullptr) {
+    fd = connectTo(port);
+    if (fd < 0) return false;
+    timeval tv{5, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ctx = SSL_CTX_new(TLS_client_method());
+    ssl = SSL_new(ctx);
+    SSL_set_fd(ssl, fd);
+    if (alpn) {
+      unsigned char p[32];
+      p[0] = (unsigned char)strlen(alpn);
+      memcpy(p + 1, alpn, strlen(alpn));
+      SSL_set_alpn_protos(ssl, p, (unsigned)strlen(alpn) + 1);
+    }
+    return SSL_connect(ssl) == 1;
+  }
+  bool write(const std::string& s) {
+    return SSL_write(ssl, s.data(), (int)s.size()) == (int)s.size();
+  }
+  // Reads one framed HTTP response (head + Content-Length body).
+  std::string readResponse() {
+    std::string out;
+    char buf[4096];
+    // Head.
+    while (out.find("\r\n\r\n") == std::string::npos) {
+      const int n = SSL_read(ssl, buf, sizeof(buf));
+      if (n <= 0) return out;
+      out.append(buf, (size_t)n);
+    }
+    const size_t end = out.find("\r\n\r\n");
+    const size_t need = end + 4 + (size_t)atol(headerOf(out, "content-length").c_str());
+    while (out.size() < need) {
+      const int n = SSL_read(ssl, buf, sizeof(buf));
+      if (n <= 0) break;
+      out.append(buf, (size_t)n);
+    }
+    return out;
+  }
+  std::string alpn() {
+    const unsigned char* p = nullptr;
+    unsigned len = 0;
+    SSL_get0_alpn_selected(ssl, &p, &len);
+    return p ? std::string((const char*)p, len) : std::string();
+  }
+  ~TlsClient() {
+    if (ssl) {
+      SSL_shutdown(ssl);
+      SSL_free(ssl);
+    }
+    if (ctx) SSL_CTX_free(ctx);
+    if (fd >= 0) close(fd);
+  }
+};
+
+int startTls(Fixture& f, const std::string& certPem, const std::string& keyPem) {
+  ServerConfig cfg;
+  cfg.port = 0;
+  cfg.defaultTimeoutMs = 5000;
+  cfg.tlsRequested = true;
+  cfg.tlsCertPem = certPem;
+  cfg.tlsKeyPem = keyPem;
+  f.server->configure(cfg);
+  EXPECT_EQ(f.server->start().kind, ErrorKind::None);
+  return (int)f.server->boundPort();
+}
+
+TEST(TlsTest, ServesARequestOverTls) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/hello", -1);
+  const int port = startTls(f, nitroserver_test::kTestCertPem,
+                            nitroserver_test::kTestKeyPem);
+  TlsClient c;
+  ASSERT_TRUE(c.open(port, "http/1.1"));
+  EXPECT_EQ(c.alpn(), "http/1.1");
+  ASSERT_TRUE(c.write("GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"));
+  const std::string res = c.readResponse();
+  EXPECT_EQ(statusOf(res), 200);
+  EXPECT_EQ(bodyOf(res), "echo:");
+}
+
+TEST(TlsTest, KeepAliveServesTwoRequestsOnOneTlsConnection) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/hello", -1);
+  const int port = startTls(f, nitroserver_test::kTestCertPem,
+                            nitroserver_test::kTestKeyPem);
+  TlsClient c;
+  ASSERT_TRUE(c.open(port));
+  for (int i = 0; i < 2; i++) {
+    ASSERT_TRUE(c.write("GET /hello HTTP/1.1\r\nHost: x\r\n\r\n"));
+    EXPECT_EQ(statusOf(c.readResponse()), 200);
+  }
+}
+
+TEST(TlsTest, PostBodyEchoesOverTls) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Post, "", "/echo", -1);
+  const int port = startTls(f, nitroserver_test::kTestCertPem,
+                            nitroserver_test::kTestKeyPem);
+  TlsClient c;
+  ASSERT_TRUE(c.open(port));
+  ASSERT_TRUE(c.write("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n"
+                      "Connection: close\r\n\r\nhello"));
+  const std::string res = c.readResponse();
+  EXPECT_EQ(statusOf(res), 200);
+  EXPECT_EQ(bodyOf(res), "echo:hello");
+  ASSERT_TRUE(f.waitForSeen(1));
+  f.server->ackBody(f.emitter.seen()[0].requestId, 1);
+}
+
+TEST(TlsTest, FileResponseStreamsOverTls) {
+  // respondFile uses read+SSL_write under TLS (sendfile cannot traverse it).
+  // No pump: the test answers with respondFile once the head is seen.
+  RecordingEmitter emitter(echoAnswer());
+  auto server = std::make_shared<ServerInstance>();
+  server->setEmitter(&emitter);
+  ASSERT_EQ(server->registerRoute(Method::Get, "", "/file", -1).kind,
+            ErrorKind::None);
+  ServerConfig cfg;
+  cfg.port = 0;
+  cfg.defaultTimeoutMs = 5000;
+  cfg.tlsRequested = true;
+  cfg.tlsCertPem = nitroserver_test::kTestCertPem;
+  cfg.tlsKeyPem = nitroserver_test::kTestKeyPem;
+  server->configure(cfg);
+  ASSERT_EQ(server->start().kind, ErrorKind::None);
+  const int port = (int)server->boundPort();
+  const std::string bytes(200000, 'z');
+  const std::string path = tempFileWith(bytes);
+
+  std::string res;
+  std::thread client([&] {
+    TlsClient c;
+    if (!c.open(port)) return;
+    c.write("GET /file HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    res = c.readResponse();
+  });
+  int64_t id = 0;
+  for (int i = 0; i < 1000 && id == 0; i++) {
+    auto seen = emitter.seen();
+    if (!seen.empty()) id = seen[0].requestId;
+    if (id == 0) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_NE(id, 0);
+  server->respondFile(id, 200, {{"Content-Type", "text/plain"}}, path, 0, -1);
+  client.join();
+  EXPECT_EQ(statusOf(res), 200);
+  EXPECT_EQ(bodyOf(res).size(), bytes.size());
+  server->stop();
+  ::remove(path.c_str());
+}
+
+TEST(TlsTest, WebSocketBothDirectionsOverTls) {
+  RecordingEmitter emitter(echoAnswer());
+  auto server = std::make_shared<ServerInstance>();
+  server->setEmitter(&emitter);
+  ASSERT_EQ(server->registerRoute(Method::Get, "", "/ws", -1, true).kind,
+            ErrorKind::None);
+  ServerConfig cfg;
+  cfg.port = 0;
+  cfg.defaultTimeoutMs = 5000;
+  cfg.tlsRequested = true;
+  cfg.tlsCertPem = nitroserver_test::kTestCertPem;
+  cfg.tlsKeyPem = nitroserver_test::kTestKeyPem;
+  server->configure(cfg);
+  ASSERT_EQ(server->start().kind, ErrorKind::None);
+  const int port = (int)server->boundPort();
+
+  TlsClient c;
+  ASSERT_TRUE(c.open(port));
+  ASSERT_TRUE(c.write(kWsHandshakeHead));
+  std::string head;
+  char b[1024];
+  while (head.find("\r\n\r\n") == std::string::npos) {
+    const int n = SSL_read(c.ssl, b, sizeof(b));
+    if (n <= 0) break;
+    head.append(b, (size_t)n);
+  }
+  ASSERT_EQ(statusOf(head), 101);
+
+  // Client -> server: a masked "hi" text frame decodes on the server.
+  const unsigned char frame[] = {0x81, 0x82, 0x00, 0x00, 0x00, 0x00, 'h', 'i'};
+  ASSERT_EQ(SSL_write(c.ssl, frame, sizeof(frame)), (int)sizeof(frame));
+  int64_t connId = 0;
+  for (int i = 0; i < 1000; i++) {
+    auto ws = emitter.wsSeen();
+    if (!ws.empty() && ws[0].opcode == 0x1) {
+      EXPECT_EQ(ws[0].payload, "hi");
+      connId = ws[0].connectionId;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_NE(connId, 0);
+
+  // Server -> client: wsSend writes an unmasked frame the client reads.
+  const char* msg = "yo";
+  server->wsSend(connId, (const uint8_t*)msg, 2, false, false);
+  unsigned char rin[8];
+  int got = 0;
+  while (got < 4) {
+    const int n = SSL_read(c.ssl, rin + got, (int)sizeof(rin) - got);
+    if (n <= 0) break;
+    got += n;
+  }
+  ASSERT_GE(got, 4);
+  EXPECT_EQ(rin[0], 0x81);
+  EXPECT_EQ(rin[1], 0x02);
+  EXPECT_EQ(rin[2], 'y');
+  EXPECT_EQ(rin[3], 'o');
+  server->stop();
+}
+
+TEST(TlsTest, CertKeyMismatchIsAnError) {
+  // A second independent key does not match the cert.
+  auto server = std::make_shared<ServerInstance>();
+  RecordingEmitter emitter(echoAnswer());
+  server->setEmitter(&emitter);
+  ServerConfig cfg;
+  cfg.port = 0;
+  cfg.tlsRequested = true;
+  cfg.tlsCertPem = nitroserver_test::kTestCertPem;
+  cfg.tlsKeyPem =
+      "-----BEGIN PRIVATE KEY-----\nnot a real key\n-----END PRIVATE KEY-----\n";
+  server->configure(cfg);
+  EXPECT_EQ(server->start().kind, ErrorKind::TlsError);
+}
+
+TEST(TlsTest, CertAndKeyLoadFromFiles) {
+  const std::string certPath = tempFileWith(nitroserver_test::kTestCertPem);
+  const std::string keyPath = tempFileWith(nitroserver_test::kTestKeyPem);
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/hello", -1);
+  ServerConfig cfg;
+  cfg.port = 0;
+  cfg.defaultTimeoutMs = 5000;
+  cfg.tlsRequested = true;
+  cfg.tlsCertFile = certPath;
+  cfg.tlsKeyFile = keyPath;
+  f.server->configure(cfg);
+  ASSERT_EQ(f.server->start().kind, ErrorKind::None);
+  TlsClient c;
+  ASSERT_TRUE(c.open((int)f.server->boundPort()));
+  ASSERT_TRUE(c.write("GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"));
+  EXPECT_EQ(statusOf(c.readResponse()), 200);
+  ::remove(certPath.c_str());
+  ::remove(keyPath.c_str());
+}
+#endif  // NITRO_SERVER_TLS
+
 
 }  // namespace

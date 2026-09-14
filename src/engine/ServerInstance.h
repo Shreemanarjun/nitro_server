@@ -64,6 +64,11 @@ struct ServerConfig {
   int64_t wsMaxBufferBytes = 1 << 20;  // <= 0: 1 MiB.
   bool wsCompression = true;
   bool tlsRequested = false;
+  // TLS identity (see RawTlsConfig). PEM strings win over file paths.
+  std::string tlsCertPem;
+  std::string tlsKeyPem;
+  std::string tlsCertFile;
+  std::string tlsKeyFile;
 };
 
 struct StatusResult {
@@ -305,6 +310,10 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
 
   void acceptLoop();
   void joinAcceptLoop();
+#ifdef NITRO_SERVER_TLS
+  StatusResult setupTls(const ServerConfig& config);
+  bool tlsHandshake(int fd, void* ssl, int64_t timeoutMs);
+#endif
   void workerLoop(Wake wake);
   void handleConnection(int fd, const Wake& wake);
   /// Drops the per-peer accounting of a closed fd (caller holds activeMutex_).
@@ -354,6 +363,9 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   std::atomic<bool> running_{false};
   std::atomic<bool> draining_{false};
   std::atomic<int64_t> boundPort_{0};
+#ifdef NITRO_SERVER_TLS
+  void* sslCtx_ = nullptr;  // SSL_CTX*; opaque here to keep OpenSSL out of the header.
+#endif
   int listenFd_ = -1;
   std::thread acceptThread_;
   Wake acceptWake_;

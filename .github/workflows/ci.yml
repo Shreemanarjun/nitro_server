@@ -12,12 +12,17 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dart-lang/setup-dart@v1
+      # This is a Flutter FFI plugin, so it declares a Flutter SDK constraint
+      # (required to publish flutter.plugin.platforms). Use the Flutter SDK,
+      # which bundles the Dart CLI the rest of the steps call.
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y lcov clang llvm
+        run: sudo apt-get update && sudo apt-get install -y lcov clang llvm libssl-dev
       - if: runner.os == 'macOS'
-        run: brew install lcov
-      - run: dart pub get
+        run: brew install lcov openssl@3
+      - run: flutter pub get
       - run: dart analyze
       - run: dart format --output=none --set-exit-if-changed lib test benchmark tool
       - run: cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release -DNITRO_SERVER_BUILD_TESTS=ON
@@ -37,6 +42,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - if: runner.os == 'macOS'
+        run: brew install openssl@3
       - run: >
           cmake -S src -B build/san -DCMAKE_BUILD_TYPE=Debug
           -DNITRO_SERVER_BUILD_TESTS=ON -DNITRO_SERVER_SANITIZE=${{ matrix.sanitizer }}

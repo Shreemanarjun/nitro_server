@@ -1,17 +1,19 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // ServerInstance — one bound server: config, router, accept loop, workers.
 //
-// Transport note: this is a minimal multithreaded blocking-IO HTTP/1.1
-// transport with the same shape as oat++'s HttpConnectionHandler (accept →
-// dispatch each connection to a worker thread → block the worker until the
-// handler answers). The Router, PendingTable and the emit/respond/ack
-// protocol above this file are transport-independent; swapping this
-// translation unit for an oat++-backed one keeps them untouched.
+// Transport: one worker thread per live connection (bounded pool), blocking
+// reads via poll()+recv on non-blocking sockets, and a DIRECT-WRITE answer
+// path: the thread that answers — Dart's `respond`, or the worker on
+// timeout/stop — serializes the response and writes it to the socket itself.
+// The worker never copies the response and never needs a wake to send it.
 //
 // Concurrency contract (mirrors the spec header):
-//   worker: parse → route → emit head → stream body → park on the request's
-//     OWN condition variable until respond() or the ROUTE's timeout.
-//   Dart isolate: never blocks; answers with respond(requestId, ...).
+//   worker: parse → route → emit head → stream body → park in poll() on the
+//     socket + its own wake pipe until the answer is on the wire, the
+//     ROUTE's timeout fires, or stop().
+//   Dart isolate: never blocks. `respond` writes non-blocking; whatever the
+//     socket buffer cannot take right now is queued as `tail` and the worker
+//     is woken (one pipe byte) to flush it.
 // No two requests ever wait on the same primitive, and the Dart thread never
 // waits at all — that is the whole deadlock story.
 //
@@ -27,7 +29,6 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -40,7 +41,6 @@
 #include "Common.h"
 #include "PendingTable.h"
 #include "Router.h"
-#include "Poller.h"
 
 namespace nitroserver {
 
@@ -52,37 +52,8 @@ struct ServerConfig {
   int64_t defaultTimeoutMs = 30000;
   int64_t keepAliveTimeoutMs = 5000;
   int64_t maxRequestsPerConn = 100;
-  int64_t workerThreads = 0;  // 0 means single reactor, >0 means multiple reactors (currently single is used)
+  int64_t workerThreads = 0;  // <= 0 means max(64, 4 × CPU cores).
   bool tlsRequested = false;
-};
-
-enum class ConnState {
-  Reading,      // Waiting for request (head or body)
-  WaitingDart,  // Request dispatched, waiting for Dart to respond()
-  Writing,      // Sending response
-  Idle,         // Keep-alive idle, waiting for next request
-  Closed        // Dead
-};
-
-struct Connection {
-  int fd = -1;
-  ConnState state = ConnState::Idle;
-  std::string readBuf;
-  std::string writeBuf;
-  
-  // Current request state
-  int64_t requestId = 0;
-  int64_t contentLength = 0;
-  size_t bodyStart = 0;
-  bool chunked = false;
-  bool keepAlive = true;
-  Method method = Method::Get;
-  std::string customMethod;
-  std::string path;
-  std::string query;
-  std::vector<Header> headers;
-  
-  int64_t requestsServed = 0;
 };
 
 struct StatusResult {
@@ -153,19 +124,21 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   StatusResult start();
   void stop();
 
-  /// Deep-copies headers/body synchronously (bridge memory dies on return)
-  /// and wakes the parked worker. Unknown/already-answered ids are no-ops.
+  /// Serializes and writes the answer on the CALLER's thread (non-blocking;
+  /// the remainder, if any, is flushed by the worker). Bridge memory is
+  /// never retained. Unknown/already-answered ids are no-ops.
   void respond(int64_t requestId, int64_t status,
                const std::vector<Header>& headers, const uint8_t* body,
                size_t bodyLen);
-  /// Starts a chunked response: finalizes status/headers and wakes the
-  /// parked worker, which sends them with `Transfer-Encoding: chunked` and
-  /// parks again for chunks. Unknown/already-answered (timeout won) ids are
-  /// no-ops, so the route timeout bounds time-to-first-byte.
+  /// Starts a chunked response: writes status/headers with
+  /// `Transfer-Encoding: chunked` on the caller's thread. Unknown or
+  /// already-answered (timeout won) ids are no-ops, so the route timeout
+  /// bounds time-to-first-byte.
   void startStream(int64_t requestId, int64_t status,
                    const std::vector<Header>& headers);
-  /// Queues one stream chunk (deep-copied synchronously); `last` completes
-  /// the stream. Chunks for unknown/incomplete/dead streams are no-ops.
+  /// Writes one chunk frame on the caller's thread; `last` appends the
+  /// terminal chunk and completes the request. Chunks for unknown,
+  /// incomplete or dead streams are no-ops.
   void sendStreamChunk(int64_t requestId, const uint8_t* chunk, size_t n,
                        bool last);
   void ackBody(int64_t requestId, int64_t ackedChunks);
@@ -189,17 +162,43 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   bool waitForDrainForTesting(int64_t timeoutMs);
 
  private:
+  /// A worker's wake pipe: the answering thread writes one byte to [w] when
+  /// the parked worker must act (flush a tail, close, or serve a queued
+  /// pipelined request); the worker drains [r] on every wake.
+  struct Wake {
+    int r = -1;
+    int w = -1;
+  };
+
   /// One iteration of a connection: exactly one request/response cycle.
   /// Returns true when the connection may serve another request.
   /// [cfg] is a snapshot taken once per keep-alive cycle to avoid
   /// re-locking configMutex_ on every request.
-  bool serveOne(int fd, std::string& carry, int64_t& served,
+  bool serveOne(int fd, const Wake& wake, std::string& carry, int64_t& served,
                 const ServerConfig& cfg);
 
-  /// The chunked tail of serveOne: sends stream headers, then forwards
-  /// queued chunks until the terminal marker, a send failure, or stop().
-  /// [served] counts this request on every exit. Returns true when the
-  /// connection may serve another request.
+  /// The park: waits in poll() until the answer is fully on the wire (Dart
+  /// wrote it, or the worker flushed the tail), the route timeout fires
+  /// (408, worker-owned) or stop() handed the worker a 503. Returns true
+  /// when the connection may serve another request.
+  bool awaitAnswer(int fd, const Wake& wake,
+                   const std::shared_ptr<PendingRequest>& req,
+                   int64_t requestId, int64_t timeoutMs,
+                   const ServerConfig& cfg, Emitter* emitter,
+                   bool inputBuffered);
+
+  /// Drains `req->tail` to the socket from the worker (blocking via poll).
+  /// Returns false on failure. Marks `done` when nothing is left and the
+  /// answer is complete.
+  bool flushTail(int fd, const std::shared_ptr<PendingRequest>& req,
+                 int64_t stallMs);
+
+  /// Non-blocking write from the answering thread: writes as much as the
+  /// socket takes, queues the rest as `tail` and wakes the worker. Must be
+  /// called with `req->writing == true` set under the lock by the caller.
+  void writeNow(const std::shared_ptr<PendingRequest>& req,
+                const uint8_t* a, size_t an, const uint8_t* b, size_t bn,
+                const uint8_t* c, size_t cn, bool completes);
 
   /// Upgrades a matched WebSocket route: validates the RFC 6455 handshake,
   /// answers 101 and runs the frame loop until close/error/stop. Always
@@ -223,19 +222,18 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
               int code);
 
   void acceptLoop();
-  void workerLoop();
-  void handleConnection(int fd);
+  void workerLoop(Wake wake);
+  void handleConnection(int fd, const Wake& wake);
   /// Parks [fd] at the FRONT of the fd queue (fair: workers pop from the
   /// back) when its socket holds no bytes but queued connections wait.
   /// Returns false when this fd already has data (serve it now) or nothing
   /// is queued (blocking here harms nobody). Never closes: keep-alive and
   /// non-idempotent methods survive a yield untouched.
   bool yieldToQueued(int fd);
-  static bool sendAll(int fd, const uint8_t* data, size_t n);
-  /// One chunked-body chunk per call (see serveStream): size line +
-  /// payload + CRLF in a single syscall where the platform allows.
-  static bool sendFrame(int fd, const char* sizeLine, size_t sizeLen,
-                        const uint8_t* payload, size_t n);
+  /// Blocking-style write on a non-blocking socket: polls for writability
+  /// between partial sends, giving up after [stallMs] without progress.
+  static bool sendAll(int fd, const uint8_t* data, size_t n,
+                      int64_t stallMs = 30000);
 
   /// Fast error path. Always closes: errors never keep alive (see header).
   /// [extra] headers ride ahead of the framing headers (e.g.
@@ -266,21 +264,14 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   std::thread acceptThread_;
   std::mutex acceptMutex_;
 
-  // Non-blocking Reactor (P1)
-  Poller poller_;
-  std::thread reactorThread_;
-  void reactorLoop();
-
-  // FDs accepted by acceptLoop, waiting to be registered by the Reactor.
-  std::mutex acceptedMutex_;
-  std::vector<int> acceptedQueue_;
-
-  // Active connections mapped by fd (owned EXCLUSIVELY by reactorThread_)
-  std::unordered_map<int, std::shared_ptr<Connection>> conns_;
-
-  // Responses queued by Dart's respond(), waiting to be written by the Reactor.
-  std::mutex readyMutex_;
-  std::vector<int> readyQueue_; // fds ready to write
+  // Worker pool: bounded queue, fixed workers. The queue bound is the
+  // listen backlog — beyond it the engine refuses fast rather than letting
+  // the accept loop outrun the workers.
+  std::vector<std::thread> workers_;
+  std::vector<Wake> workerWakes_;  // stop() pokes every parked worker
+  std::mutex queueMutex_;
+  std::condition_variable queueCv_;
+  std::deque<int> queue_;
 
   // Live connections, so stop() can wake idle keep-alive reads.
   std::mutex activeMutex_;

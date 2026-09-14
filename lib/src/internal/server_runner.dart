@@ -29,6 +29,7 @@ import '../api/event.dart';
 import '../api/http_method.dart';
 import '../api/ws.dart';
 import '../nitro_server.native.dart';
+import 'fast_calls.dart';
 import 'raw_mapping.dart';
 
 /// Wire token for a route registration: the custom token for custom methods,
@@ -99,6 +100,11 @@ class ServerRunner {
   }
 
   final NitroServerNative _native;
+
+  /// Leaf-call answer path over the real engine (see [FastCalls]); null
+  /// when the native side is a fake, in which case the generated bindings
+  /// answer. Bound on [start], released on [close].
+  FastCalls? _fast;
   final _pending = <int, _Pending>{};
 
   /// Recently answered request ids, insertion-ordered and bounded.
@@ -321,6 +327,7 @@ class ServerRunner {
 
   int start(ServerConfig config) {
     _ensureListening();
+    _fast ??= _bindFast();
     _native.configureServer(
       RawServerConfig(
         host: config.host,
@@ -347,6 +354,16 @@ class ServerRunner {
     _native.stop();
   }
 
+  /// The fast path needs a real engine instance behind [_native]; a fake
+  /// (tests) has none, and the generated bindings serve instead.
+  FastCalls? _bindFast() {
+    try {
+      return FastCalls.bind(_native);
+    } catch (_) {
+      return null;
+    }
+  }
+
   Future<void> close() async {
     if (_closed) return;
     _closed = true;
@@ -368,6 +385,8 @@ class ServerRunner {
     await _serverEvents?.cancel();
     await _wsMessages?.cancel();
     _listening = false;
+    _fast?.dispose();
+    _fast = null;
     await _events.close();
   }
 
@@ -386,26 +405,10 @@ class ServerRunner {
     if (_closed) return;
     final requestId = head.requestId;
     if (_completed.contains(requestId)) return;
-    final existing = _pending[requestId];
-    if (existing != null) {
-      // Combined head+complete message for a body request: the initial head
-      // arrived earlier (bodyComplete=false), body chunks were buffered, and
-      // now the combined message arrives with bodyComplete=true. Merge early
-      // data, mark complete, and dispatch.
-      if (head.bodyComplete && !existing.complete) {
-        final early = _early.remove(requestId);
-        if (early != null) {
-          for (final bytes in early) {
-            existing.body.add(bytes);
-          }
-        }
-        final earlyError = _earlyErrors.remove(requestId);
-        if (earlyError != null) existing.error = earlyError;
-        existing.complete = true;
-        _dispatch(existing);
-      }
-      return;
-    }
+    // The engine emits one head per request (a small body's chunk precedes
+    // its complete head; a large body's head precedes its chunks and end
+    // marker). A second head for a live id is a stale resend: ignore it.
+    if (_pending.containsKey(requestId)) return;
     final pending = _pending[requestId] = _Pending(head);
     final early = _early.remove(requestId);
     if (early != null) {
@@ -415,7 +418,8 @@ class ServerRunner {
     }
     final earlyError = _earlyErrors.remove(requestId);
     if (earlyError != null) pending.error = earlyError;
-    if (!head.hasBody || head.bodyComplete ||
+    if (!head.hasBody ||
+        head.bodyComplete ||
         _earlyComplete.remove(requestId)) {
       pending.complete = true;
       _dispatch(pending);
@@ -454,9 +458,9 @@ class ServerRunner {
           pending.error = message;
         }
       case RawBodyKind.end:
-        // Combined head+complete messages replace the separate end marker
-        // for body requests. This path is kept for backward compatibility
-        // with any in-flight messages from the old protocol.
+        // Large bodies (above the engine's inline threshold) and chunked
+        // uploads end with this marker; small bodies complete via their
+        // head instead (see _onHead).
         final pending = _pending[chunk.requestId];
         if (pending == null) {
           _earlyComplete.add(chunk.requestId);
@@ -612,12 +616,22 @@ class ServerRunner {
   void _answer(int requestId, ResponseContext response) {
     if (_closed) return;
     try {
-      _native.respond(
-        requestId,
-        response.status,
-        _rawHeaders(response),
-        response.bodyBytes,
-      );
+      final fast = _fast;
+      if (fast != null) {
+        fast.respond(
+          requestId,
+          response.status,
+          response.headers,
+          response.bodyBytes,
+        );
+      } else {
+        _native.respond(
+          requestId,
+          response.status,
+          _rawHeaders(response),
+          response.bodyBytes,
+        );
+      }
     } catch (_) {
       // The request was already answered (timeout won) or the server went
       // away mid-flight. Exactly-once is the engine's job; Dart never retries.
@@ -642,7 +656,12 @@ class ServerRunner {
   void _answerStream(int requestId, ResponseContext response) {
     if (_closed) return;
     try {
-      _native.startStream(requestId, response.status, _rawHeaders(response));
+      final fast = _fast;
+      if (fast != null) {
+        fast.startStream(requestId, response.status, response.headers);
+      } else {
+        _native.startStream(requestId, response.status, _rawHeaders(response));
+      }
     } catch (_) {
       // The timeout won before the first byte (or the server went away):
       // drop the stream unopened and mark the id answered.
@@ -657,9 +676,7 @@ class ServerRunner {
         : null;
     void send(Uint8List bytes) {
       if (_closed || bytes.isEmpty) return;
-      try {
-        _native.sendStreamChunk(requestId, bytes, false);
-      } catch (_) {}
+      _sendChunk(requestId, bytes, false);
     }
 
     void onEvent(Uint8List chunk) {
@@ -699,13 +716,22 @@ class ServerRunner {
     _outbound[requestId] = sub;
   }
 
+  /// One chunk into the engine, fast path first. Failures are the engine's
+  /// no-op cases (dead stream, timeout won): never an error for the handler.
+  void _sendChunk(int requestId, Uint8List bytes, bool last) {
+    try {
+      final fast = _fast;
+      if (fast != null) {
+        fast.sendStreamChunk(requestId, bytes, last);
+      } else {
+        _native.sendStreamChunk(requestId, bytes, last);
+      }
+    } catch (_) {}
+  }
+
   void _finishStream(int requestId) {
     final sub = _outbound.remove(requestId);
-    if (!_closed) {
-      try {
-        _native.sendStreamChunk(requestId, Uint8List(0), true);
-      } catch (_) {}
-    }
+    if (!_closed) _sendChunk(requestId, _emptyBody, true);
     _complete(requestId);
     sub?.cancel();
   }

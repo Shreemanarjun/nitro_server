@@ -1,15 +1,21 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // PendingTable — one entry per in-flight request, sharded for throughput.
 //
-// The connection thread parks on the entry's condition variable; Dart's
-// `respond` (or the route timeout) wakes it. Each entry has its OWN mutex,
-// so connections never serialize on a shared bridge lock — this is the
-// per-thread-semaphore requirement from the implementation plan, realized
-// per-request rather than per-thread, which is strictly finer-grained.
+// Direct-write protocol: the thread that answers (Dart's `respond`, or the
+// worker on timeout/stop) serializes the response and writes it to the
+// socket itself. The connection worker parks in poll() on the socket plus
+// its wake pipe, so a completed answer needs NO thread wake in the keep-alive
+// case: the next request's bytes wake the worker. Only the fallbacks — a
+// partial write (`tail`), a worker explicitly waiting for `done`, or a
+// `Connection: close` answer — write one byte to the wake pipe.
+//
+// Every field below is guarded by `mutex`. No thread ever holds it across a
+// syscall: the writer sets `writing`, unlocks, writes, relocks. The worker
+// flushes `tail` the same way (`flushing`).
 //
 // The table is split into 16 shards keyed by `requestId % 16`. Under high
-// concurrency (32+ workers) this cuts mutex contention on the hot
-// create/find/erase/ack path by ~16× compared to a single global lock.
+// concurrency this cuts mutex contention on the create/find/erase/ack path
+// by ~16× compared to a single global lock.
 //
 // Zero-copy payload logs: every body-chunk payload handed to `emit_bodyChunks`
 // stays malloc-owned here until Dart's cumulative `ackBody` releases it.
@@ -21,10 +27,10 @@
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
-#include <deque>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -35,21 +41,44 @@ namespace nitroserver {
 
 struct PendingRequest {
   std::mutex mutex;
+  /// Notified on every ownership change. The engine's worker parks in
+  /// poll(), not here; the cv exists for tests and for anyone who prefers
+  /// to wait in-process.
   std::condition_variable cv;
+
+  // ── Ownership ──────────────────────────────────────────────────────────
+  /// Someone owns the answer: Dart (respond/startStream) or the worker
+  /// (route timeout, stop()). Set exactly once under `mutex`.
   bool answered = false;
   bool timedOut = false;
+  /// The worker serializes and sends this answer itself (408/503).
+  bool workerOwned = false;
   int64_t status = 500;
   std::vector<Header> headers;
   std::vector<uint8_t> body;
 
-  // Chunked response streams (E7). `answered` doubles as "headers final":
-  // startStream sets it, so the route timeout can only win before the first
-  // byte — afterwards the stream phase is unbounded and ends with the
-  // terminal chunk, a send failure, or stop().
+  // ── Wire state (filled by the worker before it parks) ─────────────────
+  int fd = -1;
+  int wakeFd = -1;  // the parked worker's wake pipe (write end)
+  bool isHead = false;
+  bool keepAlive = false;
+  int64_t keepAliveSecs = 0;
+
+  // ── Write protocol ────────────────────────────────────────────────────
+  bool writing = false;    // Dart thread is inside a socket write
+  bool flushing = false;   // worker is draining `tail`
+  bool workerWaiting = false;  // worker parked on the wake pipe for `done`
+  std::vector<uint8_t> tail;  // unsent bytes, in order; the worker flushes
+  bool done = false;   // the whole answer is on the wire (or failed)
+  bool failed = false;  // a send failed: never keep alive
+  std::chrono::steady_clock::time_point doneAt;
+
+  // ── Chunked response streams ──────────────────────────────────────────
+  // `answered` doubles as "headers final": startStream sets it, so the
+  // route timeout can only win before the first byte.
   bool streamStarted = false;
   bool streamDone = false;
   bool streamDead = false;
-  std::deque<std::vector<uint8_t>> streamQueue;
 };
 
 struct PayloadLog {
@@ -152,8 +181,9 @@ class PendingTable {
     if (log.orphaned && log.acked == log.nextSeq) s.payloads.erase(it);
   }
 
-  /// Wakes every parked connection with a 503, then drops all entries and
-  /// frees every payload log. Called by stop().
+  /// Hands every unanswered request to its worker as a 503, kills live
+  /// streams, then drops all entries and frees every payload log. The
+  /// caller wakes the workers (they park in poll, not on the cv).
   void abortAll() {
     for (int i = 0; i < kShardCount; ++i) {
       auto& s = shards_[i];
@@ -163,6 +193,7 @@ class PendingTable {
         std::lock_guard<std::mutex> rlk(req->mutex);
         if (!req->answered) {
           req->answered = true;
+          req->workerOwned = true;
           req->status = 503;
           req->headers = {{"Content-Type", "text/plain"}};
           static const char kMsg[] = "server stopped";

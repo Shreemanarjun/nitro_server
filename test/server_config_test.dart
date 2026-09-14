@@ -187,5 +187,30 @@ void main() {
       expect(context.text(), '{"ok":true}');
       expect(context.json(), {'ok': true});
     });
+
+    test('typed JSON accessors check the shape at the boundary', () {
+      RequestContext withBody(String body) => RequestContext(
+        method: HttpMethod.post,
+        customMethod: '',
+        path: '/echo',
+        query: '',
+        queryParameters: const {},
+        headers: const {},
+        params: const {},
+        routePattern: '/echo',
+        body: Uint8List.fromList(utf8.encode(body)),
+      );
+      final object = withBody('{"id": 42, "tags": ["a"]}');
+      final Map<String, Object?> map = object.jsonMap();
+      expect(map['id'], 42);
+      expect(object.jsonAs<Map<String, Object?>>()['tags'], ['a']);
+      final List<Object?> list = withBody('[1, 2]').jsonList();
+      expect(list, [1, 2]);
+      expect(withBody('"text"').jsonAs<String>(), 'text');
+      // Valid JSON of the wrong shape fails loudly, never a late cast error.
+      expect(() => object.jsonList(), throwsFormatException);
+      expect(() => withBody('[1]').jsonMap(), throwsFormatException);
+      expect(() => withBody('{').jsonMap(), throwsFormatException);
+    });
   });
 }

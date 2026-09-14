@@ -22,11 +22,17 @@ for arg in "$@"; do
 done
 
 if command -v dart >/dev/null 2>&1; then
+  # `dart test --coverage` writes per-suite VM JSON, not lcov: convert, or
+  # the gate reads whatever stale lcov.info sits in the directory.
+  rm -rf coverage/test
   dart test --coverage=coverage
+  dart run coverage:format_coverage --lcov --in=coverage/test \
+    --out=coverage/lcov.info --report-on=lib \
+    --packages=.dart_tool/package_config.json
 else
   flutter test --coverage
 fi
-lcov --remove coverage/lcov.info \
+lcov --ignore-errors unused --remove coverage/lcov.info \
   '*/nitro_server.g.dart' '*/generated/*' \
   -o coverage/lcov.filtered.info >/dev/null
 

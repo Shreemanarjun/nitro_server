@@ -3,5 +3,4 @@
 // engine.cmake. Keep this list identical to NITRO_SERVER_ENGINE_SOURCES.
 #include "Router.cpp"
 #include "ServerInstance.cpp"
-#include "Poller.cpp"
 #include "EngineRegistry.cpp"

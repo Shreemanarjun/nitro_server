@@ -253,6 +253,21 @@ void main() {
       await expectLater(_get(port, '/'), throwsA(isA<Exception>()));
     }, skip: skipReason);
 
+    test('answers with more header bytes than the fast path preallocates',
+        () async {
+      // The leaf-call answer path stages headers in a 2 KiB native buffer
+      // and grows it on demand; a 6 KiB header set must arrive intact.
+      server = await NitroServer.bind();
+      final big = 'v' * 6000;
+      await server!.get('/big-headers', (_) async {
+        return ResponseContext.text('ok', headers: {'x-big': big});
+      });
+      final res = await _get(server!.port, '/big-headers');
+      expect(res.status, 200);
+      expect(res.body, 'ok');
+      expect(res.headers.value('x-big'), big);
+    }, skip: skipReason);
+
     test('matches a literal route and echoes the method', () async {
       server = await NitroServer.bind();
       await server!.route(HttpMethod.get, '/hello', (request) async {
@@ -646,7 +661,7 @@ void main() {
           (_) async => ResponseContext.text('ok'),
         );
 
-        final events = await _get(server!.port, '/events'); print("BODY: ${events.body}");
+        final events = await _get(server!.port, '/events');
         expect(events.status, 200);
         expect(events.body, 'data: 0\n\ndata: 1\n\ndata: 2\n\n');
 

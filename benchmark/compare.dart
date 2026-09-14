@@ -45,6 +45,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:benchmark_harness/benchmark_harness.dart';
@@ -113,6 +114,11 @@ bool _keepAlive = false;
 /// `--batch-events`; default off so the headline numbers measure the
 /// real-time (per-event) path.
 bool _batchEvents = false;
+
+/// Native worker threads for nitro (`--workers N`); 0 keeps the engine
+/// default. Threads park per connection, so fewer workers than connections
+/// means idle connections cycle through the queue between workers.
+int _workers = 0;
 
 String _connHeader() => _keepAlive ? 'keep-alive' : 'close';
 
@@ -289,8 +295,11 @@ Future<NitroServer> _startNitroServer() async {
   // others don't have.
   final server = await NitroServer.bind(
     _keepAlive
-        ? const ServerConfig(maxRequestsPerConnection: 0)
-        : const ServerConfig(keepAliveTimeout: Duration.zero),
+        ? ServerConfig(maxRequestsPerConnection: 0, workerThreads: _workers)
+        : ServerConfig(
+            keepAliveTimeout: Duration.zero,
+            workerThreads: _workers,
+          ),
   );
   // One pass-through middleware, like the other sides.
   await server.use((request, next) => next(request));
@@ -497,80 +506,149 @@ String _vmMode() {
   return isJit ? 'JIT' : 'AOT';
 }
 
-Future<({String row, Map<String, Object?> json})> _phase(
-  String label,
-  int port,
-  Future<int> Function(HttpClient, int) op, {
-  required int concurrency,
-  required int concurrentTotal,
-}) async {
-  // Sequential latency, harnessed (`measure()` runs setup → 100 ms warmup →
-  // ~2 s exercise → teardown; the client lives in setup/teardown, unmeasured).
-  final benchmark = _RequestBenchmark(label, port, op);
-  final meanUs = await benchmark.measure();
-  final lat = _summarize(benchmark.samplesUs);
+typedef _Op = Future<int> Function(HttpClient client, int port);
 
-  // Concurrent throughput (custom sweep: the harness is single-shot only).
-  final client = HttpClient()..maxConnectionsPerHost = concurrency * 2;
+final Uint8List _queryExpected = Uint8List.fromList(
+  jsonEncode({'a': '1', 'b': 'two'}).codeUnits,
+);
+final Uint8List _paramExpected = Uint8List.fromList('user 42'.codeUnits);
+final Uint8List _wildExpected = Uint8List.fromList(
+  'wild:/files/a/b/c'.codeUnits,
+);
+
+/// Every case as a top-level table so client isolates resolve an op by key:
+/// a closure over server state cannot cross an isolate boundary, a key can.
+final Map<String, _Op> _ops = {
+  '/hello': (c, p) => _getExpect(c, p, '/hello', _routes['/hello']!),
+  '/json': (c, p) => _getExpect(c, p, '/json', _routes['/json']!),
+  '/users/:id': (c, p) => _getExpect(c, p, '/users/42', _paramExpected),
+  '/files/*': (c, p) => _getExpect(c, p, '/files/a/b/c', _wildExpected),
+  '/q?a=1&b=two': (c, p) => _getExpect(c, p, '/q?a=1&b=two', _queryExpected),
+  '/mw': (c, p) => _getExpect(c, p, '/mw', _routes['/hello']!),
+  'POST /echo 4k': _postEcho,
+  'POST /echo 1m': (c, p) => _postEchoSized(c, p, _bigPayload),
+  'GET /events': _getEvents,
+};
+
+/// Sequential latency, run in its own isolate: one connection, the harness
+/// owns the loop. The server isolate only serves.
+Future<({double meanUs, List<int> samplesUs})> _sequential(
+  String opKey,
+  int port,
+) async {
+  final benchmark = _RequestBenchmark(opKey, port, _ops[opKey]!);
+  final meanUs = await benchmark.measure();
+  return (meanUs: meanUs, samplesUs: benchmark.samplesUs);
+}
+
+/// Closed-loop load from one client isolate: [connections] workers hammer
+/// [port] for [millis]. Returns the completed count, the wall time and every
+/// per-request latency, so the coordinator can report rate AND tail.
+Future<({int done, int elapsedUs, List<int> samplesUs})> _load(
+  String opKey,
+  int port,
+  int connections,
+  int millis,
+) async {
+  final op = _ops[opKey]!;
+  final client = HttpClient()..maxConnectionsPerHost = connections;
+  final samples = <int>[];
+  final deadline = DateTime.now().add(Duration(milliseconds: millis));
   final stopwatch = Stopwatch()..start();
-  var remaining = concurrentTotal;
+  var done = 0;
   await Future.wait([
-    for (var w = 0; w < concurrency; w++)
+    for (var w = 0; w < connections; w++)
       () async {
-        while (true) {
-          if (remaining-- <= 0) return;
-          await op(client, port);
+        while (DateTime.now().isBefore(deadline)) {
+          samples.add(await op(client, port));
+          done++;
         }
       }(),
   ]);
   stopwatch.stop();
   client.close(force: true);
-  final rps = concurrentTotal / stopwatch.elapsedMicroseconds * 1e6;
+  return (
+    done: done,
+    elapsedUs: stopwatch.elapsedMicroseconds,
+    samplesUs: samples,
+  );
+}
 
-  // Standard harness line, then the table row.
+/// One case: sequential latency from one client isolate, then a closed-loop
+/// sweep from [clients] isolates sharing [connections] connections. Every
+/// client lives in its own isolate so the server under test owns its event
+/// loop — a driver sharing the isolate would measure itself.
+Future<({String row, Map<String, Object?> json})> _phase(
+  String label,
+  String opKey,
+  int port, {
+  required int clients,
+  required int connections,
+  required int millis,
+}) async {
+  final seq = await Isolate.run(() => _sequential(opKey, port));
+  final lat = _summarize(seq.samplesUs);
+
+  final perClient = connections ~/ clients;
+  final loads = await Future.wait([
+    for (var i = 0; i < clients; i++)
+      Isolate.run(() => _load(opKey, port, perClient, millis)),
+  ]);
+  final rps = loads.fold(0.0, (s, l) => s + l.done / l.elapsedUs * 1e6);
+  final under = _summarize([for (final l in loads) ...l.samplesUs]);
+
   print(
-    '$label(RunTime): ${meanUs.toStringAsFixed(4)} us. '
-    '(n=${benchmark.samplesUs.length})',
+    '$label(RunTime): ${seq.meanUs.toStringAsFixed(4)} us. '
+    '(n=${seq.samplesUs.length})',
   );
   return (
     row:
-        '| $label | ${meanUs.toStringAsFixed(0)} | '
-        '${lat['p50']!.toStringAsFixed(0)} | ${lat['p99']!.toStringAsFixed(0)} | '
+        '| $label | ${lat['p50']!.toStringAsFixed(0)} | '
+        '${lat['p99']!.toStringAsFixed(0)} | '
+        '${under['p50']!.toStringAsFixed(0)} | '
+        '${under['p99']!.toStringAsFixed(0)} | '
         '${rps.toStringAsFixed(0)} |',
     json: {
       'case': label,
-      'mean_us': double.parse(meanUs.toStringAsFixed(1)),
-      'p50_us': lat['p50'],
-      'p99_us': lat['p99'],
+      'seq_mean_us': double.parse(seq.meanUs.toStringAsFixed(1)),
+      'seq_p50_us': lat['p50'],
+      'seq_p99_us': lat['p99'],
+      'load_p50_us': under['p50'],
+      'load_p99_us': under['p99'],
       'req_per_s': double.parse(rps.toStringAsFixed(1)),
-      'n': benchmark.samplesUs.length,
+      'n': seq.samplesUs.length,
+      'connections': connections,
     },
   );
+}
+
+int _flagInt(List<String> args, String flag, int fallback) {
+  final i = args.indexOf(flag);
+  return i != -1 && i + 1 < args.length ? int.parse(args[i + 1]) : fallback;
+}
+
+String? _flagStr(List<String> args, String flag) {
+  final i = args.indexOf(flag);
+  return i != -1 && i + 1 < args.length ? args[i + 1] : null;
 }
 
 Future<void> main(List<String> args) async {
   final quick = args.contains('--quick');
   _keepAlive = args.contains('--keep-alive');
   _batchEvents = args.contains('--batch-events');
-  const concurrency = 32;
-  final concurrentTotal = quick ? 800 : 4000;
+  final connections = _flagInt(args, '--connections', quick ? 32 : 64);
+  final clients = _flagInt(args, '--clients', 4);
+  final millis = _flagInt(args, '--seconds', quick ? 1 : 3) * 1000;
   final rounds = quick ? 1 : 2;
+  final only = _flagStr(args, '--only');
+  _workers = _flagInt(args, '--workers', 0);
 
   // Dart-only loading: Flutter apps skip this (the tooling bundles the
   // library); `dart run` / the compiled exe needs the explicit open.
   // `NITRO_SERVER_DYLIB` or `--dylib <path>` overrides the search when the
   // compiled exe runs from a different working directory.
-  String? dylibFlag;
-  final dylibIdx = args.indexOf('--dylib');
-  if (dylibIdx != -1 && dylibIdx + 1 < args.length) {
-    dylibFlag = args[dylibIdx + 1];
-  }
-  String? jsonPath;
-  final jsonIdx = args.indexOf('--json');
-  if (jsonIdx != -1 && jsonIdx + 1 < args.length) {
-    jsonPath = args[jsonIdx + 1];
-  }
-  final loadedFrom = loadNitroServerNative(path: dylibFlag);
+  final loadedFrom = loadNitroServerNative(path: _flagStr(args, '--dylib'));
+  final jsonPath = _flagStr(args, '--json');
   final mode = _vmMode();
   print(
     'nitro_server vs shelf vs dart:io HttpServer — same routes, same driver',
@@ -578,12 +656,14 @@ Future<void> main(List<String> args) async {
   print(
     '(mode: $mode; native library: $loadedFrom'
     '${quick ? '; --quick' : ''}${_keepAlive ? '; --keep-alive' : ''}'
-    '${_batchEvents ? '; --batch-events' : ''})',
+    '${_batchEvents ? '; --batch-events' : ''}'
+    '${_workers > 0 ? '; --workers $_workers' : ''})',
   );
   print('');
   print(
-    'Latency via package:benchmark_harness (AsyncBenchmarkBase, ~2 s '
-    'exercise per case); throughput via a custom $concurrency-worker sweep.',
+    'Sequential latency via package:benchmark_harness (AsyncBenchmarkBase, '
+    '~2 s per case) from one client isolate; load: $connections connections '
+    'across $clients client isolates for ${millis ~/ 1000} s per case.',
   );
   print('');
 
@@ -591,138 +671,35 @@ Future<void> main(List<String> args) async {
   final shelfServer = await _startShelfServer();
   final nitroServer = await _startNitroServer();
 
-  final queryExpected = Uint8List.fromList(
-    jsonEncode({'a': '1', 'b': 'two'}).codeUnits,
-  );
-  final paramExpected = Uint8List.fromList('user 42'.codeUnits);
-  final wildExpected = Uint8List.fromList('wild:/files/a/b/c'.codeUnits);
-
-  final cases = <(String, Future<int> Function(HttpClient, int), int)>[
-    (
-      'dart:io /hello',
-      (c, p) => _getExpect(c, p, '/hello', _routes['/hello']!),
-      dartServer.port,
-    ),
-    (
-      'shelf   /hello',
-      (c, p) => _getExpect(c, p, '/hello', _routes['/hello']!),
-      shelfServer.port,
-    ),
-    (
-      'nitro   /hello',
-      (c, p) => _getExpect(c, p, '/hello', _routes['/hello']!),
-      nitroServer.port,
-    ),
-    (
-      'dart:io /json',
-      (c, p) => _getExpect(c, p, '/json', _routes['/json']!),
-      dartServer.port,
-    ),
-    (
-      'shelf   /json',
-      (c, p) => _getExpect(c, p, '/json', _routes['/json']!),
-      shelfServer.port,
-    ),
-    (
-      'nitro   /json',
-      (c, p) => _getExpect(c, p, '/json', _routes['/json']!),
-      nitroServer.port,
-    ),
-    (
-      'dart:io /users/:id',
-      (c, p) => _getExpect(c, p, '/users/42', paramExpected),
-      dartServer.port,
-    ),
-    (
-      'shelf   /users/:id',
-      (c, p) => _getExpect(c, p, '/users/42', paramExpected),
-      shelfServer.port,
-    ),
-    (
-      'nitro   /users/:id',
-      (c, p) => _getExpect(c, p, '/users/42', paramExpected),
-      nitroServer.port,
-    ),
-    (
-      'dart:io /files/*',
-      (c, p) => _getExpect(c, p, '/files/a/b/c', wildExpected),
-      dartServer.port,
-    ),
-    (
-      'shelf   /files/*',
-      (c, p) => _getExpect(c, p, '/files/a/b/c', wildExpected),
-      shelfServer.port,
-    ),
-    (
-      'nitro   /files/*',
-      (c, p) => _getExpect(c, p, '/files/a/b/c', wildExpected),
-      nitroServer.port,
-    ),
-    (
-      'dart:io /q?a=1&b=two',
-      (c, p) => _getExpect(c, p, '/q?a=1&b=two', queryExpected),
-      dartServer.port,
-    ),
-    (
-      'shelf   /q?a=1&b=two',
-      (c, p) => _getExpect(c, p, '/q?a=1&b=two', queryExpected),
-      shelfServer.port,
-    ),
-    (
-      'nitro   /q?a=1&b=two',
-      (c, p) => _getExpect(c, p, '/q?a=1&b=two', queryExpected),
-      nitroServer.port,
-    ),
-    (
-      'dart:io /mw',
-      (c, p) => _getExpect(c, p, '/mw', _routes['/hello']!),
-      dartServer.port,
-    ),
-    (
-      'shelf   /mw',
-      (c, p) => _getExpect(c, p, '/mw', _routes['/hello']!),
-      shelfServer.port,
-    ),
-    (
-      'nitro   /mw',
-      (c, p) => _getExpect(c, p, '/mw', _routes['/hello']!),
-      nitroServer.port,
-    ),
-    ('dart:io POST /echo 4k', _postEcho, dartServer.port),
-    ('shelf   POST /echo 4k', _postEcho, shelfServer.port),
-    ('nitro   POST /echo 4k', _postEcho, nitroServer.port),
-    (
-      'dart:io POST /echo 1m',
-      (c, p) => _postEchoSized(c, p, _bigPayload),
-      dartServer.port,
-    ),
-    (
-      'shelf   POST /echo 1m',
-      (c, p) => _postEchoSized(c, p, _bigPayload),
-      shelfServer.port,
-    ),
-    (
-      'nitro   POST /echo 1m',
-      (c, p) => _postEchoSized(c, p, _bigPayload),
-      nitroServer.port,
-    ),
-    ('dart:io GET /events', _getEvents, dartServer.port),
-    ('shelf   GET /events', _getEvents, shelfServer.port),
-    ('nitro   GET /events', _getEvents, nitroServer.port),
+  final sides = <(String, int)>[
+    ('dart:io', dartServer.port),
+    ('shelf  ', shelfServer.port),
+    ('nitro  ', nitroServer.port),
+  ];
+  final cases = <(String, String, int)>[
+    for (final opKey in _ops.keys)
+      if (only == null || opKey == only)
+        for (final (side, port) in sides) ('$side $opKey', opKey, port),
   ];
 
   final jsonCases = <Map<String, Object?>>[];
   // Interleaved A/B/C so machine drift cannot favor one side.
   for (var round = 0; round < rounds; round++) {
-    print('| case | mean µs | p50 µs | p99 µs | req/s @32 |');
-    print('| ---- | ------- | ------ | ------ | --------- |');
-    for (final (label, op, port) in cases) {
+    print(
+      '| case | seq p50 µs | seq p99 µs | load p50 µs | load p99 µs | '
+      'req/s @$connections |',
+    );
+    print(
+      '| ---- | ---------- | ---------- | ----------- | ----------- | --- |',
+    );
+    for (final (label, opKey, port) in cases) {
       final result = await _phase(
         label,
+        opKey,
         port,
-        op,
-        concurrency: concurrency,
-        concurrentTotal: concurrentTotal,
+        clients: clients,
+        connections: connections,
+        millis: millis,
       );
       print(result.row);
       if (round == rounds - 1) jsonCases.add(result.json);
@@ -737,6 +714,8 @@ Future<void> main(List<String> args) async {
         'keep_alive': _keepAlive,
         'batch_events': _batchEvents,
         'quick': quick,
+        'connections': connections,
+        'clients': clients,
         'cases': jsonCases,
       }),
     );
@@ -747,7 +726,8 @@ Future<void> main(List<String> args) async {
   await shelfServer.close(force: true);
   await nitroServer.close();
   print(
-    'Concurrent: $concurrentTotal requests across $concurrency workers '
-    '(throughput). Sequential latency: harness 2 s exercise per case.',
+    'Load: $connections connections / $clients client isolates, '
+    '${millis ~/ 1000} s per case. Sequential: harness ~2 s per case, '
+    'one connection.',
   );
 }

@@ -158,8 +158,30 @@ class RequestContext {
   /// The body decoded as UTF-8 text.
   String text() => utf8.decode(body);
 
-  /// The body decoded as JSON (`jsonDecode` of [text]).
+  /// The body decoded as JSON (`jsonDecode` of [text]). Untyped by nature;
+  /// prefer [jsonMap], [jsonList] or [jsonAs] to get a checked type back.
   dynamic json() => jsonDecode(text());
+
+  /// The body decoded as a JSON object. Throws [FormatException] when the
+  /// body is valid JSON but not an object (e.g. an array or a string).
+  Map<String, Object?> jsonMap() => jsonAs<Map<String, Object?>>();
+
+  /// The body decoded as a JSON array. Throws [FormatException] when the
+  /// body is valid JSON but not an array.
+  List<Object?> jsonList() => jsonAs<List<Object?>>();
+
+  /// The body decoded as JSON and checked to be a [T]: a typed alternative
+  /// to [json] that fails loudly at the boundary instead of deep inside a
+  /// handler. Throws [FormatException] on a type mismatch (malformed JSON
+  /// throws the decoder's own [FormatException]).
+  T jsonAs<T>() {
+    final decoded = jsonDecode(text());
+    if (decoded is T) return decoded;
+    throw FormatException(
+      'expected JSON $T, got ${decoded.runtimeType}',
+      text(),
+    );
+  }
 }
 
 /// The answer a [RequestHandler] returns. One value or a byte stream: the

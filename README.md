@@ -25,13 +25,20 @@ await server.close();
 
 ## How it works
 
-One `NitroServer` owns one native accept loop. Each connection runs on its own
-worker thread: parse → trie route lookup → dispatch to Dart over a stream →
-park on that request's **own** condition variable until your handler answers
-with `respond` or the route's timeout fires. No shared bridge lock, no
-callbacks (one `NativeCallable` slot per method would clobber concurrent
-requests — the same lesson `nitro_http` learned), and the Dart isolate never
-blocks. That is the whole deadlock story.
+One `NitroServer` owns one native accept loop. Each connection runs on a
+worker thread (default pool `max(64, 4 × cores)`): parse → trie route lookup
+→ dispatch to Dart over a stream → park in `poll()` on the socket and the
+worker's own wake pipe until the answer is on the wire or the route's timeout
+fires. The answer is written by whoever produces it: your handler's
+`respond` serializes the response and writes it to the socket on the Dart
+thread, non-blocking — no copy into a queue, no thread wake for the common
+keep-alive case (the next request's bytes wake the worker). Whatever the
+socket buffer cannot take right now becomes a tail the worker flushes;
+stream chunks always go through that tail so a burst of small chunks
+coalesces into fewer syscalls. No shared bridge lock, no callbacks (one
+`NativeCallable` slot per method would clobber concurrent requests — the same
+lesson `nitro_http` learned), and the Dart isolate never blocks. That is the
+whole deadlock story.
 
 Routing is a segment trie built on day one: `:param` captures, trailing `*`
 wildcards, static-beats-param-beats-wildcard precedence, per-route timeouts.
@@ -95,6 +102,7 @@ differ:
 | dimension | `dart:io` / shelf | `nitro_server` |
 | --------- | ----------------- | -------------- |
 | connection handling | single-threaded event loop; slow handlers stall the loop unless offloaded to isolates | native thread per connection; a slow handler costs one thread, never the loop |
+| answer path | handler → Dart socket buffer → event loop write | handler → one non-blocking `sendmsg` on the calling thread, no copy, no wake |
 | routing | manual (`request.uri.path` switches) or shelf_router middleware | built-in trie with `:param` + `*`, static-first precedence |
 | per-route timeouts | hand-rolled `Future.timeout` per handler | enforced natively per route; late answers dropped exactly once |
 | request size cap | manual content-length accounting | `maxBodyBytes` enforced while streaming (413 + no dispatch) |
@@ -103,26 +111,32 @@ differ:
 | keep-alive | yes | yes (`keepAliveTimeout`, `maxRequestsPerConnection`); `Duration.zero` disables per server |
 | web | n/a (server) | unsupported |
 
-Measured, not claimed — same routes, same driver, interleaved A/B/C (see
-[`benchmark/`](benchmark/) for methodology and how to re-run):
+Measured, not claimed — same routes, same driver, the driver in its own
+isolates so the server under test owns its event loop, interleaved A/B/C
+(see [`benchmark/`](benchmark/) for methodology and how to re-run). AOT
+(`dart compile exe`), Apple M1 Pro, loopback, keep-alive on every side,
+64 connections across 4 client isolates, 3 s per case, second of two
+rounds:
 
-```
-| case                 | mean µs | p50 µs | p99 µs | req/s @32 |
-| dart:io /hello       |     186 |    162 |    398 |      7868 |
-| shelf   /hello       |     208 |    184 |    424 |      7328 |
-| nitro   /hello       |     171 |    151 |    350 |      9967 |
-| dart:io POST /echo 4k|     206 |    182 |    387 |      7072 |
-| shelf   POST /echo 4k|     227 |    199 |    446 |      6545 |
-| nitro   POST /echo 4k|     186 |    166 |    366 |      9798 |
-```
+__KEEPALIVE_TABLE__
 
-Read narrowly: the native accept loop shaves scheduling latency and scales
-small-route throughput ~1.2–1.4× on loopback, while `shelf` pays its
-framework layers against raw `dart:io`; on a 4 KB echo all sides are closer
-because the socket copy dominates. Keep-alive would change the picture for
-everyone — that is exactly why the table says what was measured
-(`Connection: close` all sides) instead of crowning a winner. Run
-`dart run benchmark/compare.dart` on your hardware before quoting anything.
+Read it plainly: on small routes nitro serves ~1.5× dart:io's throughput at
+~35% lower latency under load, because parsing, routing and the response
+write happen off the Dart isolate and a keep-alive answer wakes no thread.
+Streaming (`/events`, 20 chunks) is where the gap is widest: chunks are
+queued to a native worker that coalesces them. Sequential latency on a
+single idle connection is within a few microseconds of dart:io — the one
+remaining thread hop (worker → Dart port) costs about what dart:io's own
+parsing saves. The 1 MiB echo is loopback-bound and identical everywhere.
+With `Connection: close` on every side (`./build/benchmark/compare`
+without `--keep-alive`) the handshake dominates and the ordering is the
+same with smaller margins:
+
+__CLOSE_TABLE__
+
+Run `./build/benchmark/compare --keep-alive` on your hardware before quoting
+anything; `PERFORMANCE_PLAN.md` has the measured history of how these
+numbers came about and what is next.
 
 ## Limits (v1, stated plainly)
 

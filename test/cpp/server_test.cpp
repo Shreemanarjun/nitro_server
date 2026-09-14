@@ -284,8 +284,10 @@ class RecordingEmitter : public Emitter {
 
   void emitBodyData(int64_t requestId, uint8_t* payload, size_t n) override {
     std::lock_guard<std::mutex> lk(mutex_);
-    auto it = partial_.find(requestId);
-    if (it != partial_.end()) it->second.body.append((const char*)payload, n);
+    // Chunks may precede their head (small bodies are emitted before the
+    // completing head; the ports carry no cross-ordering): park them on
+    // the partial entry, exactly like the Dart runner's early-chunk buffer.
+    partial_[requestId].body.append((const char*)payload, n);
   }
 
   void emitBodyEnd(int64_t requestId) override {

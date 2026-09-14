@@ -3,6 +3,7 @@ library;
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show ZLibDecoder, ZLibEncoder;
 import 'dart:typed_data';
 
 import 'context.dart';
@@ -78,11 +79,28 @@ abstract class WsSession {
   /// transport failure, the sent code on local protocol errors).
   int? get closeCode;
 
-  /// Sends a text message (opcode 1).
-  void sendText(String text);
+  /// Sends a text message (opcode 1). Returns the bytes still queued for
+  /// this session after the call (`0` = on the wire), or `-1` once closed.
+  /// The engine writes what the socket takes at once and queues the rest;
+  /// past [ServerConfig.wsMaxBufferBytes] it closes the session with 1009,
+  /// so a producer should pause while [bufferedBytes] is high.
+  int sendText(String text);
 
-  /// Sends a binary message (opcode 2).
-  void sendBytes(Uint8List bytes);
+  /// Sends a binary message (opcode 2). Same return as [sendText].
+  int sendBytes(Uint8List bytes);
+
+  /// Bytes queued for this session at the last send.
+  int get bufferedBytes;
+
+  /// Whether `permessage-deflate` was negotiated: messages of
+  /// [compressThreshold] bytes or more go out compressed and compressed
+  /// frames from the peer are inflated before they reach [messages].
+  bool get compressed;
+
+  /// Smallest payload worth compressing (shorter ones cost more than they
+  /// save); set on [NitroServer.bind]'s config via [ServerConfig.wsCompression]
+  /// only as on/off.
+  static const int compressThreshold = 256;
 
   /// Completes the closing handshake with [code] (default 1000) and reaps
   /// the session. Idempotent.
@@ -98,3 +116,36 @@ typedef WsHandler = FutureOr<void> Function(WsSession session);
 
 /// UTF-8 bytes for [text]. Shared with the test client.
 Uint8List wsTextBytes(String text) => Uint8List.fromList(utf8.encode(text));
+
+/// One permessage-deflate message body (RFC 7692 §7.2.1, no context
+/// takeover): a raw-deflate stream ending in a sync flush, minus the
+/// trailing `00 00 ff ff`. `dart:io`'s zlib does the compressing.
+Uint8List wsDeflate(Uint8List payload) {
+  final out = BytesBuilder(copy: false);
+  final sink = ZLibEncoder(
+    raw: true,
+  ).startChunkedConversion(ByteConversionSink.withCallback(out.add));
+  // A chunked add ends with Z_SYNC_FLUSH — the empty stored block the
+  // extension expects — where a one-shot convert would finish the stream.
+  sink.add(payload);
+  final flushed = out.takeBytes();
+  sink.close();
+  final end = flushed.length >= 4 ? flushed.length - 4 : flushed.length;
+  return Uint8List.sublistView(flushed, 0, end);
+}
+
+/// Inverse of [wsDeflate]: appends the sync-flush tail and inflates.
+Uint8List wsInflate(Uint8List payload) {
+  final out = BytesBuilder(copy: false);
+  final sink = ZLibDecoder(
+    raw: true,
+  ).startChunkedConversion(ByteConversionSink.withCallback(out.add));
+  sink.add(Uint8List.fromList([...payload, 0, 0, 0xff, 0xff]));
+  final inflated = out.takeBytes();
+  try {
+    sink.close();
+  } on Object {
+    // A truncated final block is expected: the stream never finished.
+  }
+  return inflated;
+}

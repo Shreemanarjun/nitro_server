@@ -173,14 +173,25 @@ class FakeNitroServerNative extends NitroServerNative {
   /// WebSocket surface: outbound frames + close calls by connection id.
   final wsOut = StreamController<RawWsMessage>.broadcast();
   final wsSent = <(int, Uint8List, bool)>[];
+  final wsSentCompressed = <int>[];
   final wsClosed = <(int, int)>[];
+
+  /// What `wsSend` reports as still buffered (tests script backpressure).
+  int wsBuffered = 0;
 
   @override
   Stream<RawWsMessage> get wsMessages => wsOut.stream;
 
   @override
-  void wsSend(int connectionId, Uint8List payload, bool binary) {
+  int wsSend(
+    int connectionId,
+    Uint8List payload,
+    bool binary,
+    bool compressed,
+  ) {
     wsSent.add((connectionId, Uint8List.fromList(payload), binary));
+    if (compressed) wsSentCompressed.add(wsSent.length - 1);
+    return wsBuffered;
   }
 
   @override

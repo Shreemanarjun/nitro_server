@@ -501,14 +501,23 @@ class _InMemoryNative extends NitroServerNative {
   final wsCloseCodes = <int, Completer<int>>{};
 
   @override
-  void wsSend(int connectionId, Uint8List payload, bool binary) {
+  int wsSend(
+    int connectionId,
+    Uint8List payload,
+    bool binary,
+    bool compressed,
+  ) {
+    // The in-memory transport has no socket to fill: nothing ever queues.
+    // Compressed payloads are inflated back so the test side reads text.
     final outbox = wsOutbox[connectionId];
-    if (outbox == null || outbox.isClosed) return;
+    if (outbox == null || outbox.isClosed) return -1;
+    final bytes = compressed ? wsInflate(payload) : payload;
     outbox.add(
       binary
-          ? WsMessage.binary(Uint8List.fromList(payload))
-          : WsMessage.text(utf8.decode(payload)),
+          ? WsMessage.binary(Uint8List.fromList(bytes))
+          : WsMessage.text(utf8.decode(bytes)),
     );
+    return 0;
   }
 
   @override

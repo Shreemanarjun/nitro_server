@@ -1337,6 +1337,65 @@ void main() {
       expect(fake.wsClosed.single, (601, 1000));
     });
 
+    test('sends report the queue depth and inflate compressed input', () async {
+      fake.wsBuffered = 77;
+      final got = Completer<WsMessage>();
+      final session = await openSession(
+        640,
+        handler: (s) async {
+          got.complete(await s.messages.first);
+          await Completer<void>().future;
+        },
+      );
+      expect(session.sendText('a'), 77);
+      expect(session.bufferedBytes, 77);
+      expect(session.sendBytes(Uint8List(1)), 77);
+      // Sessions opened without the extension never compress.
+      expect(session.compressed, isFalse);
+      expect(fake.wsSentCompressed, isEmpty);
+      // A compressed inbound frame (aux 1) is inflated before delivery.
+      inject(640, 1, wsDeflate(Uint8List.fromList(utf8.encode('zipped'))), 1);
+      expect((await got.future).text, 'zipped');
+      // Undecodable compressed data closes with 1007.
+      inject(640, 2, Uint8List.fromList([1, 2, 3]), 1);
+      await waitWsClosed(640);
+      expect(fake.wsClosed.single, (640, 1007));
+      expect(session.sendText('late'), -1);
+    });
+
+    test('a negotiated session compresses long sends', () async {
+      runner.addWsRoute('/z', (s) async {
+        s.sendText('a' * 1000);
+        s.sendText('tiny');
+        await Completer<void>().future;
+      });
+      await Future<void>.delayed(Duration.zero);
+      fake.heads.add(
+        fakeHead(
+          requestId: 641,
+          path: '/z',
+          routePattern: '/z',
+          headers: const [
+            RawHeader(
+              name: 'sec-websocket-extensions',
+              value: 'permessage-deflate',
+            ),
+          ],
+        ),
+      );
+      for (var i = 0; i < 200 && fake.wsSent.length < 2; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+      expect(fake.wsSent, hasLength(2));
+      expect(fake.wsSentCompressed, [0]);
+      expect(wsInflate(fake.wsSent[0].$2), utf8.encode('a' * 1000));
+      expect(utf8.decode(fake.wsSent[1].$2), 'tiny');
+      // Inflated text that is not UTF-8 closes with 1007.
+      inject(641, 1, wsDeflate(Uint8List.fromList([0xff, 0xfe])), 1);
+      await waitWsClosed(641);
+      expect(fake.wsClosed.last, (641, 1007));
+    });
+
     test('sends ride wsSend with the right opcode flag', () async {
       final session = await openSession(602);
       session.sendText('yo');

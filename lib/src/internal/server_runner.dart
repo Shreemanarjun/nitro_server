@@ -271,6 +271,7 @@ class ServerRunner {
     RequestHandler handler, [
     List<Middleware> middleware = const [],
     bool streamBody = false,
+    int? maxBodyBytes,
   ]) {
     _ensureListening();
     final (rawMethod, rawCustom) = rawMethodOf(method, customToken);
@@ -282,6 +283,7 @@ class ServerRunner {
         // -1 inherits the server default (see RawRouteConfig).
         timeoutMs: timeout?.inMilliseconds ?? -1,
         streamBody: streamBody,
+        maxBodyBytes: maxBodyBytes ?? -1,
       ),
     );
     throwIfFailed(status, operation: 'registerRoute($pattern)');
@@ -357,9 +359,14 @@ class ServerRunner {
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
 
+  /// Whether the engine negotiates permessage-deflate (mirrors the config
+  /// the engine was started with; helpers inherit it via [prepareHelper]).
+  bool _wsCompression = true;
+
   int start(ServerConfig config) {
     _ensureListening();
     _fast ??= _bindFast();
+    _wsCompression = config.wsCompression;
     _native.configureServer(
       RawServerConfig(
         host: config.host,
@@ -373,6 +380,9 @@ class ServerRunner {
         maxConnections: config.maxConnections,
         maxConnectionsPerIp: config.maxConnectionsPerIp,
         headerTimeoutMs: config.headerTimeout.inMilliseconds,
+        writeTimeoutMs: config.writeTimeout.inMilliseconds,
+        wsMaxBufferBytes: config.wsMaxBufferBytes,
+        wsCompression: config.wsCompression,
         tls: RawTlsConfig(
           certPem: config.tls.certPem,
           keyPem: config.tls.keyPem,
@@ -408,9 +418,10 @@ class ServerRunner {
   /// Readies a runner that will not call [start] — a helper isolate behind
   /// a server another isolate started: subscribe the streams and bind the
   /// fast path, so the first dealt request finds everything in place.
-  void prepareHelper() {
+  void prepareHelper({bool wsCompression = true}) {
     _ensureListening();
     _fast ??= _bindFast();
+    _wsCompression = wsCompression;
   }
 
   /// The fast path needs a real engine instance behind [_native]; a fake
@@ -911,9 +922,20 @@ class ServerRunner {
     RequestContext handshake,
     WsHandler handler,
   ) {
-    final session = _WsSessionImpl(connectionId, handshake, _native, () {
-      _wsSessions.remove(connectionId);
-    });
+    final offered =
+        handshake
+            .header('sec-websocket-extensions')
+            ?.contains('permessage-deflate') ??
+        false;
+    final session = _WsSessionImpl(
+      connectionId,
+      handshake,
+      _native,
+      _wsCompression && offered,
+      () {
+        _wsSessions.remove(connectionId);
+      },
+    );
     _wsSessions[connectionId] = session;
     _wsOpened.add(connectionId);
     Future<void>.sync(() => handler(session)).then(
@@ -932,12 +954,31 @@ class ServerRunner {
     if (session == null) return; // Stale: already acked above, bytes dropped.
     if (message.kind == 8) {
       session._remoteClose(message.aux);
-    } else if (message.kind == 1) {
-      // Re-decode from the copy: the view died with the ack above, and the
-      // engine validated UTF-8 before emitting.
-      session._add(WsMessage.text(utf8.decode(copy)));
+      return;
+    }
+    // aux == 1: a permessage-deflate payload (no context takeover), one
+    // independent raw-deflate stream per message.
+    final Uint8List bytes;
+    if (message.aux == 1) {
+      try {
+        bytes = wsInflate(copy);
+      } on Object {
+        session._closeLocal(1007); // Undecodable: invalid frame payload.
+        return;
+      }
     } else {
-      session._add(WsMessage.binary(copy));
+      bytes = copy;
+    }
+    if (message.kind == 1) {
+      // Re-decode from the copy: the view died with the ack above. The
+      // engine validated UTF-8 for plain text; inflated text is checked here.
+      try {
+        session._add(WsMessage.text(utf8.decode(bytes)));
+      } on FormatException {
+        session._closeLocal(1007);
+      }
+    } else {
+      session._add(WsMessage.binary(bytes));
     }
   }
 }
@@ -946,7 +987,13 @@ class ServerRunner {
 /// native calls, so every path is safe after close — the engine no-ops
 /// unknown ids and Dart guards re-entrancy with [_done].
 class _WsSessionImpl implements WsSession {
-  _WsSessionImpl(this._id, this._handshake, this._native, this._onDone);
+  _WsSessionImpl(
+    this._id,
+    this._handshake,
+    this._native,
+    this.compressed,
+    this._onDone,
+  );
 
   final int _id;
   final RequestContext _handshake;
@@ -958,6 +1005,12 @@ class _WsSessionImpl implements WsSession {
   int? _closeCode;
 
   @override
+  final bool compressed;
+
+  @override
+  int bufferedBytes = 0;
+
+  @override
   RequestContext get handshake => _handshake;
 
   @override
@@ -967,19 +1020,25 @@ class _WsSessionImpl implements WsSession {
   int? get closeCode => _closeCode;
 
   @override
-  void sendText(String text) {
-    if (_done) return;
-    try {
-      _native.wsSend(_id, wsTextBytes(text), false);
-    } catch (_) {}
-  }
+  int sendText(String text) => _send(wsTextBytes(text), false);
 
   @override
-  void sendBytes(Uint8List bytes) {
-    if (_done) return;
+  int sendBytes(Uint8List bytes) => _send(bytes, true);
+
+  int _send(Uint8List payload, bool binary) {
+    if (_done) return -1;
+    final deflate = compressed && payload.length >= WsSession.compressThreshold;
     try {
-      _native.wsSend(_id, bytes, true);
-    } catch (_) {}
+      bufferedBytes = _native.wsSend(
+        _id,
+        deflate ? wsDeflate(payload) : payload,
+        binary,
+        deflate,
+      );
+    } catch (_) {
+      bufferedBytes = -1;
+    }
+    return bufferedBytes;
   }
 
   @override

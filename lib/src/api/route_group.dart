@@ -59,6 +59,7 @@ class RouteGroup {
     String customMethod = '',
     List<Middleware>? middleware,
     bool streamBody = false,
+    int? maxBodyBytes,
   }) async {
     await server.route(
       method,
@@ -68,6 +69,7 @@ class RouteGroup {
       customMethod: customMethod,
       middleware: [..._middleware, ...?middleware],
       streamBody: streamBody,
+      maxBodyBytes: maxBodyBytes,
     );
     return this;
   }
@@ -118,6 +120,7 @@ class RouteGroup {
     Duration? timeout,
     List<Middleware>? middleware,
     bool streamBody = false,
+    int? maxBodyBytes,
   }) => route(
     HttpMethod.post,
     pattern,
@@ -125,6 +128,7 @@ class RouteGroup {
     timeout: timeout,
     middleware: middleware,
     streamBody: streamBody,
+    maxBodyBytes: maxBodyBytes,
   );
 
   Future<RouteGroup> put(
@@ -133,6 +137,7 @@ class RouteGroup {
     Duration? timeout,
     List<Middleware>? middleware,
     bool streamBody = false,
+    int? maxBodyBytes,
   }) => route(
     HttpMethod.put,
     pattern,
@@ -140,6 +145,7 @@ class RouteGroup {
     timeout: timeout,
     middleware: middleware,
     streamBody: streamBody,
+    maxBodyBytes: maxBodyBytes,
   );
 
   Future<RouteGroup> delete(
@@ -161,6 +167,7 @@ class RouteGroup {
     Duration? timeout,
     List<Middleware>? middleware,
     bool streamBody = false,
+    int? maxBodyBytes,
   }) => route(
     HttpMethod.patch,
     pattern,
@@ -168,6 +175,7 @@ class RouteGroup {
     timeout: timeout,
     middleware: middleware,
     streamBody: streamBody,
+    maxBodyBytes: maxBodyBytes,
   );
 
   Future<RouteGroup> options(

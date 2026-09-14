@@ -71,10 +71,11 @@ int pollFd(Fd fd, short events, int timeoutMs) {
 }
 /// Polls the socket AND the worker's wake socket. [outFd]/[outWake] report
 /// readiness; returns false on poll error.
-bool pollTwo(Fd fd, Fd wake, int timeoutMs, bool& outFd, bool& outWake) {
+bool pollTwo(Fd fd, Fd wake, int timeoutMs, bool& outFd, bool& outWake,
+             bool wantWrite = false) {
   WSAPOLLFD p[2]{};
   p[0].fd = fd;
-  p[0].events = POLLIN;
+  p[0].events = wantWrite ? (POLLIN | POLLOUT) : POLLIN;
   p[1].fd = wake;
   p[1].events = POLLIN;
   const int r = WSAPoll(p, 2, timeoutMs);
@@ -187,10 +188,11 @@ int pollFd(Fd fd, short events, int timeoutMs) {
   } while (r < 0 && errno == EINTR);
   return r > 0 ? p.revents : r;
 }
-bool pollTwo(Fd fd, Fd wake, int timeoutMs, bool& outFd, bool& outWake) {
+bool pollTwo(Fd fd, Fd wake, int timeoutMs, bool& outFd, bool& outWake,
+             bool wantWrite = false) {
   struct pollfd p[2]{};
   p[0].fd = fd;
-  p[0].events = POLLIN;
+  p[0].events = wantWrite ? (POLLIN | POLLOUT) : POLLIN;
   p[1].fd = wake;
   p[1].events = POLLIN;
   int r;
@@ -572,10 +574,11 @@ StatusResult ServerInstance::registerRoute(Method method,
                                            const std::string& customMethod,
                                            const std::string& pattern,
                                            int64_t timeoutMs,
-                                           bool isWebSocket, bool streamBody) {
+                                           bool isWebSocket, bool streamBody,
+                                           int64_t maxBodyBytes) {
   std::unique_lock lk(configMutex_);
   RouteEntry e{method, customMethod, pattern, timeoutMs, isWebSocket,
-               streamBody};
+               streamBody, maxBodyBytes};
   if (!router_.add(e)) {
     return {ErrorKind::BadRequest,
             "invalid route pattern (want '/a/:b' with optional trailing '/*'): " +
@@ -685,6 +688,9 @@ StatusResult ServerInstance::start() {
   } else {
     boundPort_.store(cfg.port);
   }
+  // The accept loop polls, so a drain can sweep the backlog before the
+  // listener closes and stop() never waits on a blocked accept.
+  setNonBlocking(fd, true);
   listenFd_ = (int)fd;
 
   // A worker is pinned to its connection for the whole handler wait, so
@@ -761,15 +767,18 @@ void ServerInstance::stop() {
 
 void ServerInstance::beginDrain() {
   if (!running_.load() || draining_.exchange(true)) return;
-  // Closing the listener ends the accept loop; workers keep serving what
-  // was accepted, and every answer from now on says `Connection: close`.
+  // The accept loop notices `draining_`, sweeps whatever the kernel already
+  // queued (those clients completed a handshake and would otherwise be
+  // reset), then exits; only then does the listener close. Workers keep
+  // serving, and every answer from now on says `Connection: close`.
+  {
+    std::lock_guard<std::mutex> lk(acceptMutex_);
+    if (acceptThread_.joinable()) acceptThread_.join();
+  }
   if (listenFd_ != -1) {
-    shutdownRdwr((Fd)listenFd_);
     closeFd((Fd)listenFd_);
     listenFd_ = -1;
   }
-  std::lock_guard<std::mutex> lk(acceptMutex_);
-  if (acceptThread_.joinable()) acceptThread_.join();
 }
 
 int64_t ServerInstance::inFlightRequests() { return (int64_t)pending_.size(); }
@@ -997,51 +1006,58 @@ void ServerInstance::acceptLoop() {
     maxConn = config_.maxConnections;
     maxPerIp = config_.maxConnectionsPerIp;
   }
+  // Accepts everything the kernel holds right now. Returns false when the
+  // listener is gone.
+  auto sweep = [&]() -> bool {
+    while (true) {
+      sockaddr_storage peer{};
+      socklen_t len = sizeof(peer);
+      Fd fd = accept((Fd)listenFd_, (sockaddr*)&peer, &len);
+      if (fd == kBadFd) return wouldBlock();
+      setNoSigPipe(fd);
+      setNonBlocking(fd, true);
+      // Limits at the door: cheaper than any later stage, and the only
+      // place a per-peer cap can be enforced before a worker is spent.
+      {
+        std::lock_guard<std::mutex> lk(activeMutex_);
+        const std::string ip = peerAddress(peer);
+        const auto it = perPeer_.find(ip);
+        const int64_t fromPeer = it == perPeer_.end() ? 0 : it->second;
+        if ((maxConn > 0 && liveConnections_.load() >= maxConn) ||
+            (maxPerIp > 0 && fromPeer >= maxPerIp)) {
+          closeFd(fd);
+          continue;
+        }
+        perPeer_[ip] = fromPeer + 1;
+        peerOf_[(int)fd] = ip;
+        liveConnections_++;
+      }
+      {
+        std::lock_guard<std::mutex> lk(queueMutex_);
+        if ((int64_t)queue_.size() >= maxQueued) {
+          // Refuse fast: an accept loop that outruns its workers must shed
+          // load at the door, not queue it until every client times out.
+          closeFd(fd);
+          std::lock_guard<std::mutex> alk(activeMutex_);
+          releasePeerLocked((int)fd);
+          continue;
+        }
+        queue_.push_back((int)fd);
+        // More waiting than idle hands: grow the pool (bounded by the cap).
+        if (queue_.size() > idleWorkers_ && workerCount_ < workerCap_) {
+          spawnWorkerLocked();
+        }
+      }
+      queueCv_.notify_one();
+    }
+  };
   while (running_.load() && !draining_.load()) {
-    sockaddr_storage peer{};
-    socklen_t len = sizeof(peer);
-    Fd fd = accept((Fd)listenFd_, (sockaddr*)&peer, &len);
-    if (fd == kBadFd) {
-      if (running_.load() && !draining_.load())
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-      continue;
-    }
-    setNoSigPipe(fd);
-    setNonBlocking(fd, true);
-    // Limits at the door: cheaper than any later stage, and the only place
-    // a per-peer cap can be enforced before a worker is spent on it.
-    {
-      std::lock_guard<std::mutex> lk(activeMutex_);
-      const std::string ip = peerAddress(peer);
-      const auto it = perPeer_.find(ip);
-      const int64_t fromPeer = it == perPeer_.end() ? 0 : it->second;
-      if ((maxConn > 0 && liveConnections_.load() >= maxConn) ||
-          (maxPerIp > 0 && fromPeer >= maxPerIp)) {
-        closeFd(fd);
-        continue;
-      }
-      perPeer_[ip] = fromPeer + 1;
-      peerOf_[(int)fd] = ip;
-      liveConnections_++;
-    }
-    {
-      std::lock_guard<std::mutex> lk(queueMutex_);
-      if ((int64_t)queue_.size() >= maxQueued) {
-        // Refuse fast: a accept loop that outruns its workers must shed load
-        // at the door, not queue it until every client times out.
-        closeFd(fd);
-        std::lock_guard<std::mutex> alk(activeMutex_);
-        releasePeerLocked((int)fd);
-        continue;
-      }
-      queue_.push_back((int)fd);
-      // More waiting than idle hands: grow the pool (bounded by the cap).
-      if (queue_.size() > idleWorkers_ && workerCount_ < workerCap_) {
-        spawnWorkerLocked();
-      }
-    }
-    queueCv_.notify_one();
+    // A bounded poll keeps the loop responsive to stop()/drain without a
+    // wake pipe of its own; a closed listener errors out and re-checks.
+    const int ev = pollFd((Fd)listenFd_, POLLIN, 100);
+    if (ev > 0 && !sweep()) break;
   }
+  if (running_.load() && draining_.load()) sweep();  // Nothing queued is lost.
 }
 
 bool ServerInstance::spawnWorkerLocked() {
@@ -1316,6 +1332,7 @@ bool ServerInstance::awaitAnswer(int fd, const Wake& wake,
   const auto start = std::chrono::steady_clock::now();
   const int64_t idleMs =
       cfg.keepAliveTimeoutMs > 0 ? cfg.keepAliveTimeoutMs : 5000;
+  const int64_t writeMs = cfg.writeTimeoutMs > 0 ? cfg.writeTimeoutMs : 30000;
   // Input already waiting (a pipelined request in `carry`, or bytes that
   // land while the answer is in flight): the socket cannot wake us for it,
   // so the answering thread must — `workerWaiting` asks for that poke.
@@ -1390,15 +1407,15 @@ bool ServerInstance::awaitAnswer(int fd, const Wake& wake,
                                "ms");
       }
       if (!isHead && !body.empty()) head.append((const char*)body.data(), body.size());
-      sendAll(fd, (const uint8_t*)head.data(), head.size(), idleMs);
+      sendAll(fd, (const uint8_t*)head.data(), head.size(), writeMs);
       return false;
     }
     if (hasTail) {
-      flushTail(fd, req, idleMs);
+      flushTail(fd, req, writeMs);
       continue;
     }
     if (hasFile) {
-      sendFile(fd, req, idleMs);
+      sendFile(fd, req, writeMs);
       continue;
     }
     // ── Park ───────────────────────────────────────────────────────────
@@ -1504,7 +1521,8 @@ bool ServerInstance::serveOne(int fd, const Wake& wake, std::string& carry,
   // socket to the frame loop. Anything else on such a route (plain GET,
   // wrong version, missing key) is answered directly — never dispatched.
   if (m.route.isWebSocket) {
-    return serveUpgrade(fd, carry, bodyStart, head, m, cfg, path, query);
+    return serveUpgrade(fd, wake, carry, bodyStart, head, m, cfg, path,
+                        query);
   }
 
   // A handshake aimed at a plain HTTP route: refuse honestly (RFC 6455
@@ -1519,6 +1537,8 @@ bool ServerInstance::serveOne(int fd, const Wake& wake, std::string& carry,
 
   const int64_t timeoutMs =
       m.route.timeoutMs >= 0 ? m.route.timeoutMs : cfg.defaultTimeoutMs;
+  const int64_t maxBody =
+      m.route.maxBodyBytes >= 0 ? m.route.maxBodyBytes : cfg.maxBodyBytes;
   const int64_t requestId = nextRequestId();
   auto req = pending_.create(requestId);
   // Deal this request to one runner: every message it produces — error
@@ -1562,7 +1582,7 @@ bool ServerInstance::serveOne(int fd, const Wake& wake, std::string& carry,
     return false;
   }
   const bool hasBody = chunked || contentLength > 0;
-  if (!chunked && contentLength > cfg.maxBodyBytes) {
+  if (!chunked && contentLength > maxBody) {
     emitTerminalError(emitter, requestId, "request body exceeds maxBodyBytes",
                       ErrorKind::RequestTooLarge);
     answerDirectly(fd, head.method, 413, "content too large");
@@ -1612,7 +1632,7 @@ bool ServerInstance::serveOne(int fd, const Wake& wake, std::string& carry,
         const ssize_t n = recvWait(sock, buf, sizeof(buf), idleMs);
         if (n <= 0) return false;
         carry.append(buf, (size_t)n);
-        if (carry.size() > (size_t)cfg.maxBodyBytes + 1024) return false;
+        if (carry.size() > (size_t)maxBody + 1024) return false;
       }
       return true;
     };
@@ -1652,7 +1672,7 @@ bool ServerInstance::serveOne(int fd, const Wake& wake, std::string& carry,
         done = trailersOk;
         break;
       }
-      if (chunkSize < 0 || received + chunkSize > cfg.maxBodyBytes) {
+      if (chunkSize < 0 || received + chunkSize > maxBody) {
         tooLarge = true;
         break;
       }
@@ -1750,30 +1770,12 @@ bool ServerInstance::serveOne(int fd, const Wake& wake, std::string& carry,
   return again;
 }
 
-// ── WebSocket (RFC 6455) ─────────────────────────────────────────────────
+// ── WebSocket (RFC 6455, permessage-deflate RFC 7692) ────────────────────
 
-/// Blocking exact read. Returns false on EOF, error or (pre-upgrade only)
-/// timeout — the frame loop disables the receive timeout, so a false there
-/// means the peer went away or stop() interrupted the read.
-bool wsRecvAll(int fd, uint8_t* dst, size_t n) {
-  const Fd sock = (Fd)fd;
-  size_t got = 0;
-  while (got < n) {
-    const size_t want = std::min(n - got, (size_t)65536);
-#ifdef _WIN32
-    const int r = recv(sock, (char*)dst + got, (int)want, 0);
-#else
-    const ssize_t r = recv(sock, dst + got, want, 0);
-#endif
-    if (r <= 0) return false;
-    got += (size_t)r;
-  }
-  return true;
-}
-
-bool ServerInstance::serveUpgrade(int fd, const std::string& carry,
-                                  size_t bodyStart, const ParsedHead& head,
-                                  const MatchResult& m, const ServerConfig& cfg,
+bool ServerInstance::serveUpgrade(int fd, const Wake& wake,
+                                  const std::string& carry, size_t bodyStart,
+                                  const ParsedHead& head, const MatchResult& m,
+                                  const ServerConfig& cfg,
                                   const std::string& path,
                                   const std::string& query) {
   // Surplus bytes after the head cannot be a handshake (handshakes carry no
@@ -1800,27 +1802,45 @@ bool ServerInstance::serveUpgrade(int fd, const std::string& carry,
     answerDirectly(fd, head.method, 400, "missing sec-websocket-key");
     return false;
   }
+  // permessage-deflate, no context takeover either way: every message is
+  // an independent raw-deflate stream, so neither side keeps a window
+  // between messages and the Dart side inflates each one on its own.
+  const Header* ext = findHeader(head.headers, "sec-websocket-extensions");
+  const bool deflate =
+      cfg.wsCompression && ext && icontains(ext->value, "permessage-deflate");
 
-  // The frame loop is blocking code: undo the accept-time O_NONBLOCK.
-  setNonBlocking((Fd)fd, false);
   const std::string accept = ws::acceptKey(clientKey);
-  const std::string shake =
+  std::string shake =
       "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
       "Connection: Upgrade\r\nSec-WebSocket-Accept: " +
-      accept + "\r\n\r\n";
-  if (!sendAll(fd, (const uint8_t*)shake.data(), shake.size())) return false;
+      accept + "\r\n";
+  if (deflate) {
+    shake += "Sec-WebSocket-Extensions: permessage-deflate; "
+             "server_no_context_takeover; client_no_context_takeover\r\n";
+  }
+  shake += "\r\n";
+  const int64_t writeMs = cfg.writeTimeoutMs > 0 ? cfg.writeTimeoutMs : 30000;
+  if (!sendAll(fd, (const uint8_t*)shake.data(), shake.size(), writeMs)) {
+    return false;
+  }
 
   const int64_t connectionId = nextRequestId();
-  Emitter* emitter = nextEmitter();
+  auto conn = std::make_shared<WsConn>();
+  conn->fd = fd;
+  conn->emitter = nextEmitter();
+  conn->wakeFd = wake.w;
+  conn->deflate = deflate;
+  conn->maxBuffer = cfg.wsMaxBufferBytes > 0 ? cfg.wsMaxBufferBytes : (1 << 20);
   {
     std::lock_guard<std::mutex> lk(wsMutex_);
-    ws_[connectionId] = WsConn{fd, emitter};
+    ws_[connectionId] = conn;
   }
   // The session opens through normal head dispatch, so Dart sees the
   // handshake's pattern, params, query and headers like any request.
-  emitter->emitHead(connectionId, head.method, head.customMethod, path, query,
-                    head.headers, 0, false, true, m.route.pattern, m.params);
-  wsLoop(fd, connectionId, cfg.maxBodyBytes, emitter);
+  conn->emitter->emitHead(connectionId, head.method, head.customMethod, path,
+                          query, head.headers, 0, false, true,
+                          m.route.pattern, m.params);
+  wsLoop(fd, wake, conn, connectionId, cfg.maxBodyBytes, writeMs);
   {
     std::lock_guard<std::mutex> lk(wsMutex_);
     ws_.erase(connectionId);
@@ -1829,14 +1849,68 @@ bool ServerInstance::serveUpgrade(int fd, const std::string& carry,
   return false;  // Upgraded connections never serve HTTP again.
 }
 
-bool ServerInstance::wsSendFrame(int fd, int opcode, const uint8_t* payload,
-                                 size_t n) {
-  std::vector<uint8_t> frame;
-  frame.reserve(n + 10);
-  ws::encodeFrame(opcode, payload == nullptr ? (const uint8_t*)"" : payload,
-                  n, true, frame);
-  std::lock_guard<std::mutex> lk(wsSendMutex_);
-  return sendAll(fd, frame.data(), frame.size());
+int64_t ServerInstance::wsQueueWrite(const std::shared_ptr<WsConn>& conn,
+                                     const uint8_t* data, size_t n) {
+  std::lock_guard<std::mutex> lk(conn->mutex);
+  if (conn->closing || conn->failed || conn->overflow) return -1;
+  size_t off = 0;
+  if (conn->outbound.empty() && !conn->flushing) {
+    // Nothing ahead of these bytes: write what the socket takes right now.
+    while (off < n) {
+      const uint8_t* bufs[1] = {data + off};
+      const size_t lens[1] = {n - off};
+      const ssize_t r = writeSome((Fd)conn->fd, bufs, lens, 1);
+      if (r < 0) {
+        conn->failed = true;
+        poke((Fd)conn->wakeFd);
+        return -1;
+      }
+      if (r == 0) break;
+      off += (size_t)r;
+    }
+  }
+  if (off < n) {
+    if ((int64_t)(conn->outbound.size() + (n - off)) > conn->maxBuffer) {
+      conn->overflow = true;  // The loop closes with 1009.
+      poke((Fd)conn->wakeFd);
+      return -1;
+    }
+    conn->outbound.append((const char*)data + off, n - off);
+    poke((Fd)conn->wakeFd);  // The loop arms POLLOUT and flushes.
+  }
+  return (int64_t)conn->outbound.size();
+}
+
+bool ServerInstance::wsFlush(const std::shared_ptr<WsConn>& conn) {
+  std::string chunk;
+  {
+    std::lock_guard<std::mutex> lk(conn->mutex);
+    if (conn->outbound.empty()) return true;
+    chunk.swap(conn->outbound);
+    conn->flushing = true;
+  }
+  size_t off = 0;
+  bool ok = true;
+  while (off < chunk.size()) {
+    const uint8_t* bufs[1] = {(const uint8_t*)chunk.data() + off};
+    const size_t lens[1] = {chunk.size() - off};
+    const ssize_t r = writeSome((Fd)conn->fd, bufs, lens, 1);
+    if (r < 0) {
+      ok = false;
+      break;
+    }
+    if (r == 0) break;
+    off += (size_t)r;
+  }
+  std::lock_guard<std::mutex> lk(conn->mutex);
+  conn->flushing = false;
+  if (!ok) {
+    conn->failed = true;
+    return false;
+  }
+  // The unsent remainder goes back in front of whatever was queued since.
+  if (off < chunk.size()) conn->outbound.insert(0, chunk, off, std::string::npos);
+  return true;
 }
 
 void ServerInstance::emitWs(Emitter* emitter, int64_t connectionId,
@@ -1852,206 +1926,240 @@ void ServerInstance::emitWs(Emitter* emitter, int64_t connectionId,
   emitter->emitWsMessage(connectionId, payload, n, opcode, code);
 }
 
-void ServerInstance::wsSend(int64_t connectionId, const uint8_t* payload,
-                            size_t n, bool binary) {
-  int fd = -1;
+int64_t ServerInstance::wsSend(int64_t connectionId, const uint8_t* payload,
+                               size_t n, bool binary, bool compressed) {
+  std::shared_ptr<WsConn> conn;
   {
     std::lock_guard<std::mutex> lk(wsMutex_);
     auto it = ws_.find(connectionId);
-    if (it == ws_.end()) return;  // Unknown or reaped: no-op by design.
-    fd = it->second.fd;
+    if (it == ws_.end()) return -1;  // Unknown or reaped: no-op by design.
+    conn = it->second;
   }
-  // Synchronous write under the send mutex: bridge memory is never retained,
-  // so no copy is needed. On failure the loop's next read observes the dead
-  // peer (or stop() already did) — reap stays single-owned by the loop.
-  if (!wsSendFrame(fd, binary ? ws::kBinary : ws::kText, payload, n)) {
-    shutdownRdwr((Fd)fd);
-  }
+  std::vector<uint8_t> frame;
+  frame.reserve(n + 10);
+  ws::encodeFrame(binary ? ws::kBinary : ws::kText,
+                  payload == nullptr ? (const uint8_t*)"" : payload, n, true,
+                  frame);
+  if (compressed && conn->deflate) frame[0] |= 0x40;  // RSV1
+  return wsQueueWrite(conn, frame.data(), frame.size());
 }
 
 void ServerInstance::wsClose(int64_t connectionId, int code) {
-  int fd = -1;
+  std::shared_ptr<WsConn> conn;
   {
     std::lock_guard<std::mutex> lk(wsMutex_);
     auto it = ws_.find(connectionId);
     if (it == ws_.end()) return;  // Unknown or reaped: no-op by design.
-    fd = it->second.fd;
+    conn = it->second;
     ws_.erase(it);
   }
   uint8_t payload[2] = {(uint8_t)((code >> 8) & 0xff), (uint8_t)(code & 0xff)};
-  wsSendFrame(fd, ws::kClose, payload, 2);
-  // Do not wait for the peer's echo: unblock the loop now so no worker can
-  // park on a client that never answers.
-  shutdownRdwr((Fd)fd);
+  std::vector<uint8_t> frame;
+  ws::encodeFrame(ws::kClose, payload, 2, true, frame);
+  wsQueueWrite(conn, frame.data(), frame.size());
+  {
+    std::lock_guard<std::mutex> lk(conn->mutex);
+    conn->closing = true;
+  }
+  // The loop flushes what it can and shuts the socket down: never wait
+  // for a peer's echo here, this is the Dart thread.
+  poke((Fd)conn->wakeFd);
 }
 
-void ServerInstance::wsLoop(int fd, int64_t connectionId,
-                            int64_t maxMessageBytes, Emitter* emitter) {
+void ServerInstance::wsLoop(int fd, const Wake& wake,
+                            const std::shared_ptr<WsConn>& conn,
+                            int64_t connectionId, int64_t maxMessageBytes,
+                            int64_t writeTimeoutMs) {
   const Fd sock = (Fd)fd;
-  // Sessions live indefinitely: drop the HTTP idle deadline. stop() still
-  // interrupts via shutdown on the (tracked) fd.
-#ifdef _WIN32
-  DWORD noTimeout = 0;
-  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&noTimeout,
-             sizeof(noTimeout));
-#else
-  struct timeval noTimeout{};
-  noTimeout.tv_sec = 0;
-  noTimeout.tv_usec = 0;
-  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &noTimeout, sizeof(noTimeout));
-#endif
-
   std::vector<uint8_t> msg;
   int msgOpcode = -1;
+  bool msgCompressed = false;
   int closeCode = 1006;  // Abnormal closure unless the peer says otherwise.
   bool peerClosed = false;
   bool failed = false;
 
+  auto sendControl = [&](int opcode, const uint8_t* p, size_t n) {
+    std::vector<uint8_t> frame;
+    ws::encodeFrame(opcode, p == nullptr ? (const uint8_t*)"" : p, n, true,
+                    frame);
+    wsQueueWrite(conn, frame.data(), frame.size());
+  };
   auto protocolError = [&](int code) {
-    uint8_t payload[2] = {(uint8_t)((code >> 8) & 0xff),
-                           (uint8_t)(code & 0xff)};
-    wsSendFrame(fd, ws::kClose, payload, 2);
+    uint8_t p[2] = {(uint8_t)((code >> 8) & 0xff), (uint8_t)(code & 0xff)};
+    sendControl(ws::kClose, p, 2);
     closeCode = code;  // Dart sees what the peer already holds.
     failed = true;
   };
 
   std::vector<uint8_t> net;
   net.reserve(8192);
-  uint8_t tmp[4096];
+  uint8_t tmp[16384];
+  bool stalled = false;
+  std::chrono::steady_clock::time_point stalledSince{};
+
   while (!failed && !peerClosed) {
-    // Grow the buffer until a full header parses. parseHeader cannot tell
-    // "need more" from "malformed", so validate the fixed prefix first:
-    // RSV/opcode are decided by the first two bytes alone.
-    ws::FrameHeader h;
-    bool haveHeader = false;
-    // Pipelined frames coalesce in `net`: attempt the parse on buffered
-    // bytes BEFORE blocking in recv, or the loop waits for bytes it holds.
-    while (!haveHeader && !failed && !peerClosed) {
-      if (net.size() >= 2) {
-        const uint8_t b0 = net[0];
-        const int opcode = b0 & 0x0f;
-        if ((b0 & 0x70) || (opcode != 0x0 && opcode != 0x1 &&
-                            opcode != 0x2 && opcode != 0x8 &&
-                            opcode != 0x9 && opcode != 0xA)) {
-          protocolError(1002);
-          break;
-        }
-        // Header length is fixed by the length marker + mask flag: decide
-        // on exactly that many bytes, then parse strictly.
-        size_t need = 2;
-        const uint8_t marker = net[1] & 0x7f;
-        if (marker == 126) {
-          need = 4;
-        } else if (marker == 127) {
-          need = 10;
-        }
-        if (net[1] & 0x80) need += 4;
-        if (net.size() >= need) {
-          if (ws::parseHeader(net.data(), need, h)) {
-            haveHeader = true;
-          } else {
-            protocolError(1002);  // Complete yet invalid.
-          }
-          break;
-        }
+    // ── 1. Every complete frame in the buffer ─────────────────────────
+    while (!failed && !peerClosed && net.size() >= 2) {
+      const uint8_t b0 = net[0];
+      const int opcode = b0 & 0x0f;
+      size_t need = 2;
+      const uint8_t marker = net[1] & 0x7f;
+      if (marker == 126) {
+        need = 4;
+      } else if (marker == 127) {
+        need = 10;
       }
-#ifdef _WIN32
-      const int r = recv(sock, (char*)tmp, sizeof(tmp), 0);
-#else
-      const ssize_t r = recv(sock, (char*)tmp, sizeof(tmp), 0);
-#endif
-      if (r <= 0) {
-        failed = true;
-        break;
-      }
-      net.insert(net.end(), tmp, tmp + r);
-    }
-    if (!haveHeader) break;
-    net.erase(net.begin(), net.begin() + (ptrdiff_t)h.headerSize);
-
-    // Clients MUST mask (RFC 6455 §5.3): an unmasked frame is a protocol
-    // error, answered before reading its body.
-    if (!h.masked) {
-      protocolError(1002);
-      break;
-    }
-    // Cap by declared length before buffering the body.
-    if (!ws::isControl(h.opcode) &&
-        h.length > (uint64_t)maxMessageBytes) {
-      protocolError(1009);
-      break;
-    }
-    // The payload may already sit in `net` (coalesced segment): consume
-    // buffered bytes first so the socket read cannot block on held bytes —
-    // and leave any pipelined frames for the next iteration.
-    std::vector<uint8_t> payload;
-    payload.reserve((size_t)std::min<uint64_t>(h.length, 65536));
-    const size_t buffered =
-        std::min(net.size(), (size_t)h.length);
-    payload.insert(payload.end(), net.begin(),
-                   net.begin() + (ptrdiff_t)buffered);
-    net.erase(net.begin(), net.begin() + (ptrdiff_t)buffered);
-    payload.resize((size_t)h.length);
-    if (h.length > buffered &&
-        !wsRecvAll(fd, payload.data() + buffered, (size_t)h.length - buffered)) {
-      failed = true;
-      break;
-    }
-    for (size_t i = 0; i < payload.size(); i++) {
-      payload[i] ^= h.mask[i % 4];
-    }
-
-    if (ws::isControl(h.opcode)) {
-      if (h.opcode == ws::kPing) {
-        wsSendFrame(fd, ws::kPong, payload.data(), payload.size());
-      } else if (h.opcode == ws::kClose) {
-        if (payload.size() >= 2) {
-          closeCode = ((int)payload[0] << 8) | payload[1];
-        } else {
-          closeCode = 1000;
-        }
-        // Echo the close (RFC 6455 §5.5.1) and leave HTTP-forbidden land.
-        wsSendFrame(fd, ws::kClose, payload.data(), payload.size());
-        peerClosed = true;
-      }
-      // Pongs and unknown control frames (unreachable: parse rejects them)
-      // are ignored.
-      continue;
-    }
-
-    if (h.opcode == ws::kContinuation) {
-      if (msgOpcode < 0) {
+      if (net[1] & 0x80) need += 4;
+      if (net.size() < need) break;
+      ws::FrameHeader h;
+      if (!ws::parseHeader(net.data(), need, h, conn->deflate)) {
         protocolError(1002);
         break;
       }
-      msg.insert(msg.end(), payload.begin(), payload.end());
-    } else {
-      if (msgOpcode >= 0) {
-        protocolError(1002);  // New message before the previous FIN.
+      // Clients MUST mask (RFC 6455 §5.3).
+      if (!h.masked) {
+        protocolError(1002);
         break;
       }
-      msgOpcode = h.opcode;
-      msg = std::move(payload);
+      if (!ws::isControl(opcode) && h.length > (uint64_t)maxMessageBytes) {
+        protocolError(1009);
+        break;
+      }
+      const size_t frameLen = h.headerSize + (size_t)h.length;
+      if (net.size() < frameLen) break;  // The rest is still in flight.
+      uint8_t* payload = net.data() + h.headerSize;
+      for (size_t i = 0; i < h.length; i++) payload[i] ^= h.mask[i % 4];
+
+      if (ws::isControl(h.opcode)) {
+        if (h.opcode == ws::kPing) {
+          sendControl(ws::kPong, payload, (size_t)h.length);
+        } else if (h.opcode == ws::kClose) {
+          closeCode = h.length >= 2 ? (((int)payload[0] << 8) | payload[1])
+                                    : 1000;
+          // Echo the close (RFC 6455 §5.5.1) and leave.
+          sendControl(ws::kClose, payload, (size_t)h.length);
+          peerClosed = true;
+        }
+        // Pongs are ignored.
+      } else if (h.opcode == ws::kContinuation) {
+        if (msgOpcode < 0) {
+          protocolError(1002);
+          break;
+        }
+        msg.insert(msg.end(), payload, payload + h.length);
+      } else {
+        if (msgOpcode >= 0) {
+          protocolError(1002);  // New message before the previous FIN.
+          break;
+        }
+        msgOpcode = h.opcode;
+        msgCompressed = h.rsv1;
+        msg.assign(payload, payload + h.length);
+      }
+      if (!ws::isControl(h.opcode)) {
+        if ((int64_t)msg.size() > maxMessageBytes) {
+          protocolError(1009);
+          break;
+        }
+        if (h.fin) {
+          // Compressed text is validated after inflating, on the Dart side.
+          if (msgOpcode == ws::kText && !msgCompressed &&
+              !ws::validUtf8(msg.data(), msg.size())) {
+            protocolError(1007);
+            break;
+          }
+          emitWs(conn->emitter, connectionId, msgOpcode, msg.data(),
+                 msg.size(), msgCompressed ? 1 : 0);
+          msg.clear();
+          msgOpcode = -1;
+          msgCompressed = false;
+        }
+      }
+      net.erase(net.begin(), net.begin() + (ptrdiff_t)frameLen);
     }
-    if ((int64_t)msg.size() > maxMessageBytes) {
+    if (failed || peerClosed) break;
+
+    // ── 2. Queued sends, local close, overflow ────────────────────────
+    bool wantWrite, closing, overflow, writeFailed;
+    {
+      std::lock_guard<std::mutex> lk(conn->mutex);
+      wantWrite = !conn->outbound.empty();
+      closing = conn->closing;
+      overflow = conn->overflow;
+      writeFailed = conn->failed;
+    }
+    if (writeFailed) {
+      failed = true;
+      break;
+    }
+    if (overflow) {
+      // Drop the backlog the peer never drained; the close frame is small
+      // enough to leave directly.
+      {
+        std::lock_guard<std::mutex> lk(conn->mutex);
+        conn->outbound.clear();
+        conn->overflow = false;
+      }
       protocolError(1009);
       break;
     }
-    if (h.fin) {
-      if (msgOpcode == ws::kText && !ws::validUtf8(msg.data(), msg.size())) {
-        protocolError(1007);
+    if (wantWrite) {
+      if (!wsFlush(conn)) {
+        failed = true;
         break;
       }
-      emitWs(emitter, connectionId, msgOpcode, msg.data(), msg.size(), 0);
-      msg.clear();
-      msgOpcode = -1;
+      std::lock_guard<std::mutex> lk(conn->mutex);
+      wantWrite = !conn->outbound.empty();
+    }
+    if (closing) {
+      closeCode = 1000;
+      peerClosed = true;  // Local close: the frame went out (best effort).
+      break;
+    }
+    if (wantWrite) {
+      if (!stalled) {
+        stalled = true;
+        stalledSince = std::chrono::steady_clock::now();
+      } else if (msSince(stalledSince) >= writeTimeoutMs) {
+        failed = true;  // The peer stopped reading.
+        break;
+      }
+    } else {
+      stalled = false;
+    }
+
+    // ── 3. Wait for bytes, room to write, or a wake ───────────────────
+    bool fdReady = false, wakeReady = false;
+    const int timeout =
+        wantWrite ? (int)std::min<int64_t>(writeTimeoutMs, INT32_MAX) : -1;
+    if (!pollTwo(sock, (Fd)wake.r, timeout, fdReady, wakeReady, wantWrite)) {
+      failed = true;
+      break;
+    }
+    if (wakeReady) drainWake((Fd)wake.r);
+    if (fdReady) {
+      const ssize_t r = recvSome(sock, tmp, sizeof(tmp));
+      if (r > 0) {
+        net.insert(net.end(), tmp, tmp + r);
+      } else if (r == 0 || !wouldBlock()) {
+        failed = true;  // EOF or error: the peer (or stop()) went away.
+      }
+      // r < 0 && EAGAIN: only POLLOUT fired; the flush above handles it.
     }
   }
 
+  // No more sends land after this; push out a queued close frame if the
+  // socket takes it, then shut down so the peer sees EOF promptly.
+  {
+    std::lock_guard<std::mutex> lk(conn->mutex);
+    conn->closing = true;
+  }
+  wsFlush(conn);
+  shutdownRdwr(sock);
   // Every exit ends with opcode 8 so Dart reaps deterministically: the peer
   // code on a clean close, the sent code on our protocol errors (the peer
   // already holds the matching frame), 1006 on transport failure.
-  emitWs(emitter, connectionId, ws::kClose, nullptr, 0, closeCode);
+  emitWs(conn->emitter, connectionId, ws::kClose, nullptr, 0, closeCode);
 }
 
 }  // namespace nitroserver

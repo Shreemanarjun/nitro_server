@@ -155,6 +155,8 @@ class NitroServer {
   /// inside the server-global chain (see [use]). With [streamBody] the
   /// handler runs as soon as the head is in and reads the body from
   /// [RequestContext.bodyStream] — for uploads too large to assemble.
+  /// [maxBodyBytes] caps this route's request body; null inherits
+  /// [ServerConfig.maxBodyBytes].
   Future<NitroServer> route(
     HttpMethod method,
     String pattern,
@@ -163,6 +165,7 @@ class NitroServer {
     String customMethod = '',
     List<Middleware>? middleware,
     bool streamBody = false,
+    int? maxBodyBytes,
   }) async {
     _requirePattern(pattern);
     if (method == HttpMethod.custom && customMethod.isEmpty) {
@@ -180,6 +183,7 @@ class NitroServer {
       handler,
       middleware ?? const [],
       streamBody,
+      maxBodyBytes,
     );
     return this;
   }
@@ -238,6 +242,7 @@ class NitroServer {
     Duration? timeout,
     List<Middleware>? middleware,
     bool streamBody = false,
+    int? maxBodyBytes,
   }) => route(
     HttpMethod.post,
     pattern,
@@ -245,6 +250,7 @@ class NitroServer {
     timeout: timeout,
     middleware: middleware,
     streamBody: streamBody,
+    maxBodyBytes: maxBodyBytes,
   );
 
   Future<NitroServer> put(
@@ -253,6 +259,7 @@ class NitroServer {
     Duration? timeout,
     List<Middleware>? middleware,
     bool streamBody = false,
+    int? maxBodyBytes,
   }) => route(
     HttpMethod.put,
     pattern,
@@ -260,6 +267,7 @@ class NitroServer {
     timeout: timeout,
     middleware: middleware,
     streamBody: streamBody,
+    maxBodyBytes: maxBodyBytes,
   );
 
   Future<NitroServer> delete(
@@ -281,6 +289,7 @@ class NitroServer {
     Duration? timeout,
     List<Middleware>? middleware,
     bool streamBody = false,
+    int? maxBodyBytes,
   }) => route(
     HttpMethod.patch,
     pattern,
@@ -288,6 +297,7 @@ class NitroServer {
     timeout: timeout,
     middleware: middleware,
     streamBody: streamBody,
+    maxBodyBytes: maxBodyBytes,
   );
 
   Future<NitroServer> options(

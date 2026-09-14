@@ -612,6 +612,142 @@ void main() {
       expect(metrics.byRoute['/m']!.latency.maxUs, greaterThan(0));
     }, skip: skipReason);
 
+    test('permessage-deflate round-trips with dart:io\'s client', () async {
+      server = await NitroServer.bind();
+      await server!.ws('/deflate', (session) async {
+        expect(session.compressed, isTrue);
+        await for (final message in session.messages) {
+          session.sendText('echo:${message.text}');
+        }
+      });
+      final big = 'compressible text ' * 200;
+      final socket = await WebSocket.connect(
+        'ws://127.0.0.1:${server!.port}/deflate',
+        compression: CompressionOptions.compressionDefault,
+      );
+      expect(socket.extensions, contains('permessage-deflate'));
+      socket.add(big);
+      socket.add('tiny');
+      final replies = await socket.take(2).toList();
+      expect(replies, ['echo:$big', 'echo:tiny']);
+      await socket.close();
+    }, skip: skipReason);
+
+    test('wsCompression: false declines the extension', () async {
+      server = await NitroServer.bind(const ServerConfig(wsCompression: false));
+      await server!.ws('/plain', (session) async {
+        expect(session.compressed, isFalse);
+        await for (final m in session.messages) {
+          session.sendText(m.text!);
+        }
+      });
+      final socket = await WebSocket.connect(
+        'ws://127.0.0.1:${server!.port}/plain',
+        compression: CompressionOptions.compressionDefault,
+      );
+      expect(socket.extensions, isNot(contains('permessage-deflate')));
+      socket.add('p');
+      expect(await socket.first, 'p');
+      await socket.close();
+    }, skip: skipReason);
+
+    test('a session over its send buffer is closed with 1009', () async {
+      server = await NitroServer.bind(
+        const ServerConfig(wsMaxBufferBytes: 64 * 1024),
+      );
+      final closed = Completer<int?>();
+      await server!.ws('/flood', (session) async {
+        // The peer never reads: the socket fills, then the queue, then the
+        // engine closes the session. Sends after that report -1.
+        var last = 0;
+        for (var i = 0; i < 400 && last >= 0; i++) {
+          last = session.sendBytes(Uint8List(16 * 1024));
+          await Future<void>.delayed(Duration.zero);
+        }
+        expect(last, -1);
+        await session.messages.drain<void>();
+        closed.complete(session.closeCode);
+      });
+      final raw = await Socket.connect('127.0.0.1', server!.port);
+      raw.add(
+        ascii.encode(
+          'GET /flood HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n'
+          'Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n'
+          'Sec-WebSocket-Version: 13\r\n\r\n',
+        ),
+      );
+      // Read nothing: let the server's send buffer and queue fill.
+      expect(await closed.future.timeout(const Duration(seconds: 10)), 1009);
+      raw.destroy();
+    }, skip: skipReason);
+
+    test('a per-route body cap answers 413 below the server cap', () async {
+      server = await NitroServer.bind();
+      await server!.post(
+        '/small',
+        maxBodyBytes: 100,
+        (r) => ResponseContext.text('${r.body.length}'),
+      );
+      await server!.post(
+        '/big',
+        (r) => ResponseContext.text('${r.body.length}'),
+      );
+      final payload = List.filled(1000, 1);
+      expect(
+        (await _get(
+          server!.port,
+          '/small',
+          method: 'POST',
+          body: payload,
+        )).status,
+        413,
+      );
+      expect(
+        (await _get(server!.port, '/small', method: 'POST', body: [1, 2])).body,
+        '2',
+      );
+      expect(
+        (await _get(server!.port, '/big', method: 'POST', body: payload)).body,
+        '1000',
+      );
+    }, skip: skipReason);
+
+    test('a peer that stops reading is dropped at the write timeout', () async {
+      server = await NitroServer.bind(
+        const ServerConfig(writeTimeout: Duration(milliseconds: 300)),
+      );
+      await server!.get(
+        '/huge',
+        (_) => ResponseContext.bytes(Uint8List(8 * 1024 * 1024)),
+      );
+      final raw = await Socket.connect('127.0.0.1', server!.port);
+      raw.add(ascii.encode('GET /huge HTTP/1.1\r\nHost: x\r\n\r\n'));
+      // Never read: the engine gives up on the stalled write and closes.
+      final started = DateTime.now();
+      await raw
+          .drain<void>()
+          .timeout(const Duration(seconds: 5))
+          .catchError((_) {});
+      expect(DateTime.now().difference(started).inSeconds, lessThan(5));
+      raw.destroy();
+    }, skip: skipReason);
+
+    test('close(drain:) serves a connection still in the backlog', () async {
+      server = await NitroServer.bind();
+      await server!.get('/x', (_) => ResponseContext.text('served'));
+      final port = server!.port;
+      // Connect (kernel handshake completes) and drain at once: the sweep
+      // accepts the queued connection before the listener closes.
+      final raw = await Socket.connect('127.0.0.1', port);
+      final closing = server!.close(drain: const Duration(seconds: 5));
+      raw.add(ascii.encode('GET /x HTTP/1.1\r\nHost: x\r\n\r\n'));
+      final response = await raw.fold<List<int>>([], (b, d) => b..addAll(d));
+      expect(ascii.decode(response), contains('served'));
+      raw.destroy();
+      await closing;
+      server = null;
+    }, skip: skipReason);
+
     test('matches a literal route and echoes the method', () async {
       server = await NitroServer.bind();
       await server!.route(HttpMethod.get, '/hello', (request) async {

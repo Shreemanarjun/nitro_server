@@ -1085,6 +1085,170 @@ TEST(ServerTest, StreamBodyRouteEmitsHeadBeforeChunks) {
   server->stop();
 }
 
+TEST(ServerTest, PerRouteBodyCapOverridesTheServerCap) {
+  Fixture f([](Method, const std::string&, const std::string& body) {
+    return std::make_pair(200, "n=" + std::to_string(body.size()));
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Post, "", "/tiny", -1, false, false, 8).kind,
+            ErrorKind::None);
+  EXPECT_EQ(f.server->registerRoute(Method::Post, "", "/any", -1).kind,
+            ErrorKind::None);
+  const int port = (int)f.startOnEphemeral();
+  auto post = [&](const std::string& path, size_t n) {
+    const int fd = connectTo(port);
+    EXPECT_GE(fd, 0);
+    sendStr(fd, "POST " + path + " HTTP/1.1\r\nHost: x\r\nContent-Length: " +
+                    std::to_string(n) + "\r\nConnection: close\r\n\r\n" +
+                    std::string(n, 'a'));
+    const std::string res = readAll(fd);
+    close(fd);
+    return res;
+  };
+  EXPECT_EQ(statusOf(post("/tiny", 100)), 413);
+  EXPECT_EQ(bodyOf(post("/tiny", 8)), "n=8");
+  EXPECT_EQ(bodyOf(post("/any", 100)), "n=100");
+}
+
+TEST(ServerTest, WriteTimeoutDropsAPeerThatStopsReading) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, std::string(8 * 1024 * 1024, 'z'));
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "/huge", -1).kind,
+            ErrorKind::None);
+  ServerConfig cfg;
+  cfg.port = 0;
+  cfg.writeTimeoutMs = 200;
+  f.server->configure(cfg);
+  ASSERT_EQ((int64_t)f.server->start().kind, (int64_t)ErrorKind::None);
+  const int fd = connectTo((int)f.server->boundPort());
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "GET /huge HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+  // Read nothing; the worker must give up within the deadline (plus slack).
+  const auto t0 = std::chrono::steady_clock::now();
+  EXPECT_TRUE(f.server->waitForDrainForTesting(5000));
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0)
+                      .count();
+  EXPECT_LT(ms, 4000);
+  close(fd);
+}
+
+TEST(ServerTest, DrainSweepsTheKernelBacklog) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "served");
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "/x", -1).kind,
+            ErrorKind::None);
+  const int port = (int)f.startOnEphemeral();
+  // Connect and drain at once: the handshake completed in the kernel but
+  // the accept loop may not have taken it yet. It must not be lost.
+  const int fd = connectTo(port);
+  ASSERT_GE(fd, 0);
+  f.server->beginDrain();
+  sendStr(fd, "GET /x HTTP/1.1\r\nHost: x\r\n\r\n");
+  const std::string res = readAll(fd);
+  EXPECT_EQ(statusOf(res), 200);
+  EXPECT_EQ(bodyOf(res), "served");
+  EXPECT_EQ(headerOf(res, "connection"), "close");
+  close(fd);
+  EXPECT_LT(connectTo(port), 0);
+}
+
+TEST(ServerTest, WsSendQueuesAndOverflowCloses1009) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "unused");
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "/ws", -1, true).kind,
+            ErrorKind::None);
+  ServerConfig cfg;
+  cfg.port = 0;
+  cfg.wsMaxBufferBytes = 64 * 1024;
+  f.server->configure(cfg);
+  ASSERT_EQ((int64_t)f.server->start().kind, (int64_t)ErrorKind::None);
+  const int fd = connectTo((int)f.server->boundPort());
+  ASSERT_GE(fd, 0);
+  sendWsHandshake(fd, "/ws");
+  EXPECT_NE(readHttpHead(fd).find("101"), std::string::npos);
+  ASSERT_TRUE(f.waitForSeen(1));
+  const int64_t id = f.emitter.seen()[0].requestId;
+  // A small send goes straight out: nothing queued.
+  const char* hi = "hi";
+  EXPECT_EQ(f.server->wsSend(id, (const uint8_t*)hi, 2, false, false), 0);
+  std::string payload;
+  EXPECT_EQ(readWsFrame(fd, payload), 0x1);
+  EXPECT_EQ(payload, "hi");
+  // The peer stops reading: sends fill the socket, then the queue, then
+  // the cap trips and the session closes with 1009.
+  std::vector<uint8_t> block(16 * 1024, 'q');
+  int64_t last = 0;
+  for (int i = 0; i < 400 && last >= 0; i++) {
+    last = f.server->wsSend(id, block.data(), block.size(), true, false);
+  }
+  EXPECT_EQ(last, -1);
+  ASSERT_TRUE(f.waitForWsSeen(1));
+  EXPECT_EQ(f.emitter.wsSeen().back().opcode, 8);
+  EXPECT_EQ(f.emitter.wsSeen().back().code, 1009);
+  close(fd);
+}
+
+TEST(ServerTest, WsDeflateNegotiatedAndRsv1Honoured) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "unused");
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "/ws", -1, true).kind,
+            ErrorKind::None);
+  const int port = (int)f.startOnEphemeral();
+  const int fd = connectTo(port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n"
+              "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+              "Sec-WebSocket-Version: 13\r\n"
+              "Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n\r\n");
+  const std::string head = readHttpHead(fd);
+  EXPECT_NE(head.find("101"), std::string::npos);
+  EXPECT_EQ(headerOf(head, "sec-websocket-extensions"),
+            "permessage-deflate; server_no_context_takeover; "
+            "client_no_context_takeover");
+  ASSERT_TRUE(f.waitForSeen(1));
+  const int64_t id = f.emitter.seen()[0].requestId;
+  // An RSV1 data frame is accepted and surfaces with code 1 (compressed).
+  std::string frame;
+  frame.push_back((char)(0x80 | 0x40 | 0x1));
+  frame.push_back((char)(0x80 | 3));
+  const char key[4] = {1, 2, 3, 4};
+  frame.append(key, 4);
+  const char raw[3] = {'\x01', '\x02', '\x03'};
+  for (int i = 0; i < 3; i++) frame.push_back((char)(raw[i] ^ key[i]));
+  sendStr(fd, frame);
+  ASSERT_TRUE(f.waitForWsSeen(1));
+  EXPECT_EQ(f.emitter.wsSeen()[0].opcode, 1);
+  EXPECT_EQ(f.emitter.wsSeen()[0].code, 1);
+  EXPECT_EQ(f.emitter.wsSeen()[0].payload, std::string(raw, 3));
+  // A compressed server send carries RSV1 on the wire.
+  const uint8_t packed[2] = {0x4b, 0x04};
+  EXPECT_EQ(f.server->wsSend(id, packed, 2, false, true), 0);
+  uint8_t hdr[2];
+  ASSERT_TRUE(recvAll(fd, hdr, 2));
+  EXPECT_EQ(hdr[0], 0x80 | 0x40 | 0x1);
+  EXPECT_EQ(hdr[1], 2);
+  uint8_t body[2];
+  ASSERT_TRUE(recvAll(fd, body, 2));
+  close(fd);
+
+  // Without the offer, RSV1 is a protocol error (1002).
+  const int fd2 = connectTo(port);
+  ASSERT_GE(fd2, 0);
+  sendWsHandshake(fd2, "/ws");
+  EXPECT_EQ(headerOf(readHttpHead(fd2), "sec-websocket-extensions"), "");
+  ASSERT_TRUE(f.waitForSeen(2));
+  sendStr(fd2, frame);
+  std::string closePayload;
+  EXPECT_EQ(readWsFrame(fd2, closePayload), 0x8);
+  EXPECT_EQ(closePayload.size(), 2u);
+  EXPECT_EQ((((int)(uint8_t)closePayload[0]) << 8) | (uint8_t)closePayload[1], 1002);
+  close(fd2);
+}
+
 TEST(ServerTest, SecondBindOnSamePortFails) {
   Fixture f([](Method, const std::string&, const std::string&) {
     return std::make_pair(200, "x");
@@ -1384,7 +1548,7 @@ TEST(ServerTest, WsServerSendAndClose) {
 
   // Server-originated frames are never masked.
   const char* hi = "hi";
-  f.server->wsSend(id, (const uint8_t*)hi, 2, false);
+  f.server->wsSend(id, (const uint8_t*)hi, 2, false, false);
   std::string payload;
   EXPECT_EQ(readWsFrame(fd, payload), 0x1);
   EXPECT_EQ(payload, "hi");

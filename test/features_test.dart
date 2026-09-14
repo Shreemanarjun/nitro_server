@@ -473,6 +473,67 @@ void main() {
     });
   });
 
+  group('WebSocket compression and backpressure', () {
+    test('deflate and inflate round-trip, and strip the sync tail', () {
+      final text = Uint8List.fromList(utf8.encode('hello ' * 100));
+      final packed = wsDeflate(text);
+      expect(packed.length, lessThan(text.length));
+      expect(packed.sublist(packed.length - 4), isNot([0, 0, 0xff, 0xff]));
+      expect(wsInflate(packed), text);
+      expect(wsInflate(wsDeflate(Uint8List(0))), isEmpty);
+      expect(
+        () => wsInflate(Uint8List.fromList([0xff, 0xff, 0xff])),
+        throwsA(anything),
+      );
+    });
+
+    test('a session compresses long messages only when negotiated', () async {
+      final seen = <WsMessage>[];
+      await client.server.ws('/c', (session) async {
+        seen.add(await session.messages.first);
+        expect(session.sendText('x' * 1000), 0);
+        expect(session.bufferedBytes, 0);
+        expect(session.sendText('short'), 0);
+        expect(session.compressed, isTrue);
+      });
+      await client.server.ws('/plain', (session) async {
+        expect(session.compressed, isFalse);
+        session.sendText('y' * 1000);
+      });
+      final ws = await client.ws(
+        '/c',
+        headers: {'sec-websocket-extensions': 'permessage-deflate'},
+      );
+      ws.sendText('in');
+      expect((await ws.messages.first).text, 'x' * 1000);
+      await ws.close();
+      final plain = await client.ws('/plain');
+      expect((await plain.messages.first).text, 'y' * 1000);
+      await plain.close();
+      expect(seen.single.text, 'in');
+    });
+
+    test('ServerConfig carries the new limits through copyWith', () {
+      const base = ServerConfig();
+      expect(base.writeTimeout, const Duration(seconds: 30));
+      expect(base.wsMaxBufferBytes, 1024 * 1024);
+      expect(base.wsCompression, isTrue);
+      final c = base.copyWith(
+        writeTimeout: const Duration(seconds: 1),
+        wsMaxBufferBytes: 4096,
+        wsCompression: false,
+      );
+      expect(c.writeTimeout, const Duration(seconds: 1));
+      expect(c.wsMaxBufferBytes, 4096);
+      expect(c.wsCompression, isFalse);
+      expect(c.copyWith(port: 1).wsMaxBufferBytes, 4096);
+      expect(
+        () => ServerConfig(wsMaxBufferBytes: 0),
+        throwsA(isA<AssertionError>()),
+      );
+    });
+  });
+
   group('WsMessage', () {
     test('is sealed with text and binary variants', () {
       const text = WsMessage.text('hi');

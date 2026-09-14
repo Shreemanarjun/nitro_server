@@ -48,8 +48,12 @@ class ServerConfig {
     this.maxConnections = 0,
     this.maxConnectionsPerIp = 0,
     this.headerTimeout = Duration.zero,
+    this.writeTimeout = const Duration(seconds: 30),
+    this.wsMaxBufferBytes = 1024 * 1024,
+    this.wsCompression = true,
     this.tls = const TlsConfig(),
   }) : assert(port >= 0 && port <= 65535, 'port out of range: $port'),
+       assert(wsMaxBufferBytes > 0, 'wsMaxBufferBytes must be positive'),
        assert(isolates >= 0, 'isolates must be non-negative'),
        assert(maxConnections >= 0, 'maxConnections must be non-negative'),
        assert(
@@ -102,12 +106,25 @@ class ServerConfig {
   /// Deadline for a new connection's first request head, the slow-loris
   /// guard. [Duration.zero] means the keep-alive idle timeout applies.
   final Duration headerTimeout;
+
+  /// How long a socket write may make no progress (a peer that stops
+  /// reading) before the connection is dropped. Bounds every response,
+  /// file and WebSocket send.
+  final Duration writeTimeout;
+
+  /// Unsent bytes a WebSocket session may hold before the engine closes it
+  /// with 1009; `WsSession.bufferedBytes` reports the current level.
+  final int wsMaxBufferBytes;
+
+  /// Negotiate `permessage-deflate` when a WebSocket client offers it.
+  final bool wsCompression;
   final TlsConfig tls;
 
   /// A copy with any of [host], [port], [backlog], [maxBodyBytes],
   /// [defaultTimeout], [keepAliveTimeout], [maxRequestsPerConnection],
   /// [workerThreads], [isolates], [maxConnections], [maxConnectionsPerIp],
-  /// [headerTimeout] or [tls] replaced.
+  /// [headerTimeout], [writeTimeout], [wsMaxBufferBytes], [wsCompression]
+  /// or [tls] replaced.
   ServerConfig copyWith({
     String? host,
     int? port,
@@ -121,6 +138,9 @@ class ServerConfig {
     int? maxConnections,
     int? maxConnectionsPerIp,
     Duration? headerTimeout,
+    Duration? writeTimeout,
+    int? wsMaxBufferBytes,
+    bool? wsCompression,
     TlsConfig? tls,
   }) {
     return ServerConfig(
@@ -137,6 +157,9 @@ class ServerConfig {
       maxConnections: maxConnections ?? this.maxConnections,
       maxConnectionsPerIp: maxConnectionsPerIp ?? this.maxConnectionsPerIp,
       headerTimeout: headerTimeout ?? this.headerTimeout,
+      writeTimeout: writeTimeout ?? this.writeTimeout,
+      wsMaxBufferBytes: wsMaxBufferBytes ?? this.wsMaxBufferBytes,
+      wsCompression: wsCompression ?? this.wsCompression,
       tls: tls ?? this.tls,
     );
   }

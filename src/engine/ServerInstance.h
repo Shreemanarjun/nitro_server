@@ -191,6 +191,10 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   void workerLoop();
   void handleConnection(int fd);
   static bool sendAll(int fd, const uint8_t* data, size_t n);
+  /// One chunked-body chunk per call (see serveStream): size line +
+  /// payload + CRLF in a single syscall where the platform allows.
+  static bool sendFrame(int fd, const char* sizeLine, size_t sizeLen,
+                        const uint8_t* payload, size_t n);
 
   /// Fast error path. Always closes: errors never keep alive (see header).
   /// [extra] headers ride ahead of the framing headers (e.g.

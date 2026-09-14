@@ -34,20 +34,25 @@
 // * Warmup before measuring (JIT + connection pools settle), then reports
 //   latency distributions AND throughput, never a single headline number.
 // ignore_for_file: avoid_print
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:benchmark_harness/benchmark_harness.dart';
 import 'package:nitro_server/nitro_server.dart';
-import 'package:shelf/shelf.dart';
+import 'package:shelf/shelf.dart' hide Middleware;
 import 'package:shelf/shelf_io.dart' as shelf_io;
 
 /// Routes served byte-identically by all servers.
 final Map<String, Uint8List> _routes = {
   '/hello': Uint8List.fromList('hello world!'.codeUnits),
   '/json': Uint8List.fromList(
-    jsonEncode({'id': 42, 'name': 'nitro', 'tags': ['a', 'b', 'c']}).codeUnits,
+    jsonEncode({
+      'id': 42,
+      'name': 'nitro',
+      'tags': ['a', 'b', 'c'],
+    }).codeUnits,
   ),
 };
 
@@ -55,37 +60,91 @@ final Uint8List _echoPayload = Uint8List.fromList(
   List<int>.generate(4096, (i) => i & 0xff),
 );
 
+/// 1 MiB upload/download body. Generated, never stored per request.
+final Uint8List _bigPayload = Uint8List.fromList(
+  List<int>.generate(1024 * 1024, (i) => i & 0xff),
+);
+
+/// Streamed events: 20 chunks, same bytes on every side.
+final List<Uint8List> _eventChunks = [
+  for (var i = 0; i < 20; i++) Uint8List.fromList('data: $i\n\n'.codeUnits),
+];
+final int _eventsTotalBytes = _eventChunks.fold(
+  0,
+  (sum, chunk) => sum + chunk.length,
+);
+
+/// When true the servers may keep connections alive (the real-world mode).
+/// Wired by `--keep-alive`; the default stays `Connection: close` so the
+/// handshake cost is identical on all sides.
+bool _keepAlive = false;
+
+String _connHeader() => _keepAlive ? 'keep-alive' : 'close';
+
 // ── Servers ──────────────────────────────────────────────────────────────────
+
+/// Pass-through middleware: one extra async hop around every dart:io
+/// request, mirroring `shelf`'s pipeline and nitro's `use()` below.
+Future<void> _withDartMw(HttpRequest request, Future<void> Function() next) {
+  return next();
+}
 
 Future<HttpServer> _startDartServer() async {
   final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
   server.defaultResponseHeaders.clear();
-  server.listen((request) async {
-    final path = request.uri.path;
-    final response = request.response;
-    response.headers.set('connection', 'close');
-    try {
-      if (request.method == 'POST' && path == '/echo') {
-        final body = await request.fold<BytesBuilder>(
-          BytesBuilder(),
-          (b, d) => b..add(d),
-        );
-        response.headers.contentType = ContentType.binary;
-        response.contentLength = body.length;
-        response.add(body.toBytes());
-      } else if (_routes.containsKey(path)) {
-        final body = _routes[path]!;
-        response.contentLength = body.length;
-        response.add(body);
-      } else {
-        response.statusCode = 404;
-        response.write('not found');
+  server.listen(
+    (request) => _withDartMw(request, () async {
+      final path = request.uri.path;
+      final response = request.response;
+      response.headers.set('connection', _connHeader());
+      try {
+        if (request.method == 'POST' && path == '/echo') {
+          final body = await request.fold<BytesBuilder>(
+            BytesBuilder(),
+            (b, d) => b..add(d),
+          );
+          response.headers.contentType = ContentType.binary;
+          response.contentLength = body.length;
+          response.add(body.toBytes());
+        } else if (request.method == 'GET' && path == '/events') {
+          response.headers.contentType = ContentType('text', 'event-stream');
+          for (final chunk in _eventChunks) {
+            response.add(chunk);
+            await response.flush();
+          }
+        } else if (request.method == 'GET' && path.startsWith('/users/')) {
+          final id = path.substring('/users/'.length);
+          final body = Uint8List.fromList('user $id'.codeUnits);
+          response.contentLength = body.length;
+          response.add(body);
+        } else if (request.method == 'GET' && path.startsWith('/files/')) {
+          final body = Uint8List.fromList('wild:$path'.codeUnits);
+          response.contentLength = body.length;
+          response.add(body);
+        } else if (request.method == 'GET' && path == '/q') {
+          final body = Uint8List.fromList(
+            jsonEncode(request.uri.queryParameters).codeUnits,
+          );
+          response.contentLength = body.length;
+          response.add(body);
+        } else if (request.method == 'GET' && path == '/mw') {
+          final body = _routes['/hello']!;
+          response.contentLength = body.length;
+          response.add(body);
+        } else if (_routes.containsKey(path)) {
+          final body = _routes[path]!;
+          response.contentLength = body.length;
+          response.add(body);
+        } else {
+          response.statusCode = 404;
+          response.write('not found');
+        }
+      } catch (_) {
+        response.statusCode = 500;
       }
-    } catch (_) {
-      response.statusCode = 500;
-    }
-    await response.close();
-  });
+      await response.close();
+    }),
+  );
   return server;
 }
 
@@ -95,17 +154,50 @@ Response _shelfHandler(Request request) {
     // covers GETs, so POST is handled in [_startShelfServer]'s wrapper.
     throw StateError('unreachable');
   }
-  final body = _routes['/${request.url.path}'];
+  final path = '/${request.url.path}';
+  Uint8List? body;
+  if (request.method == 'GET' && path == '/events') {
+    return Response.ok(
+      Stream.fromIterable(_eventChunks),
+      headers: {
+        'connection': _connHeader(),
+        'content-type': 'text/event-stream',
+      },
+    );
+  } else if (request.method == 'GET' && path.startsWith('/users/')) {
+    body = Uint8List.fromList(
+      'user ${path.substring('/users/'.length)}'.codeUnits,
+    );
+  } else if (request.method == 'GET' && path.startsWith('/files/')) {
+    body = Uint8List.fromList('wild:$path'.codeUnits);
+  } else if (request.method == 'GET' && path == '/q') {
+    body = Uint8List.fromList(
+      jsonEncode(request.url.queryParameters).codeUnits,
+    );
+  } else if (request.method == 'GET' && path == '/mw') {
+    body = _routes['/hello'];
+  } else {
+    body = _routes[path];
+  }
   if (body == null) {
     return Response.notFound(
       'not found',
-      headers: {'connection': 'close'},
+      headers: {'connection': _connHeader()},
     );
   }
   return Response.ok(
     body,
-    headers: {'connection': 'close', 'content-type': 'text/plain'},
+    headers: {'connection': _connHeader(), 'content-type': 'text/plain'},
   );
+}
+
+/// One pass-through layer, like the other sides. Typed without shelf's
+/// `Middleware` typedef (hidden: it collides with nitro's) — this identical
+/// shape satisfies `Pipeline.addMiddleware` all the same.
+FutureOr<Response> Function(Request) _shelfMw(
+  FutureOr<Response> Function(Request) inner,
+) {
+  return (request) => inner(request);
 }
 
 Future<HttpServer> _startShelfServer() async {
@@ -118,7 +210,7 @@ Future<HttpServer> _startShelfServer() async {
       return Response.ok(
         builder.toBytes(),
         headers: {
-          'connection': 'close',
+          'connection': _connHeader(),
           'content-type': 'application/octet-stream',
         },
       );
@@ -126,8 +218,9 @@ Future<HttpServer> _startShelfServer() async {
     return _shelfHandler(request);
   }
 
+  final pipeline = const Pipeline().addMiddleware(_shelfMw).addHandler(handler);
   final server = await shelf_io.serve(
-    handler,
+    pipeline,
     InternetAddress.loopbackIPv4,
     0,
   );
@@ -136,19 +229,41 @@ Future<HttpServer> _startShelfServer() async {
 }
 
 Future<NitroServer> _startNitroServer() async {
-  // `Duration.zero` disables keep-alive: every response carries
-  // `Connection: close`, matching the dart:io and shelf servers below.
-  // (The engine default enables keep-alive, which `HttpClient` pools — a
-  // pooled reuse racing a server-side close measures pool luck, not servers.)
+  // Without `--keep-alive` every response carries `Connection: close`,
+  // matching the dart:io and shelf servers below. (The engine default
+  // enables keep-alive, which `HttpClient` pools — a pooled reuse racing a
+  // server-side close measures pool luck, not servers.)
   final server = await NitroServer.bind(
-    const ServerConfig(keepAliveTimeout: Duration.zero),
+    _keepAlive
+        ? const ServerConfig()
+        : const ServerConfig(keepAliveTimeout: Duration.zero),
   );
+  // One pass-through middleware, like the other sides.
+  await server.use((request, next) => next(request));
   for (final entry in _routes.entries) {
     final body = entry.value;
     await server.get(entry.key, (_) async {
       return ResponseContext.bytes(body);
     });
   }
+  await server.get('/users/:id', (request) async {
+    return ResponseContext.text('user ${request.param('id')}');
+  });
+  await server.get('/files/*', (request) async {
+    return ResponseContext.text('wild:${request.path}');
+  });
+  await server.get('/q', (request) async {
+    return ResponseContext.jsonMap(request.queryParameters);
+  });
+  await server.get('/mw', (_) async {
+    return ResponseContext.bytes(_routes['/hello']!);
+  });
+  await server.get('/events', (_) async {
+    return ResponseContext.stream(
+      Stream.fromIterable(_eventChunks),
+      headers: {'content-type': 'text/event-stream'},
+    );
+  });
   await server.post('/echo', (request) async {
     return ResponseContext.bytes(request.body);
   });
@@ -164,13 +279,17 @@ Future<int> _get(HttpClient client, int port, String path) async {
   final response = await request.close();
   await response.drain<void>();
   stopwatch.stop();
-  if (response.statusCode != 200) throw StateError('got ${response.statusCode}');
+  if (response.statusCode != 200) {
+    throw StateError('got ${response.statusCode}');
+  }
   return stopwatch.elapsedMicroseconds;
 }
 
 Future<int> _postEcho(HttpClient client, int port) async {
   final stopwatch = Stopwatch()..start();
-  final request = await client.postUrl(Uri.parse('http://127.0.0.1:$port/echo'));
+  final request = await client.postUrl(
+    Uri.parse('http://127.0.0.1:$port/echo'),
+  );
   request.add(_echoPayload);
   final response = await request.close();
   var received = 0;
@@ -184,10 +303,83 @@ Future<int> _postEcho(HttpClient client, int port) async {
   return stopwatch.elapsedMicroseconds;
 }
 
+/// One measured GET with an exact body expectation. Returns microseconds.
+Future<int> _getExpect(
+  HttpClient client,
+  int port,
+  String path,
+  List<int> expected,
+) async {
+  final stopwatch = Stopwatch()..start();
+  final request = await client.getUrl(Uri.parse('http://127.0.0.1:$port$path'));
+  final response = await request.close();
+  final builder = await response.fold<BytesBuilder>(
+    BytesBuilder(),
+    (b, d) => b..add(d),
+  );
+  stopwatch.stop();
+  final body = builder.toBytes();
+  if (response.statusCode != 200 || !_equals(body, expected)) {
+    throw StateError('GET $path mismatch: ${response.statusCode}');
+  }
+  return stopwatch.elapsedMicroseconds;
+}
+
+bool _equals(List<int> a, List<int> b) {
+  if (a.length != b.length) return false;
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) return false;
+  }
+  return true;
+}
+
+/// One measured POST echo of [payload] bytes. Returns microseconds.
+Future<int> _postEchoSized(
+  HttpClient client,
+  int port,
+  Uint8List payload,
+) async {
+  final stopwatch = Stopwatch()..start();
+  final request = await client.postUrl(
+    Uri.parse('http://127.0.0.1:$port/echo'),
+  );
+  request.add(payload);
+  final response = await request.close();
+  var received = 0;
+  await for (final chunk in response) {
+    received += chunk.length;
+  }
+  stopwatch.stop();
+  if (response.statusCode != 200 || received != payload.length) {
+    throw StateError('echo mismatch: ${response.statusCode}/$received');
+  }
+  return stopwatch.elapsedMicroseconds;
+}
+
+/// One measured SSE drain: same event bytes on every side.
+Future<int> _getEvents(HttpClient client, int port) async {
+  final stopwatch = Stopwatch()..start();
+  final request = await client.getUrl(
+    Uri.parse('http://127.0.0.1:$port/events'),
+  );
+  final response = await request.close();
+  final builder = await response.fold<BytesBuilder>(
+    BytesBuilder(),
+    (b, d) => b..add(d),
+  );
+  stopwatch.stop();
+  final body = builder.toBytes();
+  if (response.statusCode != 200 || body.length != _eventsTotalBytes) {
+    throw StateError('events mismatch: ${response.statusCode}/${body.length}');
+  }
+  return stopwatch.elapsedMicroseconds;
+}
+
 Map<String, double> _summarize(List<int> samplesUs) {
   final sorted = [...samplesUs]..sort();
   double pct(double p) =>
-      sorted[(sorted.length * p).clamp(0, sorted.length - 1).toInt()].toDouble();
+      sorted[(sorted.length * p).clamp(0, sorted.length - 1).toInt()]
+          .toDouble();
   final mean = sorted.reduce((a, b) => a + b) / sorted.length;
   return {'mean': mean, 'p50': pct(0.5), 'p99': pct(0.99)};
 }
@@ -248,7 +440,7 @@ String _vmMode() {
   return isJit ? 'JIT' : 'AOT';
 }
 
-Future<String> _phase(
+Future<({String row, Map<String, Object?> json})> _phase(
   String label,
   int port,
   Future<int> Function(HttpClient, int) op, {
@@ -279,15 +471,29 @@ Future<String> _phase(
   final rps = concurrentTotal / stopwatch.elapsedMicroseconds * 1e6;
 
   // Standard harness line, then the table row.
-  print('$label(RunTime): ${meanUs.toStringAsFixed(4)} us. '
-      '(n=${benchmark.samplesUs.length})');
-  return '| $label | ${meanUs.toStringAsFixed(0)} | '
-      '${lat['p50']!.toStringAsFixed(0)} | ${lat['p99']!.toStringAsFixed(0)} | '
-      '${rps.toStringAsFixed(0)} |';
+  print(
+    '$label(RunTime): ${meanUs.toStringAsFixed(4)} us. '
+    '(n=${benchmark.samplesUs.length})',
+  );
+  return (
+    row:
+        '| $label | ${meanUs.toStringAsFixed(0)} | '
+        '${lat['p50']!.toStringAsFixed(0)} | ${lat['p99']!.toStringAsFixed(0)} | '
+        '${rps.toStringAsFixed(0)} |',
+    json: {
+      'case': label,
+      'mean_us': double.parse(meanUs.toStringAsFixed(1)),
+      'p50_us': lat['p50'],
+      'p99_us': lat['p99'],
+      'req_per_s': double.parse(rps.toStringAsFixed(1)),
+      'n': benchmark.samplesUs.length,
+    },
+  );
 }
 
 Future<void> main(List<String> args) async {
   final quick = args.contains('--quick');
+  _keepAlive = args.contains('--keep-alive');
   const concurrency = 32;
   final concurrentTotal = quick ? 800 : 4000;
   final rounds = quick ? 1 : 2;
@@ -301,19 +507,36 @@ Future<void> main(List<String> args) async {
   if (dylibIdx != -1 && dylibIdx + 1 < args.length) {
     dylibFlag = args[dylibIdx + 1];
   }
+  String? jsonPath;
+  final jsonIdx = args.indexOf('--json');
+  if (jsonIdx != -1 && jsonIdx + 1 < args.length) {
+    jsonPath = args[jsonIdx + 1];
+  }
   final loadedFrom = loadNitroServerNative(path: dylibFlag);
   final mode = _vmMode();
-  print('nitro_server vs shelf vs dart:io HttpServer — same routes, same driver');
-  print('(mode: $mode; native library: $loadedFrom'
-      '${quick ? '; --quick' : ''})');
+  print(
+    'nitro_server vs shelf vs dart:io HttpServer — same routes, same driver',
+  );
+  print(
+    '(mode: $mode; native library: $loadedFrom'
+    '${quick ? '; --quick' : ''}${_keepAlive ? '; --keep-alive' : ''})',
+  );
   print('');
-  print('Latency via package:benchmark_harness (AsyncBenchmarkBase, ~2 s '
-      'exercise per case); throughput via a custom $concurrency-worker sweep.');
+  print(
+    'Latency via package:benchmark_harness (AsyncBenchmarkBase, ~2 s '
+    'exercise per case); throughput via a custom $concurrency-worker sweep.',
+  );
   print('');
 
   final dartServer = await _startDartServer();
   final shelfServer = await _startShelfServer();
   final nitroServer = await _startNitroServer();
+
+  final queryExpected = Uint8List.fromList(
+    jsonEncode({'a': '1', 'b': 'two'}).codeUnits,
+  );
+  final paramExpected = Uint8List.fromList('user 42'.codeUnits);
+  final wildExpected = Uint8List.fromList('wild:/files/a/b/c'.codeUnits);
 
   final cases = <(String, Future<int> Function(HttpClient, int), int)>[
     ('dart:io /hello', (c, p) => _get(c, p, '/hello'), dartServer.port),
@@ -322,30 +545,113 @@ Future<void> main(List<String> args) async {
     ('dart:io /json', (c, p) => _get(c, p, '/json'), dartServer.port),
     ('shelf   /json', (c, p) => _get(c, p, '/json'), shelfServer.port),
     ('nitro   /json', (c, p) => _get(c, p, '/json'), nitroServer.port),
+    (
+      'dart:io /users/:id',
+      (c, p) => _getExpect(c, p, '/users/42', paramExpected),
+      dartServer.port,
+    ),
+    (
+      'shelf   /users/:id',
+      (c, p) => _getExpect(c, p, '/users/42', paramExpected),
+      shelfServer.port,
+    ),
+    (
+      'nitro   /users/:id',
+      (c, p) => _getExpect(c, p, '/users/42', paramExpected),
+      nitroServer.port,
+    ),
+    (
+      'dart:io /files/*',
+      (c, p) => _getExpect(c, p, '/files/a/b/c', wildExpected),
+      dartServer.port,
+    ),
+    (
+      'shelf   /files/*',
+      (c, p) => _getExpect(c, p, '/files/a/b/c', wildExpected),
+      shelfServer.port,
+    ),
+    (
+      'nitro   /files/*',
+      (c, p) => _getExpect(c, p, '/files/a/b/c', wildExpected),
+      nitroServer.port,
+    ),
+    (
+      'dart:io /q?a=1&b=two',
+      (c, p) => _getExpect(c, p, '/q?a=1&b=two', queryExpected),
+      dartServer.port,
+    ),
+    (
+      'shelf   /q?a=1&b=two',
+      (c, p) => _getExpect(c, p, '/q?a=1&b=two', queryExpected),
+      shelfServer.port,
+    ),
+    (
+      'nitro   /q?a=1&b=two',
+      (c, p) => _getExpect(c, p, '/q?a=1&b=two', queryExpected),
+      nitroServer.port,
+    ),
+    ('dart:io /mw', (c, p) => _get(c, p, '/mw'), dartServer.port),
+    ('shelf   /mw', (c, p) => _get(c, p, '/mw'), shelfServer.port),
+    ('nitro   /mw', (c, p) => _get(c, p, '/mw'), nitroServer.port),
     ('dart:io POST /echo 4k', _postEcho, dartServer.port),
     ('shelf   POST /echo 4k', _postEcho, shelfServer.port),
     ('nitro   POST /echo 4k', _postEcho, nitroServer.port),
+    (
+      'dart:io POST /echo 1m',
+      (c, p) => _postEchoSized(c, p, _bigPayload),
+      dartServer.port,
+    ),
+    (
+      'shelf   POST /echo 1m',
+      (c, p) => _postEchoSized(c, p, _bigPayload),
+      shelfServer.port,
+    ),
+    (
+      'nitro   POST /echo 1m',
+      (c, p) => _postEchoSized(c, p, _bigPayload),
+      nitroServer.port,
+    ),
+    ('dart:io GET /events', _getEvents, dartServer.port),
+    ('shelf   GET /events', _getEvents, shelfServer.port),
+    ('nitro   GET /events', _getEvents, nitroServer.port),
   ];
 
+  final jsonCases = <Map<String, Object?>>[];
   // Interleaved A/B/C so machine drift cannot favor one side.
   for (var round = 0; round < rounds; round++) {
     print('| case | mean µs | p50 µs | p99 µs | req/s @32 |');
     print('| ---- | ------- | ------ | ------ | --------- |');
     for (final (label, op, port) in cases) {
-      print(await _phase(
+      final result = await _phase(
         label,
         port,
         op,
         concurrency: concurrency,
         concurrentTotal: concurrentTotal,
-      ));
+      );
+      print(result.row);
+      if (round == rounds - 1) jsonCases.add(result.json);
     }
     print('');
+  }
+
+  if (jsonPath != null) {
+    File(jsonPath).writeAsStringSync(
+      jsonEncode({
+        'mode': mode,
+        'keep_alive': _keepAlive,
+        'quick': quick,
+        'cases': jsonCases,
+      }),
+    );
+    print('wrote $jsonPath');
   }
 
   await dartServer.close(force: true);
   await shelfServer.close(force: true);
   await nitroServer.close();
-  print('Concurrent: $concurrentTotal requests across $concurrency workers '
-      '(throughput). Sequential latency: harness 2 s exercise per case.');
+  print(
+    'Concurrent: $concurrentTotal requests across $concurrency workers '
+    '(throughput). Sequential latency: harness 2 s exercise per case.',
+  );
 }

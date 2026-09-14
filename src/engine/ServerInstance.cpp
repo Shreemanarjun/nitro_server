@@ -539,6 +539,55 @@ bool ServerInstance::sendAll(int fd, const uint8_t* data, size_t n) {
   return true;
 }
 
+/// Sends one chunked-body chunk — size line, payload, CRLF — in a single
+/// syscall where the platform allows (POSIX writev); small chunks coalesce
+/// into one send on Windows, large ones keep the three-send path where the
+/// copy would cost more than the syscalls.
+bool ServerInstance::sendFrame(int fd, const char* sizeLine, size_t sizeLen,
+                               const uint8_t* payload, size_t n) {
+#ifdef _WIN32
+  static constexpr size_t kCoalesceLimit = 128 * 1024;
+  if (sizeLen + n + 2 <= kCoalesceLimit) {
+    std::string buf;
+    buf.reserve(sizeLen + n + 2);
+    buf.append(sizeLine, sizeLen);
+    buf.append((const char*)payload, n);
+    buf.append("\r\n");
+    return sendAll(fd, (const uint8_t*)buf.data(), buf.size());
+  }
+  return sendAll(fd, (const uint8_t*)sizeLine, sizeLen) &&
+         sendAll(fd, payload, n) &&
+         sendAll(fd, (const uint8_t*)"\r\n", 2);
+#else
+  struct iovec iov[3];
+  iov[0].iov_base = (void*)sizeLine;
+  iov[0].iov_len = sizeLen;
+  iov[1].iov_base = (void*)payload;
+  iov[1].iov_len = n;
+  static const char kCrlf[] = "\r\n";
+  iov[2].iov_base = (void*)kCrlf;
+  iov[2].iov_len = 2;
+  size_t done = 0;
+  const size_t total = sizeLen + n + 2;
+  int base = 0;
+  while (done < total) {
+    const ssize_t r = writev(fd, iov + base, 3 - base);
+    if (r <= 0) return false;
+    done += (size_t)r;
+    ssize_t left = r;
+    while (base < 3 && left >= (ssize_t)iov[base].iov_len) {
+      left -= (ssize_t)iov[base].iov_len;
+      base++;
+    }
+    if (base < 3 && left > 0) {
+      iov[base].iov_base = (char*)iov[base].iov_base + left;
+      iov[base].iov_len -= (size_t)left;
+    }
+  }
+  return true;
+#endif
+}
+
 void ServerInstance::answerDirectly(int fd, Method method, int64_t status,
                                     const std::string& body,
                                     const std::vector<Header>& extra) {
@@ -1015,13 +1064,15 @@ bool ServerInstance::serveStream(int fd, int64_t requestId, Method method,
     }
     if (dead) break;
     if (!chunk.empty()) {
+      // One syscall per chunk: size line + payload + CRLF ride a single
+      // writev (POSIX) instead of three sends. Twenty 8-byte SSE events
+      // cost 20 syscalls this way, not 60 — the benchmark's /events case
+      // measures exactly this shape.
       char sizeLine[32];
       const int sizeLen =
           snprintf(sizeLine, sizeof(sizeLine), "%zx\r\n", chunk.size());
-      if (sizeLen <= 0 ||
-          !sendAll(sock, (const uint8_t*)sizeLine, (size_t)sizeLen) ||
-          !sendAll(sock, chunk.data(), chunk.size()) ||
-          !sendAll(sock, (const uint8_t*)"\r\n", 2)) {
+      if (sizeLen <= 0 || !sendFrame(sock, sizeLine, (size_t)sizeLen,
+                                     chunk.data(), chunk.size())) {
         dead = true;
       }
     } else if (terminal) {

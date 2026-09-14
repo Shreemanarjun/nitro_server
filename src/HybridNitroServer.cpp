@@ -114,6 +114,19 @@ class BridgeEmitter final : public Emitter {
     bridge_->emit_bodyChunks(chunk);
   }
 
+  void emitWsMessage(int64_t connectionId, uint8_t* payload, size_t n,
+                     int opcode, int code) override {
+    // Same ownership as body chunks: tracked by ServerInstance, freed by
+    // the runner's cumulative ackBody(connectionId, …).
+    RawWsMessage msg;
+    msg.payload = payload;
+    msg.payloadLength = (int64_t)n;
+    msg.connectionId = connectionId;
+    msg.kind = opcode;
+    msg.aux = code;
+    bridge_->emit_wsMessages(msg);
+  }
+
   void emitEvent(ServerEventKind kind, int64_t requestId,
                  const std::string& message) override {
     RawServerEvent ev;
@@ -166,7 +179,7 @@ class HybridNitroServerImpl final : public HybridNitroServerNative {
     const RawRouteConfig raw = RawRouteConfig::fromNative(route);
     return toStatus(server_->registerRoute(
         static_cast<Method>(raw.method), raw.customMethod, raw.pattern,
-        raw.timeoutMs)).toNativeBuffer();
+        raw.timeoutMs, raw.isWebSocket)).toNativeBuffer();
   }
 
   NitroCppBuffer unregisterRoute(const std::string& method,
@@ -216,6 +229,17 @@ class HybridNitroServerImpl final : public HybridNitroServerNative {
                        size_t chunk_length, bool last) override {
     // Deep-copy happens in the engine call: the arena dies on return.
     server_->sendStreamChunk(requestId, chunk, chunk_length, last);
+  }
+
+  void wsSend(int64_t connectionId, const uint8_t* payload,
+              size_t payload_length, bool binary) override {
+    // Synchronous socket write in the engine call: nothing is retained, so
+    // no copy is needed — the arena outlives the call.
+    server_->wsSend(connectionId, payload, payload_length, binary);
+  }
+
+  void wsClose(int64_t connectionId, int64_t code) override {
+    server_->wsClose(connectionId, (int)code);
   }
 
  private:

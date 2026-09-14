@@ -77,6 +77,94 @@ void sendStr(int fd, const std::string& s) {
   }
 }
 
+/// Receives exactly [n] bytes (false on EOF/error). Tests control both ends,
+// so blocking is fine.
+bool recvAll(int fd, uint8_t* dst, size_t n) {
+  size_t got = 0;
+  while (got < n) {
+    ssize_t r = recv(fd, (char*)dst + got, n - got, 0);
+    if (r <= 0) return false;
+    got += (size_t)r;
+  }
+  return true;
+}
+
+/// Reads until the end of the HTTP head (`\r\n\r\n`).
+std::string readHttpHead(int fd) {
+  std::string out;
+  char buf[1024];
+  while (out.find("\r\n\r\n") == std::string::npos) {
+    ssize_t n = recv(fd, buf, sizeof(buf), 0);
+    if (n <= 0) break;
+    out.append(buf, (size_t)n);
+  }
+  return out;
+}
+
+void sendWsHandshake(int fd, const std::string& path,
+                     const std::string& key = "dGhlIHNhbXBsZSBub25jZQ==",
+                     const std::string& version = "13") {
+  sendStr(fd, "GET " + path + " HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n"
+              "Connection: Upgrade\r\nSec-WebSocket-Key: " +
+              key + "\r\nSec-WebSocket-Version: " + version + "\r\n\r\n");
+}
+
+/// Sends one client frame. Clients MUST mask: pass masked=false only to
+/// prove the server drops unmasked frames.
+void sendWsFrame(int fd, int opcode, const std::string& payload,
+                 bool fin = true, bool masked = true) {
+  std::string out;
+  out.push_back((char)((fin ? 0x80 : 0x00) | opcode));
+  const size_t n = payload.size();
+  const uint8_t maskBit = masked ? 0x80 : 0x00;
+  if (n < 126) {
+    out.push_back((char)(maskBit | n));
+  } else if (n <= 0xffff) {
+    out.push_back((char)(maskBit | 126));
+    out.push_back((char)((n >> 8) & 0xff));
+    out.push_back((char)(n & 0xff));
+  } else {
+    out.push_back((char)(maskBit | 127));
+    for (int i = 7; i >= 0; i--) out.push_back((char)((n >> (8 * i)) & 0xff));
+  }
+  if (masked) {
+    const char key[4] = {0x11, 0x22, 0x33, 0x44};
+    out.append(key, 4);
+    for (size_t i = 0; i < n; i++) out.push_back(payload[i] ^ key[i % 4]);
+  } else {
+    out.append(payload);
+  }
+  sendStr(fd, out);
+}
+
+/// Reads one server frame into [payload]. Returns the opcode, or -1 on EOF.
+int readWsFrame(int fd, std::string& payload, bool* fin = nullptr) {
+  uint8_t hdr[2];
+  if (!recvAll(fd, hdr, 2)) return -1;
+  if (fin != nullptr) *fin = (hdr[0] & 0x80) != 0;
+  const int opcode = hdr[0] & 0x0f;
+  uint64_t len = hdr[1] & 0x7f;
+  if (len == 126) {
+    uint8_t ext[2];
+    if (!recvAll(fd, ext, 2)) return -1;
+    len = ((uint64_t)ext[0] << 8) | ext[1];
+  } else if (len == 127) {
+    uint8_t ext[8];
+    if (!recvAll(fd, ext, 8)) return -1;
+    len = 0;
+    for (int i = 0; i < 8; i++) len = (len << 8) | ext[i];
+  }
+  if (hdr[1] & 0x80) {  // Servers never mask; drain defensively.
+    uint8_t mask[4];
+    if (!recvAll(fd, mask, 4)) return -1;
+  }
+  payload.assign(len, '\0');
+  if (len > 0 && !recvAll(fd, (uint8_t*)payload.data(), (size_t)len)) {
+    return -1;
+  }
+  return opcode;
+}
+
 int statusOf(const std::string& response) {
   // "HTTP/1.1 200 OK\r\n..."
   const size_t sp = response.find(' ');
@@ -155,6 +243,14 @@ class RecordingEmitter : public Emitter {
     std::string body;
   };
 
+  /// One decoded WebSocket event.
+  struct WsSeen {
+    int64_t connectionId = 0;
+    int opcode = 0;
+    int code = 0;
+    std::string payload;
+  };
+
   struct Job {
     int64_t requestId;
     int status;
@@ -202,12 +298,25 @@ class RecordingEmitter : public Emitter {
     seen_.push_back(s);
   }
 
-  void emitBodyError(int64_t requestId, uint8_t*, size_t,
-                     ErrorKind) override {
+  void emitBodyError(int64_t requestId, uint8_t*,
+                     size_t, ErrorKind) override {
     std::lock_guard<std::mutex> lk(mutex_);
     // Terminal for the body: drop the partial so no answer is queued. The
     // engine already answered directly.
     partial_.erase(requestId);
+  }
+
+  void emitWsMessage(int64_t connectionId, uint8_t* payload, size_t n,
+                     int opcode, int code) override {
+    // Payloads stay engine-tracked until stop()'s abortAll reaps them,
+    // exactly like unacked body payloads (see Fixture).
+    std::lock_guard<std::mutex> lk(mutex_);
+    WsSeen s;
+    s.connectionId = connectionId;
+    s.opcode = opcode;
+    s.code = code;
+    if (payload != nullptr && n > 0) s.payload.assign((const char*)payload, n);
+    wsSeen_.push_back(s);
   }
 
   void emitEvent(ServerEventKind kind, int64_t requestId,
@@ -229,6 +338,11 @@ class RecordingEmitter : public Emitter {
     return seen_;
   }
 
+  std::vector<WsSeen> wsSeen() {
+    std::lock_guard<std::mutex> lk(mutex_);
+    return wsSeen_;
+  }
+
   std::vector<std::tuple<int64_t, int64_t, std::string>> events() {
     std::lock_guard<std::mutex> lk(mutex_);
     return events_;
@@ -239,6 +353,7 @@ class RecordingEmitter : public Emitter {
   std::mutex mutex_;
   std::map<int64_t, Seen> partial_;
   std::vector<Seen> seen_;
+  std::vector<WsSeen> wsSeen_;
   std::deque<Job> jobs_;
   std::vector<std::tuple<int64_t, int64_t, std::string>> events_;
 };
@@ -288,6 +403,16 @@ struct Fixture {
     const auto end =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
     while (emitter.seen().size() < n) {
+      if (std::chrono::steady_clock::now() > end) return false;
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return true;
+  }
+
+  bool waitForWsSeen(size_t n, int64_t timeoutMs = 5000) {
+    const auto end =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    while (emitter.wsSeen().size() < n) {
       if (std::chrono::steady_clock::now() > end) return false;
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
@@ -692,6 +817,244 @@ TEST(ServerTest, WebSocketHandshakeIs426WithoutDispatch) {
   EXPECT_EQ(headerOf(res, "sec-websocket-version"), "13");
   EXPECT_EQ(headerOf(res, "connection"), "close");
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_TRUE(f.emitter.seen().empty());
+}
+
+TEST(ServerTest, WsHandshakeUpgradesWithRfcVector) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "unused");
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "/ws", -1, true).kind,
+            ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  // RFC 6455 §1.3 test vector: this key MUST yield this accept.
+  sendWsHandshake(fd, "/ws");
+  const std::string head = readHttpHead(fd);
+  EXPECT_EQ(statusOf(head), 101);
+  EXPECT_EQ(headerOf(head, "sec-websocket-accept"),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+  EXPECT_EQ(headerOf(head, "upgrade"), "websocket");
+
+  // The session opened through normal dispatch, with pattern and path.
+  ASSERT_TRUE(f.waitForSeen(1));
+  ASSERT_EQ(f.emitter.seen().size(), 1u);
+  EXPECT_EQ(f.emitter.seen()[0].routePattern, "/ws");
+  EXPECT_EQ(f.emitter.seen()[0].path, "/ws");
+  close(fd);
+}
+
+TEST(ServerTest, WsUpgradeCarriesParams) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "unused");
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "/rooms/:room", -1, true)
+                .kind,
+            ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendWsHandshake(fd, "/rooms/lobby");
+  EXPECT_EQ(statusOf(readHttpHead(fd)), 101);
+  ASSERT_TRUE(f.waitForSeen(1));
+  ASSERT_EQ(f.emitter.seen().size(), 1u);
+  EXPECT_EQ(f.emitter.seen()[0].routePattern, "/rooms/:room");
+  ASSERT_EQ(f.emitter.seen()[0].params.size(), 1u);
+  EXPECT_EQ(f.emitter.seen()[0].params[0].name, "room");
+  EXPECT_EQ(f.emitter.seen()[0].params[0].value, "lobby");
+  close(fd);
+}
+
+TEST(ServerTest, WsTextMessageDecodedAndCloseEchoed) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "unused");
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "/ws", -1, true).kind,
+            ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendWsHandshake(fd, "/ws");
+  EXPECT_EQ(statusOf(readHttpHead(fd)), 101);
+
+  sendWsFrame(fd, 0x1, "hello");
+  ASSERT_TRUE(f.waitForWsSeen(1));
+  ASSERT_EQ(f.emitter.wsSeen().size(), 1u);
+  EXPECT_EQ(f.emitter.wsSeen()[0].opcode, 1);
+  EXPECT_EQ(f.emitter.wsSeen()[0].payload, "hello");
+
+  // Client close (code 1000): echoed, then the socket closes, then the
+  // terminal opcode-8 lands so Dart reaps deterministically.
+  sendWsFrame(fd, 0x8, std::string("\x03\xe8", 2));
+  std::string payload;
+  EXPECT_EQ(readWsFrame(fd, payload), 0x8);
+  EXPECT_EQ(payload, std::string("\x03\xe8", 2));
+  EXPECT_EQ(readAll(fd), "");
+  close(fd);
+  ASSERT_TRUE(f.waitForWsSeen(2));
+  EXPECT_EQ(f.emitter.wsSeen()[1].opcode, 8);
+  EXPECT_EQ(f.emitter.wsSeen()[1].code, 1000);
+}
+
+TEST(ServerTest, WsFragmentsReassemble) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "unused");
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "/ws", -1, true).kind,
+            ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendWsHandshake(fd, "/ws");
+  EXPECT_EQ(statusOf(readHttpHead(fd)), 101);
+
+  sendWsFrame(fd, 0x1, "hel", false);
+  sendWsFrame(fd, 0x0, "lo", true);
+  ASSERT_TRUE(f.waitForWsSeen(1));
+  ASSERT_EQ(f.emitter.wsSeen().size(), 1u);
+  EXPECT_EQ(f.emitter.wsSeen()[0].opcode, 1);
+  EXPECT_EQ(f.emitter.wsSeen()[0].payload, "hello");
+  close(fd);
+}
+
+TEST(ServerTest, WsPingIsPonged) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "unused");
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "/ws", -1, true).kind,
+            ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendWsHandshake(fd, "/ws");
+  EXPECT_EQ(statusOf(readHttpHead(fd)), 101);
+
+  sendWsFrame(fd, 0x9, "xyz");
+  std::string payload;
+  bool fin = false;
+  EXPECT_EQ(readWsFrame(fd, payload, &fin), 0xA);
+  EXPECT_TRUE(fin);
+  EXPECT_EQ(payload, "xyz");
+  // Pings never surface as messages.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_TRUE(f.emitter.wsSeen().empty());
+  close(fd);
+}
+
+TEST(ServerTest, WsUnmaskedFrameDropsTheConnection) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "unused");
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "/ws", -1, true).kind,
+            ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendWsHandshake(fd, "/ws");
+  EXPECT_EQ(statusOf(readHttpHead(fd)), 101);
+
+  // RFC 6455 §5.3: clients MUST mask. An unmasked frame is a protocol
+  // error — a 1002 close frame goes out, the socket closes, and Dart sees
+  // the sent code (never a message).
+  sendWsFrame(fd, 0x1, "sneaky", true, false);
+  std::string payload;
+  EXPECT_EQ(readWsFrame(fd, payload), 0x8);
+  ASSERT_EQ(payload.size(), 2u);
+  EXPECT_EQ(((int)(uint8_t)payload[0] << 8) | (uint8_t)payload[1], 1002);
+  EXPECT_EQ(readAll(fd), "");
+  close(fd);
+  ASSERT_TRUE(f.waitForWsSeen(1));
+  ASSERT_EQ(f.emitter.wsSeen().size(), 1u);
+  EXPECT_EQ(f.emitter.wsSeen()[0].opcode, 8);
+  EXPECT_EQ(f.emitter.wsSeen()[0].code, 1002);
+}
+
+TEST(ServerTest, WsServerSendAndClose) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "unused");
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "/ws", -1, true).kind,
+            ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendWsHandshake(fd, "/ws");
+  EXPECT_EQ(statusOf(readHttpHead(fd)), 101);
+  ASSERT_TRUE(f.waitForSeen(1));
+  const int64_t id = f.emitter.seen()[0].requestId;
+
+  // Server-originated frames are never masked.
+  const char* hi = "hi";
+  f.server->wsSend(id, (const uint8_t*)hi, 2, false);
+  std::string payload;
+  EXPECT_EQ(readWsFrame(fd, payload), 0x1);
+  EXPECT_EQ(payload, "hi");
+
+  f.server->wsClose(id, 1000);
+  EXPECT_EQ(readWsFrame(fd, payload), 0x8);
+  ASSERT_EQ(payload.size(), 2u);
+  EXPECT_EQ(((int)(uint8_t)payload[0] << 8) | (uint8_t)payload[1], 1000);
+  EXPECT_EQ(readAll(fd), "");
+  close(fd);
+}
+
+TEST(ServerTest, WsWrongVersionIs426) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "unused");
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "/ws", -1, true).kind,
+            ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendWsHandshake(fd, "/ws", "dGhlIHNhbXBsZSBub25jZQ==", "12");
+  const std::string res = readAll(fd);
+  close(fd);
+
+  EXPECT_EQ(statusOf(res), 426);
+  EXPECT_EQ(headerOf(res, "sec-websocket-version"), "13");
+  EXPECT_TRUE(f.emitter.seen().empty());
+}
+
+TEST(ServerTest, WsMissingKeyIs400) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "unused");
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "/ws", -1, true).kind,
+            ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd,
+          "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n"
+          "Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\r\n");
+  EXPECT_EQ(statusOf(readAll(fd)), 400);
+  close(fd);
+}
+
+TEST(ServerTest, WsPlainGetOnWsRouteIs426) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "unused");
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "/ws", -1, true).kind,
+            ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "GET /ws HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+  EXPECT_EQ(statusOf(readAll(fd)), 426);
+  close(fd);
   EXPECT_TRUE(f.emitter.seen().empty());
 }
 

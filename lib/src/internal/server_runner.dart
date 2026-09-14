@@ -21,11 +21,13 @@
 library;
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:typed_data';
 
 import '../api/context.dart';
 import '../api/event.dart';
 import '../api/http_method.dart';
+import '../api/ws.dart';
 import '../nitro_server.native.dart';
 import 'raw_mapping.dart';
 
@@ -133,6 +135,17 @@ class ServerRunner {
   /// so a shutdown server stops forwarding into a dead engine.
   final _outbound = <int, StreamSubscription<Uint8List>>{};
 
+  /// WebSocket routes by pattern. Disjoint from [_routes] for GET: the
+  /// engine holds a single entry per (method, pattern), so registering one
+  /// side evicts the other here too (see [addRoute]/[addWsRoute]).
+  final _wsHandlers = <String, WsHandler>{};
+
+  /// Live WebSocket sessions by connection id.
+  final _wsSessions = <int, _WsSessionImpl>{};
+
+  /// Every WebSocket connection id ever opened (test seam backing).
+  final _wsOpened = <int>{};
+
   /// Answers unmatched requests. Defaults to an empty 404.
   NotFoundHandler _notFoundHandler = (_) => const ResponseContext(status: 404);
 
@@ -162,6 +175,7 @@ class ServerRunner {
   StreamSubscription<RawIncomingRequest>? _heads;
   StreamSubscription<RawBodyChunk>? _chunks;
   StreamSubscription<RawServerEvent>? _serverEvents;
+  StreamSubscription<RawWsMessage>? _wsMessages;
   bool _listening = false;
   bool _closed = false;
 
@@ -170,6 +184,13 @@ class ServerRunner {
 
   /// Test seam: ids with an unfinished request.
   Set<int> get pendingIdsForTesting => {..._pending.keys};
+
+  /// Test seam: ids with a live WebSocket session.
+  Set<int> get wsSessionIdsForTesting => {..._wsSessions.keys};
+
+  /// Test seam: every WebSocket connection id ever opened (sessions remove
+  /// themselves on close, so liveness alone cannot prove an open happened).
+  Set<int> get wsOpenedIdsForTesting => {..._wsOpened};
 
   /// Test seam: subscribes the engine streams without touching native state,
   /// mirroring what `addRoute`/`start` do in production. Needed by tests that
@@ -201,6 +222,10 @@ class ServerRunner {
       _onEvent,
       onError: (_) {},
     );
+    _wsMessages = _native.wsMessages.listen(
+      _onWsMessage,
+      onError: (_) {},
+    );
   }
 
   // ── Route table ────────────────────────────────────────────────────────────
@@ -230,7 +255,10 @@ class ServerRunner {
     final routeComposer = _composeAll(middleware);
     final entry =
         _RouteEntry(handler, routeComposer, _compose(routeComposer(handler)));
-    (_routes[_tokenOf(method, customToken)] ??= {})[pattern] = entry;
+    final token = _tokenOf(method, customToken);
+    (_routes[token] ??= {})[pattern] = entry;
+    // Single-entry mirror of the engine table (see addWsRoute).
+    if (token == 'GET') _wsHandlers.remove(pattern);
   }
 
   /// Appends [middleware] to the chain. Order is registration order: the
@@ -260,6 +288,29 @@ class ServerRunner {
     final status = _native.unregisterRoute(_tokenOf(method, customToken), pattern);
     throwIfFailed(status, operation: 'unregisterRoute($pattern)');
     _routes[_tokenOf(method, customToken)]?.remove(pattern);
+    // The engine holds one entry per (method, pattern) whatever its kind:
+    // removing a GET route removes a WS route on the same pattern too.
+    if (method == HttpMethod.get) _wsHandlers.remove(pattern);
+  }
+
+  /// Registers a WebSocket route: matching handshakes upgrade in-engine and
+  /// [handler] receives the live session. Evicts a GET HTTP route on the
+  /// same pattern (and vice versa in [addRoute]) — the engine holds a
+  /// single entry per (method, pattern).
+  void addWsRoute(String pattern, WsHandler handler) {
+    _ensureListening();
+    final status = _native.registerRoute(
+      RawRouteConfig(
+        method: RawServerMethod.get,
+        customMethod: '',
+        pattern: pattern,
+        timeoutMs: -1,
+        isWebSocket: true,
+      ),
+    );
+    throwIfFailed(status, operation: 'registerRoute($pattern)');
+    _routes['GET']?.remove(pattern);
+    _wsHandlers[pattern] = handler;
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -304,9 +355,14 @@ class ServerRunner {
       await sub.cancel();
     }
     _outbound.clear();
+    for (final session in _wsSessions.values) {
+      session._shutdown();
+    }
+    _wsSessions.clear();
     await _heads?.cancel();
     await _chunks?.cancel();
     await _serverEvents?.cancel();
+    await _wsMessages?.cancel();
     _listening = false;
     await _events.close();
   }
@@ -451,6 +507,11 @@ class ServerRunner {
       body: pending.body.isEmpty ? _emptyBody : pending.body.toBytes(),
     );
     if (entry == null) {
+      final wsHandler = _wsHandlers[head.routePattern];
+      if (wsHandler != null) {
+        _dispatchWs(head.requestId, context, wsHandler);
+        return;
+      }
       _guardedNotFound(context).then((response) {
         _deliver(head.requestId, response);
       });
@@ -585,5 +646,131 @@ class ServerRunner {
     }
     _complete(requestId);
     sub?.cancel();
+  }
+
+  // ── WebSocket sessions ───────────────────────────────────────────────────
+
+  /// Opens the session for an upgraded head and invokes its handler.
+  /// Returning (or throwing) closes the session — `await for`-then-return
+  /// is the whole read loop. A missing handler (unregister race) refuses
+  /// with 1001 instead of leaving a ghost socket.
+  void _dispatchWs(
+    int connectionId,
+    RequestContext handshake,
+    WsHandler handler,
+  ) {
+    final session = _WsSessionImpl(connectionId, handshake, _native, () {
+      _wsSessions.remove(connectionId);
+    });
+    _wsSessions[connectionId] = session;
+    _wsOpened.add(connectionId);
+    Future<void>.sync(() => handler(session)).then(
+      (_) => session._closeLocal(1000),
+      onError: (_) => session._closeLocal(1011),
+    );
+  }
+
+  void _onWsMessage(RawWsMessage message) {
+    if (_closed) return;
+    // Copy FIRST then ack: same zero-copy contract as body chunks, keyed by
+    // the connection id (the engine tracks WS payloads under it).
+    final copy = _copyAndAck(message.connectionId, message.payload);
+    final session = _wsSessions[message.connectionId];
+    if (session == null) return; // Stale: already acked above, bytes dropped.
+    if (message.kind == 8) {
+      session._remoteClose(message.aux);
+    } else if (message.kind == 1) {
+      // Re-decode from the copy: the view died with the ack above, and the
+      // engine validated UTF-8 before emitting.
+      session._add(WsMessage.text(utf8.decode(copy)));
+    } else {
+      session._add(WsMessage.binary(copy));
+    }
+  }
+}
+
+/// Server-side [WsSession]. All sends are fire-and-forget into id-keyed
+/// native calls, so every path is safe after close — the engine no-ops
+/// unknown ids and Dart guards re-entrancy with [_done].
+class _WsSessionImpl implements WsSession {
+  _WsSessionImpl(this._id, this._handshake, this._native, this._onDone);
+
+  final int _id;
+  final RequestContext _handshake;
+  final NitroServerNative _native;
+  final void Function() _onDone;
+
+  final _messages = StreamController<WsMessage>();
+  bool _done = false;
+  int? _closeCode;
+
+  @override
+  RequestContext get handshake => _handshake;
+
+  @override
+  Stream<WsMessage> get messages => _messages.stream;
+
+  @override
+  int? get closeCode => _closeCode;
+
+  @override
+  void sendText(String text) {
+    if (_done) return;
+    try {
+      _native.wsSend(_id, wsTextBytes(text), false);
+    } catch (_) {}
+  }
+
+  @override
+  void sendBytes(Uint8List bytes) {
+    if (_done) return;
+    try {
+      _native.wsSend(_id, bytes, true);
+    } catch (_) {}
+  }
+
+  @override
+  Future<void> close([int code = 1000]) async {
+    _closeLocal(code);
+  }
+
+  void _add(WsMessage message) {
+    if (!_done) _messages.add(message);
+  }
+
+  /// Peer-initiated close: echo the code (a no-op on the reaped engine
+  /// side, but it completes observers like the test client deterministically)
+  /// and finish without further answers.
+  void _remoteClose(int code) {
+    if (_done) return;
+    _done = true;
+    _closeCode = code;
+    try {
+      _native.wsClose(_id, code);
+    } catch (_) {}
+    _messages.close();
+    _onDone();
+  }
+
+  /// Local close (handler return/throw, explicit close, runner shutdown):
+  /// complete the closing handshake unless already done.
+  void _closeLocal(int code) {
+    if (_done) return;
+    _done = true;
+    _closeCode = code;
+    try {
+      _native.wsClose(_id, code);
+    } catch (_) {}
+    _messages.close();
+    _onDone();
+  }
+
+  /// Runner shutdown: same as a local close but without touching native
+  /// (stop() already landed).
+  void _shutdown() {
+    if (_done) return;
+    _done = true;
+    _closeCode ??= 1006;
+    _messages.close();
   }
 }

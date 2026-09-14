@@ -4,6 +4,7 @@ library;
 import 'context.dart';
 import 'http_method.dart';
 import 'server.dart';
+import 'ws.dart';
 
 /// A path-prefixed view of a [NitroServer].
 ///
@@ -151,6 +152,13 @@ class RouteGroup {
   }) =>
       route(HttpMethod.all, pattern, handler,
           timeout: timeout, middleware: middleware);
+
+  /// Registers a WebSocket route under the prefixed [pattern].
+  /// See [NitroServer.ws]. Returns `this`, so registrations chain.
+  Future<RouteGroup> ws(String pattern, WsHandler handler) async {
+    await server.ws('$_prefix$pattern', handler);
+    return this;
+  }
 
   /// Normalizes a group prefix: must be `/'-rooted; a single `'/'` (or a
   /// trailing slash) collapses so joining never produces `'//users'`.

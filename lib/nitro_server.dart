@@ -7,6 +7,7 @@ export 'src/api/exceptions.dart';
 export 'src/api/http_method.dart';
 export 'src/api/middleware.dart';
 export 'src/api/route_group.dart';
+export 'src/api/ws.dart';
 export 'src/api/native_loader.dart'
     show
         loadNitroServerNative,

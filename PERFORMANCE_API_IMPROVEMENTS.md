@@ -3,8 +3,9 @@
 Source: audit of `lib/src/internal/server_runner.dart`, `lib/src/api/*`,
 `src/engine/ServerInstance.cpp`, `src/engine/Router.cpp`, `src/HybridNitroServer.cpp`.
 
-Verified: 46/46 C++ engine tests, 175/175 Dart tests, `benchmark/compare.dart --quick`
-(nitro fastest on `/hello` and `/json` latency). WebSocket data transfer
+Verified: 56/56 C++ engine tests, 187/187 Dart tests, `benchmark/compare.dart --quick`
+(nitro leads `/hello` 178µs vs 253/263, `/json` 176µs vs 192/216, echo 217µs;
+throughput 11628 vs 6604/7823 req/s @32). WebSocket data transfer
 remains the only deferred future (frame codec + message API).
 
 ## 1. Native hot path
@@ -18,6 +19,7 @@ remains the only deferred future (frame codec + message API).
 | N5 | `writev` send path on POSIX (header + body, 1 syscall, no copy); keep 2-send fallback on Windows | removes `<=128k` copy into `head_out` and 2nd syscall for large bodies | medium | ✅ done (`ServerInstance.cpp`) |
 | N6 | Default workers `max(8, 2×cores)` instead of `1×cores` | worker parks on Dart `respond`; 1×cores stalls under concurrent slow handlers | low | ✅ done (`ServerInstance::start`) |
 | N7 | `string_view` zero-copy request-line parser, IPv6 dual-stack | removes ~5 `substr` allocs/req | higher | ✅ done — `parseHead` parses views (only target/query/headers/custom copied into owning strings); `parseMethod` gained a `string_view` overload; `start()` binds `AF_INET6` for v6-literal hosts with `IPV6_V6ONLY=0` (`::` serves v4-mapped too); invalid hosts fail honestly |
+| N8 (follow-up) | `string_view` path split + transparent trie lookup in `Router::match` | removes per-segment `std::string` construction on every match | low | ✅ done — `split` returns views, `statik` uses `std::less<>`; microbench (13-route table, 200k matches): 353.5 → 279.8 ns/req (−21%), identical results |
 
 ## 2. Dart dispatch
 

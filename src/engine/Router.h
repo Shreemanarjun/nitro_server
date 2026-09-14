@@ -7,9 +7,11 @@
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma once
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "Common.h"
@@ -21,6 +23,7 @@ struct RouteEntry {
   std::string customMethod;
   std::string pattern;
   int64_t timeoutMs = -1;  // -1 = inherit the server default.
+  bool isWebSocket = false;  // RFC 6455 route: handshake upgrades in-engine.
 };
 
 struct MatchResult {
@@ -51,7 +54,8 @@ class Router {
 
  private:
   struct Node {
-    std::map<std::string, std::unique_ptr<Node>> statik;
+    // Transparent comparator: lookups take string_views with no allocation.
+    std::map<std::string, std::unique_ptr<Node>, std::less<>> statik;
     std::unique_ptr<Node> param;
     std::string paramName;
     std::unique_ptr<Node> wildcard;
@@ -60,11 +64,13 @@ class Router {
   };
 
   static std::string methodKey(Method m, const std::string& custom);
-  static std::vector<std::string> split(const std::string& path);
+  /// Splits on '/' dropping empties. Views into [path] — the caller keeps
+  /// it alive for the whole match/add/remove.
+  static std::vector<std::string_view> split(std::string_view path);
   static bool validPattern(const std::string& pattern);
 
-  const Node* findNode(const std::vector<std::string>& segs) const;
-  Node* findNodeMut(const std::vector<std::string>& segs);
+  const Node* findNode(const std::vector<std::string_view>& segs) const;
+  Node* findNodeMut(const std::vector<std::string_view>& segs);
   static const RouteEntry* pickEntry(const Node* node, Method method,
                                      const std::string& custom);
 

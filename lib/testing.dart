@@ -249,8 +249,110 @@ class NitroTestClient {
         headers: headers,
       );
 
+  /// Opens a WebSocket session on a `server.ws` route. The handshake runs
+  /// through real runner dispatch (pattern, params, query, headers), then
+  /// messages flow both ways with no sockets and no frames.
+  Future<TestWsConnection> ws(
+    String path, {
+    Map<String, String>? headers,
+  }) async {
+    var clean = path;
+    var query = '';
+    final q = path.indexOf('?');
+    if (q != -1) {
+      clean = path.substring(0, q);
+      query = path.substring(q + 1);
+    }
+    if (clean.isEmpty) clean = '/';
+    final match = _native.matchRoute('GET', clean, wsOnly: true);
+    if (match == null) {
+      throw StateError('no websocket route for $path');
+    }
+    final id = ++_nextId;
+    _native.wsOutbox[id] = StreamController<WsMessage>();
+    _native.wsCloseCodes[id] = Completer<int>();
+    _native.heads.add(
+      RawIncomingRequest(
+        requestId: id,
+        method: RawServerMethod.get,
+        path: clean,
+        query: query,
+        headers: [
+          for (final entry in (headers ?? const {}).entries)
+            RawHeader(name: entry.key, value: entry.value),
+        ],
+        routePattern: match.pattern,
+        params: [
+          for (final entry in match.params.entries)
+            RawRouteParam(name: entry.key, value: entry.value),
+        ],
+      ),
+    );
+    // The session opens on dispatch (a microtask away); wait for it so
+    // sends cannot land before the session exists. Production cannot race
+    // here — the 101 round-trips before any frame — so the client restores
+    // that ordering explicitly.
+    for (var i = 0; i < 200; i++) {
+      if (_runner.wsOpenedIdsForTesting.contains(id)) break;
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+    }
+    if (!_runner.wsOpenedIdsForTesting.contains(id)) {
+      throw StateError('websocket session never opened for $path');
+    }
+    return TestWsConnection._(_native, id);
+  }
+
   /// Shuts the runner down. Idempotent, like [NitroServer.close].
   Future<void> close() => _runner.close();
+}
+
+/// The test side of an in-memory WebSocket session (see [NitroTestClient.ws]).
+/// Messages from the route handler arrive on [messages]; [sendText] and
+/// [sendBytes] deliver to the handler; [close] ends the session like a peer
+/// close; [closedCode] completes with the handler side's close code.
+class TestWsConnection {
+  TestWsConnection._(this._native, this._id);
+
+  final _InMemoryNative _native;
+  final int _id;
+
+  /// Messages sent by the route handler.
+  Stream<WsMessage> get messages => _native.wsOutbox[_id]!.stream;
+
+  /// The handler side's close code once closed (either direction).
+  Future<int> get closedCode => _native.wsCloseCodes[_id]!.future;
+
+  /// Delivers a text message to the handler.
+  void sendText(String text) {
+    _native._wsMessages.add(
+      RawWsMessage(
+        payload: wsTextBytes(text),
+        connectionId: _id,
+        kind: 1,
+        aux: 0,
+      ),
+    );
+  }
+
+  /// Delivers a binary message to the handler.
+  void sendBytes(Uint8List bytes) {
+    _native._wsMessages.add(
+      RawWsMessage(payload: bytes, connectionId: _id, kind: 2, aux: 0),
+    );
+  }
+
+  /// Closes like a peer close, then waits for the handler side to reap.
+  Future<void> close([int code = 1000]) async {
+    _native._wsMessages.add(
+      RawWsMessage(
+        payload: Uint8List(0),
+        connectionId: _id,
+        kind: 8,
+        aux: code,
+      ),
+    );
+    await closedCode.timeout(const Duration(seconds: 5));
+  }
 }
 
 /// A matched route: the registered pattern plus `:param` captures.
@@ -340,6 +442,35 @@ class _InMemoryNative extends NitroServerNative {
   @override
   void ackBody(int requestId, int ackedChunks) {}
 
+  final _wsMessages = StreamController<RawWsMessage>.broadcast();
+
+  @override
+  Stream<RawWsMessage> get wsMessages => _wsMessages.stream;
+
+  /// Handler-to-test outboxes by connection id.
+  final wsOutbox = <int, StreamController<WsMessage>>{};
+
+  /// Completed when the handler side closes (return/throw/close()).
+  final wsCloseCodes = <int, Completer<int>>{};
+
+  @override
+  void wsSend(int connectionId, Uint8List payload, bool binary) {
+    final outbox = wsOutbox[connectionId];
+    if (outbox == null || outbox.isClosed) return;
+    outbox.add(
+      binary
+          ? WsMessage.binary(Uint8List.fromList(payload))
+          : WsMessage.text(utf8.decode(payload)),
+    );
+  }
+
+  @override
+  void wsClose(int connectionId, int code) {
+    wsOutbox[connectionId]?.close();
+    final done = wsCloseCodes[connectionId];
+    if (done != null && !done.isCompleted) done.complete(code);
+  }
+
   @override
   void startStream(int requestId, int status, List<RawHeader> headers) {
     _streamStatus[requestId] = status;
@@ -376,12 +507,14 @@ class _InMemoryNative extends NitroServerNative {
 
   /// Best matching registration for [methodToken] + [path], or null when the
   /// engine would answer 404 directly. Precedence mirrors `Router::match`.
-  _RouteMatch? matchRoute(String methodToken, String path) {
+  _RouteMatch? matchRoute(String methodToken, String path,
+      {bool wsOnly = false}) {
     final pathSegs = _split(path);
     _RouteMatch? best;
     var bestSpec = -1;
     var bestMethod = -1;
     for (final route in routes) {
+      if (route.isWebSocket != wsOnly) continue;
       final routeToken = _routeToken(route);
       final int methodScore;
       if (routeToken == methodToken) {

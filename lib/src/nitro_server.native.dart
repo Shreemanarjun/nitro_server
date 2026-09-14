@@ -170,18 +170,23 @@ class RawServerConfig {
 /// A route registration. `pattern` uses `:param` segments
 /// (`/users/:id`) and an optional trailing `*` wildcard. `timeoutMs` is the
 /// per-route handler deadline; `-1` inherits `RawServerConfig.defaultTimeoutMs`.
+/// `isWebSocket` marks WebSocket routes: the engine performs the RFC 6455
+/// handshake itself and hands the socket to the frame loop — `timeoutMs`
+/// then bounds nothing (handshakes never park).
 @HybridRecord()
 class RawRouteConfig {
   final RawServerMethod method;
   final String customMethod;
   final String pattern;
   final int timeoutMs;
+  final bool isWebSocket;
 
   const RawRouteConfig({
     this.method = RawServerMethod.get,
     this.customMethod = '',
     required this.pattern,
     this.timeoutMs = -1,
+    this.isWebSocket = false,
   });
 }
 
@@ -264,6 +269,32 @@ class RawBodyChunk {
   const RawBodyChunk({
     required this.bytes,
     required this.requestId,
+    required this.kind,
+    required this.aux,
+  });
+}
+
+/// One decoded WebSocket event on `wsMessages`. `opcode` is 1 (text),
+/// 2 (binary) or 8 (close); pings never surface (the engine auto-pongs).
+/// `code` rides the close code on opcode 8, else 0. `payload` is the
+/// reassembled message bytes (UTF-8 for text), empty on close without a
+/// reason. Carries NO route fields — session open travels on
+/// `incomingRequests` with the handshake's pattern and params instead.
+@HybridStruct(zeroCopy: ['payload'])
+class RawWsMessage {
+  /// Reassembled message bytes · close: optional UTF-8 reason.
+  final Uint8List payload;
+  final int connectionId;
+
+  /// 1 = text · 2 = binary · 8 = close.
+  final int kind;
+
+  /// Close code on kind 8, else 0.
+  final int aux;
+
+  const RawWsMessage({
+    required this.payload,
+    required this.connectionId,
     required this.kind,
     required this.aux,
   });
@@ -372,6 +403,23 @@ abstract class NitroServerNative extends HybridObject {
   /// Sends one stream chunk. Fire-and-forget; `last` completes the stream.
   void sendStreamChunk(int requestId, @zeroCopy Uint8List chunk, bool last);
 
+  // ── WebSocket sessions ───────────────────────────────────────────────────
+  //
+  // The engine owns the RFC 6455 handshake and the frame loop. Once a
+  // handshake upgrades, the connection leaves HTTP mode: Dart receives
+  // decoded messages on `wsMessages` (addressed by `connectionId`, which is
+  // the upgraded request's id) and answers with `wsSend`; `wsClose`
+  // completes the closing handshake. Session teardown (peer close, send
+  // failure, stop()) always ends with an opcode-8 message so Dart can reap
+  // deterministically. Unknown or reaped ids are no-ops everywhere.
+
+  /// Sends one message frame. Fire-and-forget; `binary` selects opcode 2
+  /// over opcode 1. Server frames are never masked (RFC 6455 §5.3).
+  void wsSend(int connectionId, @zeroCopy Uint8List payload, bool binary);
+
+  /// Completes the closing handshake with [code] and reaps the session.
+  void wsClose(int connectionId, int code);
+
   // ── Module-global streams — EXACTLY ONE internal subscriber each ───────────
   //
   // See invariant 1 in the file header. `Backpressure.block` is forbidden here:
@@ -390,4 +438,7 @@ abstract class NitroServerNative extends HybridObject {
 
   @NitroStream(backpressure: Backpressure.bufferDrop)
   Stream<RawServerEvent> get serverEvents;
+
+  @NitroStream(backpressure: Backpressure.bufferDrop)
+  Stream<RawWsMessage> get wsMessages;
 }

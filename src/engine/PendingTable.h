@@ -87,6 +87,17 @@ class PendingTable {
     }
   }
 
+  /// Frees every tracked payload for [requestId] and drops the log. Used
+  /// for connection-scoped logs (WebSocket) that no table entry reaps.
+  /// Later acks for the id are defined no-ops (see [ack]).
+  void dropPayloads(int64_t requestId) {
+    std::lock_guard<std::mutex> lk(mutex_);
+    auto it = payloads_.find(requestId);
+    if (it == payloads_.end()) return;
+    for (auto& p : it->second.payloads) std::free(p.second);
+    payloads_.erase(it);
+  }
+
   /// Logs a malloc-owned payload, returning its sequence number. The payload
   /// MUST be tracked before the corresponding emit posts, so a later ack can
   /// never reference an untracked sequence.

@@ -1,5 +1,7 @@
 #include "Router.h"
 
+#include <string_view>
+
 namespace nitroserver {
 
 std::string Router::methodKey(Method m, const std::string& custom) {
@@ -8,20 +10,15 @@ std::string Router::methodKey(Method m, const std::string& custom) {
   return "M:" + std::to_string(static_cast<int64_t>(m));
 }
 
-std::vector<std::string> Router::split(const std::string& path) {
-  std::vector<std::string> segs;
-  std::string cur;
-  for (char c : path) {
-    if (c == '/') {
-      if (!cur.empty()) {
-        segs.push_back(cur);
-        cur.clear();
-      }
-    } else {
-      cur.push_back(c);
-    }
+std::vector<std::string_view> Router::split(std::string_view path) {
+  std::vector<std::string_view> segs;
+  size_t i = 0;
+  while (i < path.size()) {
+    while (i < path.size() && path[i] == '/') i++;
+    const size_t start = i;
+    while (i < path.size() && path[i] != '/') i++;
+    if (i > start) segs.push_back(path.substr(start, i - start));
   }
-  if (!cur.empty()) segs.push_back(cur);
   return segs;
 }
 
@@ -85,7 +82,7 @@ bool Router::remove(Method method, const std::string& customMethod,
   return true;
 }
 
-const Router::Node* Router::findNode(const std::vector<std::string>& segs) const {
+const Router::Node* Router::findNode(const std::vector<std::string_view>& segs) const {
   const Node* node = &root_;
   for (const auto& s : segs) {
     if (s == "*") {
@@ -103,7 +100,7 @@ const Router::Node* Router::findNode(const std::vector<std::string>& segs) const
   return node;
 }
 
-Router::Node* Router::findNodeMut(const std::vector<std::string>& segs) {
+Router::Node* Router::findNodeMut(const std::vector<std::string_view>& segs) {
   return const_cast<Node*>(const_cast<const Router*>(this)->findNode(segs));
 }
 
@@ -184,11 +181,13 @@ MatchResult Router::match(Method method, const std::string& customMethod,
   arena.push_back({&root_, 0, -1, false, {}, {}, 0});
   stack.push_back(0);
   auto pushChild = [&](const Node* node, size_t idx, int parent,
-                       const std::string& paramName, const std::string& seg,
+                       const std::string& paramName, const std::string_view seg,
                        int specificity) {
     const bool hasParam = !paramName.empty();
-    arena.push_back({node, idx, parent, hasParam, paramName,
-                     hasParam ? seg : std::string(), specificity});
+    const std::string paramValue =
+        hasParam ? std::string(seg.data(), seg.size()) : std::string();
+    arena.push_back(
+        {node, idx, parent, hasParam, paramName, paramValue, specificity});
     stack.push_back((int)arena.size() - 1);
   };
   while (!stack.empty()) {
@@ -211,7 +210,7 @@ MatchResult Router::match(Method method, const std::string& customMethod,
       continue;
     }
 
-    const std::string& seg = segs[idx];
+    const std::string_view seg = segs[idx];
     // Push in reverse precedence so static pops first.
     if (node->wildcard) {
       // Wildcard consumes the rest of the path.

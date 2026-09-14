@@ -185,4 +185,42 @@ void main() {
     final response = await client.get('/drip');
     expect(response.text(), '0,1,2,');
   });
+
+  test('websocket echo round-trips', () async {
+    await client.server.ws('/chat', (session) async {
+      await for (final message in session.messages) {
+        if (message.isText) session.sendText('echo:${message.text}');
+        if (message.isBinary) session.sendBytes(message.bytes!);
+      }
+    });
+    final conn = await client.ws('/chat');
+    final received = <WsMessage>[];
+    final sub = conn.messages.listen(received.add);
+    conn.sendText('hi');
+    conn.sendBytes(Uint8List.fromList([7]));
+    for (var i = 0; i < 200 && received.length < 2; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+    }
+    expect(received, hasLength(2));
+    expect(received[0].text, 'echo:hi');
+    expect(received[1].bytes, orderedEquals([7]));
+    await sub.cancel();
+    await conn.close();
+  });
+
+  test('websocket handshake carries params and query', () async {
+    RequestContext? seen;
+    await client.server.ws('/rooms/:room', (session) async {
+      seen = session.handshake;
+      await session.close(4401);
+    });
+    final conn = await client.ws('/rooms/lobby?token=abc');
+    expect(await conn.closedCode, 4401);
+    expect(seen!.param('room'), 'lobby');
+    expect(seen!.queryParam('token'), 'abc');
+  });
+
+  test('websocket to a missing route throws', () async {
+    await expectLater(client.ws('/ghost'), throwsStateError);
+  });
 }

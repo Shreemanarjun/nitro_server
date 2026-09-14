@@ -103,6 +103,16 @@ public:
         throw std::runtime_error("Not implemented: sendStreamChunk");
     }
 
+    void wsSend(int64_t connectionId, const uint8_t* payload, size_t payload_length, bool binary) override {
+        // TODO: implement wsSend
+        throw std::runtime_error("Not implemented: wsSend");
+    }
+
+    void wsClose(int64_t connectionId, int64_t code) override {
+        // TODO: implement wsClose
+        throw std::runtime_error("Not implemented: wsClose");
+    }
+
     // ── Streams ──────────────────────────────────────────────────────────────
     // Call emit_<name>(item) from any thread to push items to Dart.
     // emit_* helpers are defined in the generated bridge.
@@ -114,6 +124,7 @@ public:
     //   std::thread([this]{ emit_incomingRequests(/* NitroCppBuffer value */); }).detach();
     //   std::thread([this]{ emit_bodyChunks(/* RawBodyChunk value */); }).detach();
     //   std::thread([this]{ emit_serverEvents(/* NitroCppBuffer value */); }).detach();
+    //   std::thread([this]{ emit_wsMessages(/* RawWsMessage value */); }).detach();
 };
 
 // ── Registration ─────────────────────────────────────────────────────────────

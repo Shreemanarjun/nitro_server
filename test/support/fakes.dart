@@ -129,10 +129,29 @@ class FakeNitroServerNative extends NitroServerNative {
     if (last) streamsEnded.add(requestId);
   }
 
+  /// WebSocket surface: outbound frames + close calls by connection id.
+  final wsOut = StreamController<RawWsMessage>.broadcast();
+  final wsSent = <(int, Uint8List, bool)>[];
+  final wsClosed = <(int, int)>[];
+
+  @override
+  Stream<RawWsMessage> get wsMessages => wsOut.stream;
+
+  @override
+  void wsSend(int connectionId, Uint8List payload, bool binary) {
+    wsSent.add((connectionId, Uint8List.fromList(payload), binary));
+  }
+
+  @override
+  void wsClose(int connectionId, int code) {
+    wsClosed.add((connectionId, code));
+  }
+
   Future<void> close() async {
     await heads.close();
     await chunks.close();
     await events.close();
+    await wsOut.close();
   }
 }
 

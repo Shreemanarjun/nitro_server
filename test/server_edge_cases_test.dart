@@ -1111,5 +1111,169 @@ void main() {
       );
     });
   });
+
+  group('websockets', () {
+    Future<WsSession> openSession(
+      int id, {
+      String path = '/chat',
+      String pattern = '/chat',
+      List<RawRouteParam> params = const [],
+      WsHandler? handler,
+    }) async {
+      final opened = Completer<WsSession>();
+      runner.addWsRoute(pattern, (session) async {
+        if (!opened.isCompleted) opened.complete(session);
+        await handler?.call(session);
+      });
+      await Future<void>.delayed(Duration.zero);
+      fake.heads.add(
+        fakeHead(requestId: id, path: path, routePattern: pattern, params: params),
+      );
+      return opened.future.timeout(const Duration(seconds: 5));
+    }
+
+    void inject(int id, int kind, Uint8List payload, [int code = 0]) {
+      fake.wsOut.add(
+        RawWsMessage(
+          payload: payload,
+          connectionId: id,
+          kind: kind,
+          aux: code,
+        ),
+      );
+    }
+
+    Future<void> waitWsClosed(int id) async {
+      for (var i = 0; i < 200; i++) {
+        if (fake.wsClosed.any((c) => c.$1 == id)) return;
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+      throw StateError('no wsClose for $id');
+    }
+
+    test('open dispatches with the handshake pattern and params', () async {
+      final session = await openSession(
+        600,
+        path: '/rooms/lobby',
+        pattern: '/rooms/:room',
+        params: const [RawRouteParam(name: 'room', value: 'lobby')],
+      );
+      expect(session.handshake.param('room'), 'lobby');
+      expect(session.handshake.path, '/rooms/lobby');
+      expect(session.handshake.routePattern, '/rooms/:room');
+      await session.close();
+      await waitWsClosed(600);
+      expect(fake.wsClosed.single, (600, 1000));
+    });
+
+    test('text and binary messages reach the handler in order', () async {
+      final received = <WsMessage>[];
+      final done = Completer<void>();
+      await openSession(601, handler: (session) async {
+        await for (final message in session.messages) {
+          received.add(message);
+        }
+        done.complete();
+      });
+      inject(601, 1, Uint8List.fromList('hi'.codeUnits));
+      inject(601, 2, Uint8List.fromList([1, 2, 3]));
+      inject(601, 8, Uint8List(0), 1000);
+      await done.future.timeout(const Duration(seconds: 5));
+      expect(received, hasLength(2));
+      expect(received[0].isText, isTrue);
+      expect(received[0].text, 'hi');
+      expect(received[1].isBinary, isTrue);
+      expect(received[1].bytes, orderedEquals([1, 2, 3]));
+      // Peer-initiated close echoes the peer code (a no-op on the reaped
+      // engine side) so close observers complete deterministically.
+      expect(fake.wsClosed.single, (601, 1000));
+    });
+
+    test('sends ride wsSend with the right opcode flag', () async {
+      final session = await openSession(602);
+      session.sendText('yo');
+      session.sendBytes(Uint8List.fromList([9]));
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+      expect(fake.wsSent, hasLength(2));
+      expect(fake.wsSent[0].$1, 602);
+      expect(String.fromCharCodes(fake.wsSent[0].$2), 'yo');
+      expect(fake.wsSent[0].$3, isFalse);
+      expect(fake.wsSent[1].$2, orderedEquals([9]));
+      expect(fake.wsSent[1].$3, isTrue);
+      await session.close();
+    });
+
+    test('a throwing handler closes with 1011', () async {
+      await openSession(603, handler: (_) async {
+        throw StateError('handler died');
+      });
+      await waitWsClosed(603);
+      expect(fake.wsClosed.single, (603, 1011));
+    });
+
+    test('messages for unknown sessions are acked and dropped', () async {
+      await addGet('/unrelated');
+      inject(604, 1, Uint8List.fromList('ghost'.codeUnits));
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+      // Copied then acked (zero-copy contract), bytes dropped, no crash.
+      expect(fake.acked.any((a) => a.$1 == 604), isTrue);
+    });
+
+    test('registering ws evicts http on the same pattern and back', () async {
+      var httpCalls = 0;
+      var wsCalls = 0;
+      runner.addRoute(HttpMethod.get, '', '/dupe', null, (_) async {
+        httpCalls++;
+        return const ResponseContext();
+      });
+      runner.addWsRoute('/dupe', (_) async {
+        wsCalls++;
+      });
+      await Future<void>.delayed(Duration.zero);
+      fake.heads.add(fakeHead(requestId: 605, path: '/dupe', routePattern: '/dupe'));
+      await waitWsClosed(605);
+      expect(wsCalls, 1);
+      expect(httpCalls, 0);
+
+      runner.addRoute(HttpMethod.get, '', '/dupe', null, (_) async {
+        httpCalls++;
+        return const ResponseContext();
+      });
+      await Future<void>.delayed(Duration.zero);
+      final response = await driveRequest(
+        fake,
+        requestId: 606,
+        path: '/dupe',
+        routePattern: '/dupe',
+      );
+      expect(response.status, 200);
+      expect(httpCalls, 1);
+      expect(wsCalls, 1);
+    });
+
+    test('unroute removes the ws route', () async {
+      await openSession(607, pattern: '/bye');
+      await Future<void>.delayed(Duration.zero);
+      runner.removeRoute(HttpMethod.get, '', '/bye');
+      final response = await driveRequest(
+        fake,
+        requestId: 608,
+        path: '/bye',
+        routePattern: '/bye',
+      );
+      expect(response.status, 404);
+    });
+
+    test('close is idempotent and drops late sends', () async {
+      final session = await openSession(609);
+      await session.close(1000);
+      await session.close(1000);
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(fake.wsClosed.where((c) => c.$1 == 609), hasLength(1));
+      session.sendText('late');
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(fake.wsSent.where((s) => s.$1 == 609), isEmpty);
+    });
+  });
 }
 

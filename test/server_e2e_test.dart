@@ -101,6 +101,112 @@ Future<({int status, Uint8List body})> _getBytes(
   }
 }
 
+/// WebSocket test helpers: minimal RFC 6455 frame codec over a raw socket.
+/// Server frames are never masked; client frames always are.
+List<int> _maskFrame(int opcode, List<int> payload, {bool fin = true}) {
+  const mask = [0x11, 0x22, 0x33, 0x44];
+  final out = <int>[(fin ? 0x80 : 0) | opcode];
+  final n = payload.length;
+  if (n < 126) {
+    out.add(0x80 | n);
+  } else if (n <= 0xffff) {
+    out.addAll([0x80 | 126, (n >> 8) & 0xff, n & 0xff]);
+  } else {
+    out.add(0x80 | 127);
+    for (var i = 7; i >= 0; i--) {
+      out.add((n >> (8 * i)) & 0xff);
+    }
+  }
+  out.addAll(mask);
+  for (var i = 0; i < n; i++) {
+    out.add(payload[i] ^ mask[i % 4]);
+  }
+  return out;
+}
+
+Future<void> _fillWs(
+  StreamIterator<Uint8List> it,
+  BytesBuilder buf,
+  int n,
+) async {
+  while (buf.length < n) {
+    if (!await it.moveNext().timeout(const Duration(seconds: 10))) {
+      throw StateError('eof waiting for $n bytes');
+    }
+    buf.add(it.current);
+  }
+}
+
+int _crlfIndex(List<int> bytes) {
+  for (var i = 0; i + 3 < bytes.length; i++) {
+    if (bytes[i] == 13 &&
+        bytes[i + 1] == 10 &&
+        bytes[i + 2] == 13 &&
+        bytes[i + 3] == 10) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+/// Reads the HTTP head (through `\r\n\r\n`), keeping trailing frame bytes.
+Future<String> _readWsHead(
+  StreamIterator<Uint8List> it,
+  BytesBuilder buf,
+) async {
+  while (true) {
+    final i = _crlfIndex(buf.toBytes());
+    if (i != -1) {
+      final bytes = buf.toBytes();
+      final head = ascii.decode(bytes.sublist(0, i));
+      buf.clear();
+      buf.add(bytes.sublist(i + 4));
+      return head;
+    }
+    if (!await it.moveNext().timeout(const Duration(seconds: 10))) {
+      throw StateError('eof waiting for handshake');
+    }
+    buf.add(it.current);
+  }
+}
+
+/// Reads one server frame. `moveNext() == false` afterwards means the
+/// server closed the socket.
+Future<({int opcode, Uint8List payload})> _readWsFrame(
+  StreamIterator<Uint8List> it,
+  BytesBuilder buf,
+) async {
+  await _fillWs(it, buf, 2);
+  var bytes = buf.toBytes();
+  final opcode = bytes[0] & 0x0f;
+  var len = bytes[1] & 0x7f;
+  var pos = 2;
+  if (len == 126) {
+    await _fillWs(it, buf, 4);
+    bytes = buf.toBytes();
+    len = (bytes[2] << 8) | bytes[3];
+    pos = 4;
+  } else if (len == 127) {
+    await _fillWs(it, buf, 10);
+    bytes = buf.toBytes();
+    len = 0;
+    for (var i = 0; i < 8; i++) {
+      len = (len << 8) | bytes[2 + i];
+    }
+    pos = 10;
+  }
+  if ((bytes[1] & 0x80) != 0) {
+    await _fillWs(it, buf, pos + 4);
+    pos += 4;
+  }
+  await _fillWs(it, buf, pos + len);
+  bytes = buf.toBytes();
+  final payload = Uint8List.fromList(bytes.sublist(pos, pos + len));
+  buf.clear();
+  buf.add(bytes.sublist(pos + len));
+  return (opcode: opcode, payload: payload);
+}
+
 void main() {
   final libraryPath = _locateLibrary();
   final skipReason = libraryPath == null
@@ -561,6 +667,45 @@ void main() {
 
       // The streamed connection completed cleanly; the server is unaffected.
       expect((await _get(server!.port, '/ok')).body, 'ok');
+    }, skip: skipReason);
+
+    test('websocket echo works over real frames', () async {
+      server = await NitroServer.bind();
+      await server!.ws('/chat', (session) async {
+        await for (final message in session.messages) {
+          if (message.isText) session.sendText('echo:${message.text}');
+        }
+      });
+
+      final socket = await Socket.connect('127.0.0.1', server!.port);
+      addTearDown(() => socket.destroy());
+      // StreamIterator holds one subscription for its life: no pause quirk.
+      final it = StreamIterator<Uint8List>(socket);
+      final buf = BytesBuilder(copy: false);
+      socket.add(ascii.encode(
+        'GET /chat HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n'
+        'Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n'
+        'Sec-WebSocket-Version: 13\r\n\r\n',
+      ));
+      final head = await _readWsHead(it, buf);
+      expect(head, contains('101'));
+      expect(head, contains('s3pPLMBiTxaQ9kYGzzhZRbK+xOo='));
+
+      socket.add(_maskFrame(0x1, ascii.encode('hi')));
+      final text = await _readWsFrame(it, buf);
+      expect(text.opcode, 0x1);
+      expect(ascii.decode(text.payload), 'echo:hi');
+
+      socket.add(_maskFrame(0x9, [1, 2]));
+      final pong = await _readWsFrame(it, buf);
+      expect(pong.opcode, 0xA);
+      expect(pong.payload, orderedEquals([1, 2]));
+
+      socket.add(_maskFrame(0x8, [0x03, 0xE8]));
+      final echoed = await _readWsFrame(it, buf);
+      expect(echoed.opcode, 0x8);
+      // The server's echo closes the socket: stream ends.
+      expect(await it.moveNext(), isFalse);
     }, skip: skipReason);
 
     test('a second bind on the same port fails to bind', () async {

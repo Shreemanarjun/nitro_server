@@ -1,4 +1,5 @@
 #include "ServerInstance.h"
+#include "WsCodec.h"
 
 #include <algorithm>
 #include <cctype>
@@ -125,15 +126,6 @@ bool readHead(Fd fd, std::string& buf) {
   return buf.find("\r\n\r\n") != std::string::npos;
 }
 
-struct ParsedHead {
-  Method method = Method::Get;
-  std::string customMethod;
-  std::string target;
-  std::string version;
-  std::vector<Header> headers;
-  bool ok = false;
-};
-
 /// Trims whitespace off a view without allocating. The caller copies only
 /// the survivors into their owning strings.
 inline std::string_view trimSv(std::string_view s) {
@@ -238,6 +230,11 @@ class NullEmitter final : public Emitter {
   void emitBodyError(int64_t, uint8_t* payload, size_t, ErrorKind) override {
     std::free(payload);
   }
+  void emitWsMessage(int64_t, uint8_t* payload, size_t, int, int) override {
+    // Ownership transferred in: free on drop so the unbound window leaks
+    // nothing. (Unreachable in practice — see lockedEmitter.)
+    std::free(payload);
+  }
   void emitEvent(ServerEventKind, int64_t, const std::string&) override {}
 };
 
@@ -255,9 +252,10 @@ void ServerInstance::configure(const ServerConfig& config) {
 StatusResult ServerInstance::registerRoute(Method method,
                                            const std::string& customMethod,
                                            const std::string& pattern,
-                                           int64_t timeoutMs) {
+                                           int64_t timeoutMs,
+                                           bool isWebSocket) {
   std::lock_guard<std::mutex> lk(configMutex_);
-  RouteEntry e{method, customMethod, pattern, timeoutMs};
+  RouteEntry e{method, customMethod, pattern, timeoutMs, isWebSocket};
   if (!router_.add(e)) {
     return {ErrorKind::BadRequest,
             "invalid route pattern (want '/a/:b' with optional trailing '/*'): " +
@@ -624,15 +622,6 @@ bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served) {
     answerDirectly(fd, Method::Get, 400, "bad request");
     return false;
   }
-  // No WebSocket support: refuse the handshake honestly (RFC 6455 §4.2.2 —
-  // 426 plus Sec-WebSocket-Version) instead of a misleading 404. Before
-  // routing: no route can match an Upgrade, and dispatching one would park
-  // a worker on a body that never arrives.
-  if (isWebSocketUpgrade(head)) {
-    answerDirectly(fd, head.method, 426, "websocket not supported",
-                   {{"Sec-WebSocket-Version", "13"}});
-    return false;
-  }
   const bool keepPeer =
       clientWantsKeepAlive(head) && running_.load();
 
@@ -653,7 +642,32 @@ bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served) {
     m = router_.match(head.method, head.customMethod, path);
   }
   if (!m.matched) {
-    answerDirectly(fd, head.method, 404, "not found");
+    // No route at all: a handshake-shaped request is refused honestly
+    // (RFC 6455 §4.2.2) instead of a misleading 404. Before routing would
+    // be wrong here — there is nothing to route to — so this stays inline.
+    if (isWebSocketUpgrade(head)) {
+      answerDirectly(fd, head.method, 426, "websocket not supported",
+                     {{"Sec-WebSocket-Version", "13"}});
+    } else {
+      answerDirectly(fd, head.method, 404, "not found");
+    }
+    return false;
+  }
+
+  // WebSocket routes own their handshake: validate, answer 101 and hand the
+  // socket to the frame loop. Anything else on such a route (plain GET,
+  // wrong version, missing key) is answered directly — never dispatched.
+  if (m.route.isWebSocket) {
+    return serveUpgrade(fd, carry, bodyStart, head, m, cfg, path, query);
+  }
+
+  // A handshake aimed at a plain HTTP route: refuse honestly (RFC 6455
+  // §4.2.2) instead of a misleading 404. After routing, so WS routes above
+  // still upgrade — and dispatching an Upgrade would park a worker on a
+  // body that never arrives.
+  if (isWebSocketUpgrade(head)) {
+    answerDirectly(fd, head.method, 426, "websocket not supported",
+                   {{"Sec-WebSocket-Version", "13"}});
     return false;
   }
 
@@ -1030,6 +1044,307 @@ bool ServerInstance::serveStream(int fd, int64_t requestId, Method method,
   pending_.erase(requestId);
   served++;
   return keepAlive && !dead;
+}
+
+// ── WebSocket (RFC 6455) ─────────────────────────────────────────────────
+
+/// Blocking exact read. Returns false on EOF, error or (pre-upgrade only)
+/// timeout — the frame loop disables the receive timeout, so a false there
+/// means the peer went away or stop() interrupted the read.
+bool wsRecvAll(int fd, uint8_t* dst, size_t n) {
+  const Fd sock = (Fd)fd;
+  size_t got = 0;
+  while (got < n) {
+    const size_t want = std::min(n - got, (size_t)65536);
+#ifdef _WIN32
+    const int r = recv(sock, (char*)dst + got, (int)want, 0);
+#else
+    const ssize_t r = recv(sock, dst + got, want, 0);
+#endif
+    if (r <= 0) return false;
+    got += (size_t)r;
+  }
+  return true;
+}
+
+bool ServerInstance::serveUpgrade(int fd, const std::string& carry,
+                                  size_t bodyStart, const ParsedHead& head,
+                                  const MatchResult& m, const ServerConfig& cfg,
+                                  const std::string& path,
+                                  const std::string& query) {
+  // Surplus bytes after the head cannot be a handshake (handshakes carry no
+  // body) and would desync frame parsing — refuse instead of guessing.
+  if (carry.size() != bodyStart) {
+    answerDirectly(fd, head.method, 400, "unexpected bytes after upgrade");
+    return false;
+  }
+  if (!isWebSocketUpgrade(head)) {
+    answerDirectly(fd, head.method, 426, "websocket upgrade required",
+                   {{"Sec-WebSocket-Version", "13"}});
+    return false;
+  }
+  const Header* ver = findHeader(head.headers, "sec-websocket-version");
+  if (!ver || trimSv(ver->value) != "13") {
+    answerDirectly(fd, head.method, 426, "unsupported websocket version",
+                   {{"Sec-WebSocket-Version", "13"}});
+    return false;
+  }
+  const Header* key = findHeader(head.headers, "sec-websocket-key");
+  const std::string clientKey =
+      key == nullptr ? "" : std::string(trimSv(key->value));
+  if (clientKey.empty()) {
+    answerDirectly(fd, head.method, 400, "missing sec-websocket-key");
+    return false;
+  }
+
+  const std::string accept = ws::acceptKey(clientKey);
+  const std::string shake =
+      "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+      "Connection: Upgrade\r\nSec-WebSocket-Accept: " +
+      accept + "\r\n\r\n";
+  if (!sendAll(fd, (const uint8_t*)shake.data(), shake.size())) return false;
+
+  const int64_t connectionId = nextRequestId();
+  {
+    std::lock_guard<std::mutex> lk(wsMutex_);
+    ws_[connectionId] = WsConn{fd};
+  }
+  // The session opens through normal head dispatch, so Dart sees the
+  // handshake's pattern, params, query and headers like any request.
+  lockedEmitter()->emitHead(connectionId, head.method, head.customMethod,
+                            path, query, head.headers, 0, false,
+                            m.route.pattern, m.params);
+  wsLoop(fd, connectionId, cfg.maxBodyBytes);
+  {
+    std::lock_guard<std::mutex> lk(wsMutex_);
+    ws_.erase(connectionId);
+  }
+  pending_.dropPayloads(connectionId);
+  return false;  // Upgraded connections never serve HTTP again.
+}
+
+bool ServerInstance::wsSendFrame(int fd, int opcode, const uint8_t* payload,
+                                 size_t n) {
+  std::vector<uint8_t> frame;
+  frame.reserve(n + 10);
+  ws::encodeFrame(opcode, payload == nullptr ? (const uint8_t*)"" : payload,
+                  n, true, frame);
+  std::lock_guard<std::mutex> lk(wsSendMutex_);
+  return sendAll(fd, frame.data(), frame.size());
+}
+
+void ServerInstance::emitWs(int64_t connectionId, int opcode,
+                            const uint8_t* data, size_t n, int code) {
+  uint8_t* payload = nullptr;
+  if (n > 0) {
+    payload = (uint8_t*)std::malloc(n);
+    if (payload == nullptr) return;  // OOM: drop, the loop still reaps.
+    memcpy(payload, data, n);
+  }
+  pending_.trackPayload(connectionId, payload);
+  lockedEmitter()->emitWsMessage(connectionId, payload, n, opcode, code);
+}
+
+void ServerInstance::wsSend(int64_t connectionId, const uint8_t* payload,
+                            size_t n, bool binary) {
+  int fd = -1;
+  {
+    std::lock_guard<std::mutex> lk(wsMutex_);
+    auto it = ws_.find(connectionId);
+    if (it == ws_.end()) return;  // Unknown or reaped: no-op by design.
+    fd = it->second.fd;
+  }
+  // Synchronous write under the send mutex: bridge memory is never retained,
+  // so no copy is needed. On failure the loop's next read observes the dead
+  // peer (or stop() already did) — reap stays single-owned by the loop.
+  if (!wsSendFrame(fd, binary ? ws::kBinary : ws::kText, payload, n)) {
+    shutdownRdwr((Fd)fd);
+  }
+}
+
+void ServerInstance::wsClose(int64_t connectionId, int code) {
+  int fd = -1;
+  {
+    std::lock_guard<std::mutex> lk(wsMutex_);
+    auto it = ws_.find(connectionId);
+    if (it == ws_.end()) return;  // Unknown or reaped: no-op by design.
+    fd = it->second.fd;
+    ws_.erase(it);
+  }
+  uint8_t payload[2] = {(uint8_t)((code >> 8) & 0xff), (uint8_t)(code & 0xff)};
+  wsSendFrame(fd, ws::kClose, payload, 2);
+  // Do not wait for the peer's echo: unblock the loop now so no worker can
+  // park on a client that never answers.
+  shutdownRdwr((Fd)fd);
+}
+
+void ServerInstance::wsLoop(int fd, int64_t connectionId,
+                            int64_t maxMessageBytes) {
+  const Fd sock = (Fd)fd;
+  // Sessions live indefinitely: drop the HTTP idle deadline. stop() still
+  // interrupts via shutdown on the (tracked) fd.
+#ifdef _WIN32
+  DWORD noTimeout = 0;
+  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&noTimeout,
+             sizeof(noTimeout));
+#else
+  struct timeval noTimeout{};
+  noTimeout.tv_sec = 0;
+  noTimeout.tv_usec = 0;
+  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &noTimeout, sizeof(noTimeout));
+#endif
+
+  std::vector<uint8_t> msg;
+  int msgOpcode = -1;
+  int closeCode = 1006;  // Abnormal closure unless the peer says otherwise.
+  bool peerClosed = false;
+  bool failed = false;
+
+  auto protocolError = [&](int code) {
+    uint8_t payload[2] = {(uint8_t)((code >> 8) & 0xff),
+                           (uint8_t)(code & 0xff)};
+    wsSendFrame(fd, ws::kClose, payload, 2);
+    closeCode = code;  // Dart sees what the peer already holds.
+    failed = true;
+  };
+
+  std::vector<uint8_t> net;
+  net.reserve(8192);
+  uint8_t tmp[4096];
+  while (!failed && !peerClosed) {
+    // Grow the buffer until a full header parses. parseHeader cannot tell
+    // "need more" from "malformed", so validate the fixed prefix first:
+    // RSV/opcode are decided by the first two bytes alone.
+    ws::FrameHeader h;
+    bool haveHeader = false;
+    // Pipelined frames coalesce in `net`: attempt the parse on buffered
+    // bytes BEFORE blocking in recv, or the loop waits for bytes it holds.
+    while (!haveHeader && !failed && !peerClosed) {
+      if (net.size() >= 2) {
+        const uint8_t b0 = net[0];
+        const int opcode = b0 & 0x0f;
+        if ((b0 & 0x70) || (opcode != 0x0 && opcode != 0x1 &&
+                            opcode != 0x2 && opcode != 0x8 &&
+                            opcode != 0x9 && opcode != 0xA)) {
+          protocolError(1002);
+          break;
+        }
+        // Header length is fixed by the length marker + mask flag: decide
+        // on exactly that many bytes, then parse strictly.
+        size_t need = 2;
+        const uint8_t marker = net[1] & 0x7f;
+        if (marker == 126) {
+          need = 4;
+        } else if (marker == 127) {
+          need = 10;
+        }
+        if (net[1] & 0x80) need += 4;
+        if (net.size() >= need) {
+          if (ws::parseHeader(net.data(), need, h)) {
+            haveHeader = true;
+          } else {
+            protocolError(1002);  // Complete yet invalid.
+          }
+          break;
+        }
+      }
+#ifdef _WIN32
+      const int r = recv(sock, (char*)tmp, sizeof(tmp), 0);
+#else
+      const ssize_t r = recv(sock, (char*)tmp, sizeof(tmp), 0);
+#endif
+      if (r <= 0) {
+        failed = true;
+        break;
+      }
+      net.insert(net.end(), tmp, tmp + r);
+    }
+    if (!haveHeader) break;
+    net.erase(net.begin(), net.begin() + (ptrdiff_t)h.headerSize);
+
+    // Clients MUST mask (RFC 6455 §5.3): an unmasked frame is a protocol
+    // error, answered before reading its body.
+    if (!h.masked) {
+      protocolError(1002);
+      break;
+    }
+    // Cap by declared length before buffering the body.
+    if (!ws::isControl(h.opcode) &&
+        h.length > (uint64_t)maxMessageBytes) {
+      protocolError(1009);
+      break;
+    }
+    // The payload may already sit in `net` (coalesced segment): consume
+    // buffered bytes first so the socket read cannot block on held bytes —
+    // and leave any pipelined frames for the next iteration.
+    std::vector<uint8_t> payload;
+    payload.reserve((size_t)std::min<uint64_t>(h.length, 65536));
+    const size_t buffered =
+        std::min(net.size(), (size_t)h.length);
+    payload.insert(payload.end(), net.begin(),
+                   net.begin() + (ptrdiff_t)buffered);
+    net.erase(net.begin(), net.begin() + (ptrdiff_t)buffered);
+    payload.resize((size_t)h.length);
+    if (h.length > buffered &&
+        !wsRecvAll(fd, payload.data() + buffered, (size_t)h.length - buffered)) {
+      failed = true;
+      break;
+    }
+    for (size_t i = 0; i < payload.size(); i++) {
+      payload[i] ^= h.mask[i % 4];
+    }
+
+    if (ws::isControl(h.opcode)) {
+      if (h.opcode == ws::kPing) {
+        wsSendFrame(fd, ws::kPong, payload.data(), payload.size());
+      } else if (h.opcode == ws::kClose) {
+        if (payload.size() >= 2) {
+          closeCode = ((int)payload[0] << 8) | payload[1];
+        } else {
+          closeCode = 1000;
+        }
+        // Echo the close (RFC 6455 §5.5.1) and leave HTTP-forbidden land.
+        wsSendFrame(fd, ws::kClose, payload.data(), payload.size());
+        peerClosed = true;
+      }
+      // Pongs and unknown control frames (unreachable: parse rejects them)
+      // are ignored.
+      continue;
+    }
+
+    if (h.opcode == ws::kContinuation) {
+      if (msgOpcode < 0) {
+        protocolError(1002);
+        break;
+      }
+      msg.insert(msg.end(), payload.begin(), payload.end());
+    } else {
+      if (msgOpcode >= 0) {
+        protocolError(1002);  // New message before the previous FIN.
+        break;
+      }
+      msgOpcode = h.opcode;
+      msg = std::move(payload);
+    }
+    if ((int64_t)msg.size() > maxMessageBytes) {
+      protocolError(1009);
+      break;
+    }
+    if (h.fin) {
+      if (msgOpcode == ws::kText && !ws::validUtf8(msg.data(), msg.size())) {
+        protocolError(1007);
+        break;
+      }
+      emitWs(connectionId, msgOpcode, msg.data(), msg.size(), 0);
+      msg.clear();
+      msgOpcode = -1;
+    }
+  }
+
+  // Every exit ends with opcode 8 so Dart reaps deterministically: the peer
+  // code on a clean close, the sent code on our protocol errors (the peer
+  // already holds the matching frame), 1006 on transport failure.
+  emitWs(connectionId, ws::kClose, nullptr, 0, closeCode);
 }
 
 }  // namespace nitroserver

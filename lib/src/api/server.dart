@@ -10,6 +10,7 @@ import 'context.dart';
 import 'event.dart';
 import 'http_method.dart';
 import 'route_group.dart';
+import 'ws.dart';
 
 /// A bound HTTP server backed by the native multithreaded engine.
 ///
@@ -215,6 +216,22 @@ class NitroServer {
   }) =>
       route(HttpMethod.all, pattern, handler,
           timeout: timeout, middleware: middleware);
+
+  /// Registers a WebSocket route (RFC 6455). Matching handshakes upgrade
+  /// in-engine and [handler] receives the live session; anything else on
+  /// the pattern (plain requests, bad handshakes) is answered 426/400 and
+  /// never dispatched. Returns `this` for chaining.
+  ///
+  /// A pattern holds either a WS or an HTTP route: registering one evicts
+  /// the other (the engine keeps a single entry per method + pattern), and
+  /// [unroute] removes whichever stands. Global middleware does not wrap
+  /// WS handlers — the socket leaves HTTP mode before dispatch could run
+  /// it; see [WsHandler] for the auth pattern.
+  Future<NitroServer> ws(String pattern, WsHandler handler) async {
+    _requirePattern(pattern);
+    _runner.addWsRoute(pattern, handler);
+    return this;
+  }
 
   /// A path-prefixed view of this server: `server.group('/api').get(...)`
   /// registers `/api/...`. Groups nest; middleware stays server-global.

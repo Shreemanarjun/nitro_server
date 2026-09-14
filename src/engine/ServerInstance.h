@@ -30,6 +30,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "Common.h"
@@ -56,6 +57,17 @@ struct StatusResult {
   int64_t boundPort = 0;
 };
 
+/// One parsed request head. Views never escape the parse (see WsCodec): the
+/// fields that outlive it are owning strings.
+struct ParsedHead {
+  Method method = Method::Get;
+  std::string customMethod;
+  std::string target;
+  std::string version;
+  std::vector<Header> headers;
+  bool ok = false;
+};
+
 /// Sink for request dispatch. Production code posts into the Nitro streams;
 /// tests record calls. Payloads passed to emitBodyData are malloc-owned and
 /// transfer to the sink, which must have tracked them first.
@@ -76,6 +88,11 @@ class Emitter {
   /// runner's cumulative ack releases it. May be null (empty message).
   virtual void emitBodyError(int64_t requestId, uint8_t* payload, size_t n,
                              ErrorKind kind) = 0;
+  /// One decoded WebSocket event. [payload] is malloc-owned and tracked in
+  /// the connection's payload log (freed by the runner's cumulative ack on
+  /// the connection id); [opcode] is 1/2/8, [code] the close code on 8.
+  virtual void emitWsMessage(int64_t connectionId, uint8_t* payload, size_t n,
+                             int opcode, int code) = 0;
   virtual void emitEvent(ServerEventKind kind, int64_t requestId,
                          const std::string& message) = 0;
 };
@@ -94,7 +111,8 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
 
   void configure(const ServerConfig& config);
   StatusResult registerRoute(Method method, const std::string& customMethod,
-                             const std::string& pattern, int64_t timeoutMs);
+                             const std::string& pattern, int64_t timeoutMs,
+                             bool isWebSocket = false);
   StatusResult unregisterRoute(Method method, const std::string& customMethod,
                                const std::string& pattern);
   StatusResult start();
@@ -117,6 +135,18 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
                        bool last);
   void ackBody(int64_t requestId, int64_t ackedChunks);
 
+  // ── WebSocket sessions ─────────────────────────────────────────────────
+  //
+  // The connection id is the upgraded request's id. Sends are synchronous
+  // socket writes under [wsSendMutex_], so bridge memory is never retained.
+  // Unknown or reaped ids are no-ops.
+
+  /// Sends one message frame (`binary` selects opcode 2 over 1).
+  void wsSend(int64_t connectionId, const uint8_t* payload, size_t n,
+              bool binary);
+  /// Sends a close frame, shuts the socket down and reaps the session.
+  void wsClose(int64_t connectionId, int code);
+
   bool running() const { return running_.load(); }
   int64_t boundPort() const { return boundPort_.load(); }
 
@@ -135,6 +165,27 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   bool serveStream(int fd, int64_t requestId, Method method,
                    const std::shared_ptr<PendingRequest>& req,
                    const ServerConfig& cfg, int64_t& served, bool keepPeer);
+
+  /// Upgrades a matched WebSocket route: validates the RFC 6455 handshake,
+  /// answers 101 and runs the frame loop until close/error/stop. Always
+  /// returns false — upgraded connections never serve HTTP again.
+  bool serveUpgrade(int fd, const std::string& carry, size_t bodyStart,
+                    const ParsedHead& head, const MatchResult& m,
+                    const ServerConfig& cfg, const std::string& path,
+                    const std::string& query);
+
+  /// The frame loop: reads client frames, emits decoded messages, auto-pongs.
+  /// Ends with an opcode-8 emit (peer code, or 1006 on failure) and reaps.
+  void wsLoop(int fd, int64_t connectionId, int64_t maxMessageBytes);
+
+  /// Sends one server frame under [wsSendMutex_]. Synchronous: bridge memory
+  /// is never retained, so no copy is needed.
+  bool wsSendFrame(int fd, int opcode, const uint8_t* payload, size_t n);
+
+  /// Tracks a malloc-owned WS payload and emits it (freed by the runner's
+  /// cumulative ack on the connection id, or by stop()/loop-exit reap).
+  void emitWs(int64_t connectionId, int opcode, const uint8_t* data, size_t n,
+              int code);
 
   void acceptLoop();
   void workerLoop();
@@ -181,6 +232,17 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   // Live connections, so stop() can wake idle keep-alive reads.
   std::mutex activeMutex_;
   std::set<int> activeFds_;
+
+  // Live WebSocket connections by connection id. Entries are erased on
+  // loop exit and on wsClose; either order is safe (erase is idempotent).
+  struct WsConn {
+    int fd = -1;
+  };
+  std::mutex wsMutex_;
+  std::unordered_map<int64_t, WsConn> ws_;
+  // Serializes every socket write that races the frame loop: wsSend/wsClose
+  // from the Dart thread against the loop's own pongs and close echoes.
+  std::mutex wsSendMutex_;
 
   PendingTable pending_;
   std::atomic<int64_t> inFlight_{0};

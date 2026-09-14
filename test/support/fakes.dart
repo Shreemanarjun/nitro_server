@@ -36,6 +36,12 @@ class FakeNitroServerNative extends NitroServerNative {
   var stopCalls = 0;
   var resetCalls = 0;
 
+  /// Chunked streams: start status/headers by id, data chunks in order,
+  /// terminal ids. Assembles nothing — tests assert the wire pieces.
+  final streamsStarted = <int, DrivenResponse>{};
+  final streamChunks = <int, List<Uint8List>>{};
+  final streamsEnded = <int>{};
+
   @override
   Stream<RawIncomingRequest> get incomingRequests => heads.stream;
 
@@ -103,6 +109,24 @@ class FakeNitroServerNative extends NitroServerNative {
   @override
   void ackBody(int requestId, int ackedChunks) {
     acked.add((requestId, ackedChunks));
+  }
+
+  @override
+  void startStream(int requestId, int status, List<RawHeader> headers) {
+    streamsStarted[requestId] = DrivenResponse(
+      requestId: requestId,
+      status: status,
+      headers: {for (final h in headers) h.name: h.value},
+      body: Uint8List(0),
+    );
+  }
+
+  @override
+  void sendStreamChunk(int requestId, Uint8List chunk, bool last) {
+    if (chunk.isNotEmpty) {
+      (streamChunks[requestId] ??= []).add(Uint8List.fromList(chunk));
+    }
+    if (last) streamsEnded.add(requestId);
   }
 
   Future<void> close() async {

@@ -90,6 +90,21 @@ std::string bodyOf(const std::string& response) {
   return response.substr(sep + 4);
 }
 
+/// De-chunks a `Transfer-Encoding: chunked` body; pass bodyOf(response).
+std::string dechunk(const std::string& chunked) {
+  std::string out;
+  size_t pos = 0;
+  while (pos < chunked.size()) {
+    const size_t eol = chunked.find("\r\n", pos);
+    if (eol == std::string::npos) break;
+    const long n = strtol(chunked.c_str() + pos, nullptr, 16);
+    if (n <= 0) break;
+    out.append(chunked.substr(eol + 2, (size_t)n));
+    pos = eol + 2 + (size_t)n + 2;
+  }
+  return out;
+}
+
 /// Case-insensitive response header lookup; returns the trimmed value or "".
 std::string headerOf(const std::string& response, const std::string& name) {
   const size_t sep = response.find("\r\n\r\n");
@@ -766,6 +781,108 @@ TEST(ServerTest, StopWakesParkedConnections) {
   server->stop();
   client.join();
   EXPECT_EQ(statusOf(res), 503);
+}
+
+TEST(ServerTest, ChunkedStreamFramesBodyExactly) {
+  RecordingEmitter emitter([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "unused");
+  });
+  auto server = std::make_shared<ServerInstance>();
+  server->setEmitter(&emitter);
+  EXPECT_EQ(server->registerRoute(Method::Get, "", "/stream", -1).kind,
+            ErrorKind::None);
+  ServerConfig cfg;
+  cfg.port = 0;
+  server->configure(cfg);
+  ASSERT_EQ((int64_t)server->start().kind, (int64_t)ErrorKind::None);
+  const int64_t port = server->boundPort();
+
+  std::string res;
+  std::thread client([&] {
+    const int fd = connectTo((int)port);
+    if (fd < 0) return;
+    sendStr(fd, "GET /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    res = readAll(fd);
+    close(fd);
+  });
+
+  // Wait for dispatch, then stream like the Dart runner would: headers,
+  // three chunks (one empty, which must never hit the wire), terminal.
+  int64_t id = 0;
+  for (int i = 0; i < 1000 && id == 0; i++) {
+    auto seen = emitter.seen();
+    if (!seen.empty()) id = seen[0].requestId;
+    if (id == 0) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_NE(id, 0);
+  server->startStream(id, 200, {{"Content-Type", "text/plain"}});
+  const char* a = "a";
+  const char* bb = "bb";
+  const char* ccc = "ccc";
+  server->sendStreamChunk(id, (const uint8_t*)a, 1, false);
+  server->sendStreamChunk(id, nullptr, 0, false);  // Skipped, not terminal.
+  server->sendStreamChunk(id, (const uint8_t*)bb, 2, false);
+  server->sendStreamChunk(id, (const uint8_t*)ccc, 3, true);
+  // Late chunk after the terminal: dropped, never a second terminator.
+  server->sendStreamChunk(id, (const uint8_t*)a, 1, true);
+  client.join();
+
+  EXPECT_EQ(statusOf(res), 200);
+  EXPECT_EQ(headerOf(res, "transfer-encoding"), "chunked");
+  EXPECT_EQ(dechunk(bodyOf(res)), "abbccc");
+  EXPECT_EQ(res,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+            "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+            "1\r\na\r\n2\r\nbb\r\n3\r\nccc\r\n0\r\n\r\n");
+  server->stop();
+}
+
+TEST(ServerTest, StreamSurvivesForKeepAlive) {
+  RecordingEmitter emitter([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "unused");
+  });
+  auto server = std::make_shared<ServerInstance>();
+  server->setEmitter(&emitter);
+  EXPECT_EQ(server->registerRoute(Method::Get, "", "/s", -1).kind,
+            ErrorKind::None);
+  ServerConfig cfg;
+  cfg.port = 0;
+  server->configure(cfg);
+  ASSERT_EQ((int64_t)server->start().kind, (int64_t)ErrorKind::None);
+  const int64_t port = server->boundPort();
+
+  // One keep-alive connection, two sequential streams: exact framing is
+  // what lets the second request parse.
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  size_t seenCount = 0;
+  for (int round = 0; round < 2; round++) {
+    sendStr(fd, "GET /s HTTP/1.1\r\nHost: x\r\n\r\n");
+    int64_t id = 0;
+    for (int i = 0; i < 1000 && id == 0; i++) {
+      auto seen = emitter.seen();
+      if (seen.size() > seenCount) id = seen.back().requestId;
+      if (id == 0) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_NE(id, 0);
+    seenCount = emitter.seen().size();
+    server->startStream(id, 200, {});
+    std::string payload = "r" + std::to_string(round);
+    server->sendStreamChunk(id, (const uint8_t*)payload.data(), payload.size(),
+                            true);
+    // Read exactly one framed body: headers + chunks through the terminal.
+    std::string got;
+    char buf[4096];
+    while (got.find("0\r\n\r\n") == std::string::npos) {
+      ssize_t n = recv(fd, buf, sizeof(buf), 0);
+      ASSERT_GT(n, 0);
+      got.append(buf, (size_t)n);
+    }
+    EXPECT_EQ(dechunk(bodyOf(got)), payload);
+    EXPECT_EQ(headerOf(got, "connection"), "keep-alive");
+  }
+  close(fd);
+  server->stop();
 }
 
 }  // namespace

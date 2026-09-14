@@ -1,6 +1,7 @@
 // In-memory test client coverage: routing fidelity against the engine's
 // precedence, body/header/query delivery, and the documented divergences
 // (direct 404s, no timeouts). No native library, no sockets.
+import 'package:nitro/nitro.dart';
 import 'package:test/test.dart';
 import 'package:nitro_server/nitro_server.dart';
 import 'package:nitro_server/testing.dart';
@@ -154,5 +155,34 @@ void main() {
   test('close is idempotent', () async {
     await client.close();
     await client.close();
+  });
+
+  test('streams concatenate into one body', () async {
+    await client.server.get('/events', (_) async {
+      return ResponseContext.stream(
+        Stream.fromIterable([
+          Uint8List.fromList('a'.codeUnits),
+          Uint8List.fromList('bc'.codeUnits),
+        ]),
+        headers: {'content-type': 'text/event-stream'},
+      );
+    });
+    final response = await client.get('/events');
+    expect(response.status, 200);
+    expect(response.headers['content-type'], 'text/event-stream');
+    expect(response.text(), 'abc');
+  });
+
+  test('a slow stream still completes', () async {
+    await client.server.get('/drip', (_) async {
+      return ResponseContext.stream(
+        Stream.periodic(
+          const Duration(milliseconds: 20),
+          (i) => Uint8List.fromList('$i,'.codeUnits),
+        ).take(3),
+      );
+    });
+    final response = await client.get('/drip');
+    expect(response.text(), '0,1,2,');
   });
 }

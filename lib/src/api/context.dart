@@ -158,18 +158,34 @@ class RequestContext {
   dynamic json() => jsonDecode(text());
 }
 
-/// The answer a [RequestHandler] returns. There is no streaming-response half:
-/// the handler resolves one value and the runner answers exactly once.
+/// The answer a [RequestHandler] returns. One value or a byte stream: the
+/// handler resolves one [ResponseContext] and the runner answers exactly
+/// once — either a single body ([body]) or chunked transfer-encoding
+/// ([bodyStream]). The two are mutually exclusive.
 class ResponseContext {
   const ResponseContext({
     this.status = 200,
     this.headers = const {},
     this.body,
-  }) : assert(status >= 100 && status <= 599, 'status out of range: $status');
+    this.bodyStream,
+  })  : assert(status >= 100 && status <= 599, 'status out of range: $status'),
+        assert(
+          body == null || bodyStream == null,
+          'body and bodyStream are mutually exclusive',
+        );
 
   final int status;
   final Map<String, String> headers;
   final Uint8List? body;
+
+  /// Chunked body source. Null for one-shot answers. Empty chunks are
+  /// skipped on the wire (a `0`-chunk would terminate the body); closing
+  /// the stream — or a stream error — terminates it, so errors truncate
+  /// rather than hang. The route timeout bounds time-to-first-byte only.
+  final Stream<Uint8List>? bodyStream;
+
+  /// True when this answer streams ([bodyStream] != null).
+  bool get isStream => bodyStream != null;
 
   factory ResponseContext.text(
     String text, {
@@ -261,6 +277,35 @@ class ResponseContext {
       status: status,
       headers: {'content-type': contentType, ...headers},
       body: body,
+    );
+  }
+
+  /// Answers a chunked (`Transfer-Encoding: chunked`) stream. Each event is
+  /// one chunk; the stream's end — clean or by error — terminates the body.
+  /// Framing headers (`content-length`, `transfer-encoding`, `connection`)
+  /// are engine-owned and ignored if passed.
+  ///
+  /// ```dart
+  /// await server.get('/events', (_) async {
+  ///   return ResponseContext.stream(
+  ///     Stream.periodic(
+  ///       const Duration(milliseconds: 100),
+  ///       (i) => utf8.encode('data: $i\n\n'),
+  ///     ).take(10),
+  ///     contentType: 'text/event-stream',
+  ///   );
+  /// });
+  /// ```
+  factory ResponseContext.stream(
+    Stream<Uint8List> data, {
+    int status = 200,
+    Map<String, String> headers = const {},
+    String contentType = 'application/octet-stream',
+  }) {
+    return ResponseContext(
+      status: status,
+      headers: {'content-type': contentType, ...headers},
+      bodyStream: data,
     );
   }
 

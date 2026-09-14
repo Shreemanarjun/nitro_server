@@ -3,9 +3,9 @@
 Source: audit of `lib/src/internal/server_runner.dart`, `lib/src/api/*`,
 `src/engine/ServerInstance.cpp`, `src/engine/Router.cpp`, `src/HybridNitroServer.cpp`.
 
-Verified: 44/44 C++ engine tests, 167/167 Dart tests, `benchmark/compare.dart --quick`
-(nitro fastest on `/hello` and `/json` latency). Full streaming + WebSocket data
-transfer remain the only deferred futures (protocol work).
+Verified: 46/46 C++ engine tests, 175/175 Dart tests, `benchmark/compare.dart --quick`
+(nitro fastest on `/hello` and `/json` latency). WebSocket data transfer
+remains the only deferred future (frame codec + message API).
 
 ## 1. Native hot path
 
@@ -38,7 +38,7 @@ transfer remain the only deferred futures (protocol work).
 | E4 | `ServerConfig.copyWith()` + `NitroServer.bindWith({host, port, ...})` sugar | ✅ done (`context.dart`, `server.dart`) |
 | E5 | Per-route `middleware:` param + `RouteGroup.use()` (route-local list composed after globals) | ✅ done (`server.dart`, `route_group.dart`, `server_runner.dart`) |
 | E6 | Built-in `cors()` middleware | ✅ done (`middleware.dart`) |
-| E7 | In-memory test client + WebSocket 426 (streaming + WS data transfer stay future) | ✅ done — `package:nitro_server/testing.dart` (`NitroTestClient` over a real `ServerRunner` with engine-precedence matching; divergences documented); engine answers RFC 6455 handshakes with `426` + `Sec-WebSocket-Version: 13` before routing (never dispatched). Full request/response streaming and WebSocket data transfer remain ⏳ deferred (need chunked-output protocol + bridge changes) |
+| E7 | In-memory test client + WebSocket 426 + response streaming (WS data transfer stays future) | ✅ done — `package:nitro_server/testing.dart` (`NitroTestClient`); engine answers RFC 6455 handshakes with `426` + `Sec-WebSocket-Version: 13` before routing; `ResponseContext.stream` + `startStream`/`sendStreamChunk` bridge + engine chunked writes (`Transfer-Encoding: chunked`, timeout bounds first byte, keep-alive evaluated per stream). WebSocket data transfer remains ⏳ deferred (frame codec + message API) |
 
 ## Order of work
 

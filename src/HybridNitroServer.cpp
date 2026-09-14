@@ -200,6 +200,24 @@ class HybridNitroServerImpl final : public HybridNitroServerNative {
     server_->ackBody(requestId, ackedChunks);
   }
 
+  void startStream(int64_t requestId, int64_t status,
+                   NitroCppBuffer headers) override {
+    // Same indexed-argument-list decoding as respond (see Wire.h).
+    std::vector<Header> hs;
+    try {
+      hs = decodeHeaderList(headers);
+    } catch (...) {
+      return;  // Malformed blob: drop rather than crash the connection.
+    }
+    server_->startStream(requestId, status, hs);
+  }
+
+  void sendStreamChunk(int64_t requestId, const uint8_t* chunk,
+                       size_t chunk_length, bool last) override {
+    // Deep-copy happens in the engine call: the arena dies on return.
+    server_->sendStreamChunk(requestId, chunk, chunk_length, last);
+  }
+
  private:
   BridgeEmitter emitter_;
   std::shared_ptr<ServerInstance> server_;

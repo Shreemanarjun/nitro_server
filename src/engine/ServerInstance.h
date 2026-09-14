@@ -105,6 +105,16 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   void respond(int64_t requestId, int64_t status,
                const std::vector<Header>& headers, const uint8_t* body,
                size_t bodyLen);
+  /// Starts a chunked response: finalizes status/headers and wakes the
+  /// parked worker, which sends them with `Transfer-Encoding: chunked` and
+  /// parks again for chunks. Unknown/already-answered (timeout won) ids are
+  /// no-ops, so the route timeout bounds time-to-first-byte.
+  void startStream(int64_t requestId, int64_t status,
+                   const std::vector<Header>& headers);
+  /// Queues one stream chunk (deep-copied synchronously); `last` completes
+  /// the stream. Chunks for unknown/incomplete/dead streams are no-ops.
+  void sendStreamChunk(int64_t requestId, const uint8_t* chunk, size_t n,
+                       bool last);
   void ackBody(int64_t requestId, int64_t ackedChunks);
 
   bool running() const { return running_.load(); }
@@ -117,6 +127,14 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   /// One iteration of a connection: exactly one request/response cycle.
   /// Returns true when the connection may serve another request.
   bool serveOne(int fd, std::string& carry, int64_t& served);
+
+  /// The chunked tail of serveOne: sends stream headers, then forwards
+  /// queued chunks until the terminal marker, a send failure, or stop().
+  /// [served] counts this request on every exit. Returns true when the
+  /// connection may serve another request.
+  bool serveStream(int fd, int64_t requestId, Method method,
+                   const std::shared_ptr<PendingRequest>& req,
+                   const ServerConfig& cfg, int64_t& served, bool keepPeer);
 
   void acceptLoop();
   void workerLoop();

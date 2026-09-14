@@ -537,6 +537,32 @@ void main() {
       expect(res.body, 'v6');
     }, skip: skipReason);
 
+    test('a stream answers chunked events, then the server keeps serving',
+        () async {
+      server = await NitroServer.bind();
+      await server!.route(HttpMethod.get, '/events', (_) async {
+        return ResponseContext.stream(
+          Stream.periodic(
+            const Duration(milliseconds: 20),
+            (i) => ascii.encode('data: $i\n\n'),
+          ).take(3),
+          headers: {'content-type': 'text/event-stream'},
+        );
+      });
+      await server!.route(
+        HttpMethod.get,
+        '/ok',
+        (_) async => ResponseContext.text('ok'),
+      );
+
+      final events = await _get(server!.port, '/events');
+      expect(events.status, 200);
+      expect(events.body, 'data: 0\n\ndata: 1\n\ndata: 2\n\n');
+
+      // The streamed connection completed cleanly; the server is unaffected.
+      expect((await _get(server!.port, '/ok')).body, 'ok');
+    }, skip: skipReason);
+
     test('a second bind on the same port fails to bind', () async {
       server = await NitroServer.bind(const ServerConfig(port: 0));
       final port = server!.port;

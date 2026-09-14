@@ -128,8 +128,12 @@ everyone — that is exactly why the table says what was measured
 
 - HTTP/1.1 only.
 - No TLS yet (`supportsTls() == false`; tracked for the `oatpp-libressl` phase).
-- Bodies capped by `maxBodyBytes` (default 10 MB); above it the engine answers
-  413 without dispatching.
+- No WebSocket data transfer: upgrade handshakes are refused with `426` +
+  `Sec-WebSocket-Version: 13` (RFC 6455 §4.2.2).
+- Request bodies capped by `maxBodyBytes` (default 10 MB); above it the engine answers
+  413 without dispatching. Response bodies may stream unbounded via
+  `ResponseContext.stream` (`Transfer-Encoding: chunked`); the route timeout
+  then bounds time-to-first-byte only.
 - The transport is a minimal blocking-IO core shaped like oat++'s
   `HttpConnectionHandler` so the router, pending table and bridge protocol
   move over unchanged when oat++ is vendored.

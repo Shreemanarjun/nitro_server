@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <csignal>
 #include <string_view>
@@ -443,6 +444,35 @@ void ServerInstance::ackBody(int64_t requestId, int64_t ackedChunks) {
   pending_.ack(requestId, ackedChunks);
 }
 
+void ServerInstance::startStream(int64_t requestId, int64_t status,
+                                 const std::vector<Header>& headers) {
+  auto req = pending_.find(requestId);
+  if (!req) return;  // Unknown or already reaped: no-op by design.
+  std::lock_guard<std::mutex> lk(req->mutex);
+  if (req->answered || req->streamStarted) return;  // Timeout won / duplicate.
+  req->answered = true;  // Headers are final; the timeout cannot win now.
+  req->status = status;
+  req->headers = headers;  // Deep copy: bridge memory dies on return.
+  req->streamStarted = true;
+  req->cv.notify_one();
+}
+
+void ServerInstance::sendStreamChunk(int64_t requestId, const uint8_t* chunk,
+                                     size_t n, bool last) {
+  auto req = pending_.find(requestId);
+  if (!req) return;  // Unknown or already reaped: no-op by design.
+  std::vector<uint8_t> copy;
+  if (n > 0 && chunk != nullptr) copy.assign(chunk, chunk + n);
+  std::lock_guard<std::mutex> lk(req->mutex);
+  if (!req->streamStarted || req->streamDone || req->timedOut ||
+      req->streamDead) {
+    return;
+  }
+  if (!copy.empty()) req->streamQueue.push_back(std::move(copy));
+  if (last) req->streamDone = true;
+  req->cv.notify_one();
+}
+
 bool ServerInstance::waitForDrainForTesting(int64_t timeoutMs) {
   const auto end =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
@@ -788,6 +818,7 @@ bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served) {
   // Park until Dart answers or the ROUTE's timeout fires. Per-request mutex:
   // concurrent requests never touch each other here.
   bool expired = false;
+  bool stream = false;
   {
     std::unique_lock<std::mutex> lk(req->mutex);
     if (!req->answered) {
@@ -804,11 +835,20 @@ bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served) {
         req->body.assign(msg.begin(), msg.end());
       }
     }
+    // Read under the same lock: startStream writes it under this mutex.
+    stream = !expired && req->streamStarted;
   }
   if (expired) {
     lockedEmitter()->emitEvent(ServerEventKind::HandlerTimeout, requestId,
                                "handler exceeded " +
                                    std::to_string(timeoutMs) + "ms");
+  }
+
+  // Chunked stream: Dart called startStream before the route timeout, so the
+  // deadline only bounded time-to-first-byte. The stream tail owns this
+  // request from here (headers, chunks, keep-alive accounting, reaping).
+  if (stream) {
+    return serveStream(fd, requestId, head.method, req, cfg, served, keepPeer);
   }
 
   // Only a clean cycle keeps alive: the framing past this point is exact, so
@@ -895,6 +935,101 @@ bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served) {
   pending_.erase(requestId);
   served++;
   return keepAlive && sent;
+}
+
+bool ServerInstance::serveStream(int fd, int64_t requestId, Method method,
+                                 const std::shared_ptr<PendingRequest>& req,
+                                 const ServerConfig& cfg, int64_t& served,
+                                 bool keepPeer) {
+  const Fd sock = (Fd)fd;
+
+  // Snapshot headers under lock; the queue protocol owns the rest.
+  int64_t status;
+  std::vector<Header> headers;
+  {
+    std::lock_guard<std::mutex> lk(req->mutex);
+    status = req->status;
+    headers = req->headers;
+  }
+
+  // Same budget rule as the one-shot path: the final response must not
+  // promise keep-alive on the last allowed request.
+  const bool underBudget =
+      cfg.maxRequestsPerConn <= 0 || served + 1 < cfg.maxRequestsPerConn;
+  const bool keepAlive = keepPeer && cfg.keepAliveTimeoutMs > 0 &&
+                         running_.load() && underBudget;
+  std::string head_out = "HTTP/1.1 " + std::to_string(status) + " " +
+                         reasonPhrase(status) + "\r\n";
+  for (const auto& h : headers) {
+    // Authoritative framing: user headers never override it.
+    if (iequals(h.name, "content-length")) continue;
+    if (iequals(h.name, "connection")) continue;
+    if (iequals(h.name, "transfer-encoding")) continue;
+    head_out += h.name + ": " + h.value + "\r\n";
+  }
+  head_out += "Transfer-Encoding: chunked\r\n";
+  if (keepAlive) {
+    head_out += "Connection: keep-alive\r\nKeep-Alive: timeout=" +
+                std::to_string(cfg.keepAliveTimeoutMs / 1000) + "\r\n\r\n";
+  } else {
+    head_out += "Connection: close\r\n\r\n";
+  }
+  bool sent = sendAll(fd, (const uint8_t*)head_out.data(), head_out.size());
+
+  // HEAD answers headers only: the stream is drained by no-op drops after
+  // the reap below, and the connection closes (no resumption mid-stream).
+  const bool isHead = method == Method::Head;
+  bool done = !sent || isHead;
+  bool dead = !sent;
+  while (!done && !dead) {
+    std::vector<uint8_t> chunk;
+    bool terminal = false;
+    {
+      std::unique_lock<std::mutex> lk(req->mutex);
+      req->cv.wait(lk, [&] {
+        return !req->streamQueue.empty() || req->streamDone ||
+               req->streamDead;
+      });
+      if (req->streamDead) {
+        dead = true;
+      } else if (!req->streamQueue.empty()) {
+        chunk = std::move(req->streamQueue.front());
+        req->streamQueue.pop_front();
+      } else if (req->streamDone) {
+        terminal = true;
+      }
+    }
+    if (dead) break;
+    if (!chunk.empty()) {
+      char sizeLine[32];
+      const int sizeLen =
+          snprintf(sizeLine, sizeof(sizeLine), "%zx\r\n", chunk.size());
+      if (sizeLen <= 0 ||
+          !sendAll(sock, (const uint8_t*)sizeLine, (size_t)sizeLen) ||
+          !sendAll(sock, chunk.data(), chunk.size()) ||
+          !sendAll(sock, (const uint8_t*)"\r\n", 2)) {
+        dead = true;
+      }
+    } else if (terminal) {
+      static const char kEnd[] = "0\r\n\r\n";
+      if (!sendAll(sock, (const uint8_t*)kEnd, sizeof(kEnd) - 1)) dead = true;
+      done = true;
+    }
+    // Else: spurious wake with an empty queue and no terminal flag — loop
+    // re-evaluates the predicate.
+  }
+
+  // Mark terminal under lock so late chunks no-op instead of queueing
+  // behind a reaped request, then drop the entry like the one-shot path.
+  {
+    std::lock_guard<std::mutex> lk(req->mutex);
+    req->streamQueue.clear();
+    req->streamDone = true;
+    req->streamDead = true;
+  }
+  pending_.erase(requestId);
+  served++;
+  return keepAlive && !dead;
 }
 
 }  // namespace nitroserver

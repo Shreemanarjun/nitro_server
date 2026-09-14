@@ -979,5 +979,137 @@ void main() {
       );
     });
   });
+
+  group('streams', () {
+    test('status, headers and chunks ride startStream in order', () async {
+      final controller = StreamController<Uint8List>();
+      runner.addRoute(HttpMethod.get, '', '/ev', null, (_) async {
+        return ResponseContext.stream(
+          controller.stream,
+          headers: {'x-feed': 'yes'},
+        );
+      });
+      await Future<void>.delayed(Duration.zero);
+
+      fake.heads.add(fakeHead(requestId: 500, path: '/ev', routePattern: '/ev'));
+      for (var i = 0; i < 200 && !fake.streamsStarted.containsKey(500); i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+      final started = fake.streamsStarted[500]!;
+      expect(started.status, 200);
+      expect(started.headers['content-type'], contains('octet-stream'));
+      expect(started.headers['x-feed'], 'yes');
+
+      controller.add(Uint8List.fromList('a'.codeUnits));
+      controller.add(Uint8List.fromList('bc'.codeUnits));
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+      await controller.close();
+      for (var i = 0; i < 200 && !fake.streamsEnded.contains(500); i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+      final chunks = fake.streamChunks[500]!;
+      expect(
+        chunks.map(String.fromCharCodes).join(),
+        'abc',
+      );
+      expect(fake.streamsEnded, contains(500));
+      expect(runner.pendingIdsForTesting, isNot(contains(500)));
+    });
+
+    test('empty chunks never reach the engine', () async {
+      final controller = StreamController<Uint8List>();
+      runner.addRoute(HttpMethod.get, '', '/pad', null, (_) async {
+        return ResponseContext.stream(controller.stream);
+      });
+      await Future<void>.delayed(Duration.zero);
+
+      fake.heads.add(fakeHead(requestId: 501, path: '/pad', routePattern: '/pad'));
+      for (var i = 0; i < 200 && !fake.streamsStarted.containsKey(501); i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+      controller.add(Uint8List(0)); // Would terminate a chunked body.
+      controller.add(Uint8List.fromList([1]));
+      controller.add(Uint8List(0));
+      await controller.close();
+      for (var i = 0; i < 200 && !fake.streamsEnded.contains(501); i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+      // Only the payload chunk crossed; the terminal call carries no bytes.
+      expect(fake.streamChunks[501], hasLength(1));
+      expect(fake.streamChunks[501]!.single, orderedEquals([1]));
+    });
+
+    test('a stream error truncates instead of hanging', () async {
+      final controller = StreamController<Uint8List>();
+      runner.addRoute(HttpMethod.get, '', '/flaky', null, (_) async {
+        return ResponseContext.stream(controller.stream);
+      });
+      await Future<void>.delayed(Duration.zero);
+
+      fake.heads.add(
+        fakeHead(requestId: 502, path: '/flaky', routePattern: '/flaky'),
+      );
+      for (var i = 0; i < 200 && !fake.streamsStarted.containsKey(502); i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+      controller.add(Uint8List.fromList('part'.codeUnits));
+      controller.addError(StateError('feed died'));
+      for (var i = 0; i < 200 && !fake.streamsEnded.contains(502); i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+      // Bytes so far, then a clean terminator: the client sees 'part'.
+      expect(
+        fake.streamChunks[502]!.map(String.fromCharCodes).join(),
+        'part',
+      );
+      expect(fake.streamsEnded, contains(502));
+    });
+
+    test('close mid-stream stops forwarding and drops the id', () async {
+      final controller = StreamController<Uint8List>(sync: true);
+      runner.addRoute(HttpMethod.get, '', '/long', null, (_) async {
+        return ResponseContext.stream(controller.stream);
+      });
+      await Future<void>.delayed(Duration.zero);
+
+      fake.heads.add(fakeHead(requestId: 503, path: '/long', routePattern: '/long'));
+      for (var i = 0; i < 200 && !fake.streamsStarted.containsKey(503); i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+      controller.add(Uint8List.fromList([1]));
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(fake.streamChunks[503], hasLength(1));
+
+      await runner.close();
+      controller.add(Uint8List.fromList([2]));
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      // Nothing forwarded after close; no terminal for a dead engine.
+      expect(fake.streamChunks[503], hasLength(1));
+      expect(fake.streamsEnded, isNot(contains(503)));
+      await controller.close();
+    });
+
+    test('a throwing error page may answer with a stream', () async {
+      runner.addRoute(HttpMethod.get, '', '/boom', null, (_) async {
+        throw StateError('kaput');
+      });
+      runner.errorHandler = (error, _) =>
+          ResponseContext.stream(Stream.value(Uint8List.fromList('oops'.codeUnits)));
+      await Future<void>.delayed(Duration.zero);
+
+      // Streams never `respond`, so drive the head by hand and watch the
+      // stream signals instead of `fake.responded`.
+      fake.heads.add(fakeHead(requestId: 504, path: '/boom', routePattern: '/boom'));
+      for (var i = 0; i < 200 && !fake.streamsEnded.contains(504); i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+      expect(fake.responded.where((r) => r.requestId == 504), isEmpty);
+      expect(fake.streamsStarted[504]!.status, 200);
+      expect(
+        fake.streamChunks[504]!.map(String.fromCharCodes).join(),
+        'oops',
+      );
+    });
+  });
 }
 

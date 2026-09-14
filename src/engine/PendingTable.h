@@ -20,6 +20,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -36,6 +37,15 @@ struct PendingRequest {
   int64_t status = 500;
   std::vector<Header> headers;
   std::vector<uint8_t> body;
+
+  // Chunked response streams (E7). `answered` doubles as "headers final":
+  // startStream sets it, so the route timeout can only win before the first
+  // byte — afterwards the stream phase is unbounded and ends with the
+  // terminal chunk, a send failure, or stop().
+  bool streamStarted = false;
+  bool streamDone = false;
+  bool streamDead = false;
+  std::deque<std::vector<uint8_t>> streamQueue;
 };
 
 struct PayloadLog {
@@ -118,6 +128,10 @@ class PendingTable {
   /// decodes are serialized with this on the isolate thread (both arrive as
   /// FFI calls or stream events on the same thread), so no decode can
   /// straddle the free.
+  ///
+  /// Streaming requests already sent their headers, so a 503 is unframable:
+  /// they are marked dead instead, which fails their next chunk wait and
+  /// closes the connection.
   void abortAll() {
     std::lock_guard<std::mutex> lk(mutex_);
     for (auto& kv : table_) {
@@ -129,6 +143,9 @@ class PendingTable {
         req->headers = {{"Content-Type", "text/plain"}};
         static const char kMsg[] = "server stopped";
         req->body.assign(kMsg, kMsg + sizeof(kMsg) - 1);
+        req->cv.notify_one();
+      } else if (req->streamStarted && !req->streamDone && !req->streamDead) {
+        req->streamDead = true;
         req->cv.notify_one();
       }
     }

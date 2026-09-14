@@ -340,6 +340,34 @@ class _InMemoryNative extends NitroServerNative {
   @override
   void ackBody(int requestId, int ackedChunks) {}
 
+  @override
+  void startStream(int requestId, int status, List<RawHeader> headers) {
+    _streamStatus[requestId] = status;
+    _streamHeaders[requestId] = {
+      for (final h in headers) h.name: h.value,
+    };
+  }
+
+  @override
+  void sendStreamChunk(int requestId, Uint8List chunk, bool last) {
+    if (chunk.isNotEmpty) {
+      (_streamBodies[requestId] ??= BytesBuilder(copy: false)).add(chunk);
+    }
+    if (!last) return;
+    answered[requestId] = NitroTestResponse(
+      status: _streamStatus[requestId] ?? 200,
+      headers: _streamHeaders[requestId] ?? const {},
+      body: _streamBodies[requestId]?.toBytes() ?? Uint8List(0),
+    );
+    _streamStatus.remove(requestId);
+    _streamHeaders.remove(requestId);
+    _streamBodies.remove(requestId);
+  }
+
+  final _streamStatus = <int, int>{};
+  final _streamHeaders = <int, Map<String, String>>{};
+  final _streamBodies = <int, BytesBuilder>{};
+
   static String _routeToken(RawRouteConfig route) {
     if (route.method == RawServerMethod.custom) return route.customMethod;
     if (route.method == RawServerMethod.all) return '*';

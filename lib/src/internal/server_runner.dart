@@ -129,6 +129,10 @@ class ServerRunner {
   HandlerComposer _compose = _identity;
   final _events = StreamController<ServerEvent>.broadcast();
 
+  /// Live outbound stream subscriptions by request id. Cancelled on [close]
+  /// so a shutdown server stops forwarding into a dead engine.
+  final _outbound = <int, StreamSubscription<Uint8List>>{};
+
   /// Answers unmatched requests. Defaults to an empty 404.
   NotFoundHandler _notFoundHandler = (_) => const ResponseContext(status: 404);
 
@@ -296,6 +300,10 @@ class ServerRunner {
     } catch (_) {
       // Stopping a never-started server is a no-op, not an error.
     }
+    for (final sub in _outbound.values) {
+      await sub.cancel();
+    }
+    _outbound.clear();
     await _heads?.cancel();
     await _chunks?.cancel();
     await _serverEvents?.cancel();
@@ -444,8 +452,7 @@ class ServerRunner {
     );
     if (entry == null) {
       _guardedNotFound(context).then((response) {
-        _answer(head.requestId, response);
-        _complete(head.requestId);
+        _deliver(head.requestId, response);
       });
       return;
     }
@@ -459,18 +466,28 @@ class ServerRunner {
     // separate try/catch needed.
     Future<ResponseContext>.sync(() => piped(context)).then(
       (response) {
-        _answer(head.requestId, response);
-        _complete(head.requestId);
+        _deliver(head.requestId, response);
       },
       onError: (Object error) {
         // The handler's future failed: the custom error page (guarded, so it
         // cannot throw) answers instead of the default 500.
         _guardedError(error, context).then((response) {
-          _answer(head.requestId, response);
-          _complete(head.requestId);
+          _deliver(head.requestId, response);
         });
       },
     );
+  }
+
+  /// Delivers one handler answer: one-shot bodies go out with exactly-once
+  /// `respond`; stream bodies open a chunked stream instead. Fallbacks share
+  /// this path, so a custom error page may stream too.
+  void _deliver(int requestId, ResponseContext response) {
+    if (response.bodyStream != null) {
+      _answerStream(requestId, response);
+    } else {
+      _answer(requestId, response);
+      _complete(requestId);
+    }
   }
 
   /// Runs the not-found fallback. A throwing fallback degrades to an empty
@@ -507,23 +524,66 @@ class ServerRunner {
   void _answer(int requestId, ResponseContext response) {
     if (_closed) return;
     try {
-      // Headerless answers (the common small-response case) share one
-      // canonical empty list instead of allocating a fresh growable one.
-      final headers = response.headers.isEmpty
-          ? const <RawHeader>[]
-          : [
-              for (final entry in response.headers.entries)
-                RawHeader(name: entry.key, value: entry.value),
-            ];
       _native.respond(
         requestId,
         response.status,
-        headers,
+        _rawHeaders(response),
         response.bodyBytes,
       );
     } catch (_) {
       // The request was already answered (timeout won) or the server went
       // away mid-flight. Exactly-once is the engine's job; Dart never retries.
     }
+  }
+
+  /// Headerless answers (the common small-response case) share one canonical
+  /// empty list instead of allocating a fresh growable one.
+  static List<RawHeader> _rawHeaders(ResponseContext response) {
+    if (response.headers.isEmpty) return const <RawHeader>[];
+    return [
+      for (final entry in response.headers.entries)
+        RawHeader(name: entry.key, value: entry.value),
+    ];
+  }
+
+  /// Opens a chunked stream and forwards the body into it. Completion —
+  /// clean end or stream error — sends the terminal chunk and marks the id
+  /// answered, so a stale duplicate head can never dispatch again. A stream
+  /// error truncates rather than hangs: the client sees a clean terminator
+  /// after the bytes so far.
+  void _answerStream(int requestId, ResponseContext response) {
+    if (_closed) return;
+    try {
+      _native.startStream(requestId, response.status, _rawHeaders(response));
+    } catch (_) {
+      // The timeout won before the first byte (or the server went away):
+      // drop the stream unopened and mark the id answered.
+      _complete(requestId);
+      return;
+    }
+    late final StreamSubscription<Uint8List> sub;
+    sub = response.bodyStream!.listen(
+      (chunk) {
+        if (_closed || chunk.isEmpty) return;
+        try {
+          _native.sendStreamChunk(requestId, chunk, false);
+        } catch (_) {}
+      },
+      onError: (_) => _finishStream(requestId),
+      onDone: () => _finishStream(requestId),
+      cancelOnError: true,
+    );
+    _outbound[requestId] = sub;
+  }
+
+  void _finishStream(int requestId) {
+    final sub = _outbound.remove(requestId);
+    if (!_closed) {
+      try {
+        _native.sendStreamChunk(requestId, Uint8List(0), true);
+      } catch (_) {}
+    }
+    _complete(requestId);
+    sub?.cancel();
   }
 }

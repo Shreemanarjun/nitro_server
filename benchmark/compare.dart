@@ -159,18 +159,31 @@ Future<List<Isolate>> _spawnSharedDartServers(int port, int count) async {
   final isolates = <Isolate>[];
   for (var i = 0; i < count; i++) {
     final ready = ReceivePort();
+    // The isolate's own copies of the mode flags start at their defaults:
+    // hand the real ones over, or those isolates answer `Connection: close`.
     isolates.add(
-      await Isolate.spawn(_sharedDartServerMain, (port, ready.sendPort)),
+      await Isolate.spawn(_sharedDartServerMain, (
+        port: port,
+        keepAlive: _keepAlive,
+        batchEvents: _batchEvents,
+        ready: ready.sendPort,
+      ), onError: ready.sendPort),
     );
-    await ready.first;
+    final first = await ready.first;
+    if (first != true) {
+      throw StateError('dart:io shared isolate $i failed to bind: $first');
+    }
   }
   return isolates;
 }
 
-Future<void> _sharedDartServerMain((int, SendPort) args) async {
-  final (port, ready) = args;
-  await _startDartServer(port: port, shared: true);
-  ready.send(true);
+Future<void> _sharedDartServerMain(
+  ({int port, bool keepAlive, bool batchEvents, SendPort ready}) args,
+) async {
+  _keepAlive = args.keepAlive;
+  _batchEvents = args.batchEvents;
+  await _startDartServer(port: args.port, shared: true);
+  args.ready.send(true);
 }
 
 Future<HttpServer> _startDartServer({int port = 0, bool shared = false}) async {
@@ -909,7 +922,9 @@ Future<void> main(List<String> args) async {
   );
   print('');
 
-  final dartServer = await _startDartServer();
+  // `shared: true` on the FIRST bind too: a later shared bind on a port
+  // held by an exclusive listener fails with "address in use".
+  final dartServer = await _startDartServer(shared: _isolates != 1);
   final dartIsolates = _isolates == 1
       ? <Isolate>[]
       : await _spawnSharedDartServers(

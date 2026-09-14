@@ -103,6 +103,16 @@ void main() {
     });
   });
 
+  group('ServerConfig', () {
+    test('isolates is typed, defaulted and copied', () {
+      const base = ServerConfig();
+      expect(base.isolates, 1);
+      expect(base.copyWith(isolates: 0).isolates, 0);
+      expect(base.copyWith(port: 8080).isolates, 1);
+      expect(() => ServerConfig(isolates: -1), throwsA(isA<AssertionError>()));
+    });
+  });
+
   group('ResponseContext', () {
     test('factories set content types', () {
       expect(

@@ -1,71 +1,64 @@
 ## 0.0.1
 
-Initial release: a fast HTTP server backed by a native multithreaded C++
-engine over Nitro FFI, with trie routing (`:param` + trailing `*`,
-static-beats-param-beats-wildcard), per-route timeouts, middleware,
-keep-alive, and `maxBodyBytes` enforcement.
+Initial release: an HTTP/1.1 and WebSocket server backed by a native C++
+engine over Nitro FFI. Trie routing (`:param`, trailing `*`, static beats
+param beats wildcard), per-route timeouts, middleware, route groups,
+keep-alive, `maxBodyBytes`, chunked response streams, an in-memory test
+client, and a Dart-only mode with no Flutter SDK dependency.
 
-### Performance
+### Engine
 
-* Direct-write answer path: the thread that answers (Dart's `respond`, or
-  the worker on timeout/stop) serializes and writes the response itself,
-  non-blocking, and the connection worker parks in `poll()` on the socket
-  plus a per-worker wake pipe instead of a condition variable. A keep-alive
-  answer needs no thread wake and no response copy; only a partial write
-  (queued as a tail the worker flushes) or a closing answer pokes the pipe.
+* Direct-write answers. The thread that answers (Dart's `respond`, or the
+  worker on timeout and shutdown) serializes the response and writes it
+  with one non-blocking `sendmsg`. Workers park in `poll()` on the socket
+  and a per-worker wake pipe instead of a condition variable, so a
+  keep-alive answer needs no thread wake and no copy. A partial write is
+  queued as a tail the worker flushes.
 * Stream chunks are queued for the worker and coalesced per flush pass
-  instead of written on the Dart isolate one syscall per chunk.
-* Worker pool default `max(64, 4 × cores)`: fewer workers than live
-  keep-alive connections cycled connections through the queue between
-  workers (measured 14 ms p99 at 32 connections on 16 workers).
-* Small request bodies (≤ 64 KiB) are read in full before the head is
-  emitted: one chunk + one complete head instead of head + chunk + end
-  marker, and a single head decode on the Dart side. Large bodies read in
-  64 KiB blocks (was 4 KiB).
-* Leaf-call FFI fast path for `respond`/`startStream`/`sendStreamChunk`
-  over reusable native buffers (0.7 µs → 0.18 µs per call in AOT), with
-  the generated bindings as the fallback and a test pinning the wire
-  format byte-for-byte.
-* Dart dispatch: handlers are invoked inline instead of via
-  `Future(() => …)` (one event-loop turn saved per request); the middleware
-  fold is skipped when no middleware is registered; the `HttpMethod.all`
-  fallback key is only built on a miss; empty bodies share one buffer;
-  header names skip re-lowercasing when already lowercase.
-* Duplicate-head dedup is deterministic: a bounded (1024-entry) set of
-  recently answered ids outlives the in-flight entry, so a stale resend can
-  never dispatch again regardless of stream scheduling.
-* Native response path: headers and small bodies (≤ 128 KiB) go out in a
-  single `send()` instead of two; per-header names are lowered once, not
-  twice; the dispatch sink is loaded once per request instead of once per
-  body chunk.
-* `ResponseContext.text`/`json` encode UTF-8 (`utf8.encode`) instead of
-  emitting UTF-16 code units, so non-ASCII bodies survive the wire.
+  rather than written on the Dart isolate one syscall per chunk.
+* Auto-scaling worker pool: one thread per core at start, growth when a
+  queued or yielded connection finds nobody idle, retirement of idle
+  threads above the floor after 10 s. `ServerConfig.workerThreads` is the
+  cap (`0` = `max(64, 4 × cores)`).
+* Multi-isolate serving: `ServerConfig.isolates` (`0` = auto) runs that
+  many Dart runners behind one engine. Requests are dealt round-robin and
+  every message of a request goes to the runner that received its head.
+  Routes are registered by the `setup` function `bind` accepts, once per
+  isolate.
+* Bodies up to 64 KiB are read in full before the head is emitted: one
+  chunk plus one complete head instead of head, chunk and end marker.
+  Larger bodies are read in 64 KiB blocks.
+* Leaf-call FFI path for `respond`, `startStream` and `sendStreamChunk`
+  over reusable native buffers: 0.18 µs per call versus 0.7 µs for the
+  generated bindings (AOT). The generated bindings remain the fallback and
+  a test pins the wire format byte for byte.
+* Header parsing over `string_view`, allocation-free case-insensitive
+  compares, route matching without per-branch vector copies.
 
-### Dart-only mode
-
-* No Flutter SDK dependency: `dart pub get`, `dart test` and `dart run` all
-  work. The `ffiPlugin` metadata stays, so Flutter apps keep automatic
-  native bundling.
-* New `loadNitroServerNative()` one-liner for Dart CLI programs (with
-  `NITRO_SERVER_DYLIB` / `path:` override).
-* Suites run on `package:test`; `tool/coverage.sh` prefers `dart test`.
-
-### API
+### Dart API
 
 * `RequestContext.jsonMap()`, `jsonList()` and `jsonAs<T>()`: typed JSON
-  body accessors that throw `FormatException` at the boundary when the
-  shape is wrong, instead of a late cast error deep in a handler.
-  `json()` stays for callers that want the raw decode.
+  body accessors that throw `FormatException` when the shape is wrong.
+  `json()` stays for the raw decode.
+* `ResponseContext.jsonBody`, `html`, `redirect`, `stream`;
+  `ServerConfig.copyWith`; `NitroServer.bindWith`; per-route and per-group
+  middleware; built-in `cors()` and `accessLog()`.
+* Handlers may return a `ResponseContext` synchronously; the runner invokes
+  them through `Future.sync`, so a sync handler skips an event-loop turn.
+* `ResponseContext.text` and `json` encode UTF-8, so non-ASCII bodies
+  survive the wire.
+* `loadNitroServerNative()` for Dart CLI programs, with `NITRO_SERVER_DYLIB`
+  and `path:` overrides.
 
 ### Benchmark
 
-* `benchmark/compare.dart` compares `dart:io` vs `shelf` vs `nitro_server`
-  on identical routes with an identical driver: sequential latency via
-  `package:benchmark_harness` (`AsyncBenchmarkBase`, ~10k samples per case)
-  from one client isolate, plus a closed-loop load sweep from several
-  client isolates reporting throughput AND latency under load (p50/p99).
-  The driver never shares the server's isolate — a client on the server's
-  event loop measures itself. Flags: `--keep-alive`, `--connections`,
-  `--clients`, `--seconds`, `--only`, `--workers`, `--json`. See
-  `benchmark/` for methodology and numbers, `PERFORMANCE_PLAN.md` for the
-  measured history and what comes next.
+* `benchmark/compare.dart` compares `dart:io`, `shelf` and `nitro_server`
+  on identical routes. The driver runs in separate client isolates:
+  sequential latency through `package:benchmark_harness`, load through a
+  closed-loop sweep that reports throughput and latency under load.
+  `--raw` swaps in a raw-socket load client, `--isolates N` gives both
+  nitro and dart:io N isolates, `/work` measures handler CPU. Flags and
+  results are in `benchmark/README.md`; the measured history is in
+  `PERFORMANCE_PLAN.md`.
+* `tool/coverage.sh` converts `dart test --coverage` output to lcov before
+  gating; it used to read a stale file.

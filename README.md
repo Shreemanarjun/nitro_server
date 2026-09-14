@@ -1,19 +1,19 @@
 # nitro_server
 
-A fast HTTP server for Flutter backed by a native multithreaded C++ engine
-over Nitro FFI — the listener twin of
-[`nitro_http`](https://github.com/Shreemanarjun/nitro_http), built with the
-same nitrogen_cli pattern, the same test discipline, and the same honesty
-about numbers.
+An HTTP/1.1 and WebSocket server for Dart and Flutter. A native C++ engine
+(over [Nitro](https://pub.dev/packages/nitro) FFI) accepts, parses, routes
+and writes; your handlers run on the Dart isolate. Same tooling and test
+discipline as [`nitro_http`](https://github.com/Shreemanarjun/nitro_http),
+its client twin.
 
 ```dart
 import 'package:nitro_server/nitro_server.dart';
 
-final server = await NitroServer.bind(); // ephemeral port, 127.0.0.1
+final server = await NitroServer.bind(); // 127.0.0.1, free port
 
 await server.get('/hello', (_) async => ResponseContext.text('hi 👋'));
 await server.get('/users/:id', (request) async {
-  return ResponseContext.json('{"id": "${request.param('id')}"}');
+  return ResponseContext.jsonBody({'id': request.param('id')});
 });
 await server.post('/echo', (request) async {
   return ResponseContext.bytes(request.body);
@@ -25,58 +25,83 @@ await server.close();
 
 ## How it works
 
-One `NitroServer` owns one native accept loop. Each connection runs on a
-worker thread (default pool `max(64, 4 × cores)`): parse → trie route lookup
-→ dispatch to Dart over a stream → park in `poll()` on the socket and the
-worker's own wake pipe until the answer is on the wire or the route's timeout
-fires. The answer is written by whoever produces it: your handler's
-`respond` serializes the response and writes it to the socket on the Dart
-thread, non-blocking — no copy into a queue, no thread wake for the common
-keep-alive case (the next request's bytes wake the worker). Whatever the
-socket buffer cannot take right now becomes a tail the worker flushes;
-stream chunks always go through that tail so a burst of small chunks
-coalesces into fewer syscalls. No shared bridge lock, no callbacks (one
-`NativeCallable` slot per method would clobber concurrent requests — the same
-lesson `nitro_http` learned), and the Dart isolate never blocks. That is the
-whole deadlock story.
+One `NitroServer` owns one native accept loop. A connection is served by a
+native worker thread: parse, route through a segment trie, hand the request
+to Dart over a stream, then park in `poll()` until the answer is on the wire
+or the route's timeout fires.
 
-Routing is a segment trie built on day one: `:param` captures, trailing `*`
-wildcards, static-beats-param-beats-wildcard precedence, per-route timeouts.
+The answer is written by the thread that produces it. Your handler's
+`respond` serializes status, headers and body and writes them to the socket
+with one non-blocking `sendmsg` on the Dart thread. Nothing is copied into a
+queue and no thread is woken; the next request's bytes wake the worker.
+Bytes the socket buffer cannot take yet become a tail the worker flushes.
+Stream chunks always go through that tail, so a burst of small chunks
+leaves in a few syscalls instead of one per chunk.
+
+There is no shared bridge lock and there are no callbacks: each request
+waits on its own state under its own mutex, and the Dart isolate never
+blocks.
+
+Routing: `:param` captures, a trailing `*` wildcard, static beats param
+beats wildcard, per-route timeouts, `HttpMethod.all` as the fallback.
 
 ## API
 
 | call | does |
 | ---- | ---- |
-| `NitroServer.bind([config])` | binds + starts; port `0` picks a free one, read back from `server.port` |
-| `server.get/post/put/delete/patch/head/options/all(pattern, handler)` | one-line route registration |
-| `server.route(method, pattern, handler, {timeout, customMethod})` | full control, incl. custom verbs |
-| `server.unroute(method, pattern)` | removes a route (`RouteNotFoundException` if absent) |
-| `server.close()` | stops, answers parked requests with 503, idempotent |
-| `server.events` | broadcast lifecycle stream (started, stopped, handler timeouts) |
+| `NitroServer.bind([config, setup])` | binds and starts; port `0` picks a free one, read it from `server.port`; `setup` registers routes before the first request (required when `isolates > 1`) |
+| `server.get/post/put/delete/patch/head/options/all(pattern, handler)` | route registration |
+| `server.route(method, pattern, handler, {timeout, customMethod, middleware})` | the general form, custom verbs included |
+| `server.use(middleware)` | server-wide middleware, outermost first |
+| `server.group(prefix)` | a path-prefixed view with its own middleware |
+| `server.ws(pattern, handler)` | a WebSocket route (RFC 6455); the handler gets a `WsSession` |
+| `server.notFoundHandler = …`, `server.errorHandler = …` | custom 404 and 500 answers |
+| `server.unroute(method, pattern)` | removes a route; `RouteNotFoundException` if absent |
+| `server.events` | broadcast lifecycle stream: started, stopped, handler timeouts |
+| `server.close()` | stops, answers parked requests with 503; idempotent |
 
-Handlers receive a `RequestContext` (method, path, query, headers, `:param`
-captures, assembled body) and return a `ResponseContext` (status, headers,
-body) via the `text` / `json` / `bytes` factories. A handler that outlives its
-route timeout loses: the client already got a 408 and the late value is
-dropped, never sent twice. A throwing handler is a 500; the server survives.
+A handler receives a `RequestContext` (method, path, query, headers,
+`:param` captures, the assembled body with `text()`, `jsonMap()`,
+`jsonList()`, `jsonAs<T>()`) and returns a `ResponseContext` through the
+`text`, `json`, `jsonBody`, `html`, `bytes`, `redirect` or `stream`
+factories. A handler that outlives its route timeout loses: the client
+already received a 408 and the late value is dropped. A throwing handler is
+a 500 and the server keeps running.
 
-## Platform lifecycle (loud by design)
+`package:nitro_server/testing.dart` has an in-memory `NitroTestClient` for
+handler tests without sockets.
 
-- **iOS:** start only in the foreground — the OS suspends listener sockets in
-  the background. The example app stops its server when backgrounded rather
-  than letting it die silently.
+## Scaling
+
+| knob | default | effect |
+| ---- | ------- | ------ |
+| `ServerConfig.workerThreads` | `0` = `max(64, 4 × cores)` | Cap of the native worker pool. The pool starts at one thread per core, grows when a connection is queued and nobody is idle, and retires threads above the floor after 10 s idle. A worker is pinned to its connection while a handler runs, so the cap must exceed the keep-alive connections you expect to hold at once. |
+| `ServerConfig.isolates` | `1` | Dart isolates running handlers behind the one engine; `0` picks half the cores (1 to 8). Requests are dealt round-robin. Every isolate runs the `setup` function given to `bind`, so register routes there. Use it when handlers do real CPU work: one isolate serves 60k `/hello` req/s but only 3.4k of a JSON-encoding handler, and four isolates make that 10.9k (numbers in `PERFORMANCE_PLAN.md`). |
+
+```dart
+Future<void> setup(NitroServer server) async {
+  await server.get('/report', (_) async => ResponseContext.jsonBody(buildReport()));
+}
+
+final server = await NitroServer.bind(const ServerConfig(isolates: 0), setup);
+```
+
+## Platform lifecycle
+
+- **iOS:** start in the foreground only; the OS suspends listener sockets in
+  the background. The example app stops its server when backgrounded.
 - **Android:** serve from a foreground service; the engine cannot keep the
-  process alive by itself.
-- **Desktop:** no constraints — the reference platform for testing.
-- **Web:** unsupported. Browsers cannot bind raw sockets; there is no shim.
+  process alive.
+- **Desktop:** no constraints; the reference platform for testing.
+- **Web:** unsupported. Browsers cannot bind sockets.
 
 ## Dart-only mode
 
 The package has no Flutter SDK dependency: `dart pub get`, `dart test` and
-`dart run` all work. Flutter apps keep working unchanged — the `ffiPlugin`
-metadata still gets the native library built and bundled automatically.
+`dart run` work. Flutter apps are unchanged; the `ffiPlugin` metadata still
+builds and bundles the native library.
 
-Dart CLI programs build the library with cmake and open it once at startup:
+A Dart CLI program builds the library with cmake and opens it once:
 
 ```dart
 import 'package:nitro_server/nitro_server.dart';
@@ -89,95 +114,86 @@ void main() async {
 }
 ```
 
-`NITRO_SERVER_DYLIB` (or an explicit `path:` argument) overrides the search,
-which defaults to the conventional cmake outputs (`build/lib/<name>`,
-`build/<name>`).
+`NITRO_SERVER_DYLIB` or an explicit `path:` overrides the search, which
+defaults to `build/lib/<name>` then `build/<name>`.
 
 ## How it compares
 
-For Dart servers the realistic alternatives are `dart:io HttpServer` (stdlib)
-and `shelf`/`shelf_io` (which sits on `dart:io`). Dimensions that actually
-differ:
+The Dart alternatives are `dart:io HttpServer` and `shelf` (which runs on
+`dart:io`).
 
-| dimension | `dart:io` / shelf | `nitro_server` |
-| --------- | ----------------- | -------------- |
-| connection handling | single-threaded event loop; slow handlers stall the loop unless offloaded to isolates | native thread per connection; a slow handler costs one thread, never the loop |
-| answer path | handler → Dart socket buffer → event loop write | handler → one non-blocking `sendmsg` on the calling thread, no copy, no wake |
-| routing | manual (`request.uri.path` switches) or shelf_router middleware | built-in trie with `:param` + `*`, static-first precedence |
-| per-route timeouts | hand-rolled `Future.timeout` per handler | enforced natively per route; late answers dropped exactly once |
-| request size cap | manual content-length accounting | `maxBodyBytes` enforced while streaming (413 + no dispatch) |
-| upload streaming | `Stream<List<int>>` on the event loop | zero-copy chunk stream with ack-based release |
-| TLS | `SecurityContext` (mature) | **not yet** — non-empty TLS config fails honestly with `ServerTlsException` |
-| keep-alive | yes | yes (`keepAliveTimeout`, `maxRequestsPerConnection`); `Duration.zero` disables per server |
-| web | n/a (server) | unsupported |
+| | `dart:io` / shelf | `nitro_server` |
+| - | ----------------- | -------------- |
+| connection handling | one event loop; a slow handler stalls it unless moved to another isolate | native thread per connection; a slow handler costs one thread |
+| answer path | handler → Dart socket buffer → event-loop write | handler → one non-blocking `sendmsg`, no copy, no wake |
+| routing | by hand, or `shelf_router` | built-in trie with `:param` and `*` |
+| per-route timeouts | `Future.timeout` by hand | native, per route; a late answer is dropped exactly once |
+| request size cap | by hand | `maxBodyBytes`, enforced while streaming (413, no dispatch) |
+| scaling handlers | `HttpServer.bind(shared: true)` per isolate | `ServerConfig.isolates` |
+| TLS | `SecurityContext` | not yet; a non-empty `TlsConfig` throws `ServerTlsException` |
+| web | n/a | unsupported |
 
-Measured, not claimed — same routes, same driver, the driver in its own
-isolates so the server under test owns its event loop, interleaved A/B/C
-(see [`benchmark/`](benchmark/) for methodology and how to re-run). AOT
-(`dart compile exe`), Apple M1 Pro, loopback, keep-alive on every side,
-64 connections across 4 client isolates, 3 s per case, second of two
-rounds:
+Same routes, same driver, same machine, interleaved rounds; every case
+asserts exact bytes. AOT (`dart compile exe`), Apple M1 Pro, loopback,
+64 connections from 4 client isolates, 3 s per case, second of two rounds.
+Method and flags: [`benchmark/`](benchmark/).
+
+Keep-alive on every side:
 
 __KEEPALIVE_TABLE__
 
-Read it plainly: on small routes nitro serves ~1.5× dart:io's throughput at
-~35% lower latency under load, because parsing, routing and the response
-write happen off the Dart isolate and a keep-alive answer wakes no thread.
-Streaming (`/events`, 20 chunks) is where the gap is widest: chunks are
-queued to a native worker that coalesces them. Sequential latency on a
-single idle connection is within a few microseconds of dart:io — the one
-remaining thread hop (worker → Dart port) costs about what dart:io's own
-parsing saves. The 1 MiB echo is loopback-bound and identical everywhere.
-With `Connection: close` on every side (`./build/benchmark/compare`
-without `--keep-alive`) the handshake dominates and the ordering is the
-same with smaller margins:
+`Connection: close` on every side (every request pays a TCP handshake):
 
 __CLOSE_TABLE__
 
-Run `./build/benchmark/compare --keep-alive` on your hardware before quoting
-anything; `PERFORMANCE_PLAN.md` has the measured history of how these
-numbers came about and what is next.
+What the tables say: under keep-alive load nitro serves the small routes at
+about 1.5× dart:io's rate with about 35% lower p50, and streams at about
+1.6×, because parsing, routing and the write happen off the Dart isolate.
+On one idle connection the two are within a few microseconds: nitro's
+remaining worker-to-isolate hop costs about what dart:io's parsing costs.
+The 1 MiB echo is bound by loopback bandwidth. With `Connection: close`
+the handshake dominates and the margins shrink. `PERFORMANCE_PLAN.md`
+records how these numbers came about and what limits them now.
 
-## Limits (v1, stated plainly)
+## Limits
 
 - HTTP/1.1 only.
-- No TLS yet (`supportsTls() == false`; tracked for the `oatpp-libressl` phase).
-- No WebSocket data transfer: upgrade handshakes are refused with `426` +
-  `Sec-WebSocket-Version: 13` (RFC 6455 §4.2.2).
-- Request bodies capped by `maxBodyBytes` (default 10 MB); above it the engine answers
-  413 without dispatching. Response bodies may stream unbounded via
-  `ResponseContext.stream` (`Transfer-Encoding: chunked`); the route timeout
-  then bounds time-to-first-byte only.
-- The transport is a minimal blocking-IO core shaped like oat++'s
-  `HttpConnectionHandler` so the router, pending table and bridge protocol
-  move over unchanged when oat++ is vendored.
+- No TLS (`supportsTls()` is false).
+- WebSocket: text and binary messages, ping/pong, close codes; no
+  permessage-deflate.
+- Request bodies are capped by `maxBodyBytes` (default 10 MiB); above it the
+  engine answers 413 without dispatching. Response bodies may stream without
+  bound via `ResponseContext.stream`; the route timeout then bounds
+  time-to-first-byte only.
+- Thread per connection: fine to a few hundred live keep-alive connections;
+  a poller-based reactor is the planned step beyond that.
 
 ## Developing
 
-The Nitro spec `lib/src/nitro_server.native.dart` is the source of truth —
-change it and run `nitrogen generate`, never edit `*.g.*` files. CI fails if
-regeneration is not a no-op.
+`lib/src/nitro_server.native.dart` is the source of truth for the bridge.
+Change it and regenerate with `dart run build_runner build`; never edit
+`*.g.*` files. CI fails if regeneration is not a no-op.
 
 ```sh
-# native library (needed by the e2e + conformance suites; they skip without it)
+# native library (the e2e and conformance suites skip without it)
 cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release
 cmake --build build/lib --parallel
 
-# Dart: unit + e2e suites, no Flutter SDK needed (100% line floor enforced)
+# Dart suites (no Flutter SDK needed) and the coverage gate
 dart test
 bash tool/coverage.sh
 
-# C++: 36 tests (router, pending table, wire, loopback server)
-cmake -S src -B build/cpp_test -DCMAKE_BUILD_TYPE=Release -DNITRO_SERVER_BUILD_TESTS=ON
-cmake --build build/cpp_test --parallel
-./build/cpp_test/nitro_server_tests/nitro_server_engine_tests
+# C++ engine suite: router, pending table, wire, loopback server
+cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release -DNITRO_SERVER_BUILD_TESTS=ON
+cmake --build build/lib --parallel
+./build/lib/nitro_server_tests/nitro_server_engine_tests
 ```
 
-Test map: `server_config_test` (types + mapping tables) · `runner_test`
-(dispatch + ack protocol, fakes) · `server_edge_cases_test` (wild inputs,
+Test map: `server_config_test` (types, mapping tables) · `runner_test`
+(dispatch and ack protocol, fakes) · `server_edge_cases_test` (wild inputs,
 fakes) · `server_facade_test` (public entry points, fakes) ·
-`server_e2e_test` (native: start/stop, params, 32-way concurrency, per-route
-timeout) · `server_conformance_test` (RFC 9110/9112 matrix over raw sockets) ·
-`test/cpp` (gtest engine suite). Nothing depends on `dart:io HttpServer`,
-`shelf`, or the network — the driver is `HttpClient` + raw `Socket`s against
-loopback, or fakes.
+`fast_calls_test` (wire format of the leaf-call path) · `server_e2e_test`
+(native: lifecycle, params, concurrency, timeouts, isolates, WebSocket) ·
+`server_conformance_test` (RFC 9110/9112 matrix over raw sockets) ·
+`test_client_test` · `test/cpp` (gtest engine suite). Tests never depend on
+`dart:io HttpServer`, `shelf` or the network.

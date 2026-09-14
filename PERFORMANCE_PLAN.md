@@ -1,19 +1,19 @@
-# nitro_server — performance plan
+# nitro_server performance plan
 
-Goal: the fastest Dart HTTP server on latency (sequential and under load),
-throughput and tail, in the real-world keep-alive mode, measured — never
-claimed — by `benchmark/compare.dart` with the driver in separate isolates.
+Goal: the fastest Dart HTTP server on latency, throughput and tail in the
+keep-alive mode, as measured by `benchmark/compare.dart` with the driver in
+separate isolates.
 
-Every number below is from the same machine (Apple M1 Pro, 8 cores,
-loopback, AOT `dart compile exe`, `--quick`: 32 connections across 4 client
-isolates, 1 s load per case). Run-to-run variance is about ±10%; compare
-rows within one table, not across sessions. Full-length runs (64
-connections, 3 s, 2 rounds) are in `benchmark/README.md`.
+All numbers are from one machine (Apple M1 Pro, 8 cores, loopback, AOT).
+Unless a row says otherwise: `--quick`, 32 connections across 4 client
+isolates, 1 s of load per case. Run-to-run variance is about ±10%, so
+compare rows within one table. Full-length runs (64 connections, 3 s, two
+rounds) are in `benchmark/README.md`.
 
-## 1. What was wrong (measured)
+## 1. Starting point
 
-The first honest measurement — driver moved out of the server's isolate —
-showed nitro **behind** dart:io under load, with a tail 10× worse:
+With the driver moved out of the server's isolate, nitro was behind
+dart:io under load, with a tail 10× worse:
 
 | keep-alive, 32 conns | seq p50 µs | load p50 µs | load p99 µs | req/s |
 |----------------------|-----------:|------------:|------------:|------:|
@@ -24,9 +24,9 @@ showed nitro **behind** dart:io under load, with a tail 10× worse:
 | dart:io GET /events  |         98 |       1,597 |       3,578 | 17,957 |
 | nitro   /events (old)|        141 |       1,502 |       9,518 | 16,186 |
 
-(The previous driver ran the `HttpClient` on the same isolate as every
-server, so every sweep was client-bound at ~22k req/s and the three servers
-looked alike. That benchmark could not have shown any of this.)
+The previous driver ran `HttpClient` on the same isolate as every server,
+so every sweep was client-bound at ~22k req/s and the three servers looked
+alike.
 
 Three causes, isolated one at a time:
 
@@ -41,7 +41,7 @@ Three causes, isolated one at a time:
 3. **Streams crossed the bridge and woke the worker once per chunk**: 20 SSE
    events = 20 FFI calls + 20 condvar wakes + 20 syscalls.
 
-## 2. What was done (each step measured)
+## 2. Changes, each measured
 
 | step | change | /hello req/s | /hello load p50 / p99 | /events req/s | POST 4k req/s |
 |------|--------|-------------:|----------------------:|--------------:|--------------:|
@@ -51,9 +51,19 @@ Three causes, isolated one at a time:
 | C | stream chunks queued to the worker (coalescing) | 44,671* | 593 / 1,613 | 27,438 | — |
 | D | leaf-call FFI fast path (`respond`/`startStream`/`sendStreamChunk`) | **52,097** | **568 / 1,296** | **33,293** | **31,631** |
 | ref | dart:io, same run as D | 33,680 | 886 / 1,316 | 19,827 | 27,060 |
+| E | auto-scaling pool (floor = cores, grows on demand, retires idle) | 52,758 / 52,077 (two runs) | 571 / 1,230 | — | — |
+| E′ | same engine, pool pinned at 8 (`--workers 8`) | 3,128 | 184 / 433 | — | — |
+
+Step E keeps D's throughput while a quiet server holds `cores` threads
+instead of 64. E′ is the control: a pool smaller than the live connections
+cycles every request's connection through the queue. The first growth
+trigger fired only at accept time and stalled at 7.7k req/s in one run,
+because keep-alive connections are accepted once and a missed spawn was
+never retried. Growth now also fires when a worker yields a connection
+back to the queue; two consecutive runs then read 52.8k and 52.1k.
 
 \* same engine as B for this case; the 44.7k vs 50.2k spread is run-to-run
-variance, which is why the plan quotes deltas from same-session tables.
+variance.
 
 Step B in detail (`src/engine/ServerInstance.cpp`, `PendingTable.h`):
 
@@ -88,9 +98,9 @@ Where nitro still trails: sequential latency on tiny routes (72 vs 67 µs
 p50) and on POST 4k (149 vs 131 µs). That is the remaining second thread
 hop (worker → Dart port) plus the body's two copies on the way in; see §3.
 
-## 3. What comes next, in payoff order
+## 3. Next steps, in payoff order
 
-Each item names the measured cost it attacks and how to verify it.
+Each item names the cost it attacks and how to verify it.
 
 ### 3.1 Lazy request decode (spec v2) — Dart isolate, every request
 
@@ -104,28 +114,44 @@ stays; it becomes lazily built). Estimated −3 µs of ~19 µs per request on
 the isolate (~15% throughput). Needs `nitro_server.native.dart` +
 `build_runner` regeneration; verify with the /hello and POST rows.
 
-### 3.2 Multiple Dart isolates behind one engine — past the single-isolate ceiling
+### 3.2 Multiple Dart isolates behind one engine (done: `ServerConfig.isolates`)
 
-At ~52k req/s the isolate is saturated: doubling the load to 8 client
-isolates and 64 connections leaves nitro at 43.6k req/s (dart:io 28.1k)
-with load p50 1,072 µs — no more throughput, only deeper queues, while the
-C++ workers are mostly parked. dart:io scales with
-`HttpServer.bind(shared: true)` across isolates; nitro can do the same
-with less machinery: the engine keeps one accept loop and round-robins
-`emitHead` across N bound emitters (body chunks and end markers follow
-their head's emitter). API sketch, type-safe:
+With the `HttpClient` driver nitro reads ~52k req/s at 1, 2 and 4 isolates
+alike, and 8 driver isolates lower it: the driver's ~50 µs of CPU per
+request saturates the 8-core box first. The raw-socket load client
+(`--raw`) costs a few µs per request and moves the ceiling:
 
-```dart
-final server = await NitroServer.bind(
-  const ServerConfig(isolates: 4),
-  setup: registerRoutes, // top-level `FutureOr<void> Function(NitroServer)`
-);
-```
+| keep-alive, `--raw`, 32 conns | nitro req/s | dart:io req/s |
+|-------------------------------|------------:|--------------:|
+| /hello, isolates 1            | 61,464 | 36,401 |
+| /hello, isolates 2            | 60,189 | 35,727 |
+| /hello, isolates 4            | 61,893 | 36,003 |
+| /hello, isolates 1, 6 clients / 48 conns | 60,052 | 34,323 |
+| /hello, isolates 4 (dart:io `shared: true` ×4) | 61,269 | 63,253 |
 
-Each isolate runs its own `ServerRunner` with the same routes (registration
-is idempotent on the shared router). Handlers stay ordinary closures inside
-`setup`. Expected: near-linear to ~4 isolates on this machine (150–200k
-req/s on /hello). Verify with `--clients 8 --connections 128`.
+On a trivial handler nitro's single isolate is not the limit at 60k req/s
+on this machine; dart:io's is, at 36k. The knob matters where handlers do
+work. `/work` JSON-encodes 200 records (~290 µs of CPU):
+
+| keep-alive, `--raw`, 32 conns | nitro req/s | dart:io req/s (`shared: true` ×N) | shelf |
+|-------------------------------|------------:|----------------------------------:|------:|
+| /work, isolates 1             | 3,413 | 3,464 | 3,347 |
+| /work, isolates 4             | **10,929** | 11,298 | 3,058 (single) |
+
+On handler-bound work both stacks scale the same way: 3.2× on 8 cores
+with 4 isolates, and the knob costs nothing unused. On tiny routes nitro
+reaches with one isolate (61k) what dart:io needs four for (63k), because
+parsing, routing and the write are off the isolate. Neither passes ~62k on
+this box; see the 6-client row.
+
+Implementation: the engine keeps a list of sinks (`addEmitter`), deals each
+request's head round-robin and routes every later message of that request
+(chunks, end marker, timeout event) to the same sink; `NitroServer.bind`
+spawns `isolates − 1` helper isolates that resolve the same engine key,
+run the same `setup`, and close with the server. `isolates: 0` picks half
+the cores (1–8). dart:io's equivalent is `HttpServer.bind(shared: true)`
+per isolate, which the benchmark now gives it under `--isolates N` so the
+comparison stays fair.
 
 ### 3.3 Reactor instead of thread-per-connection — beyond ~500 live connections
 
@@ -160,18 +186,17 @@ POST 4k sequential row (target: below dart:io's 131 µs).
 Out of scope for performance but on the roadmap: native TLS, HTTP/2,
 WebSocket compression.
 
-## 4. Type safety (public API)
+## 4. Type safety of the public API
 
-The public surface (`lib/src/api/*`) is strongly typed: enums for methods
-and events, `Uint8List` bodies, `Map<String, String>` headers on responses,
-typed exceptions. The one untyped spot, `RequestContext.json()` returning
-`dynamic`, now has typed siblings — `jsonMap()`, `jsonList()`, `jsonAs<T>()`
-— that throw `FormatException` at the boundary when the shape is wrong.
-`json()` remains for callers that want the raw decode.
+`lib/src/api/*` is strongly typed: enums for methods and events,
+`Uint8List` bodies, `Map<String, String>` response headers, typed
+exceptions. The one untyped spot, `RequestContext.json()` returning
+`dynamic`, has typed siblings `jsonMap()`, `jsonList()` and `jsonAs<T>()`
+that throw `FormatException` when the shape is wrong. `json()` stays for
+the raw decode.
 
-Candidate for a future major: `WsMessage` as a sealed hierarchy
-(`WsText` / `WsBinary`) so `switch` is exhaustive instead of checking
-`isText`. Breaking, so not done here.
+For a future major: `WsMessage` as a sealed hierarchy (`WsText`,
+`WsBinary`) so a `switch` is exhaustive. Breaking, so not done here.
 
 ## 5. How to reproduce
 
@@ -182,5 +207,6 @@ dart compile exe benchmark/compare.dart -o build/benchmark/compare
 ./build/benchmark/compare --quick --keep-alive        # headline mode
 ./build/benchmark/compare --quick                     # Connection: close
 ./build/benchmark/compare --keep-alive --json out.json # full run
+./build/benchmark/compare --quick --keep-alive --raw --only /work --isolates 4  # handler-CPU scaling
 dart compile exe tool/perf/respond_bench.dart -o build/respond_bench && ./build/respond_bench
 ```

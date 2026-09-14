@@ -77,3 +77,19 @@ int throwIfFailed(RawServerStatus status, {required String operation}) {
     RawServerMethod.custom => (HttpMethod.custom, custom),
   };
 }
+
+/// The wire form of request headers (see `RawIncomingRequest.packedHeaders`):
+/// `name\u0000value` pairs joined by `\u0000`, empty for none.
+String packHeaders(Iterable<MapEntry<String, String>> headers) {
+  final buffer = StringBuffer();
+  var first = true;
+  for (final entry in headers) {
+    if (!first) buffer.writeCharCode(0);
+    first = false;
+    buffer
+      ..write(entry.key)
+      ..writeCharCode(0)
+      ..write(entry.value);
+  }
+  return buffer.toString();
+}

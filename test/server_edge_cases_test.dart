@@ -874,10 +874,7 @@ void main() {
           requestId: 209,
           method: RawServerMethod.get,
           path: '/fold',
-          headers: [
-            RawHeader(name: 'X-Token', value: 'a'),
-            RawHeader(name: 'x-token', value: 'b'),
-          ],
+          packedHeaders: 'X-Token\u0000a\u0000x-token\u0000b',
           routePattern: '/fold',
         ),
       );

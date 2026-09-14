@@ -16,7 +16,11 @@ variance is about ±10%. Full-length results: `benchmark/README.md`.
 | E | auto-scaling pool (floor = cores, cap = 64) | 52,758 | 571 / 1,230 |
 | E′ | pool pinned at 8 | 3,128 | 184 / 433 |
 | F | sync handlers answered inline | 57,809 (`--raw`) | 533 / 1,070 |
+| G | packed request headers, lazy unpack; query parsed on access | 61,891 (`--raw`) | 488 / 1,167 |
 | — | dart:io, same run as D | 33,680 | 886 / 1,316 |
+
+G against the `--raw` baseline below (61,464) and, with the `HttpClient`
+driver, 49,006 against 49,489: within run-to-run variance.
 
 Other cases across the same steps:
 
@@ -69,13 +73,13 @@ the isolate.
 ## Remaining per-request cost (Dart isolate, AOT, `/hello`)
 
 About 16 µs: port message delivery ~2, head decode (~10 strings) ~3,
-`RequestContext` and header fold ~2, answer call ~1, bookkeeping ~1, plus
-the handler.
+`RequestContext` ~2 (headers and query decode on first access), answer
+call ~1, bookkeeping ~1, plus the handler.
 
 ## Open items
 
-1. Lazy head decode: emit the head as one zero-copy blob, decode headers,
-   query and params on access. Expected −3 µs per request.
+1. Head as one zero-copy blob; method, path and params decoded on access.
+   Step G (headers, query) measured within variance on `/hello`.
 2. Reactor (kqueue/epoll) instead of thread per connection, for thousands of
    connections. A `Poller` scaffold exists in commit `2df34f3`.
 3. Request-side copies: inline small bodies in the head blob; skip the

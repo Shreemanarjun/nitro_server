@@ -186,25 +186,51 @@ typedef Middleware =
 
 /// One accepted request, delivered to a [RequestHandler].
 class RequestContext {
-  const RequestContext({
+  /// [_queryParameters] defaults to the parse of [query].
+  RequestContext({
     required this.method,
     required this.customMethod,
     required this.path,
     required this.query,
-    required this.queryParameters,
-    required this.headers,
+    this._queryParameters,
+    required Map<String, List<String>> this._headers,
     required this.params,
     required this.routePattern,
     required this.body,
     this.bodyStream,
-  });
+  }) : _packedHeaders = null;
+
+  /// The runner's form: headers arrive packed (`name\u0000value` pairs
+  /// joined by `\u0000`) and unpack on first use of [headers].
+  RequestContext.packed({
+    required this.method,
+    required this.customMethod,
+    required this.path,
+    required this.query,
+    required String this._packedHeaders,
+    required this.params,
+    required this.routePattern,
+    required this.body,
+    this.bodyStream,
+  }) : _headers = null,
+       _queryParameters = null;
 
   final HttpMethod method;
   final String customMethod;
   final String path;
   final String query;
-  final Map<String, String> queryParameters;
-  final Map<String, List<String>> headers;
+  final Map<String, String>? _queryParameters;
+  final Map<String, List<String>>? _headers;
+  final String? _packedHeaders;
+
+  /// Query parameters, parsed from [query] on first access.
+  late final Map<String, String> queryParameters =
+      _queryParameters ??
+      (query.isEmpty ? const {} : Uri.splitQueryString(query));
+
+  /// Headers by lowercase name, unpacked on first access.
+  late final Map<String, List<String>> headers =
+      _headers ?? unpackHeaders(_packedHeaders!);
   final Map<String, String> params;
   final String routePattern;
 
@@ -541,6 +567,34 @@ typedef NotFoundHandler =
 /// to the default 500 text body.
 typedef ErrorHandler =
     FutureOr<ResponseContext> Function(Object error, RequestContext request);
+
+/// Inverse of the runner's header packing: `name\u0000value` pairs joined
+/// by `\u0000` become a map by lowercase name, values in arrival order.
+Map<String, List<String>> unpackHeaders(String packed) {
+  if (packed.isEmpty) return const {};
+  final out = <String, List<String>>{};
+  var start = 0;
+  while (start <= packed.length) {
+    final nameEnd = packed.indexOf('\u0000', start);
+    if (nameEnd < 0) break;
+    var valueEnd = packed.indexOf('\u0000', nameEnd + 1);
+    if (valueEnd < 0) valueEnd = packed.length;
+    (out[_lowerHeaderName(packed.substring(start, nameEnd))] ??= []).add(
+      packed.substring(nameEnd + 1, valueEnd),
+    );
+    start = valueEnd + 1;
+  }
+  return out;
+}
+
+/// Lowercases a header name, fast-pathing the already-lowercase case.
+String _lowerHeaderName(String name) {
+  for (var i = 0; i < name.length; i++) {
+    final unit = name.codeUnitAt(i);
+    if (unit >= 0x41 && unit <= 0x5A) return name.toLowerCase();
+  }
+  return name;
+}
 
 /// `SameSite` policy of a [SetCookie].
 enum SameSite { strict, lax, none }

@@ -103,6 +103,59 @@ void main() {
     });
   });
 
+  group('packed headers', () {
+    test('pack and unpack round-trip, fold by lowercase name, keep order', () {
+      final packed = packHeaders(
+        {'Content-Type': 'a', 'x-Token': 'b'}.entries.followedBy(const [
+          MapEntry('X-TOKEN', 'c'),
+          MapEntry('empty', ''),
+        ]),
+      );
+      expect(
+        packed,
+        'Content-Type\u0000a\u0000x-Token\u0000b\u0000X-TOKEN\u0000c\u0000empty\u0000',
+      );
+      expect(unpackHeaders(packed), {
+        'content-type': ['a'],
+        'x-token': ['b', 'c'],
+        'empty': [''],
+      });
+      expect(unpackHeaders(''), isEmpty);
+      expect(packHeaders(const []), '');
+    });
+
+    test('a packed context unpacks headers and query on first access', () {
+      final context = RequestContext.packed(
+        method: HttpMethod.get,
+        customMethod: '',
+        path: '/q',
+        query: 'a=1&b=two',
+        packedHeaders: 'Accept\u0000*/*',
+        params: const {},
+        routePattern: '/q',
+        body: Uint8List(0),
+      );
+      expect(context.header('accept'), '*/*');
+      expect(context.headers, {
+        'accept': ['*/*'],
+      });
+      expect(context.queryParameters, {'a': '1', 'b': 'two'});
+      expect(context.queryParam('b'), 'two');
+      final plain = RequestContext(
+        method: HttpMethod.get,
+        customMethod: '',
+        path: '/',
+        query: '',
+        headers: const {},
+        params: const {},
+        routePattern: '/',
+        body: Uint8List(0),
+      );
+      expect(plain.queryParameters, isEmpty);
+      expect(plain.headers, isEmpty);
+    });
+  });
+
   group('ServerConfig', () {
     test('isolates is typed, defaulted and copied', () {
       const base = ServerConfig();

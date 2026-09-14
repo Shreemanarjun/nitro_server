@@ -252,6 +252,10 @@ class RawServerStatus {
 /// One accepted request: head only. The body, if any, follows on `bodyChunks`
 /// tagged with the same `requestId`. `params` holds the `:param` captures from
 /// the matched route, `routePattern` the pattern that matched.
+///
+/// `packedHeaders` carries every header as `name\u0000value` pairs joined by
+/// `\u0000` (empty when there are none): one string to decode per request
+/// instead of two per header, unpacked by the runner on first access.
 @HybridRecord()
 class RawIncomingRequest {
   final int requestId;
@@ -259,7 +263,7 @@ class RawIncomingRequest {
   final String customMethod;
   final String path;
   final String query;
-  final List<RawHeader> headers;
+  final String packedHeaders;
   final int contentLength;
   final bool hasBody;
   final bool bodyComplete;
@@ -272,7 +276,7 @@ class RawIncomingRequest {
     this.customMethod = '',
     required this.path,
     this.query = '',
-    this.headers = const [],
+    this.packedHeaders = '',
     this.contentLength = 0,
     this.hasBody = false,
     this.bodyComplete = false,

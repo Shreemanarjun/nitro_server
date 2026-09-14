@@ -6,6 +6,7 @@ library;
 import 'dart:async';
 import 'dart:typed_data';
 
+import 'package:nitro_server/src/internal/raw_mapping.dart';
 import 'package:nitro_server/src/nitro_server.native.dart';
 
 /// A scriptable [NitroServerNative]. Routes registered here are dispatched by
@@ -250,7 +251,9 @@ RawIncomingRequest fakeHead({
     customMethod: customMethod,
     path: path,
     query: query,
-    headers: headers,
+    packedHeaders: packHeaders([
+      for (final h in headers) MapEntry(h.name, h.value),
+    ]),
     contentLength: contentLength,
     hasBody: hasBody,
     routePattern: routePattern,

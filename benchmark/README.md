@@ -114,7 +114,41 @@ isolates, 3 s of load per case, second of two rounds.
 
 `Connection: close` (sequential only, 30 s cooldown before each side):
 
-__CLOSE_TABLE__
+| Route | Server | seq p50 µs | seq p99 µs |
+|-------|--------|-----------:|-----------:|
+| /hello | dart:io | 173 | 391 |
+| /hello | shelf | 184 | 458 |
+| /hello | nitro | 139 | 260 |
+| /json | dart:io | 161 | 339 |
+| /json | shelf | 170 | 300 |
+| /json | nitro | 149 | 290 |
+| /users/:id | dart:io | 160 | 288 |
+| /users/:id | shelf | 172 | 308 |
+| /users/:id | nitro | 150 | 311 |
+| /files/* | dart:io | 166 | 375 |
+| /files/* | shelf | 170 | 311 |
+| /files/* | nitro | 145 | 270 |
+| /q?a=1&b=two | dart:io | 163 | 378 |
+| /q?a=1&b=two | shelf | 169 | 309 |
+| /q?a=1&b=two | nitro | 139 | 247 |
+| /mw | dart:io | 161 | 301 |
+| /mw | shelf | 182 | 355 |
+| /mw | nitro | 139 | 272 |
+| /work | dart:io | 472 | 676 |
+| /work | shelf | 487 | 720 |
+| /work | nitro | 484 | 664 |
+| /file | dart:io | 265 | 462 |
+| /file | shelf | 277 | 446 |
+| /file | nitro | 201 | 375 |
+| POST /echo 4k | dart:io | 231 | 425 |
+| POST /echo 4k | shelf | 246 | 439 |
+| POST /echo 4k | nitro | 218 | 405 |
+| POST /echo 1m | dart:io | 15,195 | 16,851 |
+| POST /echo 1m | shelf | 15,155 | 16,158 |
+| POST /echo 1m | nitro | 15,036 | 19,874 |
+| GET /events | dart:io | 184 | 361 |
+| GET /events | shelf | 174 | 283 |
+| GET /events | nitro | 155 | 243 |
 
 Additional measurements (`--quick --raw`, 32 connections):
 

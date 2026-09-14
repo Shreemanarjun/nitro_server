@@ -25,26 +25,30 @@ Future<void> main(List<String> args) async {
   final deadline = DateTime.now().add(Duration(seconds: seconds));
   var done = 0;
   final started = DateTime.now();
-  await Future.wait(List.generate(32, (worker) async {
-    while (DateTime.now().isBefore(deadline)) {
-      final client = HttpClient();
-      try {
-        final request = await client.getUrl(
-          Uri.parse('http://127.0.0.1:${server.port}/hello'),
-        );
-        final response = await request.close();
-        await response.drain<void>();
-        done++;
-      } catch (_) {
-        // Load loop: a dropped connection under saturation is not the point.
-      } finally {
-        client.close(force: true);
+  await Future.wait(
+    List.generate(32, (worker) async {
+      while (DateTime.now().isBefore(deadline)) {
+        final client = HttpClient();
+        try {
+          final request = await client.getUrl(
+            Uri.parse('http://127.0.0.1:${server.port}/hello'),
+          );
+          final response = await request.close();
+          await response.drain<void>();
+          done++;
+        } catch (_) {
+          // Load loop: a dropped connection under saturation is not the point.
+        } finally {
+          client.close(force: true);
+        }
       }
-    }
-  }));
+    }),
+  );
   final elapsed = DateTime.now().difference(started);
   final rps = done / (elapsed.inMilliseconds / 1000);
-  print('DONE $done requests in ${elapsed.inMilliseconds}ms → '
-      '${rps.toStringAsFixed(0)} req/s');
+  print(
+    'DONE $done requests in ${elapsed.inMilliseconds}ms → '
+    '${rps.toStringAsFixed(0)} req/s',
+  );
   await server.close();
 }

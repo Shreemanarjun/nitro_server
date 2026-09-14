@@ -56,6 +56,8 @@ Initial release.
   larger bodies are read in 64 KiB blocks.
 * Leaf-call FFI path for `respond`, `startStream` and `sendStreamChunk`
   over reusable native buffers (0.18 µs per call vs 0.7 µs generated, AOT).
+* Request headers cross the bridge as one packed string (`packedHeaders`)
+  and unpack on first access; `queryParameters` parses on first access.
 * `sendfile` for file answers.
 
 ### Tooling

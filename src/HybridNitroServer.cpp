@@ -63,11 +63,15 @@ class BridgeEmitter final : public Emitter {
     req.customMethod = customMethod;
     req.path = path;
     req.query = query;
+    // `name\0value` pairs joined by `\0`: one string across the bridge.
+    size_t packed = 0;
+    for (const auto& h : headers) packed += h.name.size() + h.value.size() + 2;
+    req.packedHeaders.reserve(packed);
     for (const auto& h : headers) {
-      RawHeader rh;
-      rh.name = h.name;
-      rh.value = h.value;
-      req.headers.push_back(std::move(rh));
+      if (!req.packedHeaders.empty()) req.packedHeaders.push_back('\0');
+      req.packedHeaders.append(h.name);
+      req.packedHeaders.push_back('\0');
+      req.packedHeaders.append(h.value);
     }
     req.contentLength = contentLength;
     req.hasBody = hasBody;

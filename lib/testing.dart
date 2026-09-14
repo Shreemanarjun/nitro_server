@@ -144,10 +144,7 @@ class NitroTestClient {
         customMethod: rawCustom,
         path: path,
         query: query,
-        headers: [
-          for (final entry in (headers ?? const {}).entries)
-            RawHeader(name: entry.key, value: entry.value),
-        ],
+        packedHeaders: packHeaders((headers ?? const {}).entries),
         contentLength: bodyBytes.length,
         hasBody: bodyBytes.isNotEmpty,
         bodyComplete: bodyBytes.isEmpty,
@@ -284,10 +281,7 @@ class NitroTestClient {
         method: RawServerMethod.get,
         path: clean,
         query: query,
-        headers: [
-          for (final entry in (headers ?? const {}).entries)
-            RawHeader(name: entry.key, value: entry.value),
-        ],
+        packedHeaders: packHeaders((headers ?? const {}).entries),
         routePattern: match.pattern,
         params: [
           for (final entry in match.params.entries)

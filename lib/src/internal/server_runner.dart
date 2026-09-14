@@ -81,16 +81,6 @@ class _Pending {
 /// otherwise allocate its own zero-length buffer on dispatch.
 final Uint8List _emptyBody = Uint8List(0);
 
-/// Lowercases an HTTP header name, fast-pathing the already-lowercase case
-/// (the engine preserves client casing, and most clients send lowercase).
-String _lowerHeaderName(String name) {
-  for (var i = 0; i < name.length; i++) {
-    final unit = name.codeUnitAt(i);
-    if (unit >= 0x41 && unit <= 0x5A) return name.toLowerCase();
-  }
-  return name;
-}
-
 class ServerRunner {
   ServerRunner(this._native);
 
@@ -632,15 +622,12 @@ class ServerRunner {
     final entry = _entryFor(head);
     // The context is built before the branch: both the handler and the
     // not-found fallback receive it.
-    final context = RequestContext(
+    final context = RequestContext.packed(
       method: method,
       customMethod: custom,
       path: head.path,
       query: head.query,
-      queryParameters: head.query.isEmpty
-          ? const {}
-          : Uri.splitQueryString(head.query),
-      headers: _foldHeaders(head.headers),
+      packedHeaders: head.packedHeaders,
       // Paramless routes (the common GET hot path) share one empty map.
       params: head.params.isEmpty
           ? const {}
@@ -765,14 +752,6 @@ class ServerRunner {
     } catch (_) {
       return ResponseContext.text('handler error: $error', status: 500);
     }
-  }
-
-  static Map<String, List<String>> _foldHeaders(List<RawHeader> headers) {
-    final out = <String, List<String>>{};
-    for (final header in headers) {
-      (out[_lowerHeaderName(header.name)] ??= []).add(header.value);
-    }
-    return out;
   }
 
   void _answer(int requestId, ResponseContext response) {

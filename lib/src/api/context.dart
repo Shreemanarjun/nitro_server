@@ -44,11 +44,14 @@ class ServerConfig {
     this.maxRequestsPerConnection = 100,
     this.workerThreads = 0,
     this.tls = const TlsConfig(),
-  })  : assert(port >= 0 && port <= 65535, 'port out of range: $port'),
-        assert(backlog > 0, 'backlog must be positive'),
-        assert(maxBodyBytes > 0, 'maxBodyBytes must be positive'),
-        assert(maxRequestsPerConnection >= 0, 'maxRequestsPerConnection must be non-negative'),
-        assert(workerThreads >= 0, 'workerThreads must be non-negative');
+  }) : assert(port >= 0 && port <= 65535, 'port out of range: $port'),
+       assert(backlog > 0, 'backlog must be positive'),
+       assert(maxBodyBytes > 0, 'maxBodyBytes must be positive'),
+       assert(
+         maxRequestsPerConnection >= 0,
+         'maxRequestsPerConnection must be non-negative',
+       ),
+       assert(workerThreads >= 0, 'workerThreads must be non-negative');
 
   final String host;
   final int port;
@@ -110,10 +113,11 @@ class ServerConfig {
 ///   }
 /// });
 /// ```
-typedef Middleware = FutureOr<ResponseContext> Function(
-  RequestContext request,
-  RequestHandler next,
-);
+typedef Middleware =
+    FutureOr<ResponseContext> Function(
+      RequestContext request,
+      RequestHandler next,
+    );
 
 /// One accepted request, delivered to a [RequestHandler].
 class RequestContext {
@@ -168,11 +172,11 @@ class ResponseContext {
     this.headers = const {},
     this.body,
     this.bodyStream,
-  })  : assert(status >= 100 && status <= 599, 'status out of range: $status'),
-        assert(
-          body == null || bodyStream == null,
-          'body and bodyStream are mutually exclusive',
-        );
+  }) : assert(status >= 100 && status <= 599, 'status out of range: $status'),
+       assert(
+         body == null || bodyStream == null,
+         'body and bodyStream are mutually exclusive',
+       );
 
   final int status;
   final Map<String, String> headers;
@@ -246,7 +250,10 @@ class ResponseContext {
   /// the redirect codes (301, 302, 303, 307, 308); the default is 302.
   factory ResponseContext.redirect(String url, {int status = 302}) {
     assert(
-      status == 301 || status == 302 || status == 303 || status == 307 ||
+      status == 301 ||
+          status == 302 ||
+          status == 303 ||
+          status == 307 ||
           status == 308,
       'redirect status must be 301/302/303/307/308, got $status',
     );
@@ -322,19 +329,15 @@ class ResponseContext {
 /// as a 500. The route timeout bounds it: a handler that outlives its
 /// deadline loses — the client already got a 408 and the late value is
 /// dropped, never sent twice.
-typedef RequestHandler = FutureOr<ResponseContext> Function(
-  RequestContext request,
-);
+typedef RequestHandler =
+    FutureOr<ResponseContext> Function(RequestContext request);
 
 /// Answers a request no route matched. Sync or async; throwing falls back to
 /// an empty 404 — a custom page must never wedge dispatch.
-typedef NotFoundHandler = FutureOr<ResponseContext> Function(
-  RequestContext request,
-);
+typedef NotFoundHandler =
+    FutureOr<ResponseContext> Function(RequestContext request);
 
 /// Answers a request whose handler threw. Sync or async; throwing falls back
 /// to the default 500 text body.
-typedef ErrorHandler = FutureOr<ResponseContext> Function(
-  Object error,
-  RequestContext request,
-);
+typedef ErrorHandler =
+    FutureOr<ResponseContext> Function(Object error, RequestContext request);

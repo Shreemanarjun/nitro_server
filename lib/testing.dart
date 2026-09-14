@@ -62,8 +62,8 @@ class NitroTestResponse {
 /// [server] exactly as in production, then issue requests.
 class NitroTestClient {
   NitroTestClient._(this._runner, this._native)
-      // ignore: invalid_use_of_visible_for_testing_member
-      : server = NitroServer.forRunnerForTesting(_runner) {
+    // ignore: invalid_use_of_visible_for_testing_member
+    : server = NitroServer.forRunnerForTesting(_runner) {
     _runner.ensureListeningForTesting();
   }
 
@@ -199,39 +199,34 @@ class NitroTestClient {
     String path, {
     Object? body,
     Map<String, String>? headers,
-  }) =>
-      request(HttpMethod.post, path, body: body, headers: headers);
+  }) => request(HttpMethod.post, path, body: body, headers: headers);
 
   /// Issues a PUT request with an optional body.
   Future<NitroTestResponse> put(
     String path, {
     Object? body,
     Map<String, String>? headers,
-  }) =>
-      request(HttpMethod.put, path, body: body, headers: headers);
+  }) => request(HttpMethod.put, path, body: body, headers: headers);
 
   /// Issues a DELETE request.
   Future<NitroTestResponse> delete(
     String path, {
     Object? body,
     Map<String, String>? headers,
-  }) =>
-      request(HttpMethod.delete, path, body: body, headers: headers);
+  }) => request(HttpMethod.delete, path, body: body, headers: headers);
 
   /// Issues a PATCH request with an optional body.
   Future<NitroTestResponse> patch(
     String path, {
     Object? body,
     Map<String, String>? headers,
-  }) =>
-      request(HttpMethod.patch, path, body: body, headers: headers);
+  }) => request(HttpMethod.patch, path, body: body, headers: headers);
 
   /// Issues an OPTIONS request.
   Future<NitroTestResponse> options(
     String path, {
     Map<String, String>? headers,
-  }) =>
-      request(HttpMethod.options, path, headers: headers);
+  }) => request(HttpMethod.options, path, headers: headers);
 
   /// Issues a request with an explicit [method].
   Future<NitroTestResponse> request(
@@ -240,14 +235,13 @@ class NitroTestClient {
     String customMethod = '',
     Object? body,
     Map<String, String>? headers,
-  }) =>
-      _drive(
-        method,
-        path,
-        customMethod: customMethod,
-        body: body,
-        headers: headers,
-      );
+  }) => _drive(
+    method,
+    path,
+    customMethod: customMethod,
+    body: body,
+    headers: headers,
+  );
 
   /// Opens a WebSocket session on a `server.ws` route. The handshake runs
   /// through real runner dispatch (pattern, params, query, headers), then
@@ -474,9 +468,7 @@ class _InMemoryNative extends NitroServerNative {
   @override
   void startStream(int requestId, int status, List<RawHeader> headers) {
     _streamStatus[requestId] = status;
-    _streamHeaders[requestId] = {
-      for (final h in headers) h.name: h.value,
-    };
+    _streamHeaders[requestId] = {for (final h in headers) h.name: h.value};
   }
 
   @override
@@ -507,8 +499,11 @@ class _InMemoryNative extends NitroServerNative {
 
   /// Best matching registration for [methodToken] + [path], or null when the
   /// engine would answer 404 directly. Precedence mirrors `Router::match`.
-  _RouteMatch? matchRoute(String methodToken, String path,
-      {bool wsOnly = false}) {
+  _RouteMatch? matchRoute(
+    String methodToken,
+    String path, {
+    bool wsOnly = false,
+  }) {
     final pathSegs = _split(path);
     _RouteMatch? best;
     var bestSpec = -1;
@@ -564,8 +559,7 @@ class _InMemoryNative extends NitroServerNative {
     List<String> pathSegs,
   ) {
     final patternSegs = _split(pattern);
-    final wildcard =
-        patternSegs.isNotEmpty && patternSegs.last == '*';
+    final wildcard = patternSegs.isNotEmpty && patternSegs.last == '*';
     final prefix = wildcard
         ? patternSegs.sublist(0, patternSegs.length - 1)
         : patternSegs;

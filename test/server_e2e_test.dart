@@ -57,9 +57,7 @@ Future<({int status, String body, HttpHeaders headers})> _get(
     );
     headers?.forEach(request.headers.set);
     if (body != null) request.add(body);
-    final response = await request.close().timeout(
-      const Duration(seconds: 15),
-    );
+    final response = await request.close().timeout(const Duration(seconds: 15));
     final bytes = await response.fold<BytesBuilder>(
       BytesBuilder(),
       (b, d) => b..add(d),
@@ -88,9 +86,7 @@ Future<({int status, Uint8List body})> _getBytes(
       Uri.parse('http://127.0.0.1:$port$path'),
     );
     if (body != null) request.add(body);
-    final response = await request.close().timeout(
-      const Duration(seconds: 15),
-    );
+    final response = await request.close().timeout(const Duration(seconds: 15));
     final builder = await response.fold<BytesBuilder>(
       BytesBuilder(),
       (b, d) => b..add(d),
@@ -271,9 +267,7 @@ void main() {
     test('captures :param segments into the handler', () async {
       server = await NitroServer.bind();
       await server!.route(HttpMethod.get, '/users/:id', (request) async {
-        return ResponseContext.json(
-          jsonEncode({'id': request.param('id')}),
-        );
+        return ResponseContext.json(jsonEncode({'id': request.param('id')}));
       });
 
       final res = await _get(server!.port, '/users/42');
@@ -338,13 +332,10 @@ void main() {
         headers: {'x-token': 's3cret'},
       );
       expect(res.status, 200);
-      expect(
-        jsonDecode(res.body),
-        {
-          'query': {'a': '1', 'b': 'two'},
-          'token': 's3cret',
-        },
-      );
+      expect(jsonDecode(res.body), {
+        'query': {'a': '1', 'b': 'two'},
+        'token': 's3cret',
+      });
     }, skip: skipReason);
 
     test('unregistering removes the route', () async {
@@ -402,15 +393,10 @@ void main() {
 
     test('a slow handler hits its per-route timeout alone', () async {
       server = await NitroServer.bind();
-      await server!.route(
-        HttpMethod.get,
-        '/slow',
-        (_) async {
-          await Future<void>.delayed(const Duration(seconds: 5));
-          return ResponseContext.text('too late');
-        },
-        timeout: const Duration(milliseconds: 400),
-      );
+      await server!.route(HttpMethod.get, '/slow', (_) async {
+        await Future<void>.delayed(const Duration(seconds: 5));
+        return ResponseContext.text('too late');
+      }, timeout: const Duration(milliseconds: 400));
       await server!.route(
         HttpMethod.get,
         '/fast',
@@ -452,15 +438,10 @@ void main() {
           .listen(timeouts.add);
       addTearDown(sub.cancel);
 
-      await server!.route(
-        HttpMethod.get,
-        '/slow',
-        (_) async {
-          await Future<void>.delayed(const Duration(seconds: 5));
-          return ResponseContext.text('late');
-        },
-        timeout: const Duration(milliseconds: 200),
-      );
+      await server!.route(HttpMethod.get, '/slow', (_) async {
+        await Future<void>.delayed(const Duration(seconds: 5));
+        return ResponseContext.text('late');
+      }, timeout: const Duration(milliseconds: 200));
       await server!.route(
         HttpMethod.get,
         '/ready',
@@ -606,29 +587,32 @@ void main() {
       ]);
     }, skip: skipReason);
 
-    test('a websocket handshake is refused with 426, never dispatched',
-        () async {
-      var calls = 0;
-      server = await NitroServer.bind();
-      await server!.route(HttpMethod.get, '/chat', (_) async {
-        calls++;
-        return ResponseContext.text('not a socket');
-      });
+    test(
+      'a websocket handshake is refused with 426, never dispatched',
+      () async {
+        var calls = 0;
+        server = await NitroServer.bind();
+        await server!.route(HttpMethod.get, '/chat', (_) async {
+          calls++;
+          return ResponseContext.text('not a socket');
+        });
 
-      final res = await _get(
-        server!.port,
-        '/chat',
-        headers: {
-          'Connection': 'Upgrade',
-          'Upgrade': 'websocket',
-          'Sec-WebSocket-Version': '13',
-          'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
-        },
-      );
-      expect(res.status, 426);
-      expect(res.body, contains('websocket'));
-      expect(calls, 0);
-    }, skip: skipReason);
+        final res = await _get(
+          server!.port,
+          '/chat',
+          headers: {
+            'Connection': 'Upgrade',
+            'Upgrade': 'websocket',
+            'Sec-WebSocket-Version': '13',
+            'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
+          },
+        );
+        expect(res.status, 426);
+        expect(res.body, contains('websocket'));
+        expect(calls, 0);
+      },
+      skip: skipReason,
+    );
 
     test('binds IPv6 loopback when asked', () async {
       server = await NitroServer.bind(const ServerConfig(host: '::1'));
@@ -643,31 +627,34 @@ void main() {
       expect(res.body, 'v6');
     }, skip: skipReason);
 
-    test('a stream answers chunked events, then the server keeps serving',
-        () async {
-      server = await NitroServer.bind();
-      await server!.route(HttpMethod.get, '/events', (_) async {
-        return ResponseContext.stream(
-          Stream.periodic(
-            const Duration(milliseconds: 20),
-            (i) => ascii.encode('data: $i\n\n'),
-          ).take(3),
-          headers: {'content-type': 'text/event-stream'},
+    test(
+      'a stream answers chunked events, then the server keeps serving',
+      () async {
+        server = await NitroServer.bind();
+        await server!.route(HttpMethod.get, '/events', (_) async {
+          return ResponseContext.stream(
+            Stream.periodic(
+              const Duration(milliseconds: 20),
+              (i) => ascii.encode('data: $i\n\n'),
+            ).take(3),
+            headers: {'content-type': 'text/event-stream'},
+          );
+        });
+        await server!.route(
+          HttpMethod.get,
+          '/ok',
+          (_) async => ResponseContext.text('ok'),
         );
-      });
-      await server!.route(
-        HttpMethod.get,
-        '/ok',
-        (_) async => ResponseContext.text('ok'),
-      );
 
-      final events = await _get(server!.port, '/events');
-      expect(events.status, 200);
-      expect(events.body, 'data: 0\n\ndata: 1\n\ndata: 2\n\n');
+        final events = await _get(server!.port, '/events');
+        expect(events.status, 200);
+        expect(events.body, 'data: 0\n\ndata: 1\n\ndata: 2\n\n');
 
-      // The streamed connection completed cleanly; the server is unaffected.
-      expect((await _get(server!.port, '/ok')).body, 'ok');
-    }, skip: skipReason);
+        // The streamed connection completed cleanly; the server is unaffected.
+        expect((await _get(server!.port, '/ok')).body, 'ok');
+      },
+      skip: skipReason,
+    );
 
     test('websocket echo works over real frames', () async {
       server = await NitroServer.bind();
@@ -682,11 +669,13 @@ void main() {
       // StreamIterator holds one subscription for its life: no pause quirk.
       final it = StreamIterator<Uint8List>(socket);
       final buf = BytesBuilder(copy: false);
-      socket.add(ascii.encode(
-        'GET /chat HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n'
-        'Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n'
-        'Sec-WebSocket-Version: 13\r\n\r\n',
-      ));
+      socket.add(
+        ascii.encode(
+          'GET /chat HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n'
+          'Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n'
+          'Sec-WebSocket-Version: 13\r\n\r\n',
+        ),
+      );
       final head = await _readWsHead(it, buf);
       expect(head, contains('101'));
       expect(head, contains('s3pPLMBiTxaQ9kYGzzhZRbK+xOo='));
@@ -729,54 +718,57 @@ void main() {
       );
     }, skip: skipReason);
 
-    test('the first native touch of a new incarnation stops stragglers',
-        () async {
-      server = await NitroServer.bind();
-      await server!.route(
-        HttpMethod.get,
-        '/',
-        (_) async => ResponseContext.text('one'),
-      );
-      final firstPort = server!.port;
-      expect((await _get(firstPort, '/')).body, 'one');
+    test(
+      'the first native touch of a new incarnation stops stragglers',
+      () async {
+        server = await NitroServer.bind();
+        await server!.route(
+          HttpMethod.get,
+          '/',
+          (_) async => ResponseContext.text('one'),
+        );
+        final firstPort = server!.port;
+        expect((await _get(firstPort, '/')).body, 'one');
 
-      // A hot restart replaces the Dart isolate; the handshake guard — an
-      // ordinary static — goes back to false. Nothing about native changes.
-      resetNativeAttachForTesting();
-      Ids.resetForTesting();
+        // A hot restart replaces the Dart isolate; the handshake guard — an
+        // ordinary static — goes back to false. Nothing about native changes.
+        resetNativeAttachForTesting();
+        Ids.resetForTesting();
 
-      // First native touch of the new incarnation stops the old listener.
-      //
-      // NOTE: this goes through `resetNative` explicitly, not through the
-      // automatic handshake in `bind`. The handshake skips the reset unless
-      // the isolate is named 'main' (so background isolates can't kill the
-      // root isolate's servers) — and under `dart test` the isolate is named
-      // `test_suite:...`, never 'main'. In production the root isolate is
-      // always 'main', so the automatic path applies there; here we perform
-      // the same touch by hand.
-      NitroServerNative.forKey(kEngineKey).resetNative();
+        // First native touch of the new incarnation stops the old listener.
+        //
+        // NOTE: this goes through `resetNative` explicitly, not through the
+        // automatic handshake in `bind`. The handshake skips the reset unless
+        // the isolate is named 'main' (so background isolates can't kill the
+        // root isolate's servers) — and under `dart test` the isolate is named
+        // `test_suite:...`, never 'main'. In production the root isolate is
+        // always 'main', so the automatic path applies there; here we perform
+        // the same touch by hand.
+        NitroServerNative.forKey(kEngineKey).resetNative();
 
-      // A real hot restart kills the old isolate: the old runner, its stream
-      // subscriptions and its handler table die with it — only native state
-      // survives until the reset above stops it. Detach the old runner the
-      // same way here (stop is idempotent and already done), or its still-
-      // subscribed handler table answers for the reborn server and the
-      // recycled 's:1' key routes both runners' responds at one instance.
-      await server!.close();
-      server = null;
+        // A real hot restart kills the old isolate: the old runner, its stream
+        // subscriptions and its handler table die with it — only native state
+        // survives until the reset above stops it. Detach the old runner the
+        // same way here (stop is idempotent and already done), or its still-
+        // subscribed handler table answers for the reborn server and the
+        // recycled 's:1' key routes both runners' responds at one instance.
+        await server!.close();
+        server = null;
 
-      // First native touch of the new incarnation stops the old listener.
-      final reborn = await NitroServer.bind();
-      addTearDown(reborn.close);
-      await reborn.route(
-        HttpMethod.get,
-        '/',
-        (_) async => ResponseContext.text('two'),
-      );
-      expect((await _get(reborn.port, '/')).body, 'two');
+        // First native touch of the new incarnation stops the old listener.
+        final reborn = await NitroServer.bind();
+        addTearDown(reborn.close);
+        await reborn.route(
+          HttpMethod.get,
+          '/',
+          (_) async => ResponseContext.text('two'),
+        );
+        expect((await _get(reborn.port, '/')).body, 'two');
 
-      // The straggler is gone: the old port refuses connections now.
-      await expectLater(_get(firstPort, '/'), throwsA(isA<Exception>()));
-    }, skip: skipReason);
+        // The straggler is gone: the old port refuses connections now.
+        await expectLater(_get(firstPort, '/'), throwsA(isA<Exception>()));
+      },
+      skip: skipReason,
+    );
   });
 }

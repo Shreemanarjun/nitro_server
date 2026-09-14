@@ -90,11 +90,13 @@ void main() {
             RawServerStatus(errorKind: entry.key, errorMessage: 'm'),
             operation: 'op',
           ),
-          throwsA(isA<NitroServerException>().having(
-            (e) => e.runtimeType.toString(),
-            'type',
-            entry.value.toString(),
-          )),
+          throwsA(
+            isA<NitroServerException>().having(
+              (e) => e.runtimeType.toString(),
+              'type',
+              entry.value.toString(),
+            ),
+          ),
           reason: 'wrong mapping for ${entry.key}',
         );
       }
@@ -126,15 +128,12 @@ void main() {
     });
 
     test('jsonMap encodes its argument', () {
-      final response = ResponseContext.jsonMap({
+      final response = ResponseContext.jsonMap({'id': 42, 'name': 'nitro'});
+      expect(response.status, 200);
+      expect(jsonDecode(utf8.decode(response.bodyBytes)), {
         'id': 42,
         'name': 'nitro',
       });
-      expect(response.status, 200);
-      expect(
-        jsonDecode(utf8.decode(response.bodyBytes)),
-        {'id': 42, 'name': 'nitro'},
-      );
     });
 
     test('null body encodes empty', () {
@@ -143,7 +142,10 @@ void main() {
 
     test('status range is enforced', () {
       expect(() => ResponseContext(status: 99), throwsA(isA<AssertionError>()));
-      expect(() => ResponseContext(status: 600), throwsA(isA<AssertionError>()));
+      expect(
+        () => ResponseContext(status: 600),
+        throwsA(isA<AssertionError>()),
+      );
     });
   });
 

@@ -65,5 +65,4 @@ abstract class WsSession {
 typedef WsHandler = FutureOr<void> Function(WsSession session);
 
 /// UTF-8 bytes for [text]. Shared with the test client.
-Uint8List wsTextBytes(String text) =>
-    Uint8List.fromList(utf8.encode(text));
+Uint8List wsTextBytes(String text) => Uint8List.fromList(utf8.encode(text));

@@ -123,9 +123,8 @@ class _DemoPageState extends State<_DemoPage> with WidgetsBindingObserver {
         '/users/:id',
         _logged(
           'user',
-          (request) async => ResponseContext.json(
-            jsonEncode({'id': request.param('id')}),
-          ),
+          (request) async =>
+              ResponseContext.json(jsonEncode({'id': request.param('id')})),
         ),
       );
       await server.route(
@@ -171,7 +170,11 @@ class _DemoPageState extends State<_DemoPage> with WidgetsBindingObserver {
     });
   }
 
-  Future<void> _probe(String label, String path, {String method = 'GET'}) async {
+  Future<void> _probe(
+    String label,
+    String path, {
+    String method = 'GET',
+  }) async {
     final server = _server;
     if (server == null) return;
     setState(() {
@@ -286,15 +289,16 @@ class _DemoPageState extends State<_DemoPage> with WidgetsBindingObserver {
                 child: Column(
                   children: [
                     const TabBar(
-                      tabs: [Tab(text: 'Requests'), Tab(text: 'Events')],
+                      tabs: [
+                        Tab(text: 'Requests'),
+                        Tab(text: 'Events'),
+                      ],
                     ),
                     Expanded(
                       child: TabBarView(
                         children: [
                           _log.isEmpty
-                              ? const Center(
-                                  child: Text('No requests yet.'),
-                                )
+                              ? const Center(child: Text('No requests yet.'))
                               : ListView.builder(
                                   itemCount: _log.length,
                                   itemBuilder: (_, i) {

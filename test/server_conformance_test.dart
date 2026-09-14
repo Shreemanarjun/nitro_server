@@ -129,9 +129,7 @@ Future<Uint8List> _clientBody(
     );
     headers?.forEach(request.headers.set);
     if (body != null) request.add(body);
-    final response = await request.close().timeout(
-      const Duration(seconds: 20),
-    );
+    final response = await request.close().timeout(const Duration(seconds: 20));
     final builder = BytesBuilder(copy: false);
     await for (final chunk in response) {
       builder.add(chunk);
@@ -207,7 +205,10 @@ void main() {
       });
       server.route(HttpMethod.post, '/upload', (request) async {
         return ResponseContext.json(
-          jsonEncode({'length': request.body.length, 'fnv': _fnv(request.body)}),
+          jsonEncode({
+            'length': request.body.length,
+            'fnv': _fnv(request.body),
+          }),
         );
       });
       server.route(HttpMethod.get, '/binary/:n', (request) async {
@@ -263,7 +264,9 @@ void main() {
       test('custom methods round-trip their token', () async {
         final raw = await _raw(
           port,
-          ascii.encode('PURGE /cache HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n'),
+          ascii.encode(
+            'PURGE /cache HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n',
+          ),
         );
         expect(_statusOf(raw), 200);
         expect(utf8.decode(_bodyOf(raw)), 'purged');
@@ -305,7 +308,10 @@ void main() {
           ),
         );
         expect(_statusOf(raw), 200);
-        expect(_headerOf(raw, 'content-length'), 'twelve bytes'.length.toString());
+        expect(
+          _headerOf(raw, 'content-length'),
+          'twelve bytes'.length.toString(),
+        );
         expect(_bodyOf(raw), isEmpty);
       }, skip: skipReason);
     });
@@ -419,7 +425,11 @@ void main() {
               'POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n',
             ),
           );
-          for (final piece in ['5\r\nhello\r\n', '6\r\n world\r\n', '0\r\n\r\n']) {
+          for (final piece in [
+            '5\r\nhello\r\n',
+            '6\r\n world\r\n',
+            '0\r\n\r\n',
+          ]) {
             socket.add(ascii.encode(piece));
           }
           final builder = BytesBuilder(copy: false);
@@ -455,10 +465,7 @@ void main() {
           await socket.flush();
           // The interim response must arrive before the body is sent.
           await Future<void>.delayed(const Duration(milliseconds: 300));
-          expect(
-            ascii.decode(received.toBytes()),
-            contains('100 Continue'),
-          );
+          expect(ascii.decode(received.toBytes()), contains('100 Continue'));
           socket.add([1, 2, 3]);
           await done.future.timeout(const Duration(seconds: 10));
           final raw = received.toBytes();
@@ -600,15 +607,14 @@ void main() {
       test('sequential requests share one connection', () async {
         final socket = await Socket.connect('127.0.0.1', port);
         try {
-          socket.add(
-            ascii.encode('GET /methods HTTP/1.1\r\nHost: x\r\n\r\n'),
-          );
+          socket.add(ascii.encode('GET /methods HTTP/1.1\r\nHost: x\r\n\r\n'));
           socket.add(
             ascii.encode('GET /binary/16 HTTP/1.1\r\nHost: x\r\n\r\n'),
           );
-          final responses = await readResponses(socket, 2).timeout(
-            const Duration(seconds: 10),
-          );
+          final responses = await readResponses(
+            socket,
+            2,
+          ).timeout(const Duration(seconds: 10));
           expect(_statusOf(responses[0]), 200);
           expect(_headerOf(responses[0], 'connection'), 'keep-alive');
           expect(_statusOf(responses[1]), 200);
@@ -629,9 +635,10 @@ void main() {
               'GET /methods HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n',
             ),
           );
-          final responses = await readResponses(socket, 2).timeout(
-            const Duration(seconds: 10),
-          );
+          final responses = await readResponses(
+            socket,
+            2,
+          ).timeout(const Duration(seconds: 10));
           expect(_statusOf(responses[0]), 200);
           expect(_headerOf(responses[0], 'connection'), 'keep-alive');
           expect(_statusOf(responses[1]), 200);
@@ -651,12 +658,11 @@ void main() {
             ),
           );
           socket.add(payload);
-          socket.add(
-            ascii.encode('GET /methods HTTP/1.1\r\nHost: x\r\n\r\n'),
-          );
-          final responses = await readResponses(socket, 2).timeout(
-            const Duration(seconds: 10),
-          );
+          socket.add(ascii.encode('GET /methods HTTP/1.1\r\nHost: x\r\n\r\n'));
+          final responses = await readResponses(
+            socket,
+            2,
+          ).timeout(const Duration(seconds: 10));
           expect(_statusOf(responses[0]), 200);
           expect(
             jsonDecode(utf8.decode(_bodyOf(responses[0])))['length'],
@@ -700,49 +706,35 @@ void main() {
         final futures = <Future<void>>[];
         for (var i = 0; i < 40; i++) {
           final index = i;
-          futures.add(
-            () async {
-              switch (index % 4) {
-                case 0:
-                  final body = await _clientBody(
-                    port,
-                    'GET',
-                    '/binary/4096',
-                  );
-                  expect(body, orderedEquals(_patternBytes(4096)));
-                case 1:
-                  final payload = _patternBytes(65536);
-                  final body = await _clientBody(
-                    port,
-                    'POST',
-                    '/upload',
-                    body: payload,
-                  );
-                  expect(
-                    jsonDecode(utf8.decode(body))['fnv'],
-                    _fnv(payload),
-                  );
-                case 2:
-                  final body = await _clientBody(
-                    port,
-                    'GET',
-                    '/query?i=$index',
-                  );
-                  expect(
-                    jsonDecode(utf8.decode(body))['params'],
-                    {'i': '$index'},
-                  );
-                default:
-                  final raw = await _raw(
-                    port,
-                    ascii.encode(
-                      'GET /status/201 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n',
-                    ),
-                  );
-                  expect(_statusOf(raw), 201);
-              }
-            }(),
-          );
+          futures.add(() async {
+            switch (index % 4) {
+              case 0:
+                final body = await _clientBody(port, 'GET', '/binary/4096');
+                expect(body, orderedEquals(_patternBytes(4096)));
+              case 1:
+                final payload = _patternBytes(65536);
+                final body = await _clientBody(
+                  port,
+                  'POST',
+                  '/upload',
+                  body: payload,
+                );
+                expect(jsonDecode(utf8.decode(body))['fnv'], _fnv(payload));
+              case 2:
+                final body = await _clientBody(port, 'GET', '/query?i=$index');
+                expect(jsonDecode(utf8.decode(body))['params'], {
+                  'i': '$index',
+                });
+              default:
+                final raw = await _raw(
+                  port,
+                  ascii.encode(
+                    'GET /status/201 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n',
+                  ),
+                );
+                expect(_statusOf(raw), 201);
+            }
+          }());
         }
         await Future.wait(futures);
       }, skip: skipReason);

@@ -38,6 +38,7 @@ void main() {
       Future<ResponseContext> ok(RequestContext _) async {
         return const ResponseContext();
       }
+
       await server.get('/get', ok);
       await server.head('/head', ok);
       await server.post('/post', ok);
@@ -47,9 +48,7 @@ void main() {
       await server.options('/options', ok);
       await server.all('/all', ok);
 
-      final methods = {
-        for (final r in fake.registered) r.pattern: r.method,
-      };
+      final methods = {for (final r in fake.registered) r.pattern: r.method};
       expect(methods, {
         '/get': RawServerMethod.get,
         '/head': RawServerMethod.head,
@@ -110,6 +109,7 @@ void main() {
       Future<ResponseContext> ok(RequestContext _) async {
         return const ResponseContext();
       }
+
       final api = server.group('/api');
       await api.get('/users', ok);
       await api.post('/users', ok);
@@ -117,10 +117,7 @@ void main() {
 
       expect(
         {for (final r in fake.registered) r.pattern: r.method},
-        {
-          '/api/users': RawServerMethod.post,
-          '/api/wild': RawServerMethod.all,
-        },
+        {'/api/users': RawServerMethod.post, '/api/wild': RawServerMethod.all},
       );
     });
 
@@ -128,6 +125,7 @@ void main() {
       Future<ResponseContext> ok(RequestContext _) async {
         return const ResponseContext();
       }
+
       final v2 = server.group('/api').group('/v2');
       expect(v2.prefix, '/api/v2');
       await v2.get('/x', ok);
@@ -145,8 +143,7 @@ void main() {
       expect(fake.registered, isEmpty);
     });
 
-    test('grouped routes dispatch and unroute by prefixed pattern',
-        () async {
+    test('grouped routes dispatch and unroute by prefixed pattern', () async {
       final api = server.group('/api');
       await api.get('/users/:id', (request) async {
         return ResponseContext.text('user ${request.param('id')}');
@@ -188,8 +185,8 @@ void main() {
     });
 
     test('custom sync and async not-found pages see the request', () async {
-      server.notFoundHandler =
-          (request) => ResponseContext.text('lost: ${request.path}', status: 404);
+      server.notFoundHandler = (request) =>
+          ResponseContext.text('lost: ${request.path}', status: 404);
       var response = await driveRequest(
         fake,
         requestId: 42,
@@ -297,10 +294,7 @@ void main() {
         const ServerBindException('denied').toString(),
         contains('denied'),
       );
-      expect(
-        const ServerBindException('x'),
-        isA<NitroServerException>(),
-      );
+      expect(const ServerBindException('x'), isA<NitroServerException>());
     });
 
     test('ServerConfig stores its tuning', () {
@@ -361,9 +355,7 @@ void main() {
       expect(runner.pendingIdsForTesting, {40});
       fake.chunks.add(fakeData(40, [1]));
       fake.chunks.add(fakeEnd(40));
-      for (var i = 0;
-          runner.pendingIdsForTesting.isNotEmpty && i < 200;
-          i++) {
+      for (var i = 0; runner.pendingIdsForTesting.isNotEmpty && i < 200; i++) {
         await Future<void>.delayed(const Duration(milliseconds: 5));
       }
       expect(runner.pendingIdsForTesting, isEmpty);

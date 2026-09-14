@@ -1,22 +1,22 @@
 /// Dart-only native library loading for `nitro_server`.
- ///
- /// Flutter apps never touch this file: the tooling builds and bundles the
- /// `ffiPlugin` native library automatically. Dart CLI programs (benchmarks,
- /// servers, `dart test`) build it with cmake and load it explicitly:
- ///
- /// ```dart
- /// import 'package:nitro_server/nitro_server.dart';
- ///
- /// void main() async {
- ///   loadNitroServerNative(); // opens build/lib/libnitro_server.dylib (.so/.dll)
- ///   final server = await NitroServer.bind();
- ///   // ...
- /// }
- /// ```
- ///
- /// The lookup order is: explicit [path] → `NITRO_SERVER_DYLIB` env var →
- /// conventional cmake outputs relative to [Directory.current]
- /// (`build/lib/<name>`, `build/<name>`). The call is idempotent.
+///
+/// Flutter apps never touch this file: the tooling builds and bundles the
+/// `ffiPlugin` native library automatically. Dart CLI programs (benchmarks,
+/// servers, `dart test`) build it with cmake and load it explicitly:
+///
+/// ```dart
+/// import 'package:nitro_server/nitro_server.dart';
+///
+/// void main() async {
+///   loadNitroServerNative(); // opens build/lib/libnitro_server.dylib (.so/.dll)
+///   final server = await NitroServer.bind();
+///   // ...
+/// }
+/// ```
+///
+/// The lookup order is: explicit [path] → `NITRO_SERVER_DYLIB` env var →
+/// conventional cmake outputs relative to [Directory.current]
+/// (`build/lib/<name>`, `build/<name>`). The call is idempotent.
 library;
 
 import 'dart:ffi';

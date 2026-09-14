@@ -86,7 +86,13 @@ enum RawServerErrorKind {
 enum RawBodyKind { data, end, error }
 
 @HybridEnum()
-enum RawServerEventKind { started, stopped, handlerTimeout, clientError, notice }
+enum RawServerEventKind {
+  started,
+  stopped,
+  handlerTimeout,
+  clientError,
+  notice,
+}
 
 // ── Configuration records ────────────────────────────────────────────────────
 //

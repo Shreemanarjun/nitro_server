@@ -17,19 +17,19 @@ enum HttpMethod {
 
   /// The wire token: uppercase for known methods, `*` for [all].
   String get token => switch (this) {
-        HttpMethod.get => 'GET',
-        HttpMethod.head => 'HEAD',
-        HttpMethod.post => 'POST',
-        HttpMethod.put => 'PUT',
-        HttpMethod.delete => 'DELETE',
-        HttpMethod.patch => 'PATCH',
-        HttpMethod.options => 'OPTIONS',
-        HttpMethod.trace => 'TRACE',
-        HttpMethod.all => '*',
-        HttpMethod.custom => throw StateError(
-            'HttpMethod.custom needs HttpMethodX.customToken',
-          ),
-      };
+    HttpMethod.get => 'GET',
+    HttpMethod.head => 'HEAD',
+    HttpMethod.post => 'POST',
+    HttpMethod.put => 'PUT',
+    HttpMethod.delete => 'DELETE',
+    HttpMethod.patch => 'PATCH',
+    HttpMethod.options => 'OPTIONS',
+    HttpMethod.trace => 'TRACE',
+    HttpMethod.all => '*',
+    HttpMethod.custom => throw StateError(
+      'HttpMethod.custom needs HttpMethodX.customToken',
+    ),
+  };
 
   /// Parses a wire token back. Unknown tokens become [custom] with [tokenOf].
   static (HttpMethod, String) parse(String token) {

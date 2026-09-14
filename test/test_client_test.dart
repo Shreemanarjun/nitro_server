@@ -116,8 +116,8 @@ void main() {
   });
 
   test('unrouted paths bypass the runner fallbacks, like the engine', () async {
-    client.server.notFoundHandler =
-        (request) => ResponseContext.text('custom', status: 404);
+    client.server.notFoundHandler = (request) =>
+        ResponseContext.text('custom', status: 404);
     final response = await client.get('/ghost');
     expect(response.status, 404);
     expect(response.text(), 'not found');

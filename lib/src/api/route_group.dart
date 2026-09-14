@@ -22,7 +22,7 @@ class RouteGroup {
   /// Creates a group over [server] with [prefix]. Prefer [NitroServer.group]
   /// (and [group] for nesting) over calling this directly.
   RouteGroup({required this.server, required String prefix})
-      : _prefix = _normalize(prefix);
+    : _prefix = _normalize(prefix);
 
   /// The server this group registers on.
   final NitroServer server;
@@ -76,7 +76,11 @@ class RouteGroup {
     String pattern, {
     String customMethod = '',
   }) async {
-    await server.unroute(method, '$_prefix$pattern', customMethod: customMethod);
+    await server.unroute(
+      method,
+      '$_prefix$pattern',
+      customMethod: customMethod,
+    );
     return this;
   }
 
@@ -85,63 +89,91 @@ class RouteGroup {
     RequestHandler handler, {
     Duration? timeout,
     List<Middleware>? middleware,
-  }) =>
-      route(HttpMethod.get, pattern, handler,
-          timeout: timeout, middleware: middleware);
+  }) => route(
+    HttpMethod.get,
+    pattern,
+    handler,
+    timeout: timeout,
+    middleware: middleware,
+  );
 
   Future<RouteGroup> head(
     String pattern,
     RequestHandler handler, {
     Duration? timeout,
     List<Middleware>? middleware,
-  }) =>
-      route(HttpMethod.head, pattern, handler,
-          timeout: timeout, middleware: middleware);
+  }) => route(
+    HttpMethod.head,
+    pattern,
+    handler,
+    timeout: timeout,
+    middleware: middleware,
+  );
 
   Future<RouteGroup> post(
     String pattern,
     RequestHandler handler, {
     Duration? timeout,
     List<Middleware>? middleware,
-  }) =>
-      route(HttpMethod.post, pattern, handler,
-          timeout: timeout, middleware: middleware);
+  }) => route(
+    HttpMethod.post,
+    pattern,
+    handler,
+    timeout: timeout,
+    middleware: middleware,
+  );
 
   Future<RouteGroup> put(
     String pattern,
     RequestHandler handler, {
     Duration? timeout,
     List<Middleware>? middleware,
-  }) =>
-      route(HttpMethod.put, pattern, handler,
-          timeout: timeout, middleware: middleware);
+  }) => route(
+    HttpMethod.put,
+    pattern,
+    handler,
+    timeout: timeout,
+    middleware: middleware,
+  );
 
   Future<RouteGroup> delete(
     String pattern,
     RequestHandler handler, {
     Duration? timeout,
     List<Middleware>? middleware,
-  }) =>
-      route(HttpMethod.delete, pattern, handler,
-          timeout: timeout, middleware: middleware);
+  }) => route(
+    HttpMethod.delete,
+    pattern,
+    handler,
+    timeout: timeout,
+    middleware: middleware,
+  );
 
   Future<RouteGroup> patch(
     String pattern,
     RequestHandler handler, {
     Duration? timeout,
     List<Middleware>? middleware,
-  }) =>
-      route(HttpMethod.patch, pattern, handler,
-          timeout: timeout, middleware: middleware);
+  }) => route(
+    HttpMethod.patch,
+    pattern,
+    handler,
+    timeout: timeout,
+    middleware: middleware,
+  );
 
   Future<RouteGroup> options(
     String pattern,
     RequestHandler handler, {
     Duration? timeout,
     List<Middleware>? middleware,
-  }) =>
-      route(HttpMethod.options, pattern, handler,
-          timeout: timeout, middleware: middleware);
+  }) => route(
+    HttpMethod.options,
+    pattern,
+    handler,
+    timeout: timeout,
+    middleware: middleware,
+  );
 
   /// Matches every method under the prefixed [pattern].
   Future<RouteGroup> all(
@@ -149,9 +181,13 @@ class RouteGroup {
     RequestHandler handler, {
     Duration? timeout,
     List<Middleware>? middleware,
-  }) =>
-      route(HttpMethod.all, pattern, handler,
-          timeout: timeout, middleware: middleware);
+  }) => route(
+    HttpMethod.all,
+    pattern,
+    handler,
+    timeout: timeout,
+    middleware: middleware,
+  );
 
   /// Registers a WebSocket route under the prefixed [pattern].
   /// See [NitroServer.ws]. Returns `this`, so registrations chain.

@@ -49,32 +49,35 @@ void main() {
   }
 
   group('registration edges', () {
-    test('re-registering a pattern replaces the handler, not the route', () async {
-      runner.addRoute(
-        HttpMethod.get,
-        '',
-        '/r',
-        null,
-        (_) async => ResponseContext.text('first'),
-      );
-      runner.addRoute(
-        HttpMethod.get,
-        '',
-        '/r',
-        null,
-        (_) async => ResponseContext.text('second'),
-      );
-      await Future<void>.delayed(Duration.zero);
+    test(
+      're-registering a pattern replaces the handler, not the route',
+      () async {
+        runner.addRoute(
+          HttpMethod.get,
+          '',
+          '/r',
+          null,
+          (_) async => ResponseContext.text('first'),
+        );
+        runner.addRoute(
+          HttpMethod.get,
+          '',
+          '/r',
+          null,
+          (_) async => ResponseContext.text('second'),
+        );
+        await Future<void>.delayed(Duration.zero);
 
-      final response = await driveRequest(
-        fake,
-        requestId: 1,
-        path: '/r',
-        routePattern: '/r',
-      );
-      expect(String.fromCharCodes(response.body), 'second');
-      expect(fake.registered.length, 2);
-    });
+        final response = await driveRequest(
+          fake,
+          requestId: 1,
+          path: '/r',
+          routePattern: '/r',
+        );
+        expect(String.fromCharCodes(response.body), 'second');
+        expect(fake.registered.length, 2);
+      },
+    );
 
     test('unregistering an unknown route throws RouteNotFoundException', () {
       fake.unregisterFailures['/ghost'] = const RawServerStatus(
@@ -87,53 +90,52 @@ void main() {
       );
     });
 
-    test('same pattern on different methods dispatches independently', () async {
-      runner.addRoute(
-        HttpMethod.get,
-        '',
-        '/m',
-        null,
-        (_) async => ResponseContext.text('get'),
-      );
-      runner.addRoute(
-        HttpMethod.post,
-        '',
-        '/m',
-        null,
-        (_) async => ResponseContext.text('post'),
-      );
-      await Future<void>.delayed(Duration.zero);
+    test(
+      'same pattern on different methods dispatches independently',
+      () async {
+        runner.addRoute(
+          HttpMethod.get,
+          '',
+          '/m',
+          null,
+          (_) async => ResponseContext.text('get'),
+        );
+        runner.addRoute(
+          HttpMethod.post,
+          '',
+          '/m',
+          null,
+          (_) async => ResponseContext.text('post'),
+        );
+        await Future<void>.delayed(Duration.zero);
 
-      final getResponse = await driveRequest(
-        fake,
-        requestId: 2,
-        path: '/m',
-        routePattern: '/m',
-      );
-      final postResponse = await driveRequest(
-        fake,
-        requestId: 3,
-        method: RawServerMethod.post,
-        path: '/m',
-        routePattern: '/m',
-      );
-      // Dispatch keys on the head method, not just the pattern.
-      expect(String.fromCharCodes(getResponse.body), 'get');
-      expect(String.fromCharCodes(postResponse.body), 'post');
-    });
+        final getResponse = await driveRequest(
+          fake,
+          requestId: 2,
+          path: '/m',
+          routePattern: '/m',
+        );
+        final postResponse = await driveRequest(
+          fake,
+          requestId: 3,
+          method: RawServerMethod.post,
+          path: '/m',
+          routePattern: '/m',
+        );
+        // Dispatch keys on the head method, not just the pattern.
+        expect(String.fromCharCodes(getResponse.body), 'get');
+        expect(String.fromCharCodes(postResponse.body), 'post');
+      },
+    );
 
     test('custom-method heads dispatch by token', () async {
       RequestContext? seen;
-      runner.addRoute(
-        HttpMethod.custom,
-        'PURGE',
-        '/cache',
-        null,
-        (request) async {
-          seen = request;
-          return const ResponseContext();
-        },
-      );
+      runner.addRoute(HttpMethod.custom, 'PURGE', '/cache', null, (
+        request,
+      ) async {
+        seen = request;
+        return const ResponseContext();
+      });
       await Future<void>.delayed(Duration.zero);
 
       fake.heads.add(
@@ -437,9 +439,15 @@ void main() {
       runner.addRoute(HttpMethod.get, '', '/slow', null, (_) => gate.future);
       await Future<void>.delayed(Duration.zero);
 
-      fake.heads.add(fakeHead(requestId: 400, path: '/slow', routePattern: '/slow'));
+      fake.heads.add(
+        fakeHead(requestId: 400, path: '/slow', routePattern: '/slow'),
+      );
       // Wait until dispatch parks on the handler future…
-      for (var i = 0; i < 200 && !runner.pendingIdsForTesting.contains(400); i++) {
+      for (
+        var i = 0;
+        i < 200 && !runner.pendingIdsForTesting.contains(400);
+        i++
+      ) {
         await Future<void>.delayed(const Duration(milliseconds: 5));
       }
       expect(runner.pendingIdsForTesting, contains(400));
@@ -455,30 +463,36 @@ void main() {
     // NOTE: cors() wraps matched routes only — an OPTIONS preflight to a
     // path with no matching route is still the default 404. Register `all`
     // (or an explicit OPTIONS route) for preflighted paths.
-    test('preflight short-circuits with 204 and never runs the handler', () async {
-      var calls = 0;
-      runner.use(cors());
-      runner.addRoute(HttpMethod.all, '', '/res', null, (_) async {
-        calls++;
-        return ResponseContext.text('never');
-      });
-      await Future<void>.delayed(Duration.zero);
+    test(
+      'preflight short-circuits with 204 and never runs the handler',
+      () async {
+        var calls = 0;
+        runner.use(cors());
+        runner.addRoute(HttpMethod.all, '', '/res', null, (_) async {
+          calls++;
+          return ResponseContext.text('never');
+        });
+        await Future<void>.delayed(Duration.zero);
 
-      fake.heads.add(
-        fakeHead(
-          requestId: 100,
-          method: RawServerMethod.options,
-          path: '/res',
-          routePattern: '/res',
-        ),
-      );
-      final response = await waitFor(100);
-      expect(response.status, 204);
-      expect(response.body, isEmpty);
-      expect(response.headers['access-control-allow-origin'], '*');
-      expect(response.headers['access-control-allow-methods'], contains('GET'));
-      expect(calls, 0);
-    });
+        fake.heads.add(
+          fakeHead(
+            requestId: 100,
+            method: RawServerMethod.options,
+            path: '/res',
+            routePattern: '/res',
+          ),
+        );
+        final response = await waitFor(100);
+        expect(response.status, 204);
+        expect(response.body, isEmpty);
+        expect(response.headers['access-control-allow-origin'], '*');
+        expect(
+          response.headers['access-control-allow-methods'],
+          contains('GET'),
+        );
+        expect(calls, 0);
+      },
+    );
 
     test('plain responses carry the policy headers', () async {
       runner.use(cors());
@@ -740,34 +754,37 @@ void main() {
       expect(response.body, orderedEquals([3, 1, 4, 1, 5, 9]));
     });
 
-    test('a stale data chunk after the end is dropped, not answered twice', () async {
-      var calls = 0;
-      runner.addRoute(HttpMethod.post, '', '/stale', null, (request) async {
-        calls++;
-        return ResponseContext.text('n=${request.body.length}');
-      });
-      await Future<void>.delayed(Duration.zero);
+    test(
+      'a stale data chunk after the end is dropped, not answered twice',
+      () async {
+        var calls = 0;
+        runner.addRoute(HttpMethod.post, '', '/stale', null, (request) async {
+          calls++;
+          return ResponseContext.text('n=${request.body.length}');
+        });
+        await Future<void>.delayed(Duration.zero);
 
-      fake.heads.add(
-        fakeHead(
-          requestId: 204,
-          method: RawServerMethod.post,
-          path: '/stale',
-          hasBody: true,
-          contentLength: 1,
-          routePattern: '/stale',
-        ),
-      );
-      await Future<void>.delayed(const Duration(milliseconds: 10));
-      fake.chunks.add(fakeData(204, [7]));
-      fake.chunks.add(fakeEnd(204));
-      await waitFor(204);
-      fake.chunks.add(fakeData(204, [8])); // Straggler on a reaped id.
-      await Future<void>.delayed(const Duration(milliseconds: 30));
-      expect(calls, 1);
-      expect(fake.responded.where((r) => r.requestId == 204), hasLength(1));
-      expect(fake.acked.where((a) => a.$1 == 204), hasLength(2));
-    });
+        fake.heads.add(
+          fakeHead(
+            requestId: 204,
+            method: RawServerMethod.post,
+            path: '/stale',
+            hasBody: true,
+            contentLength: 1,
+            routePattern: '/stale',
+          ),
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+        fake.chunks.add(fakeData(204, [7]));
+        fake.chunks.add(fakeEnd(204));
+        await waitFor(204);
+        fake.chunks.add(fakeData(204, [8])); // Straggler on a reaped id.
+        await Future<void>.delayed(const Duration(milliseconds: 30));
+        expect(calls, 1);
+        expect(fake.responded.where((r) => r.requestId == 204), hasLength(1));
+        expect(fake.acked.where((a) => a.$1 == 204), hasLength(2));
+      },
+    );
 
     test('a duplicate head after the answer never redispatches', () async {
       var calls = 0;
@@ -783,7 +800,9 @@ void main() {
       );
       expect(calls, 1);
       // Stale resend of the same id long after completion.
-      fake.heads.add(fakeHead(requestId: 205, path: '/dup', routePattern: '/dup'));
+      fake.heads.add(
+        fakeHead(requestId: 205, path: '/dup', routePattern: '/dup'),
+      );
       await Future<void>.delayed(const Duration(milliseconds: 30));
       expect(calls, 1);
       expect(fake.responded.where((r) => r.requestId == 205), hasLength(1));
@@ -899,6 +918,7 @@ void main() {
       Future<ResponseContext> ok(RequestContext _) async {
         return const ResponseContext();
       }
+
       final afterGet = await server.get('/a', ok);
       final afterUse = await afterGet.use((request, next) => next(request));
       final afterUnroute = await afterUse.unroute(HttpMethod.get, '/a');
@@ -909,29 +929,32 @@ void main() {
       expect(await api.get('/b', ok), same(api));
     });
 
-    test('a failing native registration throws typed and installs nothing', () async {
-      fake.registerFailures['/bad'] = const RawServerStatus(
-        errorKind: RawServerErrorKind.badRequest,
-        errorMessage: 'wildcards only trail',
-      );
-      expect(
-        () => runner.addRoute(
-          HttpMethod.get,
-          '',
-          '/bad',
-          null,
-          (_) async => const ResponseContext(),
-        ),
-        throwsA(isA<ServerBadRequestException>()),
-      );
-      final response = await driveRequest(
-        fake,
-        requestId: 210,
-        path: '/bad',
-        routePattern: '/bad',
-      );
-      expect(response.status, 404);
-    });
+    test(
+      'a failing native registration throws typed and installs nothing',
+      () async {
+        fake.registerFailures['/bad'] = const RawServerStatus(
+          errorKind: RawServerErrorKind.badRequest,
+          errorMessage: 'wildcards only trail',
+        );
+        expect(
+          () => runner.addRoute(
+            HttpMethod.get,
+            '',
+            '/bad',
+            null,
+            (_) async => const ResponseContext(),
+          ),
+          throwsA(isA<ServerBadRequestException>()),
+        );
+        final response = await driveRequest(
+          fake,
+          requestId: 210,
+          path: '/bad',
+          routePattern: '/bad',
+        );
+        expect(response.status, 404);
+      },
+    );
 
     test('a failing native start surfaces the typed error', () {
       fake.startResult = const RawServerStatus(
@@ -965,7 +988,13 @@ void main() {
     });
 
     test('jsonBody encodes lists as well as maps', () async {
-      await addGet('/list', (_) async => ResponseContext.jsonBody([1, {'a': true}]));
+      await addGet(
+        '/list',
+        (_) async => ResponseContext.jsonBody([
+          1,
+          {'a': true},
+        ]),
+      );
       final response = await driveRequest(
         fake,
         requestId: 212,
@@ -973,10 +1002,10 @@ void main() {
         routePattern: '/list',
       );
       expect(response.headers['content-type'], contains('application/json'));
-      expect(
-        jsonDecode(String.fromCharCodes(response.body)),
-        [1, {'a': true}],
-      );
+      expect(jsonDecode(String.fromCharCodes(response.body)), [
+        1,
+        {'a': true},
+      ]);
     });
   });
 
@@ -991,7 +1020,9 @@ void main() {
       });
       await Future<void>.delayed(Duration.zero);
 
-      fake.heads.add(fakeHead(requestId: 500, path: '/ev', routePattern: '/ev'));
+      fake.heads.add(
+        fakeHead(requestId: 500, path: '/ev', routePattern: '/ev'),
+      );
       for (var i = 0; i < 200 && !fake.streamsStarted.containsKey(500); i++) {
         await Future<void>.delayed(const Duration(milliseconds: 5));
       }
@@ -1008,10 +1039,7 @@ void main() {
         await Future<void>.delayed(const Duration(milliseconds: 5));
       }
       final chunks = fake.streamChunks[500]!;
-      expect(
-        chunks.map(String.fromCharCodes).join(),
-        'abc',
-      );
+      expect(chunks.map(String.fromCharCodes).join(), 'abc');
       expect(fake.streamsEnded, contains(500));
       expect(runner.pendingIdsForTesting, isNot(contains(500)));
     });
@@ -1023,7 +1051,9 @@ void main() {
       });
       await Future<void>.delayed(Duration.zero);
 
-      fake.heads.add(fakeHead(requestId: 501, path: '/pad', routePattern: '/pad'));
+      fake.heads.add(
+        fakeHead(requestId: 501, path: '/pad', routePattern: '/pad'),
+      );
       for (var i = 0; i < 200 && !fake.streamsStarted.containsKey(501); i++) {
         await Future<void>.delayed(const Duration(milliseconds: 5));
       }
@@ -1058,10 +1088,7 @@ void main() {
         await Future<void>.delayed(const Duration(milliseconds: 5));
       }
       // Bytes so far, then a clean terminator: the client sees 'part'.
-      expect(
-        fake.streamChunks[502]!.map(String.fromCharCodes).join(),
-        'part',
-      );
+      expect(fake.streamChunks[502]!.map(String.fromCharCodes).join(), 'part');
       expect(fake.streamsEnded, contains(502));
     });
 
@@ -1072,7 +1099,9 @@ void main() {
       });
       await Future<void>.delayed(Duration.zero);
 
-      fake.heads.add(fakeHead(requestId: 503, path: '/long', routePattern: '/long'));
+      fake.heads.add(
+        fakeHead(requestId: 503, path: '/long', routePattern: '/long'),
+      );
       for (var i = 0; i < 200 && !fake.streamsStarted.containsKey(503); i++) {
         await Future<void>.delayed(const Duration(milliseconds: 5));
       }
@@ -1093,22 +1122,22 @@ void main() {
       runner.addRoute(HttpMethod.get, '', '/boom', null, (_) async {
         throw StateError('kaput');
       });
-      runner.errorHandler = (error, _) =>
-          ResponseContext.stream(Stream.value(Uint8List.fromList('oops'.codeUnits)));
+      runner.errorHandler = (error, _) => ResponseContext.stream(
+        Stream.value(Uint8List.fromList('oops'.codeUnits)),
+      );
       await Future<void>.delayed(Duration.zero);
 
       // Streams never `respond`, so drive the head by hand and watch the
       // stream signals instead of `fake.responded`.
-      fake.heads.add(fakeHead(requestId: 504, path: '/boom', routePattern: '/boom'));
+      fake.heads.add(
+        fakeHead(requestId: 504, path: '/boom', routePattern: '/boom'),
+      );
       for (var i = 0; i < 200 && !fake.streamsEnded.contains(504); i++) {
         await Future<void>.delayed(const Duration(milliseconds: 5));
       }
       expect(fake.responded.where((r) => r.requestId == 504), isEmpty);
       expect(fake.streamsStarted[504]!.status, 200);
-      expect(
-        fake.streamChunks[504]!.map(String.fromCharCodes).join(),
-        'oops',
-      );
+      expect(fake.streamChunks[504]!.map(String.fromCharCodes).join(), 'oops');
     });
   });
 
@@ -1127,19 +1156,19 @@ void main() {
       });
       await Future<void>.delayed(Duration.zero);
       fake.heads.add(
-        fakeHead(requestId: id, path: path, routePattern: pattern, params: params),
+        fakeHead(
+          requestId: id,
+          path: path,
+          routePattern: pattern,
+          params: params,
+        ),
       );
       return opened.future.timeout(const Duration(seconds: 5));
     }
 
     void inject(int id, int kind, Uint8List payload, [int code = 0]) {
       fake.wsOut.add(
-        RawWsMessage(
-          payload: payload,
-          connectionId: id,
-          kind: kind,
-          aux: code,
-        ),
+        RawWsMessage(payload: payload, connectionId: id, kind: kind, aux: code),
       );
     }
 
@@ -1169,12 +1198,15 @@ void main() {
     test('text and binary messages reach the handler in order', () async {
       final received = <WsMessage>[];
       final done = Completer<void>();
-      await openSession(601, handler: (session) async {
-        await for (final message in session.messages) {
-          received.add(message);
-        }
-        done.complete();
-      });
+      await openSession(
+        601,
+        handler: (session) async {
+          await for (final message in session.messages) {
+            received.add(message);
+          }
+          done.complete();
+        },
+      );
       inject(601, 1, Uint8List.fromList('hi'.codeUnits));
       inject(601, 2, Uint8List.fromList([1, 2, 3]));
       inject(601, 8, Uint8List(0), 1000);
@@ -1204,9 +1236,12 @@ void main() {
     });
 
     test('a throwing handler closes with 1011', () async {
-      await openSession(603, handler: (_) async {
-        throw StateError('handler died');
-      });
+      await openSession(
+        603,
+        handler: (_) async {
+          throw StateError('handler died');
+        },
+      );
       await waitWsClosed(603);
       expect(fake.wsClosed.single, (603, 1011));
     });
@@ -1230,7 +1265,9 @@ void main() {
         wsCalls++;
       });
       await Future<void>.delayed(Duration.zero);
-      fake.heads.add(fakeHead(requestId: 605, path: '/dupe', routePattern: '/dupe'));
+      fake.heads.add(
+        fakeHead(requestId: 605, path: '/dupe', routePattern: '/dupe'),
+      );
       await waitWsClosed(605);
       expect(wsCalls, 1);
       expect(httpCalls, 0);
@@ -1276,4 +1313,3 @@ void main() {
     });
   });
 }
-

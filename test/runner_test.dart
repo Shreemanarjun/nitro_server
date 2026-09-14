@@ -78,42 +78,42 @@ void main() {
         if (fake.responded.any((r) => r.requestId == 2)) break;
         await Future<void>.delayed(const Duration(milliseconds: 5));
       }
-      final response =
-          fake.responded.firstWhere((r) => r.requestId == 2);
+      final response = fake.responded.firstWhere((r) => r.requestId == 2);
       expect(response.status, 200);
       expect(String.fromCharCodes(response.body), 'n=6');
       expect(seen!.body, orderedEquals([1, 2, 3, 4, 5, 6]));
     });
 
-    test('chunks that arrive before their head are parked, not dropped',
-        () async {
-      runner.addRoute(HttpMethod.post, '', '/early', null, (request) async {
-        return ResponseContext.text('n=${request.body.length}');
-      });
-      await Future<void>.delayed(Duration.zero);
+    test(
+      'chunks that arrive before their head are parked, not dropped',
+      () async {
+        runner.addRoute(HttpMethod.post, '', '/early', null, (request) async {
+          return ResponseContext.text('n=${request.body.length}');
+        });
+        await Future<void>.delayed(Duration.zero);
 
-      fake.chunks.add(fakeData(3, [9, 9]));
-      fake.chunks.add(fakeEnd(3));
-      await Future<void>.delayed(const Duration(milliseconds: 20));
-      fake.heads.add(
-        fakeHead(
-          requestId: 3,
-          method: RawServerMethod.post,
-          path: '/early',
-          hasBody: true,
-          contentLength: 2,
-          routePattern: '/early',
-        ),
-      );
+        fake.chunks.add(fakeData(3, [9, 9]));
+        fake.chunks.add(fakeEnd(3));
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        fake.heads.add(
+          fakeHead(
+            requestId: 3,
+            method: RawServerMethod.post,
+            path: '/early',
+            hasBody: true,
+            contentLength: 2,
+            routePattern: '/early',
+          ),
+        );
 
-      for (var i = 0; i < 200; i++) {
-        if (fake.responded.any((r) => r.requestId == 3)) break;
-        await Future<void>.delayed(const Duration(milliseconds: 5));
-      }
-      final response =
-          fake.responded.firstWhere((r) => r.requestId == 3);
-      expect(String.fromCharCodes(response.body), 'n=2');
-    });
+        for (var i = 0; i < 200; i++) {
+          if (fake.responded.any((r) => r.requestId == 3)) break;
+          await Future<void>.delayed(const Duration(milliseconds: 5));
+        }
+        final response = fake.responded.firstWhere((r) => r.requestId == 3);
+        expect(String.fromCharCodes(response.body), 'n=2');
+      },
+    );
 
     test('params, query and headers reach the handler', () async {
       RequestContext? seen;
@@ -227,10 +227,7 @@ void main() {
         routePattern: '/boom',
       );
       expect(response.status, 500);
-      expect(
-        fake.responded.where((r) => r.requestId == 6),
-        hasLength(1),
-      );
+      expect(fake.responded.where((r) => r.requestId == 6), hasLength(1));
     });
 
     test('a terminal body error never reaches the handler', () async {
@@ -323,11 +320,9 @@ void main() {
 
       fake.chunks.add(fakeData(10, [1, 2]));
       await Future<void>.delayed(const Duration(milliseconds: 20));
-      expect(
-        fake.acked.where((a) => a.$1 == 10),
-        [(10, 1)],
-        reason: 'the copy was made, so the payload must be released',
-      );
+      expect(fake.acked.where((a) => a.$1 == 10), [
+        (10, 1),
+      ], reason: 'the copy was made, so the payload must be released');
       fake.heads.add(
         fakeHead(
           requestId: 10,
@@ -432,14 +427,17 @@ void main() {
       await sub.cancel();
     });
 
-    test('close stops native and cancels without disposing the bridge', () async {
-      await addEcho('/');
-      await runner.close();
-      expect(fake.stopCalls, 1);
-      // Heads after close are ignored, never dispatched.
-      fake.heads.add(fakeHead(requestId: 12));
-      await Future<void>.delayed(const Duration(milliseconds: 20));
-      expect(fake.responded, isEmpty);
-    });
+    test(
+      'close stops native and cancels without disposing the bridge',
+      () async {
+        await addEcho('/');
+        await runner.close();
+        expect(fake.stopCalls, 1);
+        // Heads after close are ignored, never dispatched.
+        fake.heads.add(fakeHead(requestId: 12));
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        expect(fake.responded, isEmpty);
+      },
+    );
   });
 }

@@ -92,7 +92,8 @@ class ServerRunner {
     var compose = _identity;
     for (final middleware in middlewares.reversed) {
       final next = compose;
-      compose = (handler) => (request) => middleware(request, next(handler));
+      compose = (handler) =>
+          (request) => middleware(request, next(handler));
     }
     return compose;
   }
@@ -119,6 +120,7 @@ class ServerRunner {
   /// acked the moment it is copied — including chunks that arrive before
   /// their head — so native memory is freed promptly and exactly once.
   final _acked = <int, int>{};
+
   /// Handler table, two levels: method token → pattern → route entry. A flat
   /// `'$token $pattern'` key costs a string allocation on every request;
   /// this lookup allocates nothing.
@@ -150,8 +152,8 @@ class ServerRunner {
   NotFoundHandler _notFoundHandler = (_) => const ResponseContext(status: 404);
 
   /// Answers requests whose handler threw. Defaults to a 500 text body.
-  ErrorHandler _errorHandler =
-      (error, _) => ResponseContext.text('handler error: $error', status: 500);
+  ErrorHandler _errorHandler = (error, _) =>
+      ResponseContext.text('handler error: $error', status: 500);
 
   /// Overrides the 404 answer. A throwing handler falls back to empty 404.
   ///
@@ -210,22 +212,10 @@ class ServerRunner {
   void _ensureListening() {
     if (_listening) return;
     _listening = true;
-    _heads = _native.incomingRequests.listen(
-      _onHead,
-      onError: (_) {},
-    );
-    _chunks = _native.bodyChunks.listen(
-      _onChunk,
-      onError: (_) {},
-    );
-    _serverEvents = _native.serverEvents.listen(
-      _onEvent,
-      onError: (_) {},
-    );
-    _wsMessages = _native.wsMessages.listen(
-      _onWsMessage,
-      onError: (_) {},
-    );
+    _heads = _native.incomingRequests.listen(_onHead, onError: (_) {});
+    _chunks = _native.bodyChunks.listen(_onChunk, onError: (_) {});
+    _serverEvents = _native.serverEvents.listen(_onEvent, onError: (_) {});
+    _wsMessages = _native.wsMessages.listen(_onWsMessage, onError: (_) {});
   }
 
   // ── Route table ────────────────────────────────────────────────────────────
@@ -253,8 +243,11 @@ class ServerRunner {
     // Route-local middleware sits inside the global chain: the entry's
     // `piped` is global(routeLocal(handler)), matching use()'s refresh.
     final routeComposer = _composeAll(middleware);
-    final entry =
-        _RouteEntry(handler, routeComposer, _compose(routeComposer(handler)));
+    final entry = _RouteEntry(
+      handler,
+      routeComposer,
+      _compose(routeComposer(handler)),
+    );
     final token = _tokenOf(method, customToken);
     (_routes[token] ??= {})[pattern] = entry;
     // Single-entry mirror of the engine table (see addWsRoute).
@@ -285,7 +278,10 @@ class ServerRunner {
   }
 
   void removeRoute(HttpMethod method, String customToken, String pattern) {
-    final status = _native.unregisterRoute(_tokenOf(method, customToken), pattern);
+    final status = _native.unregisterRoute(
+      _tokenOf(method, customToken),
+      pattern,
+    );
     throwIfFailed(status, operation: 'unregisterRoute($pattern)');
     _routes[_tokenOf(method, customToken)]?.remove(pattern);
     // The engine holds one entry per (method, pattern) whatever its kind:

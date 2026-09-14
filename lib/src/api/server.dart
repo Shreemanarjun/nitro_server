@@ -36,7 +36,9 @@ class NitroServer {
 
   /// Binds [config.host]:[config.port] and starts accepting. A config port of
   /// 0 asks the OS for a free port — read it back from [port].
-  static Future<NitroServer> bind([ServerConfig config = const ServerConfig()]) async {
+  static Future<NitroServer> bind([
+    ServerConfig config = const ServerConfig(),
+  ]) async {
     ensureNativeAttached();
     final serverId = Ids.nextServer();
     final runner = ServerRunner(attachedNative(serverKey(serverId)));
@@ -65,17 +67,19 @@ class NitroServer {
     int? workerThreads,
     TlsConfig? tls,
   }) {
-    return bind(const ServerConfig().copyWith(
-      host: host,
-      port: port,
-      backlog: backlog,
-      maxBodyBytes: maxBodyBytes,
-      defaultTimeout: defaultTimeout,
-      keepAliveTimeout: keepAliveTimeout,
-      maxRequestsPerConnection: maxRequestsPerConnection,
-      workerThreads: workerThreads,
-      tls: tls,
-    ));
+    return bind(
+      const ServerConfig().copyWith(
+        host: host,
+        port: port,
+        backlog: backlog,
+        maxBodyBytes: maxBodyBytes,
+        defaultTimeout: defaultTimeout,
+        keepAliveTimeout: keepAliveTimeout,
+        maxRequestsPerConnection: maxRequestsPerConnection,
+        workerThreads: workerThreads,
+        tls: tls,
+      ),
+    );
   }
 
   int _port = 0;
@@ -149,63 +153,91 @@ class NitroServer {
     RequestHandler handler, {
     Duration? timeout,
     List<Middleware>? middleware,
-  }) =>
-      route(HttpMethod.get, pattern, handler,
-          timeout: timeout, middleware: middleware);
+  }) => route(
+    HttpMethod.get,
+    pattern,
+    handler,
+    timeout: timeout,
+    middleware: middleware,
+  );
 
   Future<NitroServer> head(
     String pattern,
     RequestHandler handler, {
     Duration? timeout,
     List<Middleware>? middleware,
-  }) =>
-      route(HttpMethod.head, pattern, handler,
-          timeout: timeout, middleware: middleware);
+  }) => route(
+    HttpMethod.head,
+    pattern,
+    handler,
+    timeout: timeout,
+    middleware: middleware,
+  );
 
   Future<NitroServer> post(
     String pattern,
     RequestHandler handler, {
     Duration? timeout,
     List<Middleware>? middleware,
-  }) =>
-      route(HttpMethod.post, pattern, handler,
-          timeout: timeout, middleware: middleware);
+  }) => route(
+    HttpMethod.post,
+    pattern,
+    handler,
+    timeout: timeout,
+    middleware: middleware,
+  );
 
   Future<NitroServer> put(
     String pattern,
     RequestHandler handler, {
     Duration? timeout,
     List<Middleware>? middleware,
-  }) =>
-      route(HttpMethod.put, pattern, handler,
-          timeout: timeout, middleware: middleware);
+  }) => route(
+    HttpMethod.put,
+    pattern,
+    handler,
+    timeout: timeout,
+    middleware: middleware,
+  );
 
   Future<NitroServer> delete(
     String pattern,
     RequestHandler handler, {
     Duration? timeout,
     List<Middleware>? middleware,
-  }) =>
-      route(HttpMethod.delete, pattern, handler,
-          timeout: timeout, middleware: middleware);
+  }) => route(
+    HttpMethod.delete,
+    pattern,
+    handler,
+    timeout: timeout,
+    middleware: middleware,
+  );
 
   Future<NitroServer> patch(
     String pattern,
     RequestHandler handler, {
     Duration? timeout,
     List<Middleware>? middleware,
-  }) =>
-      route(HttpMethod.patch, pattern, handler,
-          timeout: timeout, middleware: middleware);
+  }) => route(
+    HttpMethod.patch,
+    pattern,
+    handler,
+    timeout: timeout,
+    middleware: middleware,
+  );
 
   Future<NitroServer> options(
     String pattern,
     RequestHandler handler, {
     Duration? timeout,
     List<Middleware>? middleware,
-  }) =>
-      route(HttpMethod.options, pattern, handler,
-          timeout: timeout, middleware: middleware);
+  }) => route(
+    HttpMethod.options,
+    pattern,
+    handler,
+    timeout: timeout,
+    middleware: middleware,
+  );
 
   /// Matches every method — handy for echo, proxy and fallback routes.
   Future<NitroServer> all(
@@ -213,9 +245,13 @@ class NitroServer {
     RequestHandler handler, {
     Duration? timeout,
     List<Middleware>? middleware,
-  }) =>
-      route(HttpMethod.all, pattern, handler,
-          timeout: timeout, middleware: middleware);
+  }) => route(
+    HttpMethod.all,
+    pattern,
+    handler,
+    timeout: timeout,
+    middleware: middleware,
+  );
 
   /// Registers a WebSocket route (RFC 6455). Matching handshakes upgrade
   /// in-engine and [handler] receives the live session; anything else on
@@ -235,8 +271,7 @@ class NitroServer {
 
   /// A path-prefixed view of this server: `server.group('/api').get(...)`
   /// registers `/api/...`. Groups nest; middleware stays server-global.
-  RouteGroup group(String prefix) =>
-      RouteGroup(server: this, prefix: prefix);
+  RouteGroup group(String prefix) => RouteGroup(server: this, prefix: prefix);
 
   /// Overrides the answer for unmatched routes (default: empty 404). May be
   /// sync or async; a throwing fallback degrades to the default.

@@ -245,5 +245,3 @@ Future<DrivenResponse> driveRequest(
   }
   return fake.responded.firstWhere((r) => r.requestId == requestId);
 }
-
-

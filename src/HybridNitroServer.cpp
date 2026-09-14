@@ -174,6 +174,9 @@ class HybridNitroServerImpl final : public HybridNitroServerNative {
     cfg.keepAliveTimeoutMs = raw.keepAliveTimeoutMs;
     cfg.maxRequestsPerConn = raw.maxRequestsPerConn;
     cfg.workerThreads = raw.workerThreads;
+    cfg.maxConnections = raw.maxConnections;
+    cfg.maxConnectionsPerIp = raw.maxConnectionsPerIp;
+    cfg.headerTimeoutMs = raw.headerTimeoutMs;
     cfg.tlsRequested = !raw.tls.certPem.empty() || !raw.tls.keyPem.empty() ||
                        !raw.tls.certFile.empty() || !raw.tls.keyFile.empty();
     server_->configure(cfg);
@@ -183,7 +186,7 @@ class HybridNitroServerImpl final : public HybridNitroServerNative {
     const RawRouteConfig raw = RawRouteConfig::fromNative(route);
     return toStatus(server_->registerRoute(
         static_cast<Method>(raw.method), raw.customMethod, raw.pattern,
-        raw.timeoutMs, raw.isWebSocket)).toNativeBuffer();
+        raw.timeoutMs, raw.isWebSocket, raw.streamBody)).toNativeBuffer();
   }
 
   NitroCppBuffer unregisterRoute(const std::string& method,
@@ -199,6 +202,22 @@ class HybridNitroServerImpl final : public HybridNitroServerNative {
   }
 
   void stop() override { server_->stop(); }
+
+  void beginDrain() override { server_->beginDrain(); }
+
+  int64_t inFlightRequests() override { return server_->inFlightRequests(); }
+
+  void respondFile(int64_t requestId, int64_t status, NitroCppBuffer headers,
+                   const std::string& path, int64_t offset,
+                   int64_t length) override {
+    std::vector<Header> hs;
+    try {
+      hs = decodeHeaderList(headers);
+    } catch (...) {
+      return;  // Malformed blob: drop rather than crash the connection.
+    }
+    server_->respondFile(requestId, status, hs, path, offset, length);
+  }
 
   void respond(int64_t requestId, int64_t status, NitroCppBuffer headers,
                const uint8_t* body, size_t body_length) override {

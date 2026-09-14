@@ -28,7 +28,7 @@ if command -v dart >/dev/null 2>&1; then
   dart test --coverage=coverage
   dart run coverage:format_coverage --lcov --in=coverage/test \
     --out=coverage/lcov.info --report-on=lib \
-    --packages=.dart_tool/package_config.json
+    --packages=.dart_tool/package_config.json --check-ignore
 else
   flutter test --coverage
 fi
@@ -43,7 +43,7 @@ fi
 
 SUMMARY=$(lcov --summary coverage/lcov.filtered.info 2>&1)
 echo "$SUMMARY"
-RATE=$(echo "$SUMMARY" | grep -oE 'lines\.*: [0-9.]+%' | grep -oE '[0-9.]+' | head -1)
+RATE=$(echo "$SUMMARY" | grep -oE 'lines\.*: [0-9.]+%' | grep -oE '[0-9]+(\.[0-9]+)?')
 INT=${RATE%.*}
 if [ "$INT" -lt "$FLOOR" ]; then
   echo "FAIL: line coverage ${RATE}% is below the ${FLOOR}% floor"

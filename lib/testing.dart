@@ -61,22 +61,27 @@ class NitroTestResponse {
 /// Drives [server] without sockets. Create with [start], register routes on
 /// [server] exactly as in production, then issue requests.
 class NitroTestClient {
-  NitroTestClient._(this._runner, this._native)
+  NitroTestClient._(this._runner, this._native, this._responseTimeout)
     // ignore: invalid_use_of_visible_for_testing_member
     : server = NitroServer.forRunnerForTesting(_runner) {
     _runner.ensureListeningForTesting();
   }
 
   /// Starts a client over a fresh in-memory engine. No native library, no
-  /// ports, no background threads beyond the runner's streams.
-  static Future<NitroTestClient> start() async {
+  /// ports, no background threads beyond the runner's streams. A request
+  /// or WebSocket handshake unanswered after [responseTimeout] throws
+  /// [StateError] (there are no route timeouts here to do it).
+  static Future<NitroTestClient> start({
+    Duration responseTimeout = const Duration(seconds: 5),
+  }) async {
     final native = _InMemoryNative();
     final runner = ServerRunner(native);
-    return NitroTestClient._(runner, native);
+    return NitroTestClient._(runner, native, responseTimeout);
   }
 
   final ServerRunner _runner;
   final _InMemoryNative _native;
+  final Duration _responseTimeout;
 
   /// The server under test. Register routes, middleware, groups and fallback
   /// handlers here — the same calls production makes.
@@ -170,7 +175,8 @@ class NitroTestClient {
         ),
       );
     }
-    for (var i = 0; i < 1000; i++) {
+    final deadline = DateTime.now().add(_responseTimeout);
+    while (DateTime.now().isBefore(deadline)) {
       final answered = _native.answered[requestId];
       if (answered != null) return answered;
       await Future<void>.delayed(const Duration(milliseconds: 5));
@@ -292,8 +298,9 @@ class NitroTestClient {
     // sends cannot land before the session exists. Production cannot race
     // here — the 101 round-trips before any frame — so the client restores
     // that ordering explicitly.
-    for (var i = 0; i < 200; i++) {
-      if (_runner.wsOpenedIdsForTesting.contains(id)) break;
+    final deadline = DateTime.now().add(_responseTimeout);
+    while (!_runner.wsOpenedIdsForTesting.contains(id) &&
+        DateTime.now().isBefore(deadline)) {
       await Future<void>.delayed(const Duration(milliseconds: 5));
     }
     if (!_runner.wsOpenedIdsForTesting.contains(id)) {
@@ -384,6 +391,9 @@ class _InMemoryNative extends NitroServerNative {
   @override
   Stream<RawServerEvent> get serverEvents => events.stream;
 
+  // Capability and lifecycle stubs the runner never calls without a bound
+  // engine.
+  // coverage:ignore-start
   @override
   String engineVersion() => 'nitro_server-test/0.0.1 in-memory';
 
@@ -395,6 +405,7 @@ class _InMemoryNative extends NitroServerNative {
 
   @override
   void configureServer(RawServerConfig config) {}
+  // coverage:ignore-end
 
   @override
   RawServerStatus registerRoute(RawRouteConfig route) {
@@ -417,10 +428,13 @@ class _InMemoryNative extends NitroServerNative {
     return const RawServerStatus(errorKind: RawServerErrorKind.none);
   }
 
+  // The client never binds.
+  // coverage:ignore-start
   @override
   RawServerStatus start() {
     return const RawServerStatus(errorKind: RawServerErrorKind.none);
   }
+  // coverage:ignore-end
 
   @override
   void stop() {}
@@ -551,19 +565,20 @@ class _InMemoryNative extends NitroServerNative {
     return best;
   }
 
-  /// Whether [token] is a custom-method token rather than a known verb or `*`.
-  static bool _isCustomToken(String token) => switch (token) {
-    'GET' ||
-    'HEAD' ||
-    'POST' ||
-    'PUT' ||
-    'DELETE' ||
-    'PATCH' ||
-    'OPTIONS' ||
-    'TRACE' ||
-    '*' => false,
-    _ => true,
+  static const _knownTokens = {
+    'GET',
+    'HEAD',
+    'POST',
+    'PUT',
+    'DELETE',
+    'PATCH',
+    'OPTIONS',
+    'TRACE',
+    '*',
   };
+
+  /// Whether [token] is a custom-method token rather than a known verb or `*`.
+  static bool _isCustomToken(String token) => !_knownTokens.contains(token);
 
   /// (specificity, params) when [pattern] matches [pathSegs], else null.
   static (int, Map<String, String>)? _matchPath(

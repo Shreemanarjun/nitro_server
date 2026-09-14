@@ -57,6 +57,9 @@ struct ServerConfig {
   /// and grows on demand up to the cap; idle workers above the floor retire
   /// after 10 s. `<= 0` means max(64, 4 × CPU cores).
   int64_t workerThreads = 0;
+  int64_t maxConnections = 0;      // <= 0: unlimited.
+  int64_t maxConnectionsPerIp = 0;  // <= 0: unlimited.
+  int64_t headerTimeoutMs = 0;      // <= 0: the idle timeout applies.
   bool tlsRequested = false;
 };
 
@@ -147,11 +150,25 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   void configure(const ServerConfig& config);
   StatusResult registerRoute(Method method, const std::string& customMethod,
                              const std::string& pattern, int64_t timeoutMs,
-                             bool isWebSocket = false);
+                             bool isWebSocket = false, bool streamBody = false);
   StatusResult unregisterRoute(Method method, const std::string& customMethod,
                                const std::string& pattern);
   StatusResult start();
   void stop();
+
+  /// Graceful shutdown, phase one: no more accepts, every later answer says
+  /// `Connection: close`, in-flight requests finish. Idempotent.
+  void beginDrain();
+
+  /// Requests dispatched and not yet fully answered.
+  int64_t inFlightRequests();
+
+  /// Answers with a file: head from the caller's thread, bytes by the
+  /// worker (`sendfile` on POSIX). `length < 0` means to the end. A file
+  /// that cannot be opened answers 404.
+  void respondFile(int64_t requestId, int64_t status,
+                   const std::vector<Header>& headers, const std::string& path,
+                   int64_t offset, int64_t length);
 
   /// Serializes and writes the answer on the CALLER's thread (non-blocking;
   /// the remainder, if any, is flushed by the worker). Bridge memory is
@@ -224,6 +241,11 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   /// answer is complete.
   bool flushTail(int fd, const std::shared_ptr<PendingRequest>& req,
                  int64_t stallMs);
+
+  /// Sends the queued file body (`req->fileFd`) from the worker, then marks
+  /// the answer done. Returns false on failure.
+  bool sendFile(int fd, const std::shared_ptr<PendingRequest>& req,
+                int64_t stallMs);
 
   /// Non-blocking write from the answering thread: writes as much as the
   /// socket takes, queues the rest as `tail` and wakes the worker. Must be
@@ -300,6 +322,7 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   Router router_;
 
   std::atomic<bool> running_{false};
+  std::atomic<bool> draining_{false};
   std::atomic<int64_t> boundPort_{0};
   int listenFd_ = -1;
   std::thread acceptThread_;
@@ -321,9 +344,14 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   unsigned workerFloor_ = 0;
   unsigned workerCap_ = 0;
 
-  // Live connections, so stop() can wake idle keep-alive reads.
+  // Live connections, so stop() can wake idle keep-alive reads, plus the
+  // per-peer counts behind maxConnectionsPerIp. `liveConnections_` counts
+  // accepted fds (queued or served) for maxConnections.
   std::mutex activeMutex_;
   std::set<int> activeFds_;
+  std::unordered_map<int, std::string> peerOf_;
+  std::unordered_map<std::string, int64_t> perPeer_;
+  std::atomic<int64_t> liveConnections_{0};
 
   // Live WebSocket connections by connection id. Entries are erased on
   // loop exit and on wsClose; either order is safe (erase is idempotent).

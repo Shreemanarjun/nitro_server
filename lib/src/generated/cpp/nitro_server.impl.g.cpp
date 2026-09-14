@@ -83,6 +83,22 @@ public:
         throw std::runtime_error("Not implemented: stop");
     }
 
+    void beginDrain() override {
+        // TODO: implement beginDrain
+        throw std::runtime_error("Not implemented: beginDrain");
+    }
+
+    int64_t inFlightRequests() override {
+        // TODO: implement inFlightRequests
+        throw std::runtime_error("Not implemented: inFlightRequests");
+        // return 0;
+    }
+
+    void respondFile(int64_t requestId, int64_t status, NitroCppBuffer headers, const std::string& path, int64_t offset, int64_t length) override {
+        // TODO: implement respondFile
+        throw std::runtime_error("Not implemented: respondFile");
+    }
+
     void respond(int64_t requestId, int64_t status, NitroCppBuffer headers, const uint8_t* body, size_t body_length) override {
         // TODO: implement respond
         throw std::runtime_error("Not implemented: respond");

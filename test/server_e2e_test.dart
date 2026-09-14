@@ -204,6 +204,32 @@ Future<({int opcode, Uint8List payload})> _readWsFrame(
   return (opcode: opcode, payload: payload);
 }
 
+/// A setup that only fails off the main isolate: bind must surface it.
+Future<void> _helperOnlyThrow(NitroServer server) async {
+  if (Isolate.current.debugName != 'main' &&
+      !(Isolate.current.debugName ?? '').endsWith('_test.dart')) {
+    throw StateError('helper setup failed on purpose');
+  }
+}
+
+/// Fails only in the second helper (`…:2`), so the first one is already
+/// running when bind gives up and must be closed on the way out.
+Future<void> _secondHelperThrows(NitroServer server) async {
+  if ((Isolate.current.debugName ?? '').endsWith(':2')) {
+    throw StateError('second helper failed on purpose');
+  }
+}
+
+/// Entry for the main-isolate attach test: opens the library (a fresh
+/// isolate resolves symbols through the process, but the load guard is
+/// per isolate), reconciles, and reports.
+Future<void> _attachAsMain((String?, SendPort) args) async {
+  final (libraryPath, reply) = args;
+  if (libraryPath != null) DynamicLibrary.open(libraryPath);
+  ensureNativeAttached();
+  reply.send('attached');
+}
+
 /// Routes for the isolates test: the body names the answering isolate.
 Future<void> _whoSetup(NitroServer server) async {
   await server.get('/who', (_) async {
@@ -261,20 +287,23 @@ void main() {
       await expectLater(_get(port, '/'), throwsA(isA<Exception>()));
     }, skip: skipReason);
 
-    test('answers with more header bytes than the fast path preallocates',
-        () async {
-      // The leaf-call answer path stages headers in a 2 KiB native buffer
-      // and grows it on demand; a 6 KiB header set must arrive intact.
-      server = await NitroServer.bind();
-      final big = 'v' * 6000;
-      await server!.get('/big-headers', (_) async {
-        return ResponseContext.text('ok', headers: {'x-big': big});
-      });
-      final res = await _get(server!.port, '/big-headers');
-      expect(res.status, 200);
-      expect(res.body, 'ok');
-      expect(res.headers.value('x-big'), big);
-    }, skip: skipReason);
+    test(
+      'answers with more header bytes than the fast path preallocates',
+      () async {
+        // The leaf-call answer path stages headers in a 2 KiB native buffer
+        // and grows it on demand; a 6 KiB header set must arrive intact.
+        server = await NitroServer.bind();
+        final big = 'v' * 6000;
+        await server!.get('/big-headers', (_) async {
+          return ResponseContext.text('ok', headers: {'x-big': big});
+        });
+        final res = await _get(server!.port, '/big-headers');
+        expect(res.status, 200);
+        expect(res.body, 'ok');
+        expect(res.headers.value('x-big'), big);
+      },
+      skip: skipReason,
+    );
 
     test('isolates: 2 deals requests across both runners', () async {
       server = await NitroServer.bind(
@@ -298,6 +327,67 @@ void main() {
         statuses.add((await _get(server!.port, '/main-only')).status);
       }
       expect(statuses, {200, 404});
+    }, skip: skipReason);
+
+    test('isolates: 0 picks a size from the CPU count', () async {
+      server = await NitroServer.bind(
+        const ServerConfig(isolates: 0),
+        _whoSetup,
+      );
+      expect(server!.isolates, (Platform.numberOfProcessors ~/ 2).clamp(1, 8));
+      expect((await _get(server!.port, '/who')).status, 200);
+    }, skip: skipReason);
+
+    test('bindWith forwards its arguments and setup', () async {
+      server = await NitroServer.bindWith(
+        keepAliveTimeout: Duration.zero,
+        isolates: 1,
+        setup: _whoSetup,
+      );
+      final res = await _get(server!.port, '/who');
+      expect(res.status, 200);
+      expect(res.headers.value('connection'), 'close');
+    }, skip: skipReason);
+
+    test(
+      'a setup that throws in a helper fails bind instead of hanging',
+      () async {
+        await expectLater(
+          NitroServer.bind(
+            const ServerConfig(isolates: 2),
+            _helperOnlyThrow,
+          ).timeout(const Duration(seconds: 10)),
+          throwsA(
+            isA<StateError>().having(
+              (e) => e.message,
+              'message',
+              contains('failed to start'),
+            ),
+          ),
+        );
+      },
+      skip: skipReason,
+    );
+
+    test('a helper failing after another started closes the survivor',
+        () async {
+      await expectLater(
+        NitroServer.bind(const ServerConfig(isolates: 3), _secondHelperThrows)
+            .timeout(const Duration(seconds: 10)),
+        throwsA(isA<StateError>()),
+      );
+    }, skip: skipReason);
+
+    test('the main isolate reconciles native state on attach', () async {
+      // `ensureNativeAttached` resets the engine only from the isolate named
+      // `main`; under `dart test` that is never the test isolate, so spawn
+      // one with that name and prove the reset path runs without error.
+      final done = ReceivePort();
+      await Isolate.spawn(_attachAsMain, (
+        libraryPath,
+        done.sendPort,
+      ), debugName: 'main');
+      expect(await done.first, 'attached');
     }, skip: skipReason);
 
     test('isolates above 1 need a setup function', () async {

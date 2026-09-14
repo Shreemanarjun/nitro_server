@@ -354,42 +354,44 @@ Future<HttpServer> _startShelfServer() async {
 /// it runs once per isolate, so it captures only the values it needs.
 ServerSetup _nitroSetup(bool batchEvents) {
   return (server) async {
-    // One pass-through middleware, like the other sides.
+    // One pass-through middleware, like the other sides. Handlers return
+    // their response directly: nothing here awaits, and the dart:io and
+    // shelf handlers do their work synchronously too.
     await server.use((request, next) => next(request));
     for (final entry in _routes.entries) {
       final body = entry.value;
-      await server.get(entry.key, (_) async {
-        return ResponseContext.bytes(body);
-      });
+      await server.get(entry.key, (_) => ResponseContext.bytes(body));
     }
-    await server.get('/users/:id', (request) async {
-      return ResponseContext.text('user ${request.param('id')}');
-    });
-    await server.get('/files/*', (request) async {
-      return ResponseContext.text('wild:${request.path}');
-    });
-    await server.get('/q', (request) async {
-      return ResponseContext.jsonMap(request.queryParameters);
-    });
-    await server.get('/mw', (_) async {
-      return ResponseContext.bytes(_routes['/hello']!);
-    });
-    await server.get('/work', (_) async {
-      return ResponseContext.bytes(
-        _workBody(),
-        contentType: 'application/json',
-      );
-    });
-    await server.get('/events', (_) async {
-      return ResponseContext.stream(
+    await server.get(
+      '/users/:id',
+      (request) => ResponseContext.text('user ${request.param('id')}'),
+    );
+    await server.get(
+      '/files/*',
+      (request) => ResponseContext.text('wild:${request.path}'),
+    );
+    await server.get(
+      '/q',
+      (request) => ResponseContext.jsonMap(request.queryParameters),
+    );
+    await server.get('/mw', (_) => ResponseContext.bytes(_routes['/hello']!));
+    await server.get(
+      '/work',
+      (_) =>
+          ResponseContext.bytes(_workBody(), contentType: 'application/json'),
+    );
+    await server.get(
+      '/events',
+      (_) => ResponseContext.stream(
         Stream.fromIterable(_eventChunks),
         headers: {'content-type': 'text/event-stream'},
         bufferSize: batchEvents ? 4096 : 0,
-      );
-    });
-    await server.post('/echo', (request) async {
-      return ResponseContext.bytes(request.body);
-    });
+      ),
+    );
+    await server.post(
+      '/echo',
+      (request) => ResponseContext.bytes(request.body),
+    );
   };
 }
 

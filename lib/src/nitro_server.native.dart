@@ -154,10 +154,22 @@ class RawServerConfig {
   /// unbounded (the idle timeout still applies).
   final int maxRequestsPerConn;
 
-  /// Worker threads serving connections. `<= 0` means one per CPU core.
+  /// Cap of the auto-scaling worker pool. `<= 0` means `max(64, 4 × cores)`.
   /// Accepted-but-unclaimed connections queue up to `backlog`; beyond that
   /// the engine refuses immediately instead of starving the accept loop.
   final int workerThreads;
+
+  /// Live connections the engine accepts at once; further accepts are
+  /// closed at the door. `<= 0` means unlimited.
+  final int maxConnections;
+
+  /// Live connections per peer address; further accepts from that address
+  /// are closed at the door. `<= 0` means unlimited.
+  final int maxConnectionsPerIp;
+
+  /// Deadline for a new connection's first request head (slow-loris guard).
+  /// `<= 0` means the keep-alive idle timeout applies instead.
+  final int headerTimeoutMs;
   final RawTlsConfig tls;
 
   const RawServerConfig({
@@ -169,6 +181,9 @@ class RawServerConfig {
     this.keepAliveTimeoutMs = 5000,
     this.maxRequestsPerConn = 100,
     this.workerThreads = 0,
+    this.maxConnections = 0,
+    this.maxConnectionsPerIp = 0,
+    this.headerTimeoutMs = 0,
     this.tls = const RawTlsConfig(),
   });
 }
@@ -178,7 +193,10 @@ class RawServerConfig {
 /// per-route handler deadline; `-1` inherits `RawServerConfig.defaultTimeoutMs`.
 /// `isWebSocket` marks WebSocket routes: the engine performs the RFC 6455
 /// handshake itself and hands the socket to the frame loop — `timeoutMs`
-/// then bounds nothing (handshakes never park).
+/// then bounds nothing (handshakes never park). `streamBody` makes the
+/// engine emit the head before the body (never the inline small-body
+/// form), so the runner can dispatch immediately and stream chunks to the
+/// handler as they arrive.
 @HybridRecord()
 class RawRouteConfig {
   final RawServerMethod method;
@@ -186,6 +204,7 @@ class RawRouteConfig {
   final String pattern;
   final int timeoutMs;
   final bool isWebSocket;
+  final bool streamBody;
 
   const RawRouteConfig({
     this.method = RawServerMethod.get,
@@ -193,6 +212,7 @@ class RawRouteConfig {
     required this.pattern,
     this.timeoutMs = -1,
     this.isWebSocket = false,
+    this.streamBody = false,
   });
 }
 
@@ -369,6 +389,30 @@ abstract class NitroServerNative extends HybridObject {
   RawServerStatus start();
 
   void stop();
+
+  /// Graceful shutdown, phase one: closes the listening socket and marks
+  /// every following answer `Connection: close`, while requests already
+  /// accepted keep being served. Poll [inFlightRequests] until it reaches
+  /// zero (or a deadline passes), then call [stop].
+  void beginDrain();
+
+  /// Requests dispatched but not yet fully answered on the wire.
+  int inFlightRequests();
+
+  /// Answers a pending request with [length] bytes of the file at [path]
+  /// starting at [offset] (`length` `< 0` means to the end). The status
+  /// line and [headers] go out from the calling thread; the file bytes are
+  /// sent by the native worker (`sendfile` where the platform has it), so
+  /// they never cross into Dart. A file that cannot be opened answers 404.
+  /// Same no-op rules as [respond] for unknown or answered ids.
+  void respondFile(
+    int requestId,
+    int status,
+    List<RawHeader> headers,
+    String path,
+    int offset,
+    int length,
+  );
 
   /// Answers a pending request. Fire-and-forget: the connection thread is
   /// parked on its own condition variable and wakes when this lands. Answering

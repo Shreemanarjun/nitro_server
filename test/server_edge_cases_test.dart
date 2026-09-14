@@ -1139,6 +1139,34 @@ void main() {
       expect(fake.streamsStarted[504]!.status, 200);
       expect(fake.streamChunks[504]!.map(String.fromCharCodes).join(), 'oops');
     });
+
+    test(
+      'a rejected startStream (timeout won) drops the stream cleanly',
+      () async {
+        fake.startStreamFailures.add(505);
+        runner.addRoute(
+          HttpMethod.get,
+          '',
+          '/late',
+          null,
+          (_) => ResponseContext.stream(Stream.value(Uint8List.fromList([1]))),
+        );
+        await Future<void>.delayed(Duration.zero);
+        fake.heads.add(
+          fakeHead(requestId: 505, path: '/late', routePattern: '/late'),
+        );
+        for (
+          var i = 0;
+          i < 100 && runner.pendingIdsForTesting.contains(505);
+          i++
+        ) {
+          await Future<void>.delayed(const Duration(milliseconds: 5));
+        }
+        expect(runner.pendingIdsForTesting, isNot(contains(505)));
+        expect(fake.streamsStarted, isNot(contains(505)));
+        expect(fake.streamChunks, isNot(contains(505)));
+      },
+    );
   });
 
   group('websockets', () {
@@ -1179,6 +1207,24 @@ void main() {
       }
       throw StateError('no wsClose for $id');
     }
+
+    test(
+      'session seams: live ids, close code, shutdown on runner close',
+      () async {
+        final session = await openSession(590);
+        expect(runner.wsSessionIdsForTesting, {590});
+        expect(session.closeCode, isNull);
+        // Runner shutdown reaps the session without a native close call: the
+        // engine is already stopped by then.
+        await runner.close();
+        expect(session.closeCode, 1006);
+        expect(runner.wsSessionIdsForTesting, isEmpty);
+        expect(fake.wsClosed, isEmpty);
+        // Sends after shutdown are dropped, never errors.
+        session.sendText('late');
+        expect(fake.wsSent, isEmpty);
+      },
+    );
 
     test('open dispatches with the handshake pattern and params', () async {
       final session = await openSession(

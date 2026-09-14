@@ -88,8 +88,7 @@ class NitroServer {
 
   /// Auto size for [ServerConfig.isolates] == 0: half the cores, so the
   /// native workers and the client side keep the rest, clamped to 1–8.
-  static int _autoIsolates() =>
-      (Platform.numberOfProcessors ~/ 2).clamp(1, 8);
+  static int _autoIsolates() => (Platform.numberOfProcessors ~/ 2).clamp(1, 8);
 
   /// [bind] with named-argument sugar over a default [ServerConfig]:
   ///
@@ -364,10 +363,13 @@ class _Helper {
     final helpers = <_Helper>[];
     for (var i = 0; i < count; i++) {
       final replies = ReceivePort();
+      // Uncaught errors in the helper (a throwing `setup`) land on the same
+      // port, so a failure surfaces here instead of hanging `bind`.
       await Isolate.spawn(
         _helperMain,
         _HelperBoot(key, dylibPath, setup, replies.sendPort),
         debugName: 'nitro_server:$key:${i + 1}',
+        onError: replies.sendPort,
       );
       final queue = StreamIterator<Object?>(replies);
       // The first message is the control port, sent once routes are
@@ -375,7 +377,13 @@ class _Helper {
       // helper from that moment on.
       if (!await queue.moveNext() || queue.current is! SendPort) {
         replies.close();
-        throw StateError('nitro_server: helper isolate $i failed to start');
+        for (final helper in helpers) {
+          await helper.close();
+        }
+        throw StateError(
+          'nitro_server: helper isolate ${i + 1} failed to start: '
+          '${queue.current}',
+        );
       }
       final helper = _Helper(queue.current as SendPort, replies);
       helper._queue = queue;
@@ -388,7 +396,7 @@ class _Helper {
 
   Future<void> close() async {
     _control.send(_HelperBoot.closeSignal);
-    await _queue.moveNext();  // 'closed' — the helper's runner is shut.
+    await _queue.moveNext(); // 'closed' — the helper's runner is shut.
     _replies.close();
   }
 }

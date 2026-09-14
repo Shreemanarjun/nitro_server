@@ -73,6 +73,13 @@ struct PendingRequest {
   bool failed = false;  // a send failed: never keep alive
   std::chrono::steady_clock::time_point doneAt;
 
+  // ── File answers (respondFile) ────────────────────────────────────────
+  // The worker sends [fileRemaining] bytes from [fileFd] at [fileOffset]
+  // after the head (and any tail) is on the wire, then closes the file.
+  int fileFd = -1;
+  int64_t fileOffset = 0;
+  int64_t fileRemaining = 0;
+
   // ── Chunked response streams ──────────────────────────────────────────
   // `answered` doubles as "headers final": startStream sets it, so the
   // route timeout can only win before the first byte.
@@ -220,6 +227,16 @@ class PendingTable {
         for (auto& p : kv.second.payloads) std::free(p.second);
       s.payloads.clear();
     }
+  }
+
+  /// Requests with a live entry (dispatched, not yet reaped).
+  size_t size() const {
+    size_t n = 0;
+    for (int i = 0; i < kShardCount; ++i) {
+      std::lock_guard<std::mutex> lk(shards_[i].mutex);
+      n += shards_[i].table.size();
+    }
+    return n;
   }
 
   /// Test seam.

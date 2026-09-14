@@ -38,26 +38,35 @@ bool get nitroServerNativeLoadedForTesting => _loaded;
 /// library again. Test seam.
 void resetNitroServerNativeLoadedForTesting() => _loaded = false;
 
-/// Platform file name of the built native library.
-String nitroServerLibraryName() {
-  if (Platform.isMacOS) return 'libnitro_server.dylib';
-  if (Platform.isLinux) return 'libnitro_server.so';
-  if (Platform.isWindows) return 'nitro_server.dll';
-  throw UnsupportedError(
-    'nitro_server has no native library for ${Platform.operatingSystem}',
-  );
+const _libraryNames = {
+  'macos': 'libnitro_server.dylib',
+  'linux': 'libnitro_server.so',
+  'windows': 'nitro_server.dll',
+};
+
+/// Platform file name of the built native library, for [operatingSystem]
+/// (default: the current one). Throws [UnsupportedError] elsewhere.
+String nitroServerLibraryName({String? operatingSystem}) {
+  final os = operatingSystem ?? Platform.operatingSystem;
+  return _libraryNames[os] ??
+      (throw UnsupportedError('nitro_server has no native library for $os'));
 }
 
-/// Candidate locations for the cmake-built library, in priority order.
-List<String> nitroServerLibraryCandidates({String? path}) {
+/// Candidate locations for the cmake-built library, in priority order:
+/// [path], then `NITRO_SERVER_DYLIB` from [environment] (default: the
+/// process environment), then the conventional cmake outputs.
+List<String> nitroServerLibraryCandidates({
+  String? path,
+  Map<String, String>? environment,
+}) {
   final name = nitroServerLibraryName();
-  final candidates = <String>[];
-  if (path != null) candidates.add(path);
-  final override = Platform.environment['NITRO_SERVER_DYLIB'];
-  if (override != null && override.isNotEmpty) candidates.add(override);
-  candidates.add('build/lib/$name');
-  candidates.add('build/$name');
-  return candidates;
+  final override = (environment ?? Platform.environment)['NITRO_SERVER_DYLIB'];
+  return [
+    ?path,
+    if (override != null && override.isNotEmpty) override,
+    'build/lib/$name',
+    'build/$name',
+  ];
 }
 
 /// Opens the native library so the generated bindings can resolve it.

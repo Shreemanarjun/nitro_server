@@ -1,6 +1,8 @@
 // In-memory test client coverage: routing fidelity against the engine's
 // precedence, body/header/query delivery, and the documented divergences
 // (direct 404s, no timeouts). No native library, no sockets.
+import 'dart:async';
+
 import 'package:nitro/nitro.dart';
 import 'package:test/test.dart';
 import 'package:nitro_server/nitro_server.dart';
@@ -15,6 +17,95 @@ void main() {
 
   tearDown(() async {
     await client.close();
+  });
+
+  test('every verb shorthand reaches its route', () async {
+    for (final method in [
+      HttpMethod.head,
+      HttpMethod.put,
+      HttpMethod.delete,
+      HttpMethod.patch,
+      HttpMethod.options,
+      HttpMethod.trace,
+    ]) {
+      await client.server.route(
+        method,
+        '/verb',
+        (request) => ResponseContext.text(request.method.token),
+      );
+    }
+    expect((await client.head('/verb')).status, 200);
+    expect((await client.put('/verb', body: 'x')).text(), 'PUT');
+    expect((await client.delete('/verb')).text(), 'DELETE');
+    expect((await client.patch('/verb', body: 'x')).text(), 'PATCH');
+    expect((await client.options('/verb')).text(), 'OPTIONS');
+    expect((await client.request(HttpMethod.trace, '/verb')).text(), 'TRACE');
+    // `*` as a request token is not a custom verb either.
+    expect((await client.request(HttpMethod.all, '/verb')).status, 404);
+  });
+
+  test(
+    'an all-method route answers every known verb, never a custom one',
+    () async {
+      await client.server.all(
+        '/any',
+        (r) => ResponseContext.text(r.method.token),
+      );
+      for (final method in [
+        HttpMethod.put,
+        HttpMethod.delete,
+        HttpMethod.patch,
+        HttpMethod.options,
+        HttpMethod.trace,
+      ]) {
+        expect((await client.request(method, '/any')).text(), method.token);
+      }
+      final custom = await client.request(
+        HttpMethod.custom,
+        '/any',
+        customMethod: 'PURGE',
+      );
+      expect(custom.status, 404);
+    },
+  );
+
+  test('a custom method needs its token, a body needs a known type', () async {
+    await client.server.post('/x', (_) => const ResponseContext());
+    await expectLater(
+      client.request(HttpMethod.custom, '/x'),
+      throwsArgumentError,
+    );
+    await expectLater(client.post('/x', body: 42), throwsArgumentError);
+  });
+
+  test('an unanswered request times out with StateError', () async {
+    final slow = await NitroTestClient.start(
+      responseTimeout: const Duration(milliseconds: 30),
+    );
+    await slow.server.get('/never', (_) => Completer<ResponseContext>().future);
+    await expectLater(slow.get('/never'), throwsStateError);
+    await slow.close();
+  });
+
+  test('a websocket handshake carries headers to the session', () async {
+    await client.server.ws('/live', (session) async {
+      session.sendText(session.handshake.header('x-token') ?? 'none');
+    });
+    final ws = await client.ws('/live', headers: {'x-token': 't1'});
+    expect((await ws.messages.first).text, 't1');
+    await ws.close();
+  });
+
+  test('a websocket route displaced by an HTTP route never opens', () async {
+    final slow = await NitroTestClient.start(
+      responseTimeout: const Duration(milliseconds: 30),
+    );
+    await slow.server.ws('/live', (_) async {});
+    // Same pattern, GET: the runner evicts the WS handler; the in-memory
+    // engine still sees a WS route and dispatches, so no session opens.
+    await slow.server.get('/live', (_) => ResponseContext.text('http'));
+    await expectLater(slow.ws('/live'), throwsStateError);
+    await slow.close();
   });
 
   test('a literal route answers', () async {

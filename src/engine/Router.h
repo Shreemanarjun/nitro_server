@@ -24,6 +24,7 @@ struct RouteEntry {
   std::string pattern;
   int64_t timeoutMs = -1;  // -1 = inherit the server default.
   bool isWebSocket = false;  // RFC 6455 route: handshake upgrades in-engine.
+  bool streamBody = false;   // Head first, then chunks: never the inline form.
 };
 
 struct MatchResult {

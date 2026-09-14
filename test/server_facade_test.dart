@@ -2,6 +2,7 @@
 // fakes. The engine behavior behind these is covered by the e2e and C++
 // suites; what lives here is the promise that each public entry point reaches
 // the bridge with the right wire values.
+import 'dart:async';
 import 'dart:isolate';
 import 'dart:typed_data';
 import 'package:test/test.dart';
@@ -113,12 +114,28 @@ void main() {
       final api = server.group('/api');
       await api.get('/users', ok);
       await api.post('/users', ok);
+      await api.head('/head', ok);
+      await api.put('/put', ok);
+      await api.delete('/delete', ok);
+      await api.patch('/patch', ok);
+      await api.options('/options', ok);
       await api.all('/wild', ok);
+      await api.ws('/live', (_) async {});
 
       expect(
         {for (final r in fake.registered) r.pattern: r.method},
-        {'/api/users': RawServerMethod.post, '/api/wild': RawServerMethod.all},
+        {
+          '/api/users': RawServerMethod.post,
+          '/api/head': RawServerMethod.head,
+          '/api/put': RawServerMethod.put,
+          '/api/delete': RawServerMethod.delete,
+          '/api/patch': RawServerMethod.patch,
+          '/api/options': RawServerMethod.options,
+          '/api/wild': RawServerMethod.all,
+          '/api/live': RawServerMethod.get,
+        },
       );
+      expect(fake.registered.last.isWebSocket, isTrue);
     });
 
     test('nesting appends, slashes collapse, root is identity', () async {
@@ -270,7 +287,45 @@ void main() {
     });
   });
 
+  group('middleware', () {
+    test('accessLog prints by default and names custom methods', () async {
+      final lines = <String>[];
+      await runZoned(
+        () async {
+          await server.use(accessLog());
+          await server.route(
+            HttpMethod.custom,
+            '/p',
+            (_) => const ResponseContext(),
+            customMethod: 'PURGE',
+          );
+          await driveRequest(
+            fake,
+            requestId: 60,
+            method: RawServerMethod.custom,
+            customMethod: 'PURGE',
+            path: '/p',
+            routePattern: '/p',
+          );
+        },
+        zoneSpecification: ZoneSpecification(
+          print: (_, _, _, line) => lines.add(line),
+        ),
+      );
+      expect(lines, hasLength(1));
+      expect(lines.single, startsWith('"PURGE /p" 200 '));
+    });
+  });
+
   group('value types', () {
+    test('ResponseContext.isStream tells the two body kinds apart', () {
+      expect(const ResponseContext().isStream, isFalse);
+      expect(
+        ResponseContext.stream(const Stream<Uint8List>.empty()).isStream,
+        isTrue,
+      );
+    });
+
     test('TlsConfig.enabled', () {
       expect(const TlsConfig().enabled, isFalse);
       expect(const TlsConfig(certPem: 'c', keyPem: 'k').enabled, isTrue);

@@ -111,8 +111,15 @@ class FakeNitroServerNative extends NitroServerNative {
     acked.add((requestId, ackedChunks));
   }
 
+  /// Ids whose `startStream` throws, standing in for an engine that already
+  /// answered (timeout won) and rejected the bridge call.
+  final startStreamFailures = <int>{};
+
   @override
   void startStream(int requestId, int status, List<RawHeader> headers) {
+    if (startStreamFailures.contains(requestId)) {
+      throw StateError('startStream rejected for $requestId');
+    }
     streamsStarted[requestId] = DrivenResponse(
       requestId: requestId,
       status: status,
@@ -173,6 +180,7 @@ class DrivenResponse {
 RawIncomingRequest fakeHead({
   required int requestId,
   RawServerMethod method = RawServerMethod.get,
+  String customMethod = '',
   String path = '/',
   String query = '',
   List<RawHeader> headers = const [],
@@ -184,6 +192,7 @@ RawIncomingRequest fakeHead({
   return RawIncomingRequest(
     requestId: requestId,
     method: method,
+    customMethod: customMethod,
     path: path,
     query: query,
     headers: headers,
@@ -218,6 +227,7 @@ Future<DrivenResponse> driveRequest(
   FakeNitroServerNative fake, {
   required int requestId,
   RawServerMethod method = RawServerMethod.get,
+  String customMethod = '',
   String path = '/',
   String routePattern = '/',
   List<RawRouteParam> params = const [],
@@ -227,6 +237,7 @@ Future<DrivenResponse> driveRequest(
     fakeHead(
       requestId: requestId,
       method: method,
+      customMethod: customMethod,
       path: path,
       hasBody: body.isNotEmpty,
       contentLength: body.length,

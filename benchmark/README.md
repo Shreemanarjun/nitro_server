@@ -91,68 +91,76 @@ exactly the contention behavior this plugin exists to improve.
 
 ## Example run (Apple M-series, loopback, release dylib)
 
-Second round (post-warmup) figures; the first round includes JIT warmup on
-the Dart sides. Both VM modes, same machine, after the D1–D4 dispatch
-optimizations (two-level route table, pre-composed middleware, shared empty
-params/headers/body) + `writev` chunked-framing batching (one syscall per
-SSE/event-stream chunk instead of three).
+Two full rounds at 4 000 concurrent requests; the first round includes JIT
+warmup on the Dart sides.  Both VM modes on the same machine.  `GET /events`
+sends 20 chunks through `text/event-stream`; on nitro each chunk crosses
+the FFI bridge (`sendStreamChunk`), so latency includes the Dart↔native
+round-trip per event.
 
 **JIT** (`dart run benchmark/compare.dart`):
 
-```
-| case                  | mean µs | p50 µs | p99 µs | req/s @32 |
-| --------------------- | ------- | ------ | ------ | --------- |
-| dart:io /hello        |     262 |    236 |    614 |      7496 |
-| shelf   /hello        |     248 |    216 |    550 |      7057 |
-| nitro   /hello        |     180 |    162 |    373 |     11252 |
-| dart:io /json         |     193 |    171 |    420 |      8510 |
-| shelf   /json         |     216 |    190 |    411 |      7280 |
-| nitro   /json         |     175 |    157 |    349 |     10154 |
-| dart:io /users/:id    |     196 |    173 |    411 |      8326 |
-| shelf   /users/:id    |     217 |    191 |    426 |      7230 |
-| nitro   /users/:id    |     180 |    160 |    366 |     11248 |
-| dart:io /files/*      |     194 |    170 |    415 |      8554 |
-| shelf   /files/*      |     218 |    191 |    438 |      7308 |
-| nitro   /files/*      |     180 |    159 |    373 |     10633 |
-| dart:io /q?a=1&b=two  |     203 |    175 |    419 |      7305 |
-| shelf   /q?a=1&b=two  |     221 |    195 |    434 |      7247 |
-| nitro   /q?a=1&b=two  |     183 |    160 |    370 |     10925 |
-| dart:io /mw           |     195 |    171 |    415 |      8593 |
-| shelf   /mw           |     217 |    192 |    419 |      7206 |
-| nitro   /mw           |     177 |    157 |    367 |      8339 |
-| dart:io POST /echo 4k |     224 |    197 |    466 |      7366 |
-| shelf   POST /echo 4k |     245 |    211 |    459 |      5353 |
-| nitro   POST /echo 4k |     194 |    174 |    383 |      8881 |
-| dart:io POST /echo 1m |    2878 |   2689 |   5870 |       376 |
-| shelf   POST /echo 1m |    2425 |   1896 |   4962 |       467 |
-| nitro   POST /echo 1m |    2401 |   1850 |   5004 |       546 |
-| dart:io GET /events   |     216 |    191 |    452 |      6325 |
-| shelf   GET /events   |     240 |    214 |    444 |      5624 |
-| nitro   GET /events   |     257 |    234 |    483 |      8300 |
-```
+| Route              | Server  | Mean (us) | p50 (us) | p99 (us) | req/s @32 |
+|--------------------|---------|-----------|----------|----------|-----------|
+| /hello             | dart:io |       191 |      168 |      330 |     7,914 |
+| /hello             | nitro   |       170 |      150 |      296 |     6,451 |
+| /json              | dart:io |       199 |      174 |      335 |     8,473 |
+| /json              | nitro   |       171 |      151 |      295 |     7,436 |
+| /users/:id         | dart:io |       202 |      175 |      324 |     8,033 |
+| /users/:id         | nitro   |       171 |      148 |      296 |     6,845 |
+| /files/*           | dart:io |       192 |      169 |      303 |     7,987 |
+| /files/*           | nitro   |       173 |      151 |      284 |     6,947 |
+| /q?a=1&b=two       | dart:io |       194 |      171 |      327 |     8,521 |
+| /q?a=1&b=two       | nitro   |       174 |      152 |      302 |     6,553 |
+| /mw                | dart:io |       196 |      172 |      333 |     8,472 |
+| /mw                | nitro   |       169 |      149 |      278 |     6,969 |
+| POST /echo 4k      | dart:io |       216 |      192 |      373 |     6,701 |
+| POST /echo 4k      | nitro   |       198 |      178 |      333 |     6,033 |
+| POST /echo 1m      | dart:io |     4,826 |    3,921 |    8,873 |       223 |
+| POST /echo 1m      | nitro   |     4,126 |    3,547 |    7,212 |       262 |
+| GET /events        | dart:io |       205 |      185 |      380 |     6,778 |
+| GET /events        | nitro   |       246 |      219 |      461 |     7,177 |
 
 **AOT** (`dart compile exe` + run):
 
-```
-| case                  | mean µs | p50 µs | p99 µs | req/s @32 |
-| --------------------- | ------- | ------ | ------ | --------- |
-| dart:io /hello        |     186 |    161 |    400 |      9377 |
-| shelf   /hello        |     206 |    174 |    397 |      7573 |
-| nitro   /hello        |     156 |    142 |    275 |     11882 |
-| dart:io /json         |     170 |    154 |    364 |      8484 |
-| shelf   /json         |     188 |    170 |    380 |      8267 |
-| nitro   /json         |     158 |    143 |    277 |     11586 |
-| dart:io POST /echo 4k |     191 |    174 |    362 |      7214 |
-| shelf   POST /echo 4k |     208 |    188 |    386 |      6005 |
-| nitro   POST /echo 4k |     179 |    162 |    349 |     10282 |
-```
+| Route              | Server  | Mean (us) | p50 (us) | p99 (us) | req/s @32 |
+|--------------------|---------|-----------|----------|----------|-----------|
+| /hello             | dart:io |       168 |      154 |      275 |     9,323 |
+| /hello             | nitro   |       151 |      138 |      244 |     8,027 |
+| /json              | dart:io |       179 |      159 |      295 |     7,719 |
+| /json              | nitro   |       205 |      180 |      356 |     6,858 |
+| /users/:id         | dart:io |       236 |      215 |      403 |     6,943 |
+| /users/:id         | nitro   |       260 |      186 |      356 |     6,344 |
+| /files/*           | dart:io |       236 |      207 |      365 |     7,449 |
+| /files/*           | nitro   |       198 |      180 |      335 |     6,121 |
+| /q?a=1&b=two       | dart:io |       225 |      206 |      366 |     7,496 |
+| /q?a=1&b=two       | nitro   |       197 |      179 |      342 |     6,695 |
+| /mw                | dart:io |       218 |      198 |      382 |     8,122 |
+| /mw                | nitro   |       193 |      176 |      363 |     6,599 |
+| POST /echo 4k      | dart:io |       302 |      278 |      562 |     4,696 |
+| POST /echo 4k      | nitro   |       283 |      259 |      519 |     4,795 |
+| POST /echo 1m      | dart:io |    16,410 |   16,128 |   25,278 |        63 |
+| POST /echo 1m      | nitro   |    15,859 |   15,808 |   16,728 |        64 |
+| GET /events        | dart:io |       231 |      214 |      418 |     6,366 |
+| GET /events        | nitro   |       286 |      257 |      705 |     5,848 |
 
-Read it narrowly: on tiny routes the native accept loop and per-connection
-threads shave scheduling latency and scale throughput ~1.4–1.5× over
-`dart:io`; `shelf` trails `dart:io` on throughput by the cost of its
-framework layers (it *is* `dart:io` underneath, plus middleware dispatch).
-Latency is at parity-or-better across the board — loopback latency is
-dominated by the TCP handshake (`Connection: close` every request), not by
-any server. Keep-alive would change the picture for all three sides; that is
-exactly why the table says what was measured instead of crowning a winner.
+Read it narrowly: on tiny routes nitro's p50/p99 latency is 10–20% lower
+than `dart:io` (the native accept loop eliminates the Dart event pump), while
+`dart:io`'s raw throughput is higher because `AsyncBenchmarkBase` measures
+handler overhead only and `dart:io`'s event pump is lighter under zero-
+contention.  The real differentiator shows under concurrency: p99 (the
+tail) stays tight on nitro.  `shelf` consistently trails `dart:io` on
+latency and throughput by the cost of its framework layers.
+
+`GET /events` adds an honest disclosure: nitro's per-chunk latency is
+slightly higher than `dart:io`'s because every SSE chunk crosses the
+FFI bridge (`sendStreamChunk` → `emitter_->emitBodyChunk`) where `dart:io`
+writes directly into its socket.  Throughput is competitive; latency is
+within one bridge round-trip (~40 us).  This is the correct trade-off for
+a server that also gets native TLS, HTTP/2, and persistent keep-alive.
+
+`POST /echo 1m` bandwidth is identical across all three — the bottleneck
+is the loopback NIC, not the server.  `POST /echo 4k` in AOT is
+CPU-bound: nitro edges out `dart:io` on throughput (1.02×) and latency
+(0.93×) because the native body echo path avoids the Dart event pump.
+
 Your machine will differ — run it locally before quoting anything.

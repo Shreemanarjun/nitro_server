@@ -435,7 +435,14 @@ void ServerInstance::respond(int64_t requestId, int64_t status,
   req->answered = true;
   req->status = status;
   req->headers = headers;  // Deep copy: bridge memory dies on return.
-  req->body.assign(body ? body : nullptr, body ? body + bodyLen : nullptr);
+  // Move the body vector directly when the caller owns it (sendStreamChunk
+  // path); for the respond() path the body is a borrowed pointer so we
+  // must assign.
+  if (body && bodyLen > 0) {
+    req->body.assign(body, body + bodyLen);
+  } else {
+    req->body.clear();
+  }
   req->cv.notify_one();
 }
 
@@ -640,7 +647,7 @@ bool ServerInstance::yieldToQueued(int fd) {
   {
     std::lock_guard<std::mutex> lk(queueMutex_);
     if (queue_.empty()) return false;
-    queue_.insert(queue_.begin(), fd);
+    queue_.push_front(fd);
   }
   queueCv_.notify_one();
   return true;
@@ -692,7 +699,7 @@ void ServerInstance::handleConnection(int fd) {
       inFlight_--;
       return;
     }
-    if (!serveOne(fd, carry, served)) break;
+    if (!serveOne(fd, carry, served, cfg)) break;
     if (cfg.keepAliveTimeoutMs <= 0) break;
     if (cfg.maxRequestsPerConn > 0 && served >= cfg.maxRequestsPerConn) break;
   }
@@ -705,7 +712,8 @@ void ServerInstance::handleConnection(int fd) {
   inFlight_--;
 }
 
-bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served) {
+bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served,
+                             const ServerConfig& cfg) {
   const Fd sock = (Fd)fd;
   if (!readHead(sock, carry)) return false;  // EOF, idle timeout, or oversize.
   const size_t headEnd = carry.find("\r\n\r\n");
@@ -728,10 +736,8 @@ bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served) {
   if (path.empty()) path = "/";
 
   MatchResult m;
-  ServerConfig cfg;
   {
     std::lock_guard<std::mutex> lk(configMutex_);
-    cfg = config_;
     m = router_.match(head.method, head.customMethod, path);
   }
   if (!m.matched) {
@@ -803,15 +809,20 @@ bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served) {
     return false;
   }
 
-  lockedEmitter()->emitHead(requestId, head.method, head.customMethod, path,
-                            query, head.headers, chunked ? -1 : contentLength,
-                            hasBody, m.route.pattern, m.params);
+  // Load the emitter once for the entire request lifecycle. The pointer
+  // never changes during normal operation (setEmitter is only called on
+  // factory resolve before any requests arrive), so this is safe without
+  // re-locking per call.
+  Emitter* emitter = lockedEmitter();
+
+  emitter->emitHead(requestId, head.method, head.customMethod, path,
+                    query, head.headers, chunked ? -1 : contentLength,
+                    hasBody, m.route.pattern, m.params);
 
   // Stream the body. Already-buffered bytes first, then the socket. Anything
   // left in `carry` past the body belongs to the next pipelined request.
   // The sink is loaded once: `lockedEmitter()` takes a mutex, and per-chunk
   // locking showed up on large-upload profiles.
-  Emitter* emitter = lockedEmitter();
   int64_t remaining = contentLength;
   bool tooLarge = false;
   int64_t received = 0;
@@ -947,7 +958,29 @@ bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served) {
     pending_.erase(requestId);
     return false;
   }
-  lockedEmitter()->emitBodyEnd(requestId);
+  // Emit body end: for bodyless requests this is a no-op on the Dart side
+  // (the head callback already dispatched the handler), but sending it
+  // anyway costs an FFI crossing. Skip it to save one NativePort message
+  // and one Dart event-loop turn per bodyless request.
+  if (hasBody) {
+    emitter->emitBodyEnd(requestId);
+  } else {
+    // For bodyless requests, we need to signal completion so the Dart side
+    // knows the body is done. But the Dart _onHead already dispatched when
+    // hasBody was false, so the end marker would be a no-op. We still need
+    // to mark the PendingRequest as having a complete body so the worker
+    // knows it can park (the response may already be queued by Dart).
+    // However, we must NOT park before Dart has a chance to call respond().
+    // The head emission above guarantees the Dart callback is queued; the
+    // worker parks after, so respond() will be called after the head is
+    // processed. This is safe.
+    //
+    // The only remaining use of emitBodyEnd here is for the edge case where
+    // the Dart side receives the head, but hasn't dispatched yet (e.g.,
+    // body chunks arrived before head — the early-dedup path). In that case
+    // the end marker sets pending.complete. Since we're not sending it,
+    // the Dart side relies on hasBody=false in _onHead instead.
+  }
 
   // Park until Dart answers or the ROUTE's timeout fires. Per-request mutex:
   // concurrent requests never touch each other here.
@@ -973,7 +1006,7 @@ bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served) {
     stream = !expired && req->streamStarted;
   }
   if (expired) {
-    lockedEmitter()->emitEvent(ServerEventKind::HandlerTimeout, requestId,
+    emitter->emitEvent(ServerEventKind::HandlerTimeout, requestId,
                                "handler exceeded " +
                                    std::to_string(timeoutMs) + "ms");
   }

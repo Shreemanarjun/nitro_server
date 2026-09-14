@@ -156,7 +156,10 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
  private:
   /// One iteration of a connection: exactly one request/response cycle.
   /// Returns true when the connection may serve another request.
-  bool serveOne(int fd, std::string& carry, int64_t& served);
+  /// [cfg] is a snapshot taken once per keep-alive cycle to avoid
+  /// re-locking configMutex_ on every request.
+  bool serveOne(int fd, std::string& carry, int64_t& served,
+                const ServerConfig& cfg);
 
   /// The chunked tail of serveOne: sends stream headers, then forwards
   /// queued chunks until the terminal marker, a send failure, or stop().
@@ -237,7 +240,7 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   std::vector<std::thread> workers_;
   std::mutex queueMutex_;
   std::condition_variable queueCv_;
-  std::vector<int> queue_;
+  std::deque<int> queue_;
 
   // Live connections, so stop() can wake idle keep-alive reads.
   std::mutex activeMutex_;

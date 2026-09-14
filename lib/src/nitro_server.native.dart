@@ -354,6 +354,24 @@ abstract class NitroServerNative extends HybridObject {
   /// (Same protocol as `nitro_http`'s `grantCredit` ack half.)
   void ackBody(int requestId, int ackedChunks);
 
+  // ── Chunked response streams ─────────────────────────────────────────────
+  //
+  // One-shot `respond` cannot emit an unbounded body, so stream responses
+  // split the answer in two: `startStream` sends status + headers with
+  // `Transfer-Encoding: chunked` and parks the connection thread;
+  // `sendStreamChunk` appends one chunk per call, `last: true` writes the
+  // terminal `0`-chunk and completes the request (keep-alive evaluated as
+  // usual). Calls for unknown, completed, timed-out or dead ids are no-ops —
+  // the route timeout may win before the first byte, exactly like `respond`.
+  // Empty non-terminal chunks are skipped (a `0`-chunk would terminate the
+  // body); the terminal call always completes, even with an empty payload.
+
+  /// Starts a chunked response. Fire-and-forget, same terms as `respond`.
+  void startStream(int requestId, int status, List<RawHeader> headers);
+
+  /// Sends one stream chunk. Fire-and-forget; `last` completes the stream.
+  void sendStreamChunk(int requestId, @zeroCopy Uint8List chunk, bool last);
+
   // ── Module-global streams — EXACTLY ONE internal subscriber each ───────────
   //
   // See invariant 1 in the file header. `Backpressure.block` is forbidden here:

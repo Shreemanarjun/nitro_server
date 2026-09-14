@@ -93,6 +93,16 @@ public:
         throw std::runtime_error("Not implemented: ackBody");
     }
 
+    void startStream(int64_t requestId, int64_t status, NitroCppBuffer headers) override {
+        // TODO: implement startStream
+        throw std::runtime_error("Not implemented: startStream");
+    }
+
+    void sendStreamChunk(int64_t requestId, const uint8_t* chunk, size_t chunk_length, bool last) override {
+        // TODO: implement sendStreamChunk
+        throw std::runtime_error("Not implemented: sendStreamChunk");
+    }
+
     // ── Streams ──────────────────────────────────────────────────────────────
     // Call emit_<name>(item) from any thread to push items to Dart.
     // emit_* helpers are defined in the generated bridge.

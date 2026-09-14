@@ -3,6 +3,8 @@
 //
 // Each test names the failure it guards, because an edge-case test without
 // its "why" gets deleted the first time someone confuses it with redundancy.
+import 'dart:async';
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:test/test.dart';
@@ -428,6 +430,553 @@ void main() {
       await Future<void>.delayed(const Duration(milliseconds: 30));
       expect(kinds, ServerEventKind.values);
       await sub.cancel();
+    });
+
+    test('a late answer after close is dropped, never sent', () async {
+      final gate = Completer<ResponseContext>();
+      runner.addRoute(HttpMethod.get, '', '/slow', null, (_) => gate.future);
+      await Future<void>.delayed(Duration.zero);
+
+      fake.heads.add(fakeHead(requestId: 400, path: '/slow', routePattern: '/slow'));
+      // Wait until dispatch parks on the handler future…
+      for (var i = 0; i < 200 && !runner.pendingIdsForTesting.contains(400); i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+      expect(runner.pendingIdsForTesting, contains(400));
+      await runner.close();
+      gate.complete(const ResponseContext());
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+      // The engine never saw a response for the reaped request.
+      expect(fake.responded.where((r) => r.requestId == 400), isEmpty);
+    });
+  });
+
+  group('cors', () {
+    // NOTE: cors() wraps matched routes only — an OPTIONS preflight to a
+    // path with no matching route is still the default 404. Register `all`
+    // (or an explicit OPTIONS route) for preflighted paths.
+    test('preflight short-circuits with 204 and never runs the handler', () async {
+      var calls = 0;
+      runner.use(cors());
+      runner.addRoute(HttpMethod.all, '', '/res', null, (_) async {
+        calls++;
+        return ResponseContext.text('never');
+      });
+      await Future<void>.delayed(Duration.zero);
+
+      fake.heads.add(
+        fakeHead(
+          requestId: 100,
+          method: RawServerMethod.options,
+          path: '/res',
+          routePattern: '/res',
+        ),
+      );
+      final response = await waitFor(100);
+      expect(response.status, 204);
+      expect(response.body, isEmpty);
+      expect(response.headers['access-control-allow-origin'], '*');
+      expect(response.headers['access-control-allow-methods'], contains('GET'));
+      expect(calls, 0);
+    });
+
+    test('plain responses carry the policy headers', () async {
+      runner.use(cors());
+      await addGet('/res', (_) async => ResponseContext.text('hi'));
+      final response = await driveRequest(
+        fake,
+        requestId: 101,
+        path: '/res',
+        routePattern: '/res',
+      );
+      expect(response.status, 200);
+      expect(response.headers['access-control-allow-origin'], '*');
+      expect(response.headers['access-control-max-age'], '86400');
+    });
+
+    test('handler-set headers win over the policy', () async {
+      runner.use(cors(allowOrigin: 'https://policy.test'));
+      runner.addRoute(HttpMethod.get, '', '/refined', null, (_) async {
+        return ResponseContext.text(
+          'hi',
+          headers: {'access-control-allow-origin': 'https://route.test'},
+        );
+      });
+      await Future<void>.delayed(Duration.zero);
+
+      final response = await driveRequest(
+        fake,
+        requestId: 102,
+        path: '/refined',
+        routePattern: '/refined',
+      );
+      expect(
+        response.headers['access-control-allow-origin'],
+        'https://route.test',
+      );
+    });
+
+    test('credentials and opt-out max-age are honoured', () async {
+      runner.use(
+        cors(
+          allowOrigin: 'https://app.test',
+          allowCredentials: true,
+          maxAge: null,
+        ),
+      );
+      await addGet('/cred', (_) async => ResponseContext.text('hi'));
+      final response = await driveRequest(
+        fake,
+        requestId: 103,
+        path: '/cred',
+        routePattern: '/cred',
+      );
+      expect(
+        response.headers['access-control-allow-origin'],
+        'https://app.test',
+      );
+      expect(response.headers['access-control-allow-credentials'], 'true');
+      expect(response.headers, isNot(contains('access-control-max-age')));
+    });
+  });
+
+  group('middleware composition', () {
+    test('global wraps group wraps route-local wraps handler', () async {
+      final server = NitroServer.forRunnerForTesting(runner);
+      final order = <String>[];
+      Middleware named(String name) {
+        return (request, next) async {
+          order.add('$name-before');
+          final response = await next(request);
+          order.add('$name-after');
+          return response;
+        };
+      }
+
+      await server.use(named('global'));
+      final api = server.group('/api');
+      await api.use(named('group'));
+      await api.get('/x', (request) async {
+        order.add('handler');
+        return const ResponseContext();
+      }, middleware: [named('route')]);
+
+      await driveRequest(
+        fake,
+        requestId: 110,
+        path: '/api/x',
+        routePattern: '/api/x',
+      );
+      expect(order, [
+        'global-before',
+        'group-before',
+        'route-before',
+        'handler',
+        'route-after',
+        'group-after',
+        'global-after',
+      ]);
+    });
+
+    test('group middleware does not leak to ungrouped routes', () async {
+      final server = NitroServer.forRunnerForTesting(runner);
+      var groupCalls = 0;
+      final api = server.group('/api');
+      await api.use((request, next) async {
+        groupCalls++;
+        return next(request);
+      });
+      await api.get('/in', (_) async => const ResponseContext());
+      await server.get('/out', (_) async => const ResponseContext());
+
+      await driveRequest(
+        fake,
+        requestId: 111,
+        path: '/out',
+        routePattern: '/out',
+      );
+      expect(groupCalls, 0);
+      await driveRequest(
+        fake,
+        requestId: 112,
+        path: '/api/in',
+        routePattern: '/api/in',
+      );
+      expect(groupCalls, 1);
+    });
+
+    test('a short-circuit middleware answers without the handler', () async {
+      var calls = 0;
+      runner.use((request, next) async {
+        if (request.path == '/blocked') {
+          return ResponseContext.text('denied', status: 403);
+        }
+        return next(request);
+      });
+      runner.addRoute(HttpMethod.get, '', '/blocked', null, (_) async {
+        calls++;
+        return const ResponseContext();
+      });
+      await Future<void>.delayed(Duration.zero);
+
+      final response = await driveRequest(
+        fake,
+        requestId: 113,
+        path: '/blocked',
+        routePattern: '/blocked',
+      );
+      expect(response.status, 403);
+      expect(String.fromCharCodes(response.body), 'denied');
+      expect(calls, 0);
+    });
+
+    test('middleware can stamp the outgoing response', () async {
+      runner.use((request, next) async {
+        final response = await next(request);
+        return ResponseContext(
+          status: response.status,
+          headers: {...response.headers, 'x-via': 'edge'},
+          body: response.body,
+        );
+      });
+      await addGet('/stamped', (_) async => ResponseContext.text('hi'));
+      final response = await driveRequest(
+        fake,
+        requestId: 114,
+        path: '/stamped',
+        routePattern: '/stamped',
+      );
+      expect(response.headers['x-via'], 'edge');
+      expect(String.fromCharCodes(response.body), 'hi');
+    });
+  });
+
+  group('dispatch robustness', () {
+    test('data chunks arriving before the head are reassembled', () async {
+      runner.addRoute(HttpMethod.post, '', '/early', null, (request) async {
+        return ResponseContext.text('got:${request.text()}');
+      });
+      await Future<void>.delayed(Duration.zero);
+
+      // Chunks land first (separate ports, no cross-ordering) and park…
+      fake.chunks.add(fakeData(200, 'hel'.codeUnits));
+      fake.chunks.add(fakeData(200, 'lo'.codeUnits));
+      fake.chunks.add(fakeEnd(200));
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      // …then the head releases them.
+      fake.heads.add(
+        fakeHead(
+          requestId: 200,
+          method: RawServerMethod.post,
+          path: '/early',
+          hasBody: true,
+          contentLength: 5,
+          routePattern: '/early',
+        ),
+      );
+      final response = await waitFor(200);
+      expect(String.fromCharCodes(response.body), 'got:hello');
+    });
+
+    test('interleaved bodies stay with their own request', () async {
+      runner.addRoute(HttpMethod.post, '', '/mix', null, (request) async {
+        return ResponseContext.text(request.text());
+      });
+      await Future<void>.delayed(Duration.zero);
+
+      fake.heads.add(
+        fakeHead(
+          requestId: 201,
+          method: RawServerMethod.post,
+          path: '/mix',
+          hasBody: true,
+          contentLength: 2,
+          routePattern: '/mix',
+        ),
+      );
+      fake.heads.add(
+        fakeHead(
+          requestId: 202,
+          method: RawServerMethod.post,
+          path: '/mix',
+          hasBody: true,
+          contentLength: 2,
+          routePattern: '/mix',
+        ),
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      fake.chunks.add(fakeData(201, 'aa'.codeUnits));
+      fake.chunks.add(fakeData(202, 'bb'.codeUnits));
+      fake.chunks.add(fakeEnd(202));
+      fake.chunks.add(fakeEnd(201));
+      final first = await waitFor(201);
+      final second = await waitFor(202);
+      expect(String.fromCharCodes(first.body), 'aa');
+      expect(String.fromCharCodes(second.body), 'bb');
+    });
+
+    test('multi-chunk bodies concatenate in order', () async {
+      runner.addRoute(HttpMethod.post, '', '/cat', null, (request) async {
+        return ResponseContext.bytes(request.body);
+      });
+      await Future<void>.delayed(Duration.zero);
+
+      fake.heads.add(
+        fakeHead(
+          requestId: 203,
+          method: RawServerMethod.post,
+          path: '/cat',
+          hasBody: true,
+          contentLength: 6,
+          routePattern: '/cat',
+        ),
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      fake.chunks.add(fakeData(203, [3, 1]));
+      fake.chunks.add(fakeData(203, [4, 1]));
+      fake.chunks.add(fakeData(203, [5, 9]));
+      fake.chunks.add(fakeEnd(203));
+      final response = await waitFor(203);
+      expect(response.body, orderedEquals([3, 1, 4, 1, 5, 9]));
+    });
+
+    test('a stale data chunk after the end is dropped, not answered twice', () async {
+      var calls = 0;
+      runner.addRoute(HttpMethod.post, '', '/stale', null, (request) async {
+        calls++;
+        return ResponseContext.text('n=${request.body.length}');
+      });
+      await Future<void>.delayed(Duration.zero);
+
+      fake.heads.add(
+        fakeHead(
+          requestId: 204,
+          method: RawServerMethod.post,
+          path: '/stale',
+          hasBody: true,
+          contentLength: 1,
+          routePattern: '/stale',
+        ),
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      fake.chunks.add(fakeData(204, [7]));
+      fake.chunks.add(fakeEnd(204));
+      await waitFor(204);
+      fake.chunks.add(fakeData(204, [8])); // Straggler on a reaped id.
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+      expect(calls, 1);
+      expect(fake.responded.where((r) => r.requestId == 204), hasLength(1));
+      expect(fake.acked.where((a) => a.$1 == 204), hasLength(2));
+    });
+
+    test('a duplicate head after the answer never redispatches', () async {
+      var calls = 0;
+      await addGet('/dup', (_) async {
+        calls++;
+        return const ResponseContext();
+      });
+      await driveRequest(
+        fake,
+        requestId: 205,
+        path: '/dup',
+        routePattern: '/dup',
+      );
+      expect(calls, 1);
+      // Stale resend of the same id long after completion.
+      fake.heads.add(fakeHead(requestId: 205, path: '/dup', routePattern: '/dup'));
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+      expect(calls, 1);
+      expect(fake.responded.where((r) => r.requestId == 205), hasLength(1));
+    });
+
+    test('a removed route answers 404', () async {
+      await addGet('/gone', (_) async => ResponseContext.text('here'));
+      runner.removeRoute(HttpMethod.get, '', '/gone');
+      final response = await driveRequest(
+        fake,
+        requestId: 206,
+        path: '/gone',
+        routePattern: '/gone',
+      );
+      expect(response.status, 404);
+    });
+
+    test('status and headers ride the wire untouched', () async {
+      runner.addRoute(HttpMethod.post, '', '/made', null, (_) async {
+        return ResponseContext(
+          status: 201,
+          headers: {'location': '/made/1', 'x-n': 'v'},
+        );
+      });
+      await Future<void>.delayed(Duration.zero);
+
+      final response = await driveRequest(
+        fake,
+        requestId: 207,
+        method: RawServerMethod.post,
+        path: '/made',
+        routePattern: '/made',
+      );
+      expect(response.status, 201);
+      expect(response.headers['location'], '/made/1');
+      expect(response.headers['x-n'], 'v');
+    });
+
+    test('query strings land in queryParameters', () async {
+      RequestContext? seen;
+      runner.addRoute(HttpMethod.get, '', '/q', null, (request) async {
+        seen = request;
+        return const ResponseContext();
+      });
+      await Future<void>.delayed(Duration.zero);
+
+      fake.heads.add(
+        fakeHead(
+          requestId: 208,
+          path: '/q',
+          query: 'a=1&b=two',
+          routePattern: '/q',
+        ),
+      );
+      await waitFor(208);
+      expect(seen!.query, 'a=1&b=two');
+      expect(seen!.queryParameters, {'a': '1', 'b': 'two'});
+      expect(seen!.queryParam('a'), '1');
+    });
+
+    test('casing variants of one header fold to a single key', () async {
+      RequestContext? seen;
+      await addGet('/fold', (request) async {
+        seen = request;
+        return const ResponseContext();
+      });
+      fake.heads.add(
+        RawIncomingRequest(
+          requestId: 209,
+          method: RawServerMethod.get,
+          path: '/fold',
+          headers: [
+            RawHeader(name: 'X-Token', value: 'a'),
+            RawHeader(name: 'x-token', value: 'b'),
+          ],
+          routePattern: '/fold',
+        ),
+      );
+      await waitFor(209);
+      expect(seen!.headers['x-token'], ['a', 'b']);
+      expect(seen!.header('X-TOKEN'), 'a');
+    });
+  });
+
+  group('config and value edges', () {
+    test('copyWith keeps defaults and replaces only given fields', () {
+      const base = ServerConfig();
+      final copy = base.copyWith(port: 8080, host: '0.0.0.0');
+      expect(copy.port, 8080);
+      expect(copy.host, '0.0.0.0');
+      expect(copy.backlog, base.backlog);
+      expect(copy.maxBodyBytes, base.maxBodyBytes);
+      expect(copy.defaultTimeout, base.defaultTimeout);
+      expect(copy.keepAliveTimeout, base.keepAliveTimeout);
+      expect(copy.maxRequestsPerConnection, base.maxRequestsPerConnection);
+      expect(copy.workerThreads, base.workerThreads);
+      expect(const ServerConfig().copyWith().port, 0);
+    });
+
+    test('ServerConfig rejects negative budgets', () {
+      expect(
+        () => ServerConfig(maxRequestsPerConnection: -1),
+        throwsA(isA<AssertionError>()),
+      );
+      expect(
+        () => ServerConfig(workerThreads: -1),
+        throwsA(isA<AssertionError>()),
+      );
+    });
+
+    test('registration methods return the server for chaining', () async {
+      final server = NitroServer.forRunnerForTesting(runner);
+      Future<ResponseContext> ok(RequestContext _) async {
+        return const ResponseContext();
+      }
+      final afterGet = await server.get('/a', ok);
+      final afterUse = await afterGet.use((request, next) => next(request));
+      final afterUnroute = await afterUse.unroute(HttpMethod.get, '/a');
+      expect(afterGet, same(server));
+      expect(afterUse, same(server));
+      expect(afterUnroute, same(server));
+      final api = server.group('/g');
+      expect(await api.get('/b', ok), same(api));
+    });
+
+    test('a failing native registration throws typed and installs nothing', () async {
+      fake.registerFailures['/bad'] = const RawServerStatus(
+        errorKind: RawServerErrorKind.badRequest,
+        errorMessage: 'wildcards only trail',
+      );
+      expect(
+        () => runner.addRoute(
+          HttpMethod.get,
+          '',
+          '/bad',
+          null,
+          (_) async => const ResponseContext(),
+        ),
+        throwsA(isA<ServerBadRequestException>()),
+      );
+      final response = await driveRequest(
+        fake,
+        requestId: 210,
+        path: '/bad',
+        routePattern: '/bad',
+      );
+      expect(response.status, 404);
+    });
+
+    test('a failing native start surfaces the typed error', () {
+      fake.startResult = const RawServerStatus(
+        errorKind: RawServerErrorKind.bindFailed,
+        errorMessage: 'denied',
+      );
+      expect(
+        () => runner.start(const ServerConfig()),
+        throwsA(isA<ServerBindException>()),
+      );
+    });
+
+    test('redirect answers empty with a location', () async {
+      await addGet('/old', (_) async => ResponseContext.redirect('/new'));
+      final response = await driveRequest(
+        fake,
+        requestId: 211,
+        path: '/old',
+        routePattern: '/old',
+      );
+      expect(response.status, 302);
+      expect(response.body, isEmpty);
+      expect(response.headers['location'], '/new');
+    });
+
+    test('redirect rejects non-redirect statuses', () {
+      expect(
+        () => ResponseContext.redirect('/x', status: 200),
+        throwsA(isA<AssertionError>()),
+      );
+    });
+
+    test('jsonBody encodes lists as well as maps', () async {
+      await addGet('/list', (_) async => ResponseContext.jsonBody([1, {'a': true}]));
+      final response = await driveRequest(
+        fake,
+        requestId: 212,
+        path: '/list',
+        routePattern: '/list',
+      );
+      expect(response.headers['content-type'], contains('application/json'));
+      expect(
+        jsonDecode(String.fromCharCodes(response.body)),
+        [1, {'a': true}],
+      );
     });
   });
 }

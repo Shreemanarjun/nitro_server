@@ -5,7 +5,18 @@
 //
 //   cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release
 //   cmake --build build/lib --parallel
+//
+//   # JIT mode (default `dart run`: fast to iterate, includes JIT warmup):
 //   dart run benchmark/compare.dart [--quick]
+//
+//   # AOT mode (what Flutter release ships: no JIT warmup, peak optimizer):
+//   dart compile exe benchmark/compare.dart -o build/benchmark/compare
+//   ./build/benchmark/compare [--quick]
+//
+// Run BOTH and compare: round 1 of the JIT run includes compiler warmup on
+// the Dart sides (nitro's engine is native either way), while the AOT run
+// shows steady-state without it. If nitro wins in one mode only, say so —
+// a benchmark that can only pass in one VM mode is a hint, not a verdict.
 //
 // This file is pure Dart (no Flutter imports): it is the proof that the
 // package runs in Dart-only mode. `shelf` is used the way everyone uses it —
@@ -222,6 +233,21 @@ class _RequestBenchmark extends AsyncBenchmarkBase {
   }
 }
 
+/// JIT vs AOT detection for labeling results.
+///
+/// `dart run` launches the Dart VM binary (executable ends in `dart` /
+/// `dartaotruntime`); a `dart compile exe` binary IS the executable, so any
+/// other executable name means AOT. AOT is what Flutter release ships, JIT
+/// is the edit-run loop — the numbers are only comparable within one mode.
+String _vmMode() {
+  final exe = Platform.executable.toLowerCase();
+  final isJit =
+      exe.endsWith('dart') ||
+      exe.endsWith('dart.exe') ||
+      exe.contains('dartaotruntime');
+  return isJit ? 'JIT' : 'AOT';
+}
+
 Future<String> _phase(
   String label,
   int port,
@@ -267,10 +293,19 @@ Future<void> main(List<String> args) async {
   final rounds = quick ? 1 : 2;
 
   // Dart-only loading: Flutter apps skip this (the tooling bundles the
-  // library); `dart run` needs the explicit open.
-  final loadedFrom = loadNitroServerNative();
+  // library); `dart run` / the compiled exe needs the explicit open.
+  // `NITRO_SERVER_DYLIB` or `--dylib <path>` overrides the search when the
+  // compiled exe runs from a different working directory.
+  String? dylibFlag;
+  final dylibIdx = args.indexOf('--dylib');
+  if (dylibIdx != -1 && dylibIdx + 1 < args.length) {
+    dylibFlag = args[dylibIdx + 1];
+  }
+  final loadedFrom = loadNitroServerNative(path: dylibFlag);
+  final mode = _vmMode();
   print('nitro_server vs shelf vs dart:io HttpServer — same routes, same driver');
-  print('(native library: $loadedFrom${quick ? '; --quick' : ''})');
+  print('(mode: $mode; native library: $loadedFrom'
+      '${quick ? '; --quick' : ''})');
   print('');
   print('Latency via package:benchmark_harness (AsyncBenchmarkBase, ~2 s '
       'exercise per case); throughput via a custom $concurrency-worker sweep.');

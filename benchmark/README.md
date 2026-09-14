@@ -20,8 +20,25 @@ package works in Dart-only mode.
 ```sh
 cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release
 cmake --build build/lib --parallel
+
+# JIT (edit-run loop; round 1 includes compiler warmup on the Dart sides)
 dart run benchmark/compare.dart [--quick]
+
+# AOT (what Flutter release ships; no JIT warmup, peak optimizer)
+dart compile exe benchmark/compare.dart -o build/benchmark/compare
+./build/benchmark/compare [--quick]
+# from another directory:
+# ./build/benchmark/compare --dylib /abs/path/to/libnitro_server.dylib
 ```
+
+Run BOTH modes before quoting numbers. The header line reports the
+detected mode (`JIT` under `dart run`, `AOT` in the compiled exe), so a
+pasted table always says which VM it came from. If nitro wins in one mode
+only, report exactly that — a benchmark that can only pass in one VM mode
+is a hint, not a verdict. The native engine itself is AOT-compiled C++
+either way; the mode changes the Dart driver, the shelf/dart:io handlers,
+and nitro's Dart runner — i.e. everything except the engine under test,
+which is why the AOT run is the cleaner engine comparison.
 
 `--quick` runs 1 round with 800 concurrent requests (smoke test). The
 default is 2 rounds at 4000 concurrent requests per throughput sweep; the

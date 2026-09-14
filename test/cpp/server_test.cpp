@@ -549,6 +549,10 @@ TEST(ServerTest, SecondBindOnSamePortFails) {
   cfg.port = port;
   second->configure(cfg);
   EXPECT_EQ(second->start().kind, ErrorKind::BindFailed);
+  // Defensive: if the platform ever allows the rebind (e.g. a future
+  // SO_REUSEPORT), stop the stray server so its threads never outlive the
+  // stack-owned emitter and never steal accepts from later tests.
+  if (second->running()) second->stop();
 }
 
 TEST(ServerTest, TlsConfigIsRefused) {
@@ -569,6 +573,10 @@ TEST(ServerTest, StartStopCyclesLeaveNoResidue) {
   // Leak soak: repeated bind/serve/stop cycles with bodies in flight. LSan
   // renders the verdict at exit — any tracked payload, pending entry or
   // thread resource left behind fails the run.
+  //
+  // Each cycle runs its own answering pump (the stand-in for the Dart
+  // runner): without it every request would park until the 30 s route
+  // timeout and the test would take 200 × 30 s instead of milliseconds.
   for (int cycle = 0; cycle < 5; cycle++) {
     RecordingEmitter emitter(
         [](Method, const std::string&, const std::string& body) {
@@ -584,6 +592,21 @@ TEST(ServerTest, StartStopCyclesLeaveNoResidue) {
     ASSERT_EQ((int64_t)server->start().kind, (int64_t)ErrorKind::None);
     const int64_t port = server->boundPort();
 
+    std::atomic<bool> pumping{true};
+    std::thread pump([&] {
+      while (pumping.load()) {
+        RecordingEmitter::Job job{0, 0, ""};
+        if (emitter.takeJob(job)) {
+          std::vector<uint8_t> bytes(job.body.begin(), job.body.end());
+          server->respond(job.requestId, job.status,
+                          {{"Content-Type", "text/plain"}}, bytes.data(),
+                          bytes.size());
+        } else {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+      }
+    });
+
     for (int i = 0; i < 40; i++) {
       const int fd = connectTo((int)port);
       ASSERT_GE(fd, 0) << "cycle " << cycle << " conn " << i;
@@ -596,6 +619,8 @@ TEST(ServerTest, StartStopCyclesLeaveNoResidue) {
       EXPECT_EQ(statusOf(res), 200) << "cycle " << cycle << " conn " << i;
       EXPECT_EQ(bodyOf(res), "n=8192") << "cycle " << cycle << " conn " << i;
     }
+    pumping.store(false);
+    pump.join();
     server->stop();
     EXPECT_TRUE(server->waitForDrainForTesting(5000));
   }

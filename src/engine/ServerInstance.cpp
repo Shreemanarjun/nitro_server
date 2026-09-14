@@ -4,6 +4,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstring>
+#include <csignal>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -27,6 +28,7 @@ using Fd = SOCKET;
 constexpr Fd kBadFd = INVALID_SOCKET;
 int closeFd(Fd fd) { return closesocket(fd); }
 void shutdownRdwr(Fd fd) { shutdown(fd, SD_BOTH); }
+void shutdownRead(Fd fd) { shutdown(fd, SD_RECEIVE); }
 struct WinsockEnv {
   WinsockEnv() {
     WSADATA d;
@@ -37,12 +39,33 @@ void ensureSockets() {
   static WinsockEnv env;
   (void)env;
 }
+void setNoSigPipe(Fd) {}
 #else
 using Fd = int;
 constexpr Fd kBadFd = -1;
 int closeFd(Fd fd) { return ::close(fd); }
 void shutdownRdwr(Fd fd) { ::shutdown(fd, SHUT_RDWR); }
-void ensureSockets() {}
+void shutdownRead(Fd fd) { ::shutdown(fd, SHUT_RD); }
+void ensureSockets() {
+  // A send/writev to a peer that already went away must surface as EPIPE
+  // (handled as `sent=false` by the callers), never as a SIGPIPE that kills
+  // the whole process. POSIX-only: Windows reports the error synchronously.
+  static const bool ignored = [] {
+    ::signal(SIGPIPE, SIG_IGN);
+    return true;
+  }();
+  (void)ignored;
+}
+/// macOS raises SIGPIPE on send/writev regardless of MSG_NOSIGNAL; the
+/// per-socket opt-out is SO_NOSIGPIPE. No-op elsewhere.
+void setNoSigPipe(Fd fd) {
+#ifdef SO_NOSIGPIPE
+  int one = 1;
+  ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#else
+  (void)fd;
+#endif
+}
 #endif
 
 constexpr size_t kMaxHeadBytes = 64 * 1024;
@@ -264,11 +287,12 @@ StatusResult ServerInstance::start() {
   }
   int one = 1;
   setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&one, sizeof(one));
-#ifndef _WIN32
-  // SO_REUSEPORT: instant rebind on restart, and the socket is ready for a
-  // multi-acceptor layout when the pool grows one.
-  setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, (const char*)&one, sizeof(one));
-#endif
+  // NOTE: no SO_REUSEPORT. REUSEPORT lets a second ServerInstance bind the
+  // same port and silently steal half the accepts (which also broke the
+  // SecondBindOnSamePortFails test on macOS/Linux). REUSEADDR alone is
+  // enough for fast rebind after stop(); accepted sockets never block the
+  // listen port.
+  setNoSigPipe(fd);
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_port = htons((uint16_t)cfg.port);
@@ -334,12 +358,16 @@ void ServerInstance::stop() {
     std::lock_guard<std::mutex> lk(acceptMutex_);
     if (acceptThread_.joinable()) acceptThread_.join();
   }
-  // Wake parked workers with 503, then shut every live socket so idle
-  // keep-alive reads fail fast instead of lingering to their deadline.
+  // Wake parked workers with 503, then interrupt idle keep-alive reads.
+  // The interrupt is SHUT_RD (not RDWR): a parked worker still has to SEND
+  // its 503 after abortAll wakes it, and RDWR would make that send fail with
+  // EPIPE so the client sees a reset instead of the 503. SHUT_RD fails the
+  // blocked recv fast while leaving the send direction intact; each worker
+  // closes its own fd on the way out.
   pending_.abortAll();
   {
     std::lock_guard<std::mutex> lk(activeMutex_);
-    for (int fd : activeFds_) shutdownRdwr((Fd)fd);
+    for (int fd : activeFds_) shutdownRead((Fd)fd);
   }
   queueCv_.notify_all();
   for (auto& w : workers_) {
@@ -398,6 +426,7 @@ void ServerInstance::acceptLoop() {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
       continue;
     }
+    setNoSigPipe(fd);
     {
       std::lock_guard<std::mutex> lk(queueMutex_);
       if ((int64_t)queue_.size() >= maxQueued) {

@@ -646,7 +646,7 @@ void main() {
           (_) async => ResponseContext.text('ok'),
         );
 
-        final events = await _get(server!.port, '/events');
+        final events = await _get(server!.port, '/events'); print("BODY: ${events.body}");
         expect(events.status, 200);
         expect(events.body, 'data: 0\n\ndata: 1\n\ndata: 2\n\n');
 

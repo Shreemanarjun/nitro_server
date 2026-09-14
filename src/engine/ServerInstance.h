@@ -24,11 +24,14 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
-#include <shared_mutex>
 #include <set>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -37,6 +40,7 @@
 #include "Common.h"
 #include "PendingTable.h"
 #include "Router.h"
+#include "Poller.h"
 
 namespace nitroserver {
 
@@ -48,8 +52,37 @@ struct ServerConfig {
   int64_t defaultTimeoutMs = 30000;
   int64_t keepAliveTimeoutMs = 5000;
   int64_t maxRequestsPerConn = 100;
-  int64_t workerThreads = 0;  // <= 0 means one per CPU core.
+  int64_t workerThreads = 0;  // 0 means single reactor, >0 means multiple reactors (currently single is used)
   bool tlsRequested = false;
+};
+
+enum class ConnState {
+  Reading,      // Waiting for request (head or body)
+  WaitingDart,  // Request dispatched, waiting for Dart to respond()
+  Writing,      // Sending response
+  Idle,         // Keep-alive idle, waiting for next request
+  Closed        // Dead
+};
+
+struct Connection {
+  int fd = -1;
+  ConnState state = ConnState::Idle;
+  std::string readBuf;
+  std::string writeBuf;
+  
+  // Current request state
+  int64_t requestId = 0;
+  int64_t contentLength = 0;
+  size_t bodyStart = 0;
+  bool chunked = false;
+  bool keepAlive = true;
+  Method method = Method::Get;
+  std::string customMethod;
+  std::string path;
+  std::string query;
+  std::vector<Header> headers;
+  
+  int64_t requestsServed = 0;
 };
 
 struct StatusResult {
@@ -167,9 +200,6 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   /// queued chunks until the terminal marker, a send failure, or stop().
   /// [served] counts this request on every exit. Returns true when the
   /// connection may serve another request.
-  bool serveStream(int fd, int64_t requestId, Method method,
-                   const std::shared_ptr<PendingRequest>& req,
-                   const ServerConfig& cfg, int64_t& served, bool keepPeer);
 
   /// Upgrades a matched WebSocket route: validates the RFC 6455 handshake,
   /// answers 101 and runs the frame loop until close/error/stop. Always
@@ -236,13 +266,21 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   std::thread acceptThread_;
   std::mutex acceptMutex_;
 
-  // Worker pool: bounded queue, fixed workers. The queue bound is the
-  // listen backlog — beyond it the engine refuses fast rather than letting
-  // the accept loop outrun the workers.
-  std::vector<std::thread> workers_;
-  std::mutex queueMutex_;
-  std::condition_variable queueCv_;
-  std::deque<int> queue_;
+  // Non-blocking Reactor (P1)
+  Poller poller_;
+  std::thread reactorThread_;
+  void reactorLoop();
+
+  // FDs accepted by acceptLoop, waiting to be registered by the Reactor.
+  std::mutex acceptedMutex_;
+  std::vector<int> acceptedQueue_;
+
+  // Active connections mapped by fd (owned EXCLUSIVELY by reactorThread_)
+  std::unordered_map<int, std::shared_ptr<Connection>> conns_;
+
+  // Responses queued by Dart's respond(), waiting to be written by the Reactor.
+  std::mutex readyMutex_;
+  std::vector<int> readyQueue_; // fds ready to write
 
   // Live connections, so stop() can wake idle keep-alive reads.
   std::mutex activeMutex_;

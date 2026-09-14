@@ -77,36 +77,59 @@ struct TlsSockets {
 TlsSockets g_tls;
 
 // SSL_read mapped to the recv contract: >0 bytes, 0 clean close, -1 with
-// errno EWOULDBLOCK for a retry (poll), any other -1 is a hard error.
-// ponytail: WANT_WRITE mid-read (renegotiation) is treated as a retry on
-// POLLIN; we run TLS 1.2+ with renegotiation disabled, so it does not occur.
+// errno EWOULDBLOCK for a retry (the caller polls POLLIN), any other -1 is a
+// hard error. WANT_WRITE happens on a non-blocking socket when SSL must send
+// before it can return app data (a TLS 1.3 post-handshake message, e.g. a
+// session ticket or key update). The caller only knows to poll for reads, so
+// wait for writability here and retry — otherwise the read hangs forever.
 ssize_t tlsRead(SSL* ssl, void* buf, size_t n) {
-  ERR_clear_error();
-  const int r = SSL_read(ssl, buf, (int)std::min<size_t>(n, 0x7fffffff));
-  if (r > 0) return r;
-  const int e = SSL_get_error(ssl, r);
-  if (e == SSL_ERROR_ZERO_RETURN) return 0;
-  if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
-    errno = EWOULDBLOCK;
+  const int fd = SSL_get_fd(ssl);
+  for (;;) {
+    ERR_clear_error();
+    const int r = SSL_read(ssl, buf, (int)std::min<size_t>(n, 0x7fffffff));
+    if (r > 0) return r;
+    const int e = SSL_get_error(ssl, r);
+    if (e == SSL_ERROR_ZERO_RETURN) return 0;
+    if (e == SSL_ERROR_WANT_READ) {
+      errno = EWOULDBLOCK;
+      return -1;
+    }
+    if (e == SSL_ERROR_WANT_WRITE) {
+      struct pollfd p {fd, POLLOUT, 0};
+      if (::poll(&p, 1, 5000) <= 0) {
+        errno = EWOULDBLOCK;
+        return -1;
+      }
+      continue;
+    }
+    errno = ECONNRESET;
     return -1;
   }
-  errno = ECONNRESET;
-  return -1;
 }
 
 // SSL_write mapped to the writeSome contract: writes one non-empty segment,
 // returns bytes written (partial allowed via SSL_MODE_ENABLE_PARTIAL_WRITE),
 // 0 when it would block (caller polls POLLOUT and retries), -1 on error.
+// WANT_READ during a write (SSL must read before it can send) is handled here
+// so the caller — which only polls for writability — does not stall.
 ssize_t tlsWrite(SSL* ssl, const uint8_t* const* bufs, const size_t* lens,
                  int n) {
+  const int fd = SSL_get_fd(ssl);
   for (int i = 0; i < n; i++) {
     if (lens[i] == 0) continue;
-    ERR_clear_error();
-    const int r = SSL_write(ssl, bufs[i], (int)std::min<size_t>(lens[i], 0x7fffffff));
-    if (r > 0) return r;
-    const int e = SSL_get_error(ssl, r);
-    if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) return 0;
-    return -1;
+    for (;;) {
+      ERR_clear_error();
+      const int r = SSL_write(ssl, bufs[i], (int)std::min<size_t>(lens[i], 0x7fffffff));
+      if (r > 0) return r;
+      const int e = SSL_get_error(ssl, r);
+      if (e == SSL_ERROR_WANT_WRITE) return 0;
+      if (e == SSL_ERROR_WANT_READ) {
+        struct pollfd p {fd, POLLIN, 0};
+        if (::poll(&p, 1, 5000) <= 0) return 0;
+        continue;
+      }
+      return -1;
+    }
   }
   return 0;
 }
@@ -742,7 +765,10 @@ StatusResult ServerInstance::setupTls(const ServerConfig& cfg) {
   SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE |
                             SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER |
                             SSL_MODE_AUTO_RETRY);
-  SSL_CTX_set_options(ctx, SSL_OP_NO_RENEGOTIATION);
+  SSL_CTX_set_options(ctx, SSL_OP_NO_RENEGOTIATION | SSL_OP_NO_TICKET);
+  // No TLS 1.3 session tickets: they are the main reason a post-handshake
+  // SSL_read would need to write, and this server keeps no session cache.
+  SSL_CTX_set_num_tickets(ctx, 0);
   SSL_CTX_set_alpn_select_cb(ctx, tlsAlpnSelect, nullptr);
 
   // Certificate (chain).

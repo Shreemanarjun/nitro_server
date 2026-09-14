@@ -40,6 +40,13 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         sanitizer: [thread, address]
     runs-on: ${{ matrix.os }}
+    # Job-level so the build step's gtest test-discovery run (which executes the
+    # instrumented binary) sees them too. detect_container_overflow=0 silences a
+    # GoogleTest static-init false positive: ASan container annotations mismatch
+    # against the platform's non-instrumented libc++.
+    env:
+      TSAN_OPTIONS: halt_on_error=1
+      ASAN_OPTIONS: detect_leaks=0:detect_container_overflow=0
     steps:
       - uses: actions/checkout@v4
       - if: runner.os == 'Linux'
@@ -51,6 +58,3 @@ jobs:
           -DNITRO_SERVER_BUILD_TESTS=ON -DNITRO_SERVER_SANITIZE=${{ matrix.sanitizer }}
       - run: cmake --build build/san --parallel --target nitro_server_engine_tests
       - run: ./build/san/nitro_server_tests/nitro_server_engine_tests
-        env:
-          TSAN_OPTIONS: halt_on_error=1
-          ASAN_OPTIONS: detect_leaks=0

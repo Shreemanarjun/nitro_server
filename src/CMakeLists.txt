@@ -4,6 +4,22 @@ project(nitro_server_library VERSION 0.0.1 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# ── Aggressive native optimization flags ──────────────────────────────────────
+# Override CMake's default Release flags with CPU-tuned optimizations.
+# -O3: aggressive inlining + vectorization
+# -march=native: use all native CPU extensions (SSE4, AVX2, NEON, etc.)
+# -mtune=native: schedule for the local microarch
+# -flto: link-time optimization across TUs (whole-program devirtualization)
+# -DNDEBUG: strip assertions and bounds checks
+# -fomit-frame-pointer: free up a register on x86_64
+# -funroll-loops: unroll hot loops (parser, header scan)
+# -ffast-math: allow reordering FP ops (no NaN/Inf sensitivity in HTTP)
+set(CMAKE_C_FLAGS_RELEASE   "-O3 -march=native -mtune=native -DNDEBUG -fomit-frame-pointer -funroll-loops -ffast-math")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -mtune=native -DNDEBUG -fomit-frame-pointer -funroll-loops -ffast-math")
+# Link-time optimization at the linker level (requires matching compile flags).
+set(CMAKE_EXE_LINKER_FLAGS_RELEASE  "-flto -O3")
+set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "-flto -O3")
+
 # ── Optimization guard ───────────────────────────────────────────────────────
 # The Android Gradle Plugin passes the VARIANT name (e.g. "profile") as
 # CMAKE_BUILD_TYPE. CMake only defines per-config flags for
@@ -13,8 +29,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # unoptimized native code. Give any non-standard config Release-grade flags.
 string(TOUPPER "${CMAKE_BUILD_TYPE}" _NITRO_CFG)
 if(NOT "${_NITRO_CFG}" MATCHES "^(DEBUG|RELEASE|RELWITHDEBINFO|MINSIZEREL|)$")
-  set(CMAKE_C_FLAGS_${_NITRO_CFG} "-O2 -DNDEBUG")
-  set(CMAKE_CXX_FLAGS_${_NITRO_CFG} "-O2 -DNDEBUG")
+  set(CMAKE_C_FLAGS_${_NITRO_CFG} "-O3 -march=native -mtune=native -DNDEBUG -fomit-frame-pointer -funroll-loops -ffast-math")
+  set(CMAKE_CXX_FLAGS_${_NITRO_CFG} "-O3 -march=native -mtune=native -DNDEBUG -fomit-frame-pointer -funroll-loops -ffast-math")
 endif()
 
 set(NITRO_NATIVE "${CMAKE_CURRENT_SOURCE_DIR}/native")

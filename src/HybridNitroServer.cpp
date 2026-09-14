@@ -146,7 +146,10 @@ class HybridNitroServerImpl final : public HybridNitroServerNative {
   explicit HybridNitroServerImpl(const std::string& key)
       : emitter_(this), server_(EngineRegistry::resolve(key, &emitter_)) {}
 
-  ~HybridNitroServerImpl() override = default;
+  // The bridge object owns the sink: unbind it before the sink dies. Dart
+  // stops the server before its bridge objects go away, so no request is
+  // mid-flight on this sink by then.
+  ~HybridNitroServerImpl() override { server_->removeEmitter(&emitter_); }
 
   // ── Capabilities ───────────────────────────────────────────────────────────
 

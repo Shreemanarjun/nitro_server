@@ -697,6 +697,99 @@ TEST(ServerTest, ConcurrentConnectionsDoNotDeadlock) {
   }
 }
 
+TEST(ServerTest, WorkerPoolGrowsForParkedConnections) {
+  // No pump: every request parks on its worker for the route timeout, so
+  // more parked connections than the floor must make the pool grow.
+  RecordingEmitter emitter([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "never");
+  });
+  auto server = std::make_shared<ServerInstance>();
+  server->setEmitter(&emitter);
+  EXPECT_EQ(server->registerRoute(Method::Get, "", "/park", 30000).kind,
+            ErrorKind::None);
+  ServerConfig cfg;
+  cfg.port = 0;
+  cfg.workerThreads = 48;  // The cap.
+  server->configure(cfg);
+  ASSERT_EQ((int64_t)server->start().kind, (int64_t)ErrorKind::None);
+  const size_t floor = server->workersForTesting();
+  EXPECT_GE(floor, 1u);
+  EXPECT_LE(floor, 48u);
+
+  constexpr int kConns = 40;
+  std::vector<int> fds;
+  for (int i = 0; i < kConns; i++) {
+    const int fd = connectTo((int)server->boundPort());
+    ASSERT_GE(fd, 0);
+    sendStr(fd, "GET /park HTTP/1.1\r\nHost: x\r\n\r\n");
+    fds.push_back(fd);
+  }
+  // Every connection dispatched (so every one holds a worker).
+  bool all = false;
+  for (int i = 0; i < 1000 && !all; i++) {
+    all = emitter.seen().size() >= (size_t)kConns;
+    if (!all) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_TRUE(all);
+  EXPECT_GE(server->workersForTesting(), (size_t)kConns);
+  EXPECT_LE(server->workersForTesting(), 48u);
+  server->stop();  // Wakes every parked worker with a 503 and reaps.
+  for (int fd : fds) close(fd);
+  EXPECT_EQ(server->workersForTesting(), 0u);
+}
+
+TEST(ServerTest, RequestsAreDealtRoundRobinAcrossEmitters) {
+  // Two runners behind one server: heads alternate, and each request's
+  // answer still lands (the pump answers through the shared server).
+  RecordingEmitter a([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "a");
+  });
+  RecordingEmitter b([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "b");
+  });
+  auto server = std::make_shared<ServerInstance>();
+  server->addEmitter(&a);
+  server->addEmitter(&b);
+  server->addEmitter(&b);  // Duplicate binds are ignored.
+  EXPECT_EQ(server->emitterCountForTesting(), 2u);
+  EXPECT_EQ(server->registerRoute(Method::Get, "", "/rr", -1).kind,
+            ErrorKind::None);
+  ServerConfig cfg;
+  cfg.port = 0;
+  server->configure(cfg);
+  ASSERT_EQ((int64_t)server->start().kind, (int64_t)ErrorKind::None);
+  std::atomic<bool> pumping{true};
+  std::thread pump([&] {
+    while (pumping.load()) {
+      RecordingEmitter::Job job{0, 0, ""};
+      bool got = a.takeJob(job) || b.takeJob(job);
+      if (got) {
+        std::vector<uint8_t> bytes(job.body.begin(), job.body.end());
+        server->respond(job.requestId, job.status, {}, bytes.data(),
+                        bytes.size());
+      } else {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }
+  });
+  std::string bodies;
+  for (int i = 0; i < 6; i++) {
+    const int fd = connectTo((int)server->boundPort());
+    ASSERT_GE(fd, 0);
+    sendStr(fd, "GET /rr HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    bodies += bodyOf(readAll(fd));
+    close(fd);
+  }
+  pumping.store(false);
+  pump.join();
+  EXPECT_EQ(a.seen().size(), 3u);
+  EXPECT_EQ(b.seen().size(), 3u);
+  EXPECT_TRUE(bodies == "ababab" || bodies == "bababa") << bodies;
+  server->removeEmitter(&a);
+  EXPECT_EQ(server->emitterCountForTesting(), 1u);
+  server->stop();
+}
+
 TEST(ServerTest, SecondBindOnSamePortFails) {
   Fixture f([](Method, const std::string&, const std::string&) {
     return std::make_pair(200, "x");

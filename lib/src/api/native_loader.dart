@@ -23,6 +23,12 @@ import 'dart:ffi';
 import 'dart:io';
 
 bool _loaded = false;
+String? _loadedPath;
+
+/// The absolute path [loadNitroServerNative] opened in this isolate, or null
+/// when the library came bundled (Flutter) or was never loaded explicitly.
+/// Helper isolates open the same file so their bindings resolve.
+String? get loadedNitroServerNativePath => _loadedPath;
 
 /// Whether [loadNitroServerNative] has already opened the library in this
 /// isolate. Test seam.
@@ -70,6 +76,7 @@ String loadNitroServerNative({String? path}) {
       final absolute = File(candidate).absolute.path;
       DynamicLibrary.open(absolute);
       _loaded = true;
+      _loadedPath = absolute;
       return absolute;
     }
   }

@@ -478,7 +478,7 @@ class NullEmitter final : public Emitter {
                 const std::vector<RouteParam>&) override {}
   void emitBodyData(int64_t, uint8_t* payload, size_t) override {
     // Ownership transferred in: free on drop so the unbound window leaks
-    // nothing. (Unreachable in practice — see lockedEmitter.)
+    // nothing. (Unreachable in practice — see nextEmitter.)
     std::free(payload);
   }
   void emitBodyEnd(int64_t) override {}
@@ -491,10 +491,23 @@ class NullEmitter final : public Emitter {
   void emitEvent(ServerEventKind, int64_t, const std::string&) override {}
 };
 
-Emitter* ServerInstance::lockedEmitter() {
+Emitter* ServerInstance::nextEmitter() {
   static NullEmitter null;
   std::lock_guard<std::mutex> lk(emitterMutex_);
-  return emitter_ ? emitter_ : &null;
+  if (emitters_.empty()) return &null;
+  if (emitters_.size() == 1) return emitters_[0];
+  return emitters_[emitterRr_.fetch_add(1, std::memory_order_relaxed) %
+                   emitters_.size()];
+}
+
+void ServerInstance::broadcastEvent(ServerEventKind kind, int64_t requestId,
+                                    const std::string& message) {
+  std::vector<Emitter*> sinks;
+  {
+    std::lock_guard<std::mutex> lk(emitterMutex_);
+    sinks = emitters_;
+  }
+  for (Emitter* e : sinks) e->emitEvent(kind, requestId, message);
 }
 
 void ServerInstance::configure(const ServerConfig& config) {
@@ -619,36 +632,33 @@ StatusResult ServerInstance::start() {
   }
   listenFd_ = (int)fd;
 
-  unsigned workers = cfg.workerThreads > 0 ? (unsigned)cfg.workerThreads : 0;
-  if (workers == 0) {
-    // A worker is pinned to its connection for the whole handler wait, so
-    // fewer workers than live keep-alive connections means connections
-    // cycle through the queue between workers (measured: a 14 ms p99 at 32
-    // connections on 16 workers). Parked threads are cheap; size the pool
-    // for real concurrency.
-    // ponytail: thread-per-connection caps out around a few hundred live
-    // connections; a poller-driven reactor is the upgrade path.
-    const unsigned cores = std::thread::hardware_concurrency();
-    workers = std::max(64u, (cores == 0 ? 8u : cores) * 4);
-  }
+  // A worker is pinned to its connection for the whole handler wait, so
+  // fewer workers than live keep-alive connections means connections cycle
+  // through the queue between workers (measured: a 14 ms p99 at 32
+  // connections on 16 workers). The pool therefore auto-scales: it starts
+  // at one thread per core and grows on demand up to the cap, retiring
+  // idle threads above the floor so a quiet server holds few threads.
+  // ponytail: thread-per-connection caps out around a few hundred live
+  // connections; a poller-driven reactor is the upgrade path.
+  const unsigned cores = std::thread::hardware_concurrency();
+  const unsigned effectiveCores = cores == 0 ? 8u : cores;
+  const unsigned cap = cfg.workerThreads > 0 ? (unsigned)cfg.workerThreads
+                                             : std::max(64u, effectiveCores * 4);
   {
     auto self = shared_from_this();
     std::lock_guard<std::mutex> lk(acceptMutex_);
     acceptThread_ = std::thread([self]() { self->acceptLoop(); });
-    workerWakes_.clear();
-    workerWakes_.reserve(workers);
-    for (unsigned i = 0; i < workers; i++) {
-      Fd r, w;
-      if (!makeWake(r, w)) break;  // Out of fds: run with fewer workers.
-      Wake wake{(int)r, (int)w};
-      workerWakes_.push_back(wake);
-      workers_.emplace_back([self, wake]() { self->workerLoop(wake); });
+    std::lock_guard<std::mutex> qlk(queueMutex_);
+    workerCap_ = cap;
+    workerFloor_ = std::min(cap, effectiveCores);
+    while (workerCount_ < workerFloor_) {
+      if (!spawnWorkerLocked()) break;  // Out of fds: run with fewer.
     }
   }
-  lockedEmitter()->emitEvent(ServerEventKind::Started, 0,
-                             "listening on port " +
-                                 std::to_string(boundPort_.load()) + " with " +
-                                 std::to_string(workers_.size()) + " workers");
+  broadcastEvent(ServerEventKind::Started, 0,
+                 "listening on port " + std::to_string(boundPort_.load()) +
+                     " with " + std::to_string(workerFloor_) + " workers (cap " +
+                     std::to_string(cap) + ")");
   return {ErrorKind::None, "", boundPort_.load()};
 }
 
@@ -673,24 +683,18 @@ void ServerInstance::stop() {
     std::lock_guard<std::mutex> lk(activeMutex_);
     for (int fd : activeFds_) shutdownRead((Fd)fd);
   }
-  for (const Wake& w : workerWakes_) poke((Fd)w.w);
-  queueCv_.notify_all();
-  for (auto& w : workers_) {
-    if (w.joinable()) w.join();
-  }
-  workers_.clear();
-  for (const Wake& w : workerWakes_) {
-    closeWake((Fd)w.r);
-    closeWake((Fd)w.w);
-  }
-  workerWakes_.clear();
   {
-    std::lock_guard<std::mutex> lk(queueMutex_);
+    // Workers are detached: poke every parked one, then wait for the count
+    // to reach zero (each retires itself and closes its own wake pipe).
+    std::unique_lock<std::mutex> lk(queueMutex_);
+    for (const Wake& w : workerWakes_) poke((Fd)w.w);
+    queueCv_.notify_all();
+    workersGoneCv_.wait(lk, [&] { return workerCount_ == 0; });
     for (int fd : queue_) closeFd((Fd)fd);
     queue_.clear();
   }
   boundPort_.store(0);
-  lockedEmitter()->emitEvent(ServerEventKind::Stopped, 0, "stopped");
+  broadcastEvent(ServerEventKind::Stopped, 0, "stopped");
 }
 
 // ── Direct-write answer path ────────────────────────────────────────────────
@@ -887,23 +891,60 @@ void ServerInstance::acceptLoop() {
         continue;
       }
       queue_.push_back((int)fd);
+      // More waiting than idle hands: grow the pool (bounded by the cap).
+      if (queue_.size() > idleWorkers_ && workerCount_ < workerCap_) {
+        spawnWorkerLocked();
+      }
     }
     queueCv_.notify_one();
   }
 }
 
+bool ServerInstance::spawnWorkerLocked() {
+  Fd r, w;
+  if (!makeWake(r, w)) return false;
+  const Wake wake{(int)r, (int)w};
+  workerWakes_.push_back(wake);
+  workerCount_++;
+  auto self = shared_from_this();
+  std::thread([self, wake]() { self->workerLoop(wake); }).detach();
+  return true;
+}
+
 void ServerInstance::workerLoop(Wake wake) {
+  static constexpr auto kIdleRetire = std::chrono::seconds(10);
   while (true) {
     int fd = -1;
     {
       std::unique_lock<std::mutex> lk(queueMutex_);
-      queueCv_.wait(lk, [&] { return !queue_.empty() || !running_.load(); });
-      if (queue_.empty()) return;  // Stop was requested and nothing is queued.
+      idleWorkers_++;
+      queueCv_.wait_for(lk, kIdleRetire,
+                        [&] { return !queue_.empty() || !running_.load(); });
+      idleWorkers_--;
+      if (queue_.empty()) {
+        // Stopped, or idle past the retire window while above the floor:
+        // leave the pool. Otherwise keep waiting (floor threads never go).
+        if (running_.load() && workerCount_ <= workerFloor_) continue;
+        workerWakes_.erase(
+            std::remove_if(workerWakes_.begin(), workerWakes_.end(),
+                           [&](const Wake& x) { return x.r == wake.r; }),
+            workerWakes_.end());
+        closeWake((Fd)wake.r);
+        closeWake((Fd)wake.w);
+        workerCount_--;
+        if (workerCount_ == 0) workersGoneCv_.notify_all();
+        return;
+      }
       fd = queue_.back();
       queue_.pop_back();
     }
     handleConnection(fd, wake);
   }
+}
+
+size_t ServerInstance::workersForTesting() {
+  std::lock_guard<std::mutex> lk(queueMutex_);
+  return workerCount_;
 }
 
 bool ServerInstance::sendAll(int fd, const uint8_t* data, size_t n,
@@ -937,7 +978,7 @@ void ServerInstance::answerDirectly(int fd, Method method, int64_t status,
   sendAll(fd, (const uint8_t*)head.data(), head.size());
 }
 
-void ServerInstance::emitTerminalError(int64_t requestId,
+void ServerInstance::emitTerminalError(Emitter* emitter, int64_t requestId,
                                         const std::string& message,
                                         ErrorKind kind) {
   uint8_t* payload = nullptr;
@@ -946,8 +987,8 @@ void ServerInstance::emitTerminalError(int64_t requestId,
     if (payload) memcpy(payload, message.data(), message.size());
   }
   if (payload) pending_.trackPayload(requestId, payload);
-  lockedEmitter()->emitBodyError(requestId, payload, message.size(), kind);
-  lockedEmitter()->emitBodyEnd(requestId);
+  emitter->emitBodyError(requestId, payload, message.size(), kind);
+  emitter->emitBodyEnd(requestId);
 }
 
 bool ServerInstance::yieldToQueued(int fd) {
@@ -960,6 +1001,12 @@ bool ServerInstance::yieldToQueued(int fd) {
     std::lock_guard<std::mutex> lk(queueMutex_);
     if (queue_.empty()) return false;
     queue_.push_front(fd);
+    // A yield IS the under-provisioning signal: live keep-alive connections
+    // outnumber workers, and in keep-alive mode no accept will come along
+    // to notice. Grow here too (this worker is about to be idle: +1).
+    if (queue_.size() > idleWorkers_ + 1 && workerCount_ < workerCap_) {
+      spawnWorkerLocked();
+    }
   }
   queueCv_.notify_one();
   return true;
@@ -1243,6 +1290,9 @@ bool ServerInstance::serveOne(int fd, const Wake& wake, std::string& carry,
       m.route.timeoutMs >= 0 ? m.route.timeoutMs : cfg.defaultTimeoutMs;
   const int64_t requestId = nextRequestId();
   auto req = pending_.create(requestId);
+  // Deal this request to one runner: every message it produces — error
+  // chunks included — goes to the sink chosen here.
+  Emitter* emitter = nextEmitter();
   // Wire state the answering thread needs, fixed before anyone can answer.
   // The max-requests budget is honored in the framing: the final response
   // on a connection must say `close`, not promise a keep-alive it will not
@@ -1281,18 +1331,12 @@ bool ServerInstance::serveOne(int fd, const Wake& wake, std::string& carry,
   }
   const bool hasBody = chunked || contentLength > 0;
   if (!chunked && contentLength > cfg.maxBodyBytes) {
-    emitTerminalError(requestId, "request body exceeds maxBodyBytes",
+    emitTerminalError(emitter, requestId, "request body exceeds maxBodyBytes",
                       ErrorKind::RequestTooLarge);
     answerDirectly(fd, head.method, 413, "content too large");
     pending_.erase(requestId);
     return false;
   }
-
-  // Load the emitter once for the entire request lifecycle. The pointer
-  // never changes during normal operation (setEmitter is only called on
-  // factory resolve before any requests arrive), so this is safe without
-  // re-locking per call.
-  Emitter* emitter = lockedEmitter();
 
   // Small bodies (the common POST) are read in full first, so Dart gets one
   // chunk then one COMPLETE head — two port messages and a single head
@@ -1385,7 +1429,7 @@ bool ServerInstance::serveOne(int fd, const Wake& wake, std::string& carry,
       pos += (size_t)chunkSize + 2;  // Skip trailing CRLF.
     }
     if (!done && !tooLarge) {
-      emitTerminalError(requestId, "truncated chunked body",
+      emitTerminalError(emitter, requestId, "truncated chunked body",
                         ErrorKind::BadRequest);
       answerDirectly(fd, head.method, 400, "truncated body");
       pending_.erase(requestId);
@@ -1398,7 +1442,7 @@ bool ServerInstance::serveOne(int fd, const Wake& wake, std::string& carry,
       char buf[16384];
       const ssize_t n = recvWait(sock, buf, sizeof(buf), idleMs);
       if (n <= 0) {
-        emitTerminalError(requestId, "truncated body", ErrorKind::BadRequest);
+        emitTerminalError(emitter, requestId, "truncated body", ErrorKind::BadRequest);
         answerDirectly(fd, head.method, 400, "truncated body");
         pending_.erase(requestId);
         return false;
@@ -1432,7 +1476,7 @@ bool ServerInstance::serveOne(int fd, const Wake& wake, std::string& carry,
       received += n;
     }
     if (remaining != 0 && !tooLarge) {
-      emitTerminalError(requestId, "truncated body", ErrorKind::BadRequest);
+      emitTerminalError(emitter, requestId, "truncated body", ErrorKind::BadRequest);
       answerDirectly(fd, head.method, 400, "truncated body");
       pending_.erase(requestId);
       return false;
@@ -1448,7 +1492,7 @@ bool ServerInstance::serveOne(int fd, const Wake& wake, std::string& carry,
   }
 
   if (tooLarge) {
-    emitTerminalError(requestId, "request body exceeds maxBodyBytes",
+    emitTerminalError(emitter, requestId, "request body exceeds maxBodyBytes",
                       ErrorKind::RequestTooLarge);
     answerDirectly(fd, head.method, 413, "content too large");
     pending_.erase(requestId);
@@ -1534,16 +1578,16 @@ bool ServerInstance::serveUpgrade(int fd, const std::string& carry,
   if (!sendAll(fd, (const uint8_t*)shake.data(), shake.size())) return false;
 
   const int64_t connectionId = nextRequestId();
+  Emitter* emitter = nextEmitter();
   {
     std::lock_guard<std::mutex> lk(wsMutex_);
-    ws_[connectionId] = WsConn{fd};
+    ws_[connectionId] = WsConn{fd, emitter};
   }
   // The session opens through normal head dispatch, so Dart sees the
   // handshake's pattern, params, query and headers like any request.
-  lockedEmitter()->emitHead(connectionId, head.method, head.customMethod,
-                            path, query, head.headers, 0, false, true,
-                            m.route.pattern, m.params);
-  wsLoop(fd, connectionId, cfg.maxBodyBytes);
+  emitter->emitHead(connectionId, head.method, head.customMethod, path, query,
+                    head.headers, 0, false, true, m.route.pattern, m.params);
+  wsLoop(fd, connectionId, cfg.maxBodyBytes, emitter);
   {
     std::lock_guard<std::mutex> lk(wsMutex_);
     ws_.erase(connectionId);
@@ -1562,8 +1606,9 @@ bool ServerInstance::wsSendFrame(int fd, int opcode, const uint8_t* payload,
   return sendAll(fd, frame.data(), frame.size());
 }
 
-void ServerInstance::emitWs(int64_t connectionId, int opcode,
-                            const uint8_t* data, size_t n, int code) {
+void ServerInstance::emitWs(Emitter* emitter, int64_t connectionId,
+                            int opcode, const uint8_t* data, size_t n,
+                            int code) {
   uint8_t* payload = nullptr;
   if (n > 0) {
     payload = (uint8_t*)std::malloc(n);
@@ -1571,7 +1616,7 @@ void ServerInstance::emitWs(int64_t connectionId, int opcode,
     memcpy(payload, data, n);
   }
   pending_.trackPayload(connectionId, payload);
-  lockedEmitter()->emitWsMessage(connectionId, payload, n, opcode, code);
+  emitter->emitWsMessage(connectionId, payload, n, opcode, code);
 }
 
 void ServerInstance::wsSend(int64_t connectionId, const uint8_t* payload,
@@ -1608,7 +1653,7 @@ void ServerInstance::wsClose(int64_t connectionId, int code) {
 }
 
 void ServerInstance::wsLoop(int fd, int64_t connectionId,
-                            int64_t maxMessageBytes) {
+                            int64_t maxMessageBytes, Emitter* emitter) {
   const Fd sock = (Fd)fd;
   // Sessions live indefinitely: drop the HTTP idle deadline. stop() still
   // interrupts via shutdown on the (tracked) fd.
@@ -1764,7 +1809,7 @@ void ServerInstance::wsLoop(int fd, int64_t connectionId,
         protocolError(1007);
         break;
       }
-      emitWs(connectionId, msgOpcode, msg.data(), msg.size(), 0);
+      emitWs(emitter, connectionId, msgOpcode, msg.data(), msg.size(), 0);
       msg.clear();
       msgOpcode = -1;
     }
@@ -1773,7 +1818,7 @@ void ServerInstance::wsLoop(int fd, int64_t connectionId,
   // Every exit ends with opcode 8 so Dart reaps deterministically: the peer
   // code on a clean close, the sent code on our protocol errors (the peer
   // already holds the matching frame), 1006 on transport failure.
-  emitWs(connectionId, ws::kClose, nullptr, 0, closeCode);
+  emitWs(emitter, connectionId, ws::kClose, nullptr, 0, closeCode);
 }
 
 }  // namespace nitroserver

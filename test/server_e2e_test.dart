@@ -25,6 +25,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 import 'dart:ffi';
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:test/test.dart';
 import 'package:nitro_server/nitro_server.dart';
@@ -203,6 +204,13 @@ Future<({int opcode, Uint8List payload})> _readWsFrame(
   return (opcode: opcode, payload: payload);
 }
 
+/// Routes for the isolates test: the body names the answering isolate.
+Future<void> _whoSetup(NitroServer server) async {
+  await server.get('/who', (_) async {
+    return ResponseContext.text(Isolate.current.debugName ?? 'unnamed');
+  });
+}
+
 void main() {
   final libraryPath = _locateLibrary();
   final skipReason = libraryPath == null
@@ -266,6 +274,37 @@ void main() {
       expect(res.status, 200);
       expect(res.body, 'ok');
       expect(res.headers.value('x-big'), big);
+    }, skip: skipReason);
+
+    test('isolates: 2 deals requests across both runners', () async {
+      server = await NitroServer.bind(
+        const ServerConfig(isolates: 2),
+        _whoSetup,
+      );
+      expect(server!.isolates, 2);
+      final seen = <String>{};
+      for (var i = 0; i < 8; i++) {
+        final res = await _get(server!.port, '/who');
+        expect(res.status, 200);
+        seen.add(res.body);
+      }
+      // Round-robin: every other request lands on the helper isolate.
+      expect(seen, hasLength(2));
+      // A route only the main isolate knows is a 404 on the helper's turn:
+      // registration outside `setup` does not reach helpers.
+      await server!.get('/main-only', (_) async => ResponseContext.text('m'));
+      final statuses = <int>{};
+      for (var i = 0; i < 4; i++) {
+        statuses.add((await _get(server!.port, '/main-only')).status);
+      }
+      expect(statuses, {200, 404});
+    }, skip: skipReason);
+
+    test('isolates above 1 need a setup function', () async {
+      await expectLater(
+        NitroServer.bind(const ServerConfig(isolates: 2)),
+        throwsArgumentError,
+      );
     }, skip: skipReason);
 
     test('matches a literal route and echoes the method', () async {

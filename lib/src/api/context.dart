@@ -43,8 +43,10 @@ class ServerConfig {
     this.keepAliveTimeout = const Duration(seconds: 5),
     this.maxRequestsPerConnection = 100,
     this.workerThreads = 0,
+    this.isolates = 1,
     this.tls = const TlsConfig(),
   }) : assert(port >= 0 && port <= 65535, 'port out of range: $port'),
+       assert(isolates >= 0, 'isolates must be non-negative'),
        assert(backlog > 0, 'backlog must be positive'),
        assert(maxBodyBytes > 0, 'maxBodyBytes must be positive'),
        assert(
@@ -67,13 +69,23 @@ class ServerConfig {
   /// unbounded (the idle timeout still applies).
   final int maxRequestsPerConnection;
 
-  /// Native worker threads serving connections. `0` means one per CPU core.
+  /// Cap on the native worker pool. The pool starts at one thread per CPU
+  /// core and grows on demand up to this cap (idle threads above the floor
+  /// retire after 10 s). `0` means `max(64, 4 × cores)`.
   final int workerThreads;
+
+  /// Dart isolates running handlers behind this server. `1` (default) runs
+  /// everything on the calling isolate. Above 1, requests are dealt
+  /// round-robin across that many isolates — the only way past a single
+  /// isolate's throughput ceiling — and routes must be registered by the
+  /// `setup` function passed to [NitroServer.bind], which runs once per
+  /// isolate. `0` picks a size from the CPU count (half the cores, 1–8).
+  final int isolates;
   final TlsConfig tls;
 
   /// A copy with any of [host], [port], [backlog], [maxBodyBytes],
   /// [defaultTimeout], [keepAliveTimeout], [maxRequestsPerConnection],
-  /// [workerThreads] or [tls] replaced.
+  /// [workerThreads], [isolates] or [tls] replaced.
   ServerConfig copyWith({
     String? host,
     int? port,
@@ -83,6 +95,7 @@ class ServerConfig {
     Duration? keepAliveTimeout,
     int? maxRequestsPerConnection,
     int? workerThreads,
+    int? isolates,
     TlsConfig? tls,
   }) {
     return ServerConfig(
@@ -95,6 +108,7 @@ class ServerConfig {
       maxRequestsPerConnection:
           maxRequestsPerConnection ?? this.maxRequestsPerConnection,
       workerThreads: workerThreads ?? this.workerThreads,
+      isolates: isolates ?? this.isolates,
       tls: tls ?? this.tls,
     );
   }

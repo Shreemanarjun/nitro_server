@@ -1,6 +1,10 @@
 /// The public HTTP server.
 library;
 
+import 'dart:async';
+import 'dart:io';
+import 'dart:isolate';
+
 import 'package:meta/meta.dart';
 
 import '../internal/instance_keys.dart';
@@ -9,8 +13,16 @@ import '../internal/server_runner.dart';
 import 'context.dart';
 import 'event.dart';
 import 'http_method.dart';
+import 'native_loader.dart';
 import 'route_group.dart';
 import 'ws.dart';
+
+/// Registers routes and middleware on a freshly bound server. With
+/// [ServerConfig.isolates] above 1 it runs once per isolate (the calling
+/// one first), so it must be a top-level or static function — or a closure
+/// capturing only values an isolate can receive — and everything the server
+/// serves must be registered inside it.
+typedef ServerSetup = FutureOr<void> Function(NitroServer server);
 
 /// A bound HTTP server backed by the native multithreaded engine.
 ///
@@ -34,19 +46,50 @@ class NitroServer {
 
   final ServerRunner _runner;
 
+  /// Helper isolates dealt a share of this server's requests (empty for a
+  /// single-isolate server). Closed with the server.
+  List<_Helper> _helpers = const [];
+
   /// Binds [config.host]:[config.port] and starts accepting. A config port of
   /// 0 asks the OS for a free port — read it back from [port].
+  ///
+  /// [setup] registers routes before the first request can arrive; it is
+  /// required when [ServerConfig.isolates] is not 1, because every isolate
+  /// behind the server must register the same handlers (see [ServerSetup]).
   static Future<NitroServer> bind([
     ServerConfig config = const ServerConfig(),
+    ServerSetup? setup,
   ]) async {
     ensureNativeAttached();
-    final serverId = Ids.nextServer();
-    final runner = ServerRunner(attachedNative(serverKey(serverId)));
-    final boundPort = runner.start(config);
+    final isolates = config.isolates == 0 ? _autoIsolates() : config.isolates;
+    if (isolates > 1 && setup == null) {
+      throw ArgumentError.value(
+        config.isolates,
+        'isolates',
+        'a multi-isolate server needs a `setup` function: routes must be '
+            'registered in every isolate',
+      );
+    }
+    final key = serverKey(Ids.nextServer());
+    final runner = ServerRunner(attachedNative(key));
     final server = NitroServer._(runner);
-    server._port = boundPort;
+    if (setup != null) await setup(server);
+    if (isolates > 1) {
+      server._helpers = await _Helper.spawnAll(
+        count: isolates - 1,
+        key: key,
+        setup: setup!,
+        dylibPath: loadedNitroServerNativePath,
+      );
+    }
+    server._port = runner.start(config);
     return server;
   }
+
+  /// Auto size for [ServerConfig.isolates] == 0: half the cores, so the
+  /// native workers and the client side keep the rest, clamped to 1–8.
+  static int _autoIsolates() =>
+      (Platform.numberOfProcessors ~/ 2).clamp(1, 8);
 
   /// [bind] with named-argument sugar over a default [ServerConfig]:
   ///
@@ -65,7 +108,9 @@ class NitroServer {
     Duration? keepAliveTimeout,
     int? maxRequestsPerConnection,
     int? workerThreads,
+    int? isolates,
     TlsConfig? tls,
+    ServerSetup? setup,
   }) {
     return bind(
       const ServerConfig().copyWith(
@@ -77,10 +122,15 @@ class NitroServer {
         keepAliveTimeout: keepAliveTimeout,
         maxRequestsPerConnection: maxRequestsPerConnection,
         workerThreads: workerThreads,
+        isolates: isolates,
         tls: tls,
       ),
+      setup,
     );
   }
+
+  /// Number of isolates running handlers for this server (1 + helpers).
+  int get isolates => 1 + _helpers.length;
 
   int _port = 0;
 
@@ -286,7 +336,92 @@ class NitroServer {
   }
 
   /// Stops accepting and answers every parked request with 503. Idempotent.
-  Future<void> close() => _runner.close();
+  Future<void> close() async {
+    await _runner.close();
+    // The engine is stopped: helpers have nothing left to answer.
+    final helpers = _helpers;
+    _helpers = const [];
+    for (final helper in helpers) {
+      await helper.close();
+    }
+  }
+}
+
+/// One helper isolate: a [ServerRunner] on the same engine key, dealt every
+/// n-th request by the engine. Lives until the server closes.
+class _Helper {
+  _Helper(this._control, this._replies);
+
+  final SendPort _control;
+  final ReceivePort _replies;
+
+  static Future<List<_Helper>> spawnAll({
+    required int count,
+    required String key,
+    required ServerSetup setup,
+    required String? dylibPath,
+  }) async {
+    final helpers = <_Helper>[];
+    for (var i = 0; i < count; i++) {
+      final replies = ReceivePort();
+      await Isolate.spawn(
+        _helperMain,
+        _HelperBoot(key, dylibPath, setup, replies.sendPort),
+        debugName: 'nitro_server:$key:${i + 1}',
+      );
+      final queue = StreamIterator<Object?>(replies);
+      // The first message is the control port, sent once routes are
+      // registered and streams subscribed — the engine may deal to this
+      // helper from that moment on.
+      if (!await queue.moveNext() || queue.current is! SendPort) {
+        replies.close();
+        throw StateError('nitro_server: helper isolate $i failed to start');
+      }
+      final helper = _Helper(queue.current as SendPort, replies);
+      helper._queue = queue;
+      helpers.add(helper);
+    }
+    return helpers;
+  }
+
+  late final StreamIterator<Object?> _queue;
+
+  Future<void> close() async {
+    _control.send(_HelperBoot.closeSignal);
+    await _queue.moveNext();  // 'closed' — the helper's runner is shut.
+    _replies.close();
+  }
+}
+
+class _HelperBoot {
+  const _HelperBoot(this.key, this.dylibPath, this.setup, this.reply);
+
+  static const closeSignal = 'close';
+
+  final String key;
+  final String? dylibPath;
+  final ServerSetup setup;
+  final SendPort reply;
+}
+
+/// Helper isolate entry: same key, own runner, same routes, then wait for
+/// the close signal. Never starts or stops the engine — the main isolate
+/// owns its lifecycle — but does close its runner so its stream ports and
+/// native buffers are released before the isolate exits.
+Future<void> _helperMain(_HelperBoot boot) async {
+  if (boot.dylibPath != null) loadNitroServerNative(path: boot.dylibPath);
+  final runner = ServerRunner(attachedNative(boot.key));
+  final server = NitroServer._(runner);
+  await boot.setup(server);
+  runner.prepareHelper();
+  final control = ReceivePort();
+  boot.reply.send(control.sendPort);
+  await for (final message in control) {
+    if (message == _HelperBoot.closeSignal) break;
+  }
+  control.close();
+  await runner.close();
+  boot.reply.send('closed');
 }
 
 void _requirePattern(String pattern) {

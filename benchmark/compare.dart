@@ -65,6 +65,23 @@ final Map<String, Uint8List> _routes = {
   ),
 };
 
+/// `/work`: a handler doing real CPU — JSON-encoding 200 small records —
+/// the shape of an API endpoint rather than a byte echo. Deterministic, so
+/// the exact bytes are asserted like every other case. This is where
+/// isolates matter: a single Dart isolate is the ceiling for handler work.
+Uint8List _workBody() => Uint8List.fromList(
+  jsonEncode([
+    for (var i = 0; i < 200; i++)
+      {
+        'id': i,
+        'name': 'item-\$i',
+        'tags': ['a', 'b'],
+        'score': i * 1.5,
+      },
+  ]).codeUnits,
+);
+final Uint8List _workExpected = _workBody();
+
 final Uint8List _echoPayload = Uint8List.fromList(
   List<int>.generate(4096, (i) => i & 0xff),
 );
@@ -120,6 +137,10 @@ bool _batchEvents = false;
 /// means idle connections cycle through the queue between workers.
 int _workers = 0;
 
+/// Dart isolates behind nitro (`--isolates N`; 1 = the calling isolate
+/// only, 0 = auto-size from the CPU count).
+int _isolates = 1;
+
 String _connHeader() => _keepAlive ? 'keep-alive' : 'close';
 
 // ── Servers ──────────────────────────────────────────────────────────────────
@@ -130,8 +151,34 @@ Future<void> _withDartMw(HttpRequest request, Future<void> Function() next) {
   return next();
 }
 
-Future<HttpServer> _startDartServer() async {
-  final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+/// Extra dart:io isolates sharing the port (`HttpServer.bind(shared:
+/// true)`): dart:io's own answer to the single-isolate ceiling, spawned
+/// when `--isolates N` asks nitro for N isolates so both sides get the
+/// same number of cores for handler work.
+Future<List<Isolate>> _spawnSharedDartServers(int port, int count) async {
+  final isolates = <Isolate>[];
+  for (var i = 0; i < count; i++) {
+    final ready = ReceivePort();
+    isolates.add(
+      await Isolate.spawn(_sharedDartServerMain, (port, ready.sendPort)),
+    );
+    await ready.first;
+  }
+  return isolates;
+}
+
+Future<void> _sharedDartServerMain((int, SendPort) args) async {
+  final (port, ready) = args;
+  await _startDartServer(port: port, shared: true);
+  ready.send(true);
+}
+
+Future<HttpServer> _startDartServer({int port = 0, bool shared = false}) async {
+  final server = await HttpServer.bind(
+    InternetAddress.loopbackIPv4,
+    port,
+    shared: shared,
+  );
   server.defaultResponseHeaders.clear();
   server.listen(
     (request) => _withDartMw(request, () async {
@@ -175,6 +222,11 @@ Future<HttpServer> _startDartServer() async {
           response.add(body);
         } else if (request.method == 'GET' && path == '/mw') {
           final body = _routes['/hello']!;
+          response.contentLength = body.length;
+          response.add(body);
+        } else if (request.method == 'GET' && path == '/work') {
+          final body = _workBody();
+          response.headers.contentType = ContentType.json;
           response.contentLength = body.length;
           response.add(body);
         } else if (_routes.containsKey(path)) {
@@ -231,6 +283,8 @@ Response _shelfHandler(Request request) {
     );
   } else if (request.method == 'GET' && path == '/mw') {
     body = _routes['/hello'];
+  } else if (request.method == 'GET' && path == '/work') {
+    body = _workBody();
   } else {
     body = _routes[path];
   }
@@ -283,6 +337,49 @@ Future<HttpServer> _startShelfServer() async {
   return server;
 }
 
+/// Route registration for nitro as a setup function: with `--isolates N`
+/// it runs once per isolate, so it captures only the values it needs.
+ServerSetup _nitroSetup(bool batchEvents) {
+  return (server) async {
+    // One pass-through middleware, like the other sides.
+    await server.use((request, next) => next(request));
+    for (final entry in _routes.entries) {
+      final body = entry.value;
+      await server.get(entry.key, (_) async {
+        return ResponseContext.bytes(body);
+      });
+    }
+    await server.get('/users/:id', (request) async {
+      return ResponseContext.text('user ${request.param('id')}');
+    });
+    await server.get('/files/*', (request) async {
+      return ResponseContext.text('wild:${request.path}');
+    });
+    await server.get('/q', (request) async {
+      return ResponseContext.jsonMap(request.queryParameters);
+    });
+    await server.get('/mw', (_) async {
+      return ResponseContext.bytes(_routes['/hello']!);
+    });
+    await server.get('/work', (_) async {
+      return ResponseContext.bytes(
+        _workBody(),
+        contentType: 'application/json',
+      );
+    });
+    await server.get('/events', (_) async {
+      return ResponseContext.stream(
+        Stream.fromIterable(_eventChunks),
+        headers: {'content-type': 'text/event-stream'},
+        bufferSize: batchEvents ? 4096 : 0,
+      );
+    });
+    await server.post('/echo', (request) async {
+      return ResponseContext.bytes(request.body);
+    });
+  };
+}
+
 Future<NitroServer> _startNitroServer() async {
   // Without `--keep-alive` every response carries `Connection: close`,
   // matching the dart:io and shelf servers below. (The engine default
@@ -293,45 +390,18 @@ Future<NitroServer> _startNitroServer() async {
   // dart:io and shelf never cap requests per connection, so metering
   // reconnects into only nitro's numbers would punish it for a limit the
   // others don't have.
-  final server = await NitroServer.bind(
-    _keepAlive
-        ? ServerConfig(maxRequestsPerConnection: 0, workerThreads: _workers)
-        : ServerConfig(
-            keepAliveTimeout: Duration.zero,
-            workerThreads: _workers,
-          ),
-  );
-  // One pass-through middleware, like the other sides.
-  await server.use((request, next) => next(request));
-  for (final entry in _routes.entries) {
-    final body = entry.value;
-    await server.get(entry.key, (_) async {
-      return ResponseContext.bytes(body);
-    });
-  }
-  await server.get('/users/:id', (request) async {
-    return ResponseContext.text('user ${request.param('id')}');
-  });
-  await server.get('/files/*', (request) async {
-    return ResponseContext.text('wild:${request.path}');
-  });
-  await server.get('/q', (request) async {
-    return ResponseContext.jsonMap(request.queryParameters);
-  });
-  await server.get('/mw', (_) async {
-    return ResponseContext.bytes(_routes['/hello']!);
-  });
-  await server.get('/events', (_) async {
-    return ResponseContext.stream(
-      Stream.fromIterable(_eventChunks),
-      headers: {'content-type': 'text/event-stream'},
-      bufferSize: _batchEvents ? 4096 : 0,
-    );
-  });
-  await server.post('/echo', (request) async {
-    return ResponseContext.bytes(request.body);
-  });
-  return server;
+  final config = _keepAlive
+      ? ServerConfig(
+          maxRequestsPerConnection: 0,
+          workerThreads: _workers,
+          isolates: _isolates,
+        )
+      : ServerConfig(
+          keepAliveTimeout: Duration.zero,
+          workerThreads: _workers,
+          isolates: _isolates,
+        );
+  return NitroServer.bind(config, _nitroSetup(_batchEvents));
 }
 
 // ── Driver (identical for every server) ──────────────────────────────────────
@@ -525,6 +595,7 @@ final Map<String, _Op> _ops = {
   '/files/*': (c, p) => _getExpect(c, p, '/files/a/b/c', _wildExpected),
   '/q?a=1&b=two': (c, p) => _getExpect(c, p, '/q?a=1&b=two', _queryExpected),
   '/mw': (c, p) => _getExpect(c, p, '/mw', _routes['/hello']!),
+  '/work': (c, p) => _getExpect(c, p, '/work', _workExpected),
   'POST /echo 4k': _postEcho,
   'POST /echo 1m': (c, p) => _postEchoSized(c, p, _bigPayload),
   'GET /events': _getEvents,
@@ -541,15 +612,171 @@ Future<({double meanUs, List<int> samplesUs})> _sequential(
   return (meanUs: meanUs, samplesUs: benchmark.samplesUs);
 }
 
+/// Raw-socket request/expectation for the cases the `--raw` load client
+/// can drive: one-shot bodies with a `Content-Length` (streams and the
+/// megabyte echo stay on `HttpClient`). Returns null for other cases.
+({List<int> request, Uint8List expected})? _rawCase(
+  String opKey,
+  bool keepAlive,
+) {
+  final conn = keepAlive ? 'keep-alive' : 'close';
+  ({List<int> request, Uint8List expected}) get(String path, Uint8List body) =>
+      (
+        request: ascii.encode(
+          'GET $path HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: $conn\r\n\r\n',
+        ),
+        expected: body,
+      );
+  return switch (opKey) {
+    '/hello' => get('/hello', _routes['/hello']!),
+    '/json' => get('/json', _routes['/json']!),
+    '/users/:id' => get('/users/42', _paramExpected),
+    '/files/*' => get('/files/a/b/c', _wildExpected),
+    '/q?a=1&b=two' => get('/q?a=1&b=two', _queryExpected),
+    '/mw' => get('/mw', _routes['/hello']!),
+    '/work' => get('/work', _workExpected),
+    'POST /echo 4k' => (
+      request: [
+        ...ascii.encode(
+          'POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: $conn\r\n'
+          'Content-Length: ${_echoPayload.length}\r\n\r\n',
+        ),
+        ..._echoPayload,
+      ],
+      expected: _echoPayload,
+    ),
+    _ => null,
+  };
+}
+
+/// One raw-socket connection in a closed loop: send, read one framed
+/// response (`Content-Length`), verify status + exact bytes, repeat. Costs
+/// the client a few microseconds per request instead of `HttpClient`'s
+/// tens, so the server — not the driver — is what saturates.
+Future<void> _rawConnection(
+  int port,
+  List<int> request,
+  Uint8List expected,
+  bool keepAlive,
+  DateTime deadline,
+  List<int> samples,
+) async {
+  Socket? socket;
+  final buffer = BytesBuilder(copy: false);
+  StreamIterator<Uint8List>? chunks;
+  Future<Socket> connect() async {
+    final s = await Socket.connect('127.0.0.1', port);
+    s.setOption(SocketOption.tcpNoDelay, true);
+    chunks = StreamIterator(s);
+    return s;
+  }
+
+  while (DateTime.now().isBefore(deadline)) {
+    final stopwatch = Stopwatch()..start();
+    socket ??= await connect();
+    socket.add(request);
+    var bytes = buffer.toBytes();
+    buffer.clear();
+    var headEnd = _indexOfCrlfCrlf(bytes);
+    while (headEnd < 0) {
+      if (!await chunks!.moveNext()) throw StateError('raw: closed in head');
+      buffer
+        ..add(bytes)
+        ..add(chunks!.current);
+      bytes = buffer.toBytes();
+      buffer.clear();
+      headEnd = _indexOfCrlfCrlf(bytes);
+    }
+    final head = ascii.decode(bytes.sublist(0, headEnd));
+    if (!head.startsWith('HTTP/1.1 200')) {
+      throw StateError('raw: bad status: ${head.split('\r\n').first}');
+    }
+    final length = _contentLength(head);
+    final total = headEnd + 4 + length;
+    while (bytes.length < total) {
+      if (!await chunks!.moveNext()) throw StateError('raw: closed in body');
+      buffer
+        ..add(bytes)
+        ..add(chunks!.current);
+      bytes = buffer.toBytes();
+      buffer.clear();
+    }
+    stopwatch.stop();
+    if (length != expected.length ||
+        !_equals(Uint8List.sublistView(bytes, headEnd + 4, total), expected)) {
+      throw StateError('raw: body mismatch');
+    }
+    samples.add(stopwatch.elapsedMicroseconds);
+    // Surplus bytes belong to the next response; a closing server ends it.
+    if (bytes.length > total) buffer.add(Uint8List.sublistView(bytes, total));
+    if (!keepAlive || head.toLowerCase().contains('connection: close')) {
+      socket.destroy();
+      socket = null;
+      buffer.clear();
+    }
+  }
+  socket?.destroy();
+}
+
+int _indexOfCrlfCrlf(Uint8List bytes) {
+  for (var i = 0; i + 3 < bytes.length; i++) {
+    if (bytes[i] == 13 &&
+        bytes[i + 1] == 10 &&
+        bytes[i + 2] == 13 &&
+        bytes[i + 3] == 10) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+int _contentLength(String head) {
+  for (final line in head.split('\r\n').skip(1)) {
+    final colon = line.indexOf(':');
+    if (colon > 0 &&
+        line.substring(0, colon).trim().toLowerCase() == 'content-length') {
+      return int.parse(line.substring(colon + 1).trim());
+    }
+  }
+  throw StateError('raw: no content-length in response');
+}
+
 /// Closed-loop load from one client isolate: [connections] workers hammer
 /// [port] for [millis]. Returns the completed count, the wall time and every
 /// per-request latency, so the coordinator can report rate AND tail.
+/// With [raw] the workers are raw sockets (see [_rawConnection]) for the
+/// cases that support it; others fall back to `HttpClient`.
 Future<({int done, int elapsedUs, List<int> samplesUs})> _load(
   String opKey,
   int port,
   int connections,
-  int millis,
-) async {
+  int millis, {
+  required bool raw,
+  required bool keepAlive,
+}) async {
+  final rawCase = raw ? _rawCase(opKey, keepAlive) : null;
+  if (rawCase != null) {
+    final samples = <int>[];
+    final deadline = DateTime.now().add(Duration(milliseconds: millis));
+    final stopwatch = Stopwatch()..start();
+    await Future.wait([
+      for (var w = 0; w < connections; w++)
+        _rawConnection(
+          port,
+          rawCase.request,
+          rawCase.expected,
+          keepAlive,
+          deadline,
+          samples,
+        ),
+    ]);
+    stopwatch.stop();
+    return (
+      done: samples.length,
+      elapsedUs: stopwatch.elapsedMicroseconds,
+      samplesUs: samples,
+    );
+  }
   final op = _ops[opKey]!;
   final client = HttpClient()..maxConnectionsPerHost = connections;
   final samples = <int>[];
@@ -585,6 +812,8 @@ Future<({String row, Map<String, Object?> json})> _phase(
   required int clients,
   required int connections,
   required int millis,
+  required bool raw,
+  required bool keepAlive,
 }) async {
   final seq = await Isolate.run(() => _sequential(opKey, port));
   final lat = _summarize(seq.samplesUs);
@@ -592,7 +821,16 @@ Future<({String row, Map<String, Object?> json})> _phase(
   final perClient = connections ~/ clients;
   final loads = await Future.wait([
     for (var i = 0; i < clients; i++)
-      Isolate.run(() => _load(opKey, port, perClient, millis)),
+      Isolate.run(
+        () => _load(
+          opKey,
+          port,
+          perClient,
+          millis,
+          raw: raw,
+          keepAlive: keepAlive,
+        ),
+      ),
   ]);
   final rps = loads.fold(0.0, (s, l) => s + l.done / l.elapsedUs * 1e6);
   final under = _summarize([for (final l in loads) ...l.samplesUs]);
@@ -641,7 +879,9 @@ Future<void> main(List<String> args) async {
   final millis = _flagInt(args, '--seconds', quick ? 1 : 3) * 1000;
   final rounds = quick ? 1 : 2;
   final only = _flagStr(args, '--only');
+  final raw = args.contains('--raw');
   _workers = _flagInt(args, '--workers', 0);
+  _isolates = _flagInt(args, '--isolates', 1);
 
   // Dart-only loading: Flutter apps skip this (the tooling bundles the
   // library); `dart run` / the compiled exe needs the explicit open.
@@ -657,7 +897,9 @@ Future<void> main(List<String> args) async {
     '(mode: $mode; native library: $loadedFrom'
     '${quick ? '; --quick' : ''}${_keepAlive ? '; --keep-alive' : ''}'
     '${_batchEvents ? '; --batch-events' : ''}'
-    '${_workers > 0 ? '; --workers $_workers' : ''})',
+    '${_workers > 0 ? '; --workers $_workers' : ''}'
+    '${_isolates != 1 ? '; --isolates $_isolates' : ''}'
+    '${raw ? '; --raw' : ''})',
   );
   print('');
   print(
@@ -668,6 +910,12 @@ Future<void> main(List<String> args) async {
   print('');
 
   final dartServer = await _startDartServer();
+  final dartIsolates = _isolates == 1
+      ? <Isolate>[]
+      : await _spawnSharedDartServers(
+          dartServer.port,
+          (_isolates == 0 ? Platform.numberOfProcessors ~/ 2 : _isolates) - 1,
+        );
   final shelfServer = await _startShelfServer();
   final nitroServer = await _startNitroServer();
 
@@ -700,6 +948,8 @@ Future<void> main(List<String> args) async {
         clients: clients,
         connections: connections,
         millis: millis,
+        raw: raw,
+        keepAlive: _keepAlive,
       );
       print(result.row);
       if (round == rounds - 1) jsonCases.add(result.json);
@@ -714,6 +964,7 @@ Future<void> main(List<String> args) async {
         'keep_alive': _keepAlive,
         'batch_events': _batchEvents,
         'quick': quick,
+        'raw': raw,
         'connections': connections,
         'clients': clients,
         'cases': jsonCases,
@@ -723,6 +974,9 @@ Future<void> main(List<String> args) async {
   }
 
   await dartServer.close(force: true);
+  for (final isolate in dartIsolates) {
+    isolate.kill(priority: Isolate.immediate);
+  }
   await shelfServer.close(force: true);
   await nitroServer.close();
   print(

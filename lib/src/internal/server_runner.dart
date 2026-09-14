@@ -354,6 +354,14 @@ class ServerRunner {
     _native.stop();
   }
 
+  /// Readies a runner that will not call [start] — a helper isolate behind
+  /// a server another isolate started: subscribe the streams and bind the
+  /// fast path, so the first dealt request finds everything in place.
+  void prepareHelper() {
+    _ensureListening();
+    _fast ??= _bindFast();
+  }
+
   /// The fast path needs a real engine instance behind [_native]; a fake
   /// (tests) has none, and the generated bindings serve instead.
   FastCalls? _bindFast() {

@@ -24,6 +24,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -52,7 +53,10 @@ struct ServerConfig {
   int64_t defaultTimeoutMs = 30000;
   int64_t keepAliveTimeoutMs = 5000;
   int64_t maxRequestsPerConn = 100;
-  int64_t workerThreads = 0;  // <= 0 means max(64, 4 × CPU cores).
+  /// Cap on the worker pool. The pool starts at min(cores, cap) threads
+  /// and grows on demand up to the cap; idle workers above the floor retire
+  /// after 10 s. `<= 0` means max(64, 4 × CPU cores).
+  int64_t workerThreads = 0;
   bool tlsRequested = false;
 };
 
@@ -107,12 +111,37 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
  public:
   ServerInstance() = default;
 
-  /// (Re)binds the dispatch sink. Re-bound on every factory resolve: Dart
-  /// caches impls per key, but a disposed-and-recreated instance must emit on
-  /// the NEW bridge object, which owns the new stream-port registration.
+  /// Replaces every dispatch sink with [emitter] (tests, single runner).
   void setEmitter(Emitter* emitter) {
     std::lock_guard<std::mutex> lk(emitterMutex_);
-    emitter_ = emitter;
+    emitters_.clear();
+    if (emitter) emitters_.push_back(emitter);
+  }
+
+  /// Adds a dispatch sink. One per Dart runner: with several isolates
+  /// behind one server, requests are dealt round-robin across the sinks
+  /// and every message of a request (head, chunks, end, events) goes to
+  /// the sink that got its head. Adding an already-bound sink is a no-op.
+  void addEmitter(Emitter* emitter) {
+    std::lock_guard<std::mutex> lk(emitterMutex_);
+    for (Emitter* e : emitters_) {
+      if (e == emitter) return;
+    }
+    emitters_.push_back(emitter);
+  }
+
+  /// Drops a sink (its bridge object is going away). Requests that already
+  /// captured it finish on it; callers stop the server first.
+  void removeEmitter(Emitter* emitter) {
+    std::lock_guard<std::mutex> lk(emitterMutex_);
+    emitters_.erase(std::remove(emitters_.begin(), emitters_.end(), emitter),
+                    emitters_.end());
+  }
+
+  /// Number of bound sinks. Test seam.
+  size_t emitterCountForTesting() {
+    std::lock_guard<std::mutex> lk(emitterMutex_);
+    return emitters_.size();
   }
 
   void configure(const ServerConfig& config);
@@ -160,6 +189,9 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
 
   /// Test seam: blocks until no connection is active (or timeout).
   bool waitForDrainForTesting(int64_t timeoutMs);
+
+  /// Test seam: live worker threads right now (the pool auto-scales).
+  size_t workersForTesting();
 
  private:
   /// A worker's wake pipe: the answering thread writes one byte to [w] when
@@ -210,7 +242,8 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
 
   /// The frame loop: reads client frames, emits decoded messages, auto-pongs.
   /// Ends with an opcode-8 emit (peer code, or 1006 on failure) and reaps.
-  void wsLoop(int fd, int64_t connectionId, int64_t maxMessageBytes);
+  void wsLoop(int fd, int64_t connectionId, int64_t maxMessageBytes,
+              Emitter* emitter);
 
   /// Sends one server frame under [wsSendMutex_]. Synchronous: bridge memory
   /// is never retained, so no copy is needed.
@@ -218,12 +251,15 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
 
   /// Tracks a malloc-owned WS payload and emits it (freed by the runner's
   /// cumulative ack on the connection id, or by stop()/loop-exit reap).
-  void emitWs(int64_t connectionId, int opcode, const uint8_t* data, size_t n,
-              int code);
+  void emitWs(Emitter* emitter, int64_t connectionId, int opcode,
+              const uint8_t* data, size_t n, int code);
 
   void acceptLoop();
   void workerLoop(Wake wake);
   void handleConnection(int fd, const Wake& wake);
+  /// Adds one detached worker (caller holds queueMutex_). Returns false
+  /// when no wake pipe could be made.
+  bool spawnWorkerLocked();
   /// Parks [fd] at the FRONT of the fd queue (fair: workers pop from the
   /// back) when its socket holds no bytes but queued connections wait.
   /// Returns false when this fd already has data (serve it now) or nothing
@@ -242,17 +278,22 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
                       const std::string& body,
                       const std::vector<Header>& extra = {});
 
-  /// Loads the sink under lock, falling back to a dropping null sink when
-  /// unbound. The single-subscriber invariant guarantees a real sink from
-  /// the first subscribe, which always precedes start().
-  Emitter* lockedEmitter();
+  /// Deals the next request's sink: round-robin over the bound sinks, or a
+  /// dropping null sink when none is bound. Every message of one request
+  /// goes to the sink captured here.
+  Emitter* nextEmitter();
+
+  /// Lifecycle events go to every bound sink.
+  void broadcastEvent(ServerEventKind kind, int64_t requestId,
+                      const std::string& message);
 
   /// Emits an error chunk (tracked, so the runner's ack frees it) followed by
   /// the end marker for a request whose body will never complete.
-  void emitTerminalError(int64_t requestId, const std::string& message,
-                         ErrorKind kind);
+  void emitTerminalError(Emitter* emitter, int64_t requestId,
+                         const std::string& message, ErrorKind kind);
 
-  Emitter* emitter_ = nullptr;
+  std::vector<Emitter*> emitters_;
+  std::atomic<uint64_t> emitterRr_{0};
   std::mutex emitterMutex_;
   mutable std::shared_mutex configMutex_;
   ServerConfig config_;
@@ -264,14 +305,21 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   std::thread acceptThread_;
   std::mutex acceptMutex_;
 
-  // Worker pool: bounded queue, fixed workers. The queue bound is the
-  // listen backlog — beyond it the engine refuses fast rather than letting
-  // the accept loop outrun the workers.
-  std::vector<std::thread> workers_;
-  std::vector<Wake> workerWakes_;  // stop() pokes every parked worker
+  // Worker pool: bounded queue, auto-scaling detached workers. The accept
+  // loop spawns a worker when it queues an fd and none is idle (up to the
+  // cap); a worker idle for 10 s retires if the pool is above its floor.
+  // The queue bound is the listen backlog — beyond it the engine refuses
+  // fast rather than letting the accept loop outrun the workers.
+  // All pool state below is guarded by queueMutex_.
   std::mutex queueMutex_;
   std::condition_variable queueCv_;
+  std::condition_variable workersGoneCv_;  // stop() waits for count == 0
   std::deque<int> queue_;
+  std::vector<Wake> workerWakes_;  // live workers: stop() pokes each
+  unsigned workerCount_ = 0;
+  unsigned idleWorkers_ = 0;
+  unsigned workerFloor_ = 0;
+  unsigned workerCap_ = 0;
 
   // Live connections, so stop() can wake idle keep-alive reads.
   std::mutex activeMutex_;
@@ -281,6 +329,7 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   // loop exit and on wsClose; either order is safe (erase is idempotent).
   struct WsConn {
     int fd = -1;
+    Emitter* emitter = nullptr;  // the runner that owns the session
   };
   std::mutex wsMutex_;
   std::unordered_map<int64_t, WsConn> ws_;

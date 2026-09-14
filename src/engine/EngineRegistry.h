@@ -18,8 +18,10 @@ namespace nitroserver {
 
 class EngineRegistry {
  public:
-  /// Resolves (creating on demand) the server for [key]. The `engine` key
-  /// returns a shared unbound instance used only for capabilities/reset.
+  /// Resolves (creating on demand) the server for [key] and binds [emitter]
+  /// as one of its sinks: several Dart isolates resolving the same key share
+  /// one server and split its requests. The `engine` key returns a shared
+  /// unbound instance used only for capabilities/reset.
   static std::shared_ptr<ServerInstance> resolve(const std::string& key,
                                                  Emitter* emitter);
 

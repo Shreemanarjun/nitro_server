@@ -19,11 +19,11 @@ std::shared_ptr<ServerInstance> EngineRegistry::resolve(const std::string& key,
   auto& map = instances();
   auto it = map.find(key);
   if (it != map.end()) {
-    it->second->setEmitter(emitter);
+    it->second->addEmitter(emitter);
     return it->second;
   }
   auto inst = std::make_shared<ServerInstance>();
-  inst->setEmitter(emitter);
+  inst->addEmitter(emitter);
   map.emplace(key, inst);
   return inst;
 }

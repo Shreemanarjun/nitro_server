@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstring>
 #include <csignal>
+#include <string_view>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -104,19 +105,6 @@ inline bool icontains(const std::string& hay, const char* needle) {
   return false;
 }
 
-std::string lower(std::string s) {
-  std::transform(s.begin(), s.end(), s.begin(),
-                 [](unsigned char c) { return (char)std::tolower(c); });
-  return s;
-}
-
-std::string trim(const std::string& s) {
-  size_t b = s.find_first_not_of(" \t");
-  if (b == std::string::npos) return "";
-  size_t e = s.find_last_not_of(" \t");
-  return s.substr(b, e - b + 1);
-}
-
 /// Reads until a full head is buffered, honouring the per-connection receive
 /// timeout (idle deadline between keep-alive requests, header deadline on the
 /// first). Surplus bytes after the head stay in [buf] for the body reader and
@@ -145,28 +133,43 @@ struct ParsedHead {
   bool ok = false;
 };
 
+/// Trims whitespace off a view without allocating. The caller copies only
+/// the survivors into their owning strings.
+inline std::string_view trimSv(std::string_view s) {
+  const size_t b = s.find_first_not_of(" \t");
+  if (b == std::string_view::npos) return {};
+  const size_t e = s.find_last_not_of(" \t");
+  return s.substr(b, e - b + 1);
+}
+
 ParsedHead parseHead(const std::string& raw, size_t headEnd) {
   ParsedHead p;
-  const std::string head = raw.substr(0, headEnd);
-  size_t lineEnd = head.find("\r\n");
-  if (lineEnd == std::string::npos) return p;
-  const std::string requestLine = head.substr(0, lineEnd);
-  size_t sp1 = requestLine.find(' ');
-  size_t sp2 = sp1 == std::string::npos
-                   ? std::string::npos
-                   : requestLine.find(' ', sp1 + 1);
-  if (sp1 == std::string::npos || sp2 == std::string::npos) return p;
+  // Zero-copy: every slice below is a view into `raw`. Only the fields that
+  // outlive the parse (target halves, header names/values, custom method)
+  // are copied into owning strings. Views never escape: `carry` may
+  // reallocate on later appends, so nothing here may be retained.
+  const std::string_view head(raw.data(), headEnd);
+  const size_t lineEnd = head.find("\r\n");
+  if (lineEnd == std::string_view::npos) return p;
+  const std::string_view requestLine = head.substr(0, lineEnd);
+  const size_t sp1 = requestLine.find(' ');
+  const size_t sp2 = sp1 == std::string_view::npos
+                         ? std::string_view::npos
+                         : requestLine.find(' ', sp1 + 1);
+  if (sp1 == std::string_view::npos || sp2 == std::string_view::npos) return p;
   p.method = parseMethod(requestLine.substr(0, sp1), p.customMethod);
-  p.target = requestLine.substr(sp1 + 1, sp2 - sp1 - 1);
-  p.version = trim(requestLine.substr(sp2 + 1));
+  const std::string_view target = requestLine.substr(sp1 + 1, sp2 - sp1 - 1);
+  p.target.assign(target.data(), target.size());
+  const std::string_view version = trimSv(requestLine.substr(sp2 + 1));
+  p.version.assign(version.data(), version.size());
   // The head slice excludes the terminal \r\n\r\n, so the LAST header line
   // has no line ending — a loop that requires one silently drops it (which
   // used to hide `Connection: close` and a trailing Content-Length).
   size_t pos = lineEnd + 2;
   while (pos <= head.size()) {
-    size_t eol = head.find("\r\n", pos);
-    std::string line;
-    if (eol == std::string::npos) {
+    const size_t eol = head.find("\r\n", pos);
+    std::string_view line;
+    if (eol == std::string_view::npos) {
       line = head.substr(pos);
       pos = head.size() + 1;
     } else {
@@ -175,10 +178,11 @@ ParsedHead parseHead(const std::string& raw, size_t headEnd) {
       pos = eol + 2;
     }
     if (line.empty()) break;
-    size_t colon = line.find(':');
-    if (colon == std::string::npos) return p;
-    p.headers.push_back(
-        {trim(line.substr(0, colon)), trim(line.substr(colon + 1))});
+    const size_t colon = line.find(':');
+    if (colon == std::string_view::npos) return p;
+    const std::string_view name = trimSv(line.substr(0, colon));
+    const std::string_view value = trimSv(line.substr(colon + 1));
+    p.headers.push_back({std::string(name), std::string(value)});
   }
   p.ok = true;
   return p;
@@ -203,6 +207,18 @@ bool clientWantsKeepAlive(const ParsedHead& head) {
   if (icontains(conn->value, "close")) return false;
   if (is11) return true;
   return icontains(conn->value, "keep-alive");
+}
+
+/// True for an RFC 6455 WebSocket handshake attempt: `Connection` names
+/// `upgrade` and `Upgrade` names `websocket` (both case-insensitive).
+/// The engine speaks plain HTTP/1.1 only, so these never reach routing —
+/// serveOne answers 426 directly (see below).
+bool isWebSocketUpgrade(const ParsedHead& head) {
+  const Header* conn = findHeader(head.headers, "connection");
+  const Header* upgrade = findHeader(head.headers, "upgrade");
+  if (!conn || !upgrade) return false;
+  return icontains(conn->value, "upgrade") &&
+         icontains(upgrade->value, "websocket");
 }
 
 }  // namespace
@@ -280,7 +296,10 @@ StatusResult ServerInstance::start() {
             0};
   }
 
-  Fd fd = socket(AF_INET, SOCK_STREAM, 0);
+  // IPv6 when the host is a v6 literal (contains ':'). Binding "::" is
+  // dual-stack (IPV6_V6ONLY off), so one socket serves v4-mapped clients too.
+  const bool isV6 = cfg.host.find(':') != std::string::npos;
+  Fd fd = socket(isV6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
   if (fd == kBadFd) {
     running_.store(false);
     return {ErrorKind::BindFailed, "socket() failed", 0};
@@ -292,20 +311,41 @@ StatusResult ServerInstance::start() {
   // SecondBindOnSamePortFails test on macOS/Linux). REUSEADDR alone is
   // enough for fast rebind after stop(); accepted sockets never block the
   // listen port.
+  if (isV6) {
+    int off = 0;
+    setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&off, sizeof(off));
+  }
   setNoSigPipe(fd);
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons((uint16_t)cfg.port);
-  if (cfg.host == "0.0.0.0") {
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-  } else {
-    if (inet_pton(AF_INET, cfg.host.c_str(), &addr.sin_addr) != 1) {
+  sockaddr_storage addr{};
+  socklen_t addrLen = 0;
+  if (isV6) {
+    auto* a6 = (sockaddr_in6*)&addr;
+    a6->sin6_family = AF_INET6;
+    a6->sin6_port = htons((uint16_t)cfg.port);
+    if (cfg.host == "::") {
+      a6->sin6_addr = in6addr_any;
+    } else if (inet_pton(AF_INET6, cfg.host.c_str(), &a6->sin6_addr) != 1) {
       closeFd(fd);
       running_.store(false);
       return {ErrorKind::BindFailed, "invalid host: " + cfg.host, 0};
     }
+    addrLen = sizeof(sockaddr_in6);
+  } else {
+    auto* a4 = (sockaddr_in*)&addr;
+    a4->sin_family = AF_INET;
+    a4->sin_port = htons((uint16_t)cfg.port);
+    if (cfg.host == "0.0.0.0") {
+      a4->sin_addr.s_addr = htonl(INADDR_ANY);
+    } else {
+      if (inet_pton(AF_INET, cfg.host.c_str(), &a4->sin_addr) != 1) {
+        closeFd(fd);
+        running_.store(false);
+        return {ErrorKind::BindFailed, "invalid host: " + cfg.host, 0};
+      }
+    }
+    addrLen = sizeof(sockaddr_in);
   }
-  if (bind(fd, (sockaddr*)&addr, sizeof(addr)) != 0 ||
+  if (bind(fd, (sockaddr*)&addr, addrLen) != 0 ||
       listen(fd, (int)(cfg.backlog > 0 ? cfg.backlog : 128)) != 0) {
     closeFd(fd);
     running_.store(false);
@@ -315,10 +355,12 @@ StatusResult ServerInstance::start() {
             0};
   }
   if (cfg.port == 0) {
-    sockaddr_in bound{};
+    sockaddr_storage bound{};
     socklen_t len = sizeof(bound);
     if (getsockname(fd, (sockaddr*)&bound, &len) == 0) {
-      boundPort_.store(ntohs(bound.sin_port));
+      boundPort_.store(ntohs(bound.ss_family == AF_INET6
+                                 ? ((sockaddr_in6*)&bound)->sin6_port
+                                 : ((sockaddr_in*)&bound)->sin_port));
     }
   } else {
     boundPort_.store(cfg.port);
@@ -418,7 +460,7 @@ void ServerInstance::acceptLoop() {
     maxQueued = config_.backlog > 0 ? config_.backlog : 128;
   }
   while (running_.load()) {
-    sockaddr_in peer{};
+    sockaddr_storage peer{};
     socklen_t len = sizeof(peer);
     Fd fd = accept((Fd)listenFd_, (sockaddr*)&peer, &len);
     if (fd == kBadFd) {
@@ -470,12 +512,14 @@ bool ServerInstance::sendAll(int fd, const uint8_t* data, size_t n) {
 }
 
 void ServerInstance::answerDirectly(int fd, Method method, int64_t status,
-                                    const std::string& body) {
+                                    const std::string& body,
+                                    const std::vector<Header>& extra) {
   std::string head = "HTTP/1.1 " + std::to_string(status) + " " +
                      reasonPhrase(status) +
                      "\r\nContent-Type: text/plain\r\nContent-Length: " +
-                     std::to_string(body.size()) +
-                     "\r\nConnection: close\r\n\r\n";
+                     std::to_string(body.size()) + "\r\n";
+  for (const auto& h : extra) head += h.name + ": " + h.value + "\r\n";
+  head += "Connection: close\r\n\r\n";
   sendAll(fd, (const uint8_t*)head.data(), head.size());
   if (method != Method::Head && !body.empty())
     sendAll(fd, (const uint8_t*)body.data(), body.size());
@@ -548,6 +592,15 @@ bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served) {
   ParsedHead head = parseHead(carry, headEnd);
   if (!head.ok) {
     answerDirectly(fd, Method::Get, 400, "bad request");
+    return false;
+  }
+  // No WebSocket support: refuse the handshake honestly (RFC 6455 §4.2.2 —
+  // 426 plus Sec-WebSocket-Version) instead of a misleading 404. Before
+  // routing: no route can match an Upgrade, and dispatching one would park
+  // a worker on a body that never arrives.
+  if (isWebSocketUpgrade(head)) {
+    answerDirectly(fd, head.method, 426, "websocket not supported",
+                   {{"Sec-WebSocket-Version", "13"}});
     return false;
   }
   const bool keepPeer =

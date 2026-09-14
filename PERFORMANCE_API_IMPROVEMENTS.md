@@ -3,8 +3,9 @@
 Source: audit of `lib/src/internal/server_runner.dart`, `lib/src/api/*`,
 `src/engine/ServerInstance.cpp`, `src/engine/Router.cpp`, `src/HybridNitroServer.cpp`.
 
-Verified: 40/40 C++ engine tests, 127/127 Dart tests, `benchmark/compare.dart --quick`
-(nitro fastest on `/hello` and `/json` latency). N7/E7 remain deferred futures by design.
+Verified: 44/44 C++ engine tests, 167/167 Dart tests, `benchmark/compare.dart --quick`
+(nitro fastest on `/hello` and `/json` latency). Full streaming + WebSocket data
+transfer remain the only deferred futures (protocol work).
 
 ## 1. Native hot path
 
@@ -16,7 +17,7 @@ Verified: 40/40 C++ engine tests, 127/127 Dart tests, `benchmark/compare.dart --
 | N4 | `kBodyEmitBytes` 32k → 64k | halves `malloc` + `ackBody` FFI crossings on uploads | low | ✅ done |
 | N5 | `writev` send path on POSIX (header + body, 1 syscall, no copy); keep 2-send fallback on Windows | removes `<=128k` copy into `head_out` and 2nd syscall for large bodies | medium | ✅ done (`ServerInstance.cpp`) |
 | N6 | Default workers `max(8, 2×cores)` instead of `1×cores` | worker parks on Dart `respond`; 1×cores stalls under concurrent slow handlers | low | ✅ done (`ServerInstance::start`) |
-| N7 (future) | `string_view` zero-copy request-line parser, IPv6 dual-stack | removes ~5 `substr` allocs/req | higher — deferred | ⏳ deferred |
+| N7 | `string_view` zero-copy request-line parser, IPv6 dual-stack | removes ~5 `substr` allocs/req | higher | ✅ done — `parseHead` parses views (only target/query/headers/custom copied into owning strings); `parseMethod` gained a `string_view` overload; `start()` binds `AF_INET6` for v6-literal hosts with `IPV6_V6ONLY=0` (`::` serves v4-mapped too); invalid hosts fail honestly |
 
 ## 2. Dart dispatch
 
@@ -37,7 +38,7 @@ Verified: 40/40 C++ engine tests, 127/127 Dart tests, `benchmark/compare.dart --
 | E4 | `ServerConfig.copyWith()` + `NitroServer.bindWith({host, port, ...})` sugar | ✅ done (`context.dart`, `server.dart`) |
 | E5 | Per-route `middleware:` param + `RouteGroup.use()` (route-local list composed after globals) | ✅ done (`server.dart`, `route_group.dart`, `server_runner.dart`) |
 | E6 | Built-in `cors()` middleware | ✅ done (`middleware.dart`) |
-| E7 (future) | In-memory test client, request/response streaming, WebSocket 426 — tracked, not in this pass | ⏳ deferred |
+| E7 | In-memory test client + WebSocket 426 (streaming + WS data transfer stay future) | ✅ done — `package:nitro_server/testing.dart` (`NitroTestClient` over a real `ServerRunner` with engine-precedence matching; divergences documented); engine answers RFC 6455 handshakes with `426` + `Sec-WebSocket-Version: 13` before routing (never dispatched). Full request/response streaming and WebSocket data transfer remain ⏳ deferred (need chunked-output protocol + bridge changes) |
 
 ## Order of work
 

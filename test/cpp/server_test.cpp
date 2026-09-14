@@ -12,6 +12,7 @@
 #include <atomic>
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <deque>
@@ -33,6 +34,25 @@ int connectTo(int port) {
   addr.sin_family = AF_INET;
   addr.sin_port = htons((uint16_t)port);
   inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+  if (connect(fd, (sockaddr*)&addr, sizeof(addr)) != 0) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+/// Connects over IPv6 loopback. Returns -1 when IPv6 is unavailable, so
+/// callers can GTEST_SKIP instead of failing where v6 does not exist.
+int connectToV6(int port, const char* host = "::1") {
+  int fd = socket(AF_INET6, SOCK_STREAM, 0);
+  if (fd < 0) return -1;
+  sockaddr_in6 addr{};
+  addr.sin6_family = AF_INET6;
+  addr.sin6_port = htons((uint16_t)port);
+  if (inet_pton(AF_INET6, host, &addr.sin6_addr) != 1) {
+    close(fd);
+    return -1;
+  }
   if (connect(fd, (sockaddr*)&addr, sizeof(addr)) != 0) {
     close(fd);
     return -1;
@@ -567,6 +587,97 @@ TEST(ServerTest, TlsConfigIsRefused) {
   server->configure(cfg);
   StatusResult r = server->start();
   EXPECT_EQ(r.kind, ErrorKind::TlsError);
+}
+
+TEST(ServerTest, InvalidHostIsBindFailed) {
+  auto server = std::make_shared<ServerInstance>();
+  RecordingEmitter emitter([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "x");
+  });
+  server->setEmitter(&emitter);
+  for (const char* bad : {"not a host", "999.1.1.1", "::zzzz"}) {
+    ServerConfig cfg;
+    cfg.port = 0;
+    cfg.host = bad;
+    server->configure(cfg);
+    EXPECT_EQ(server->start().kind, ErrorKind::BindFailed) << bad;
+  }
+}
+
+TEST(ServerTest, Ipv6LoopbackServes) {
+  if (connectToV6(1) == -1 && errno != ECONNREFUSED) {
+    GTEST_SKIP() << "no IPv6 loopback on this machine";
+  }
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "v6");
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "/hello", -1).kind,
+            ErrorKind::None);
+  ServerConfig cfg;
+  cfg.port = 0;
+  cfg.host = "::1";
+  f.server->configure(cfg);
+  ASSERT_EQ((int64_t)f.server->start().kind, (int64_t)ErrorKind::None);
+  const int64_t port = f.server->boundPort();
+
+  const int fd = connectToV6((int)port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+  const std::string res = readAll(fd);
+  close(fd);
+
+  EXPECT_EQ(statusOf(res), 200);
+  EXPECT_EQ(bodyOf(res), "v6");
+}
+
+TEST(ServerTest, DualStackWildcardServesIpv4) {
+  if (connectToV6(1) == -1 && errno != ECONNREFUSED) {
+    GTEST_SKIP() << "no IPv6 on this machine";
+  }
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "dual");
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "/hello", -1).kind,
+            ErrorKind::None);
+  ServerConfig cfg;
+  cfg.port = 0;
+  cfg.host = "::";
+  f.server->configure(cfg);
+  ASSERT_EQ((int64_t)f.server->start().kind, (int64_t)ErrorKind::None);
+  const int64_t port = f.server->boundPort();
+
+  // A v4 client reaches the v6-any socket via mapped addresses: one socket
+  // serves both families.
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+  EXPECT_EQ(statusOf(readAll(fd)), 200);
+  close(fd);
+}
+
+TEST(ServerTest, WebSocketHandshakeIs426WithoutDispatch) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "unreachable");
+  });
+  // Even a matching route must not see the handshake.
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "/chat", -1).kind,
+            ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd,
+          "GET /chat HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n"
+          "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+          "Sec-WebSocket-Version: 13\r\n\r\n");
+  const std::string res = readAll(fd);
+  close(fd);
+
+  EXPECT_EQ(statusOf(res), 426);
+  EXPECT_EQ(headerOf(res, "sec-websocket-version"), "13");
+  EXPECT_EQ(headerOf(res, "connection"), "close");
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_TRUE(f.emitter.seen().empty());
 }
 
 TEST(ServerTest, StartStopCyclesLeaveNoResidue) {

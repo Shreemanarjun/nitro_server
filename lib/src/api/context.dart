@@ -31,6 +31,9 @@ class TlsConfig {
 
 /// Tuning for one bound server.
 class ServerConfig {
+  /// [host] is an IPv4 literal (`'127.0.0.1'`), the wildcard `'0.0.0.0'`,
+  /// or an IPv6 literal (`'::1'`, or `'::'` for dual-stack: one socket
+  /// serving both v4-mapped and v6 clients).
   const ServerConfig({
     this.host = '127.0.0.1',
     this.port = 0,

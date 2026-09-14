@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace nitroserver {
@@ -69,8 +70,10 @@ struct RouteParam {
   std::string value;
 };
 
-/// Parses an HTTP method token. Unknown tokens become Custom.
-inline Method parseMethod(const std::string& token, std::string& customOut) {
+/// Parses an HTTP method token. Unknown tokens become Custom. The
+/// `string_view` overload compares in place so the hot path allocates
+/// nothing; the `string` overload delegates to it.
+inline Method parseMethod(std::string_view token, std::string& customOut) {
   if (token == "GET") return Method::Get;
   if (token == "HEAD") return Method::Head;
   if (token == "POST") return Method::Post;
@@ -79,8 +82,12 @@ inline Method parseMethod(const std::string& token, std::string& customOut) {
   if (token == "PATCH") return Method::Patch;
   if (token == "OPTIONS") return Method::Options;
   if (token == "TRACE") return Method::Trace;
-  customOut = token;
+  customOut.assign(token.data(), token.size());
   return Method::Custom;
+}
+
+inline Method parseMethod(const std::string& token, std::string& customOut) {
+  return parseMethod(std::string_view(token), customOut);
 }
 
 inline std::string methodName(Method m, const std::string& custom) {
@@ -109,6 +116,7 @@ inline const char* reasonPhrase(int64_t status) {
     case 405: return "Method Not Allowed";
     case 408: return "Request Timeout";
     case 413: return "Content Too Large";
+    case 426: return "Upgrade Required";
     case 500: return "Internal Server Error";
     case 503: return "Service Unavailable";
     default: return "Unknown";

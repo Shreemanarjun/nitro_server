@@ -47,12 +47,13 @@ Future<({int status, String body, HttpHeaders headers})> _get(
   String method = 'GET',
   Map<String, String>? headers,
   List<int>? body,
+  String host = '127.0.0.1',
 }) async {
   final client = HttpClient();
   try {
     final request = await client.openUrl(
       method,
-      Uri.parse('http://127.0.0.1:$port$path'),
+      Uri.parse('http://$host:$port$path'),
     );
     headers?.forEach(request.headers.set);
     if (body != null) request.add(body);
@@ -497,6 +498,43 @@ void main() {
         'inner-after',
         'outer-after',
       ]);
+    }, skip: skipReason);
+
+    test('a websocket handshake is refused with 426, never dispatched',
+        () async {
+      var calls = 0;
+      server = await NitroServer.bind();
+      await server!.route(HttpMethod.get, '/chat', (_) async {
+        calls++;
+        return ResponseContext.text('not a socket');
+      });
+
+      final res = await _get(
+        server!.port,
+        '/chat',
+        headers: {
+          'Connection': 'Upgrade',
+          'Upgrade': 'websocket',
+          'Sec-WebSocket-Version': '13',
+          'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
+        },
+      );
+      expect(res.status, 426);
+      expect(res.body, contains('websocket'));
+      expect(calls, 0);
+    }, skip: skipReason);
+
+    test('binds IPv6 loopback when asked', () async {
+      server = await NitroServer.bind(const ServerConfig(host: '::1'));
+      await server!.route(
+        HttpMethod.get,
+        '/h6',
+        (_) async => ResponseContext.text('v6'),
+      );
+
+      final res = await _get(server!.port, '/h6', host: '[::1]');
+      expect(res.status, 200);
+      expect(res.body, 'v6');
     }, skip: skipReason);
 
     test('a second bind on the same port fails to bind', () async {

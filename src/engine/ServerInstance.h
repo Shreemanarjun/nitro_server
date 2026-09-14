@@ -124,8 +124,11 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   static bool sendAll(int fd, const uint8_t* data, size_t n);
 
   /// Fast error path. Always closes: errors never keep alive (see header).
+  /// [extra] headers ride ahead of the framing headers (e.g.
+  /// `Sec-WebSocket-Version` on a 426).
   void answerDirectly(int fd, Method method, int64_t status,
-                      const std::string& body);
+                      const std::string& body,
+                      const std::vector<Header>& extra = {});
 
   /// Loads the sink under lock, falling back to a dropping null sink when
   /// unbound. The single-subscriber invariant guarantees a real sink from

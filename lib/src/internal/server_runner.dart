@@ -400,40 +400,43 @@ class ServerRunner {
   void _onChunk(RawBodyChunk chunk) {
     if (_closed) return;
     final kind = RawBodyKind.values[chunk.kind];
-    if (kind == RawBodyKind.data) {
-      // Copy FIRST: `bytes` is a view into native memory that the ack frees.
-      final copy = _copyAndAck(chunk.requestId, chunk.bytes);
-      final pending = _pending[chunk.requestId];
-      if (pending == null) {
-        // Head has not landed yet: park the COPY (already acked) until it
-        // does. Never the view — it dies with this handler.
-        (_early[chunk.requestId] ??= []).add(copy);
-        _boundEarly();
-      } else if (!pending.complete) {
-        pending.body.add(copy);
-      }
+    // Switch, exhaustive with no default: a new RawBodyKind breaks
+    // compilation instead of silently falling into end-marker handling.
+    switch (kind) {
+      case RawBodyKind.data:
+        // Copy FIRST: `bytes` is a view into native memory that the ack frees.
+        final copy = _copyAndAck(chunk.requestId, chunk.bytes);
+        final pending = _pending[chunk.requestId];
+        if (pending == null) {
+          // Head has not landed yet: park the COPY (already acked) until it
+          // does. Never the view — it dies with this handler.
+          (_early[chunk.requestId] ??= []).add(copy);
+          _boundEarly();
+        } else if (!pending.complete) {
+          pending.body.add(copy);
+        }
       // A chunk for a completed request is a stale duplicate: already acked
       // above, bytes dropped.
-    } else if (kind == RawBodyKind.error) {
-      final message = String.fromCharCodes(chunk.bytes);
-      _copyAndAck(chunk.requestId, chunk.bytes);
-      final pending = _pending[chunk.requestId];
-      if (pending == null) {
-        _earlyErrors[chunk.requestId] = message;
-        _boundEarly();
-      } else if (!pending.complete) {
-        pending.error = message;
-      }
-    } else {
-      // End marker: no payload, no sequence consumed, no ack.
-      final pending = _pending[chunk.requestId];
-      if (pending == null) {
-        _earlyComplete.add(chunk.requestId);
-        _boundEarly();
-      } else if (!pending.complete) {
-        pending.complete = true;
-        _dispatch(pending);
-      }
+      case RawBodyKind.error:
+        final message = String.fromCharCodes(chunk.bytes);
+        _copyAndAck(chunk.requestId, chunk.bytes);
+        final pending = _pending[chunk.requestId];
+        if (pending == null) {
+          _earlyErrors[chunk.requestId] = message;
+          _boundEarly();
+        } else if (!pending.complete) {
+          pending.error = message;
+        }
+      case RawBodyKind.end:
+        // End marker: no payload, no sequence consumed, no ack.
+        final pending = _pending[chunk.requestId];
+        if (pending == null) {
+          _earlyComplete.add(chunk.requestId);
+          _boundEarly();
+        } else if (!pending.complete) {
+          pending.complete = true;
+          _dispatch(pending);
+        }
     }
   }
 
@@ -618,16 +621,51 @@ class ServerRunner {
       _complete(requestId);
       return;
     }
+    // A positive [streamBufferSize] coalesces events into fewer bridge
+    // crossings; zero forwards every event immediately (real-time feeds).
+    final bufferSize = response.streamBufferSize;
+    final BytesBuilder? pending = bufferSize > 0
+        ? BytesBuilder(copy: false)
+        : null;
+    void send(Uint8List bytes) {
+      if (_closed || bytes.isEmpty) return;
+      try {
+        _native.sendStreamChunk(requestId, bytes, false);
+      } catch (_) {}
+    }
+
+    void onEvent(Uint8List chunk) {
+      if (chunk.isEmpty) return;
+      final acc = pending;
+      if (acc == null) {
+        send(chunk);
+        return;
+      }
+      acc.add(chunk);
+      if (acc.length >= bufferSize) {
+        final bytes = acc.toBytes();
+        acc.clear();
+        send(bytes);
+      }
+    }
+
+    void onEnd() {
+      // Flush the remainder before the terminal chunk: bytes already
+      // accepted must reach the client even when the stream errors.
+      final acc = pending;
+      if (acc != null && acc.isNotEmpty) {
+        final rest = acc.toBytes();
+        acc.clear();
+        send(rest);
+      }
+      _finishStream(requestId);
+    }
+
     late final StreamSubscription<Uint8List> sub;
     sub = response.bodyStream!.listen(
-      (chunk) {
-        if (_closed || chunk.isEmpty) return;
-        try {
-          _native.sendStreamChunk(requestId, chunk, false);
-        } catch (_) {}
-      },
-      onError: (_) => _finishStream(requestId),
-      onDone: () => _finishStream(requestId),
+      onEvent,
+      onError: (_) => onEnd(),
+      onDone: onEnd,
       cancelOnError: true,
     );
     _outbound[requestId] = sub;

@@ -13,7 +13,12 @@
       "Shell(dart run tool/repro/ka_first.dart 2>&1; echo \"=== e2e rerun ===\"; dart test test/server_e2e_test.dart --plain-name \"native server idle keep-alive connections close after the timeout\" 2>&1 | tail -8)",
       "Shell(grep:*)",
       "Shell(echo:*)",
-      "Shell(mkdir -p build/benchmark && dart compile exe benchmark/compare.dart -o build/benchmark/compare >/tmp/aot_compile.log 2>&1 && echo COMPILED && ./build/benchmark/compare 2>&1 | tail -26)"
+      "Shell(mkdir -p build/benchmark && dart compile exe benchmark/compare.dart -o build/benchmark/compare >/tmp/aot_compile.log 2>&1 && echo COMPILED && ./build/benchmark/compare 2>&1 | tail -26)",
+      "Shell(dart run tool/perf/nitro_only.dart 20 > /tmp/nitro_only.log 2>&1 & echo \"started pid=$!\"; sleep 6; PID=$(pgrep -f \"nitro_only\" | head -1); echo \"sampling pid=$PID\"; sample $PID 8 -file /tmp/nitro_sample.txt >/dev/null 2>&1; echo sampled; tail -3 /tmp/nitro_only.log)",
+      "Shell(awk:*)",
+      "Shell(dart compile exe tool/perf/nitro_only.dart -o build/perf/nitro_only >/tmp/perf_compile.log 2>&1 && echo COMPILED && (./build/perf/nitro_only 20 > /tmp/nitro_only.log 2>&1 &) && sleep 5 && PID=$(pgrep -f \"build/perf/nitro_only\" | head -1) && echo \"pid=$PID\" && sample $PID 8 -file /tmp/nitro_sample.txt >/dev/null 2>&1 && echo sampled && grep -E \"^\\s+[0-9]+ |Sort by top\" -A25 /tmp/nitro_sample.txt | head -50)",
+      "Shell(tail -5 /tmp/perf_compile.log; ls -la build/perf/ 2>/dev/null; echo \"---\"; cat /tmp/nitro_only.log 2>/dev/null | tail -3)",
+      "Shell(mkdir -p build/perf && dart compile exe tool/perf/nitro_only.dart -o build/perf/nitro_only >/tmp/perf_compile.log 2>&1 && echo COMPILED && (./build/perf/nitro_only 20 > /tmp/nitro_only.log 2>&1 &) && sleep 5 && PID=$(pgrep -f \"build/perf/nitro_only\" | head -1) && echo \"pid=$PID\" && sample $PID 8 -file /tmp/nitro_sample.txt >/dev/null 2>&1 && echo sampled && tail -2 /tmp/nitro_only.log)"
     ],
     "deny": [],
     "defaultMode": "default"

@@ -14,29 +14,36 @@ import '../nitro_server.native.dart';
 /// Throws the typed exception for a failed [RawServerStatus]. A `none`
 /// status returns the envelope's `boundPort` instead.
 int throwIfFailed(RawServerStatus status, {required String operation}) {
-  switch (status.errorKind) {
-    case RawServerErrorKind.none:
-      return status.boundPort;
-    case RawServerErrorKind.alreadyRunning:
-      throw ServerAlreadyRunningException('$operation: ${status.errorMessage}');
-    case RawServerErrorKind.notRunning:
-      throw ServerNotRunningException('$operation: ${status.errorMessage}');
-    case RawServerErrorKind.bindFailed:
-      throw ServerBindException('$operation: ${status.errorMessage}');
-    case RawServerErrorKind.tlsError:
-      throw ServerTlsException('$operation: ${status.errorMessage}');
-    case RawServerErrorKind.routeNotFound:
-      throw RouteNotFoundException('$operation: ${status.errorMessage}');
-    case RawServerErrorKind.handlerTimeout:
-      throw HandlerTimeoutException('$operation: ${status.errorMessage}');
-    case RawServerErrorKind.requestTooLarge:
-    case RawServerErrorKind.badRequest:
-      throw ServerBadRequestException('$operation: ${status.errorMessage}');
-    case RawServerErrorKind.responseTooLarge:
-    case RawServerErrorKind.io:
-    case RawServerErrorKind.unknown:
-      throw ServerUnknownException('$operation: ${status.errorMessage}');
-  }
+  // Switch expression, exhaustive with no default: adding a
+  // RawServerErrorKind breaks compilation until a mapping follows.
+  return switch (status.errorKind) {
+    RawServerErrorKind.none => status.boundPort,
+    RawServerErrorKind.alreadyRunning => throw ServerAlreadyRunningException(
+      '$operation: ${status.errorMessage}',
+    ),
+    RawServerErrorKind.notRunning => throw ServerNotRunningException(
+      '$operation: ${status.errorMessage}',
+    ),
+    RawServerErrorKind.bindFailed => throw ServerBindException(
+      '$operation: ${status.errorMessage}',
+    ),
+    RawServerErrorKind.tlsError => throw ServerTlsException(
+      '$operation: ${status.errorMessage}',
+    ),
+    RawServerErrorKind.routeNotFound => throw RouteNotFoundException(
+      '$operation: ${status.errorMessage}',
+    ),
+    RawServerErrorKind.handlerTimeout => throw HandlerTimeoutException(
+      '$operation: ${status.errorMessage}',
+    ),
+    RawServerErrorKind.requestTooLarge || RawServerErrorKind.badRequest =>
+      throw ServerBadRequestException('$operation: ${status.errorMessage}'),
+    RawServerErrorKind.responseTooLarge ||
+    RawServerErrorKind.io ||
+    RawServerErrorKind.unknown => throw ServerUnknownException(
+      '$operation: ${status.errorMessage}',
+    ),
+  };
 }
 
 /// Maps a public method to its wire value plus custom token.

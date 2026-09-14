@@ -190,6 +190,12 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   void acceptLoop();
   void workerLoop();
   void handleConnection(int fd);
+  /// Parks [fd] at the FRONT of the fd queue (fair: workers pop from the
+  /// back) when its socket holds no bytes but queued connections wait.
+  /// Returns false when this fd already has data (serve it now) or nothing
+  /// is queued (blocking here harms nobody). Never closes: keep-alive and
+  /// non-idempotent methods survive a yield untouched.
+  bool yieldToQueued(int fd);
   static bool sendAll(int fd, const uint8_t* data, size_t n);
   /// One chunked-body chunk per call (see serveStream): size line +
   /// payload + CRLF in a single syscall where the platform allows.

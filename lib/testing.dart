@@ -82,6 +82,12 @@ class NitroTestClient {
   /// handlers here — the same calls production makes.
   late final NitroServer server;
 
+  /// Total non-terminal `sendStreamChunk` calls so far — the bridge
+  /// crossings streams have cost. Batching tests assert this drops while
+  /// response bytes stay identical.
+  int get streamChunkCount =>
+      _native.streamChunkCounts.values.fold(0, (a, b) => a + b);
+
   var _nextId = 0;
 
   Future<NitroTestResponse> _drive(
@@ -171,20 +177,19 @@ class NitroTestClient {
     throw StateError('test client timed out waiting for response to $target');
   }
 
-  static Uint8List _encodeBody(Object? body) {
-    if (body == null) return Uint8List(0);
-    if (body is Uint8List) return body;
-    if (body is List<int>) return Uint8List.fromList(body);
-    if (body is String) return Uint8List.fromList(utf8.encode(body));
-    if (body is Map) {
-      return Uint8List.fromList(utf8.encode(jsonEncode(body)));
-    }
-    throw ArgumentError.value(
+  static Uint8List _encodeBody(Object? body) => switch (body) {
+    null => Uint8List(0),
+    // Uint8List first: it implements List<int>, and the first match wins.
+    Uint8List bytes => bytes,
+    List<int> bytes => Uint8List.fromList(bytes),
+    String text => Uint8List.fromList(utf8.encode(text)),
+    Map _ => Uint8List.fromList(utf8.encode(jsonEncode(body))),
+    _ => throw ArgumentError.value(
       body,
       'body',
       'want String, List<int>, Uint8List or Map (JSON)',
-    );
-  }
+    ),
+  };
 
   /// Issues a GET request.
   Future<NitroTestResponse> get(String path, {Map<String, String>? headers}) =>
@@ -473,6 +478,11 @@ class _InMemoryNative extends NitroServerNative {
 
   @override
   void sendStreamChunk(int requestId, Uint8List chunk, bool last) {
+    if (!last) {
+      // Introspection for batching tests: how many bridge crossings one
+      // stream cost (coalesced or per-event).
+      streamChunkCounts[requestId] = (streamChunkCounts[requestId] ?? 0) + 1;
+    }
     if (chunk.isNotEmpty) {
       (_streamBodies[requestId] ??= BytesBuilder(copy: false)).add(chunk);
     }
@@ -490,6 +500,11 @@ class _InMemoryNative extends NitroServerNative {
   final _streamStatus = <int, int>{};
   final _streamHeaders = <int, Map<String, String>>{};
   final _streamBodies = <int, BytesBuilder>{};
+
+  /// Non-terminal `sendStreamChunk` calls per request id — the bridge
+  /// crossings one stream cost. Single-request tests can read
+  /// `.values.single`; concurrent tests sum or group by id.
+  final streamChunkCounts = <int, int>{};
 
   static String _routeToken(RawRouteConfig route) {
     if (route.method == RawServerMethod.custom) return route.customMethod;
@@ -536,22 +551,18 @@ class _InMemoryNative extends NitroServerNative {
   }
 
   /// Whether [token] is a custom-method token rather than a known verb or `*`.
-  static bool _isCustomToken(String token) {
-    switch (token) {
-      case 'GET':
-      case 'HEAD':
-      case 'POST':
-      case 'PUT':
-      case 'DELETE':
-      case 'PATCH':
-      case 'OPTIONS':
-      case 'TRACE':
-      case '*':
-        return false;
-      default:
-        return true;
-    }
-  }
+  static bool _isCustomToken(String token) => switch (token) {
+    'GET' ||
+    'HEAD' ||
+    'POST' ||
+    'PUT' ||
+    'DELETE' ||
+    'PATCH' ||
+    'OPTIONS' ||
+    'TRACE' ||
+    '*' => false,
+    _ => true,
+  };
 
   /// (specificity, params) when [pattern] matches [pathSegs], else null.
   static (int, Map<String, String>)? _matchPath(

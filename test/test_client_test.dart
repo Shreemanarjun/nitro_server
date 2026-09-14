@@ -186,6 +186,56 @@ void main() {
     expect(response.text(), '0,1,2,');
   });
 
+  test('buffered streams coalesce chunks with identical bytes', () async {
+    await client.server.get('/buf', (_) async {
+      return ResponseContext.stream(
+        Stream.fromIterable([
+          Uint8List.fromList('a'.codeUnits),
+          Uint8List.fromList('bc'.codeUnits),
+          Uint8List.fromList('def'.codeUnits),
+        ]),
+        bufferSize: 1024,
+      );
+    });
+    await client.server.get('/raw', (_) async {
+      return ResponseContext.stream(
+        Stream.fromIterable([
+          Uint8List.fromList('a'.codeUnits),
+          Uint8List.fromList('bc'.codeUnits),
+          Uint8List.fromList('def'.codeUnits),
+        ]),
+      );
+    });
+    final before = client.streamChunkCount;
+    final buffered = await client.get('/buf');
+    final afterBuffered = client.streamChunkCount;
+    final raw = await client.get('/raw');
+    final afterRaw = client.streamChunkCount;
+    expect(buffered.text(), 'abcdef');
+    expect(raw.text(), 'abcdef');
+    // 6 bytes under a 1024-byte buffer: one crossing. Unbuffered: three.
+    expect(afterBuffered - before, 1);
+    expect(afterRaw - afterBuffered, 3);
+  });
+
+  test('buffered streams flush partial buffers at end', () async {
+    await client.server.get('/part', (_) async {
+      return ResponseContext.stream(
+        Stream.fromIterable([
+          Uint8List.fromList('abcdef'.codeUnits),
+          Uint8List.fromList('gh'.codeUnits),
+        ]),
+        bufferSize: 5,
+      );
+    });
+    final before = client.streamChunkCount;
+    final response = await client.get('/part');
+    // 6 bytes flush as one chunk at threshold, 2 remainder at end: two
+    // crossings, bytes identical and ordered.
+    expect(response.text(), 'abcdefgh');
+    expect(client.streamChunkCount - before, 2);
+  });
+
   test('websocket echo round-trips', () async {
     await client.server.ws('/chat', (session) async {
       await for (final message in session.messages) {

@@ -18,6 +18,7 @@ using socklen_t = int;
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -615,6 +616,36 @@ void ServerInstance::emitTerminalError(int64_t requestId,
   lockedEmitter()->emitBodyEnd(requestId);
 }
 
+bool ServerInstance::yieldToQueued(int fd) {
+  // Bytes already waiting: serve them now instead of cycling the fd. This
+  // check runs lock-free first so the uncontended hot path (pipelined or
+  // coalesced bytes) costs one syscall and no mutex.
+#ifdef _WIN32
+  WSAPOLLFD pfd{};
+  pfd.fd = (SOCKET)fd;
+  pfd.events = POLLRDNORM | POLLHUP | POLLERR;
+  const int r = WSAPoll(&pfd, 1, 0);
+  if (r > 0 && (pfd.revents & (POLLRDNORM | POLLHUP | POLLERR)) != 0) {
+    return false;
+  }
+#else
+  struct pollfd pfd{};
+  pfd.fd = fd;
+  pfd.events = POLLIN | POLLHUP | POLLERR;
+  const int r = poll(&pfd, 1, 0);
+  if (r > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
+    return false;
+  }
+#endif
+  {
+    std::lock_guard<std::mutex> lk(queueMutex_);
+    if (queue_.empty()) return false;
+    queue_.insert(queue_.begin(), fd);
+  }
+  queueCv_.notify_one();
+  return true;
+}
+
 void ServerInstance::handleConnection(int fd) {
   const Fd sock = (Fd)fd;
   {
@@ -648,6 +679,19 @@ void ServerInstance::handleConnection(int fd) {
   std::string carry;
   int64_t served = 0;
   while (running_.load()) {
+    // Starvation guard: when this fd has no buffered bytes but other
+    // connections already wait, blocking in the 5s keep-alive recv pins a
+    // worker while work starves — under concurrency every worker ends up
+    // parked on an idle connection and nothing progresses until the idle
+    // timeouts fire at once. Yielding parks the fd at the queue front
+    // (fair order) and frees this worker; the fd cycles back, unclosed.
+    // Skipped when `carry` holds bytes: those were already consumed from
+    // the socket, so only serveOne can see them — yielding would orphan
+    // them into a hang.
+    if (carry.empty() && yieldToQueued(fd)) {
+      inFlight_--;
+      return;
+    }
     if (!serveOne(fd, carry, served)) break;
     if (cfg.keepAliveTimeoutMs <= 0) break;
     if (cfg.maxRequestsPerConn > 0 && served >= cfg.maxRequestsPerConn) break;

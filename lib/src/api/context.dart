@@ -172,11 +172,13 @@ class ResponseContext {
     this.headers = const {},
     this.body,
     this.bodyStream,
+    this.streamBufferSize = 0,
   }) : assert(status >= 100 && status <= 599, 'status out of range: $status'),
        assert(
          body == null || bodyStream == null,
          'body and bodyStream are mutually exclusive',
-       );
+       ),
+       assert(streamBufferSize >= 0, 'streamBufferSize < 0: $streamBufferSize');
 
   final int status;
   final Map<String, String> headers;
@@ -187,6 +189,17 @@ class ResponseContext {
   /// the stream — or a stream error — terminates it, so errors truncate
   /// rather than hang. The route timeout bounds time-to-first-byte only.
   final Stream<Uint8List>? bodyStream;
+
+  /// Coalesces stream events into fewer wire chunks: events accumulate until
+  /// [streamBufferSize] bytes are pending, then cross the bridge as one
+  /// chunk; the remainder flushes when the stream ends. Zero (the default)
+  /// forwards every event immediately — the right choice for real-time
+  /// feeds (SSE), where delaying bytes to fill a buffer breaks semantics.
+  /// Set it for throughput-oriented streams whose events are tiny: twenty
+  /// 8-byte SSE events cost twenty bridge crossings unbuffered, one
+  /// buffered. Batching delays bytes until the buffer fills or the stream
+  /// ends — never use it when the consumer waits on each event.
+  final int streamBufferSize;
 
   /// True when this answer streams ([bodyStream] != null).
   bool get isStream => bodyStream != null;
@@ -292,6 +305,9 @@ class ResponseContext {
   /// Framing headers (`content-length`, `transfer-encoding`, `connection`)
   /// are engine-owned and ignored if passed.
   ///
+  /// Pass [bufferSize] to coalesce tiny events into fewer bridge crossings
+  /// (see [streamBufferSize]); leave it zero for real-time feeds.
+  ///
   /// ```dart
   /// await server.get('/events', (_) async {
   ///   return ResponseContext.stream(
@@ -308,11 +324,13 @@ class ResponseContext {
     int status = 200,
     Map<String, String> headers = const {},
     String contentType = 'application/octet-stream',
+    int bufferSize = 0,
   }) {
     return ResponseContext(
       status: status,
       headers: {'content-type': contentType, ...headers},
       bodyStream: data,
+      streamBufferSize: bufferSize,
     );
   }
 

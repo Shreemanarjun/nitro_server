@@ -29,10 +29,18 @@
 //   enforced on every side (the dart:io and shelf handlers answer `close`;
 //   nitro binds with `keepAliveTimeout: Duration.zero`), so nobody benefits
 //   from keep-alive pooling while someone else pays for handshakes.
+// * In `--keep-alive` mode nitro binds `maxRequestsPerConnection: 0`:
+//   dart:io and shelf never cap requests per connection, so capping only
+//   nitro would meter reconnects into nitro's numbers.
+// * Every case asserts exact status AND bytes (full compare on small
+//   bodies, FNV checksum on large/echo bodies) — a faster wrong answer
+//   cannot win.
 // * Same machine, same loopback, interleaved phases (A/B/C/A/B/C) so a
 //   thermal excursion cannot favor one side.
 // * Warmup before measuring (JIT + connection pools settle), then reports
 //   latency distributions AND throughput, never a single headline number.
+// * `--batch-events` coalesces the 20 SSE events on ALL sides (same bytes,
+//   each side's natural framing) to show the batching tradeoff fairly.
 // ignore_for_file: avoid_print
 import 'dart:async';
 import 'dart:convert';
@@ -74,10 +82,37 @@ final int _eventsTotalBytes = _eventChunks.fold(
   (sum, chunk) => sum + chunk.length,
 );
 
+/// The 20 events coalesced: identical bytes, one write. Used by all sides
+/// under `--batch-events` so the batching tradeoff is measured fairly.
+final Uint8List _eventsAll = Uint8List.fromList([
+  for (final chunk in _eventChunks) ...chunk,
+]);
+
+/// FNV-1a checksums, precomputed once: echo verification must touch content
+/// (a server returning wrong bytes of the right length must fail) without
+/// retaining megabyte bodies per iteration.
+int _fnv(List<int> bytes) {
+  var h = 0x811c9dc5;
+  for (final b in bytes) {
+    h ^= b;
+    h = (h * 0x01000193) & 0xffffffff;
+  }
+  return h;
+}
+
+final int _echoHash = _fnv(_echoPayload);
+final int _bigHash = _fnv(_bigPayload);
+
 /// When true the servers may keep connections alive (the real-world mode).
 /// Wired by `--keep-alive`; the default stays `Connection: close` so the
 /// handshake cost is identical on all sides.
 bool _keepAlive = false;
+
+/// When true every side sends the 20 SSE events coalesced instead of
+/// per-chunk (same bytes, each side's natural framing). Wired by
+/// `--batch-events`; default off so the headline numbers measure the
+/// real-time (per-event) path.
+bool _batchEvents = false;
 
 String _connHeader() => _keepAlive ? 'keep-alive' : 'close';
 
@@ -108,9 +143,14 @@ Future<HttpServer> _startDartServer() async {
           response.add(body.toBytes());
         } else if (request.method == 'GET' && path == '/events') {
           response.headers.contentType = ContentType('text', 'event-stream');
-          for (final chunk in _eventChunks) {
-            response.add(chunk);
-            await response.flush();
+          if (_batchEvents) {
+            response.contentLength = _eventsAll.length;
+            response.add(_eventsAll);
+          } else {
+            for (final chunk in _eventChunks) {
+              response.add(chunk);
+              await response.flush();
+            }
           }
         } else if (request.method == 'GET' && path.startsWith('/users/')) {
           final id = path.substring('/users/'.length);
@@ -157,6 +197,15 @@ Response _shelfHandler(Request request) {
   final path = '/${request.url.path}';
   Uint8List? body;
   if (request.method == 'GET' && path == '/events') {
+    if (_batchEvents) {
+      return Response.ok(
+        _eventsAll,
+        headers: {
+          'connection': _connHeader(),
+          'content-type': 'text/event-stream',
+        },
+      );
+    }
     return Response.ok(
       Stream.fromIterable(_eventChunks),
       headers: {
@@ -233,9 +282,14 @@ Future<NitroServer> _startNitroServer() async {
   // matching the dart:io and shelf servers below. (The engine default
   // enables keep-alive, which `HttpClient` pools — a pooled reuse racing a
   // server-side close measures pool luck, not servers.)
+  //
+  // With `--keep-alive` the request cap is lifted as well as the timeout:
+  // dart:io and shelf never cap requests per connection, so metering
+  // reconnects into only nitro's numbers would punish it for a limit the
+  // others don't have.
   final server = await NitroServer.bind(
     _keepAlive
-        ? const ServerConfig()
+        ? const ServerConfig(maxRequestsPerConnection: 0)
         : const ServerConfig(keepAliveTimeout: Duration.zero),
   );
   // One pass-through middleware, like the other sides.
@@ -262,6 +316,7 @@ Future<NitroServer> _startNitroServer() async {
     return ResponseContext.stream(
       Stream.fromIterable(_eventChunks),
       headers: {'content-type': 'text/event-stream'},
+      bufferSize: _batchEvents ? 4096 : 0,
     );
   });
   await server.post('/echo', (request) async {
@@ -272,19 +327,6 @@ Future<NitroServer> _startNitroServer() async {
 
 // ── Driver (identical for every server) ──────────────────────────────────────
 
-/// One measured GET. Returns microseconds.
-Future<int> _get(HttpClient client, int port, String path) async {
-  final stopwatch = Stopwatch()..start();
-  final request = await client.getUrl(Uri.parse('http://127.0.0.1:$port$path'));
-  final response = await request.close();
-  await response.drain<void>();
-  stopwatch.stop();
-  if (response.statusCode != 200) {
-    throw StateError('got ${response.statusCode}');
-  }
-  return stopwatch.elapsedMicroseconds;
-}
-
 Future<int> _postEcho(HttpClient client, int port) async {
   final stopwatch = Stopwatch()..start();
   final request = await client.postUrl(
@@ -293,11 +335,18 @@ Future<int> _postEcho(HttpClient client, int port) async {
   request.add(_echoPayload);
   final response = await request.close();
   var received = 0;
+  var hash = 0x811c9dc5;
   await for (final chunk in response) {
     received += chunk.length;
+    for (final b in chunk) {
+      hash ^= b;
+      hash = (hash * 0x01000193) & 0xffffffff;
+    }
   }
   stopwatch.stop();
-  if (response.statusCode != 200 || received != _echoPayload.length) {
+  if (response.statusCode != 200 ||
+      received != _echoPayload.length ||
+      hash != _echoHash) {
     throw StateError('echo mismatch: ${response.statusCode}/$received');
   }
   return stopwatch.elapsedMicroseconds;
@@ -333,7 +382,8 @@ bool _equals(List<int> a, List<int> b) {
   return true;
 }
 
-/// One measured POST echo of [payload] bytes. Returns microseconds.
+/// One measured POST echo of [payload] bytes (only [_bigPayload] is used;
+/// the hash is precomputed). Returns microseconds.
 Future<int> _postEchoSized(
   HttpClient client,
   int port,
@@ -346,11 +396,18 @@ Future<int> _postEchoSized(
   request.add(payload);
   final response = await request.close();
   var received = 0;
+  var hash = 0x811c9dc5;
   await for (final chunk in response) {
     received += chunk.length;
+    for (final b in chunk) {
+      hash ^= b;
+      hash = (hash * 0x01000193) & 0xffffffff;
+    }
   }
   stopwatch.stop();
-  if (response.statusCode != 200 || received != payload.length) {
+  if (response.statusCode != 200 ||
+      received != payload.length ||
+      hash != _bigHash) {
     throw StateError('echo mismatch: ${response.statusCode}/$received');
   }
   return stopwatch.elapsedMicroseconds;
@@ -494,6 +551,7 @@ Future<({String row, Map<String, Object?> json})> _phase(
 Future<void> main(List<String> args) async {
   final quick = args.contains('--quick');
   _keepAlive = args.contains('--keep-alive');
+  _batchEvents = args.contains('--batch-events');
   const concurrency = 32;
   final concurrentTotal = quick ? 800 : 4000;
   final rounds = quick ? 1 : 2;
@@ -519,7 +577,8 @@ Future<void> main(List<String> args) async {
   );
   print(
     '(mode: $mode; native library: $loadedFrom'
-    '${quick ? '; --quick' : ''}${_keepAlive ? '; --keep-alive' : ''})',
+    '${quick ? '; --quick' : ''}${_keepAlive ? '; --keep-alive' : ''}'
+    '${_batchEvents ? '; --batch-events' : ''})',
   );
   print('');
   print(
@@ -539,12 +598,36 @@ Future<void> main(List<String> args) async {
   final wildExpected = Uint8List.fromList('wild:/files/a/b/c'.codeUnits);
 
   final cases = <(String, Future<int> Function(HttpClient, int), int)>[
-    ('dart:io /hello', (c, p) => _get(c, p, '/hello'), dartServer.port),
-    ('shelf   /hello', (c, p) => _get(c, p, '/hello'), shelfServer.port),
-    ('nitro   /hello', (c, p) => _get(c, p, '/hello'), nitroServer.port),
-    ('dart:io /json', (c, p) => _get(c, p, '/json'), dartServer.port),
-    ('shelf   /json', (c, p) => _get(c, p, '/json'), shelfServer.port),
-    ('nitro   /json', (c, p) => _get(c, p, '/json'), nitroServer.port),
+    (
+      'dart:io /hello',
+      (c, p) => _getExpect(c, p, '/hello', _routes['/hello']!),
+      dartServer.port,
+    ),
+    (
+      'shelf   /hello',
+      (c, p) => _getExpect(c, p, '/hello', _routes['/hello']!),
+      shelfServer.port,
+    ),
+    (
+      'nitro   /hello',
+      (c, p) => _getExpect(c, p, '/hello', _routes['/hello']!),
+      nitroServer.port,
+    ),
+    (
+      'dart:io /json',
+      (c, p) => _getExpect(c, p, '/json', _routes['/json']!),
+      dartServer.port,
+    ),
+    (
+      'shelf   /json',
+      (c, p) => _getExpect(c, p, '/json', _routes['/json']!),
+      shelfServer.port,
+    ),
+    (
+      'nitro   /json',
+      (c, p) => _getExpect(c, p, '/json', _routes['/json']!),
+      nitroServer.port,
+    ),
     (
       'dart:io /users/:id',
       (c, p) => _getExpect(c, p, '/users/42', paramExpected),
@@ -590,9 +673,21 @@ Future<void> main(List<String> args) async {
       (c, p) => _getExpect(c, p, '/q?a=1&b=two', queryExpected),
       nitroServer.port,
     ),
-    ('dart:io /mw', (c, p) => _get(c, p, '/mw'), dartServer.port),
-    ('shelf   /mw', (c, p) => _get(c, p, '/mw'), shelfServer.port),
-    ('nitro   /mw', (c, p) => _get(c, p, '/mw'), nitroServer.port),
+    (
+      'dart:io /mw',
+      (c, p) => _getExpect(c, p, '/mw', _routes['/hello']!),
+      dartServer.port,
+    ),
+    (
+      'shelf   /mw',
+      (c, p) => _getExpect(c, p, '/mw', _routes['/hello']!),
+      shelfServer.port,
+    ),
+    (
+      'nitro   /mw',
+      (c, p) => _getExpect(c, p, '/mw', _routes['/hello']!),
+      nitroServer.port,
+    ),
     ('dart:io POST /echo 4k', _postEcho, dartServer.port),
     ('shelf   POST /echo 4k', _postEcho, shelfServer.port),
     ('nitro   POST /echo 4k', _postEcho, nitroServer.port),
@@ -640,6 +735,7 @@ Future<void> main(List<String> args) async {
       jsonEncode({
         'mode': mode,
         'keep_alive': _keepAlive,
+        'batch_events': _batchEvents,
         'quick': quick,
         'cases': jsonCases,
       }),

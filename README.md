@@ -148,18 +148,53 @@ Method and flags: [`benchmark/`](benchmark/).
 
 Keep-alive on every side:
 
-__KEEPALIVE_TABLE__
+| Route | Server | seq p50 µs | seq p99 µs | load p50 µs | load p99 µs | req/s @64 |
+|-------|--------|-----------:|-----------:|------------:|------------:|----------:|
+| /hello | dart:io | 67 | 140 | 1,855 | 3,174 | 32,782 |
+| /hello | shelf | 79 | 153 | 2,564 | 3,348 | 24,273 |
+| /hello | nitro | 77 | 179 | 1,149 | 2,944 | 49,489 |
+| /json | dart:io | 67 | 127 | 1,837 | 2,482 | 33,875 |
+| /json | shelf | 79 | 140 | 2,543 | 3,239 | 24,581 |
+| /json | nitro | 72 | 124 | 1,128 | 2,896 | 52,021 |
+| /users/:id | dart:io | 69 | 141 | 1,861 | 2,559 | 33,354 |
+| /users/:id | shelf | 82 | 162 | 2,604 | 3,479 | 23,847 |
+| /users/:id | nitro | 75 | 145 | 1,171 | 3,241 | 50,101 |
+| /files/* | dart:io | 69 | 160 | 1,882 | 2,871 | 32,599 |
+| /files/* | shelf | 99 | 295 | 2,776 | 3,859 | 22,496 |
+| /files/* | nitro | 74 | 156 | 1,155 | 2,675 | 51,398 |
+| /q?a=1&b=two | dart:io | 68 | 119 | 1,928 | 2,919 | 31,986 |
+| /q?a=1&b=two | shelf | 81 | 178 | 2,669 | 3,543 | 23,199 |
+| /q?a=1&b=two | nitro | 73 | 123 | 1,139 | 2,397 | 53,180 |
+| /mw | dart:io | 67 | 118 | 1,829 | 2,445 | 34,079 |
+| /mw | shelf | 79 | 136 | 2,615 | 4,588 | 22,162 |
+| /mw | nitro | 74 | 158 | 1,127 | 2,468 | 53,297 |
+| /work | dart:io | 372 | 525 | 18,238 | 29,308 | 3,448 |
+| /work | shelf | 382 | 515 | 18,965 | 23,338 | 3,345 |
+| /work | nitro | 375 | 526 | 17,562 | 20,955 | 3,595 |
+| /file | dart:io | 187 | 352 | 5,605 | 9,971 | 10,731 |
+| /file | shelf | 227 | 665 | 6,616 | 13,007 | 9,040 |
+| /file | nitro | 147 | 306 | 4,804 | 12,120 | 12,679 |
+| POST /echo 4k | dart:io | 143 | 286 | 2,403 | 5,054 | 24,806 |
+| POST /echo 4k | shelf | 149 | 291 | 3,004 | 4,471 | 20,597 |
+| POST /echo 4k | nitro | 144 | 232 | 1,787 | 3,361 | 33,266 |
+| POST /echo 1m | dart:io | 14,706 | 15,687 | 259,430 | 546,536 | 255 |
+| POST /echo 1m | shelf | 14,843 | 31,390 | 263,898 | 571,859 | 224 |
+| POST /echo 1m | nitro | 14,933 | 16,419 | 261,244 | 515,991 | 254 |
+| GET /events | dart:io | 97 | 170 | 3,177 | 3,812 | 19,777 |
+| GET /events | shelf | 89 | 155 | 2,851 | 3,556 | 21,991 |
+| GET /events | nitro | 94 | 151 | 1,766 | 3,921 | 34,710 |
 
 `Connection: close` on every side (every request pays a TCP handshake):
 
 __CLOSE_TABLE__
 
 What the tables say: under keep-alive load nitro serves the small routes at
-about 1.5× dart:io's rate with about 35% lower p50, and streams at about
+about 1.5× dart:io's rate with about 40% lower p50, and streams at about
 1.8×, because parsing, routing and the write happen off the Dart isolate.
-A 64 KiB static file goes out about 2× as fast (`sendfile`, no copy into
-Dart; 24.6k vs 11.8k req/s with the raw client). `/work` is handler-bound
-and equal on every side at one isolate; see Scaling above. On one idle connection the two are within a few
+The 64 KiB static file reads 1.2× in the table, where the `HttpClient`
+driver bounds it, and 2× with the raw-socket client (24.6k vs 11.8k req/s):
+`sendfile` never copies it into Dart. `/work` is handler-bound and equal
+on every side at one isolate; see Scaling above. On one idle connection the two are within a few
 microseconds: nitro's remaining worker-to-isolate hop costs about what
 dart:io's parsing costs. The 1 MiB echo is bound by loopback bandwidth.
 With `Connection: close` the handshake dominates: throughput is within

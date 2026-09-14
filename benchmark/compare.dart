@@ -591,8 +591,14 @@ class _RequestBenchmark extends AsyncBenchmarkBase {
 
   @override
   Future<void> run() async {
-    final us = await op(client, port);
-    if (_record) samplesUs.add(us);
+    try {
+      final us = await op(client, port);
+      if (_record) samplesUs.add(us);
+    } on SocketException catch (e) {
+      // Close mode: out of ephemeral ports (see _load). Back off, skip.
+      if (!_isPortExhaustion(e)) rethrow;
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
   }
 
   @override
@@ -715,7 +721,13 @@ Future<void> _rawConnection(
 
   while (DateTime.now().isBefore(deadline)) {
     final stopwatch = Stopwatch()..start();
-    socket ??= await connect();
+    try {
+      socket ??= await connect();
+    } on SocketException catch (e) {
+      if (!_isPortExhaustion(e)) rethrow;
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      continue;
+    }
     socket.add(request);
     var bytes = buffer.toBytes();
     buffer.clear();
@@ -758,6 +770,12 @@ Future<void> _rawConnection(
     }
   }
   socket?.destroy();
+}
+
+/// EADDRNOTAVAIL (macOS errno 49, Linux 99): no ephemeral port free.
+bool _isPortExhaustion(SocketException e) {
+  final code = e.osError?.errorCode;
+  return code == 49 || code == 99;
 }
 
 int _indexOfCrlfCrlf(Uint8List bytes) {
@@ -829,8 +847,16 @@ Future<({int done, int elapsedUs, List<int> samplesUs})> _load(
     for (var w = 0; w < connections; w++)
       () async {
         while (DateTime.now().isBefore(deadline)) {
-          samples.add(await op(client, port));
-          done++;
+          try {
+            samples.add(await op(client, port));
+            done++;
+          } on SocketException catch (e) {
+            // Close mode opens a connection per request: the OS runs out
+            // of ephemeral ports (TIME_WAIT) before the server runs out of
+            // anything. Back off and retry; the request is not counted.
+            if (!_isPortExhaustion(e)) rethrow;
+            await Future<void>.delayed(const Duration(milliseconds: 50));
+          }
         }
       }(),
   ]);

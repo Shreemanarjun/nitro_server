@@ -124,6 +124,36 @@ MatchResult Router::match(Method method, const std::string& customMethod,
   MatchResult out;
   const auto segs = split(path);
 
+  // Method keys computed once per request (not per visited node): the old
+  // pickEntry built a fresh std::string on every node visit.
+  const std::string mkey = methodKey(method, customMethod);
+  const std::string akey = methodKey(Method::All, "");
+  const bool allowAll =
+      (method != Method::All && method != Method::Custom);
+  auto pick = [&](const Node* node) -> const RouteEntry* {
+    if (!node) return nullptr;
+    auto it = node->entries.find(mkey);
+    if (it != node->entries.end()) return &it->second;
+    if (allowAll) {
+      auto all = node->entries.find(akey);
+      if (all != node->entries.end()) return &all->second;
+    }
+    return nullptr;
+  };
+  auto consider = [&](const RouteEntry* e, const std::vector<RouteParam>& ps,
+                      int spec, const RouteEntry*& best,
+                      std::vector<RouteParam>& bestParams, int& bestSpec,
+                      bool& bestIsAll) {
+    if (!e) return;
+    const bool isAll = (e->method == Method::All);
+    if (spec > bestSpec || (spec == bestSpec && bestIsAll && !isAll)) {
+      best = e;
+      bestParams = ps;
+      bestSpec = spec;
+      bestIsAll = isAll;
+    }
+  };
+
   // Depth-first search with static > param > wildcard precedence. The first
   // hit in that order wins; an All-route only counts when no method-specific
   // route matched anywhere at equal-or-better specificity.
@@ -141,6 +171,7 @@ MatchResult Router::match(Method method, const std::string& customMethod,
   bool bestIsAll = true;
 
   std::vector<Frame> stack;
+  stack.reserve(segs.size() + 1);
   stack.push_back({&root_, 0, {}, 0});
   while (!stack.empty()) {
     Frame fr = std::move(stack.back());
@@ -148,28 +179,12 @@ MatchResult Router::match(Method method, const std::string& customMethod,
     const Node* node = fr.node;
 
     if (fr.idx == segs.size()) {
-      if (const RouteEntry* e = pickEntry(node, method, customMethod)) {
-        const bool isAll = (e->method == Method::All);
-        if (fr.specificity > bestSpec ||
-            (fr.specificity == bestSpec && bestIsAll && !isAll)) {
-          best = e;
-          bestParams = fr.params;
-          bestSpec = fr.specificity;
-          bestIsAll = isAll;
-        }
-      }
+      consider(pick(node), fr.params, fr.specificity, best, bestParams,
+               bestSpec, bestIsAll);
       // A trailing wildcard also matches the empty remainder.
       if (node->wildcard) {
-        if (const RouteEntry* e = pickEntry(node->wildcard.get(), method, customMethod)) {
-          const bool isAll = (e->method == Method::All);
-          if (fr.specificity > bestSpec ||
-              (fr.specificity == bestSpec && bestIsAll && !isAll)) {
-            best = e;
-            bestParams = fr.params;
-            bestSpec = fr.specificity;
-            bestIsAll = isAll;
-          }
-        }
+        consider(pick(node->wildcard.get()), fr.params, fr.specificity, best,
+                 bestParams, bestSpec, bestIsAll);
       }
       continue;
     }
@@ -178,26 +193,27 @@ MatchResult Router::match(Method method, const std::string& customMethod,
     // Push in reverse precedence so static pops first.
     if (node->wildcard) {
       // Wildcard consumes the rest of the path.
-      if (const RouteEntry* e =
-              pickEntry(node->wildcard.get(), method, customMethod)) {
-        const bool isAll = (e->method == Method::All);
-        if (fr.specificity > bestSpec ||
-            (fr.specificity == bestSpec && bestIsAll && !isAll)) {
-          best = e;
-          bestParams = fr.params;
-          bestSpec = fr.specificity;
-          bestIsAll = isAll;
-        }
-      }
+      consider(pick(node->wildcard.get()), fr.params, fr.specificity, best,
+               bestParams, bestSpec, bestIsAll);
     }
-    if (node->param) {
-      Frame nf{node->param.get(), fr.idx + 1, fr.params, fr.specificity + 1};
-      nf.params.push_back({node->paramName, seg});
-      stack.push_back(std::move(nf));
-    }
+    const bool hasParam = (node->param != nullptr);
     auto sit = node->statik.find(seg);
-    if (sit != node->statik.end()) {
-      stack.push_back({sit->second.get(), fr.idx + 1, fr.params,
+    const bool hasStatic = (sit != node->statik.end());
+    if (hasParam && hasStatic) {
+      // Two children: move into one, copy into the other. Static pops first
+      // so it gets the moved vector.
+      Frame paramFr{node->param.get(), fr.idx + 1, fr.params,
+                    fr.specificity + 1};
+      paramFr.params.push_back({node->paramName, seg});
+      stack.push_back(std::move(paramFr));
+      stack.push_back({sit->second.get(), fr.idx + 1, std::move(fr.params),
+                       fr.specificity + 2});
+    } else if (hasParam) {
+      fr.params.push_back({node->paramName, seg});
+      stack.push_back({node->param.get(), fr.idx + 1, std::move(fr.params),
+                       fr.specificity + 1});
+    } else if (hasStatic) {
+      stack.push_back({sit->second.get(), fr.idx + 1, std::move(fr.params),
                        fr.specificity + 2});
     }
   }

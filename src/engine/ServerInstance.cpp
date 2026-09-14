@@ -15,6 +15,7 @@ using socklen_t = int;
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #endif
 
@@ -45,7 +46,40 @@ void ensureSockets() {}
 #endif
 
 constexpr size_t kMaxHeadBytes = 64 * 1024;
-constexpr size_t kBodyEmitBytes = 32 * 1024;
+// 64 KiB per emit: halves malloc + ackBody FFI crossings vs 32 KiB while
+// staying well under maxBodyBytes accounting granularity.
+constexpr size_t kBodyEmitBytes = 64 * 1024;
+
+inline char toLowerAscii(char c) {
+  return (c >= 'A' && c <= 'Z') ? (char)(c + ('a' - 'A')) : c;
+}
+
+/// Case-insensitive equality without allocating (replaces lower(a)==lower(b)).
+inline bool iequals(const std::string& a, const char* b) {
+  size_t i = 0;
+  for (; i < a.size() && b[i] != '\0'; i++) {
+    if (toLowerAscii(a[i]) != toLowerAscii(b[i])) return false;
+  }
+  return i == a.size() && b[i] == '\0';
+}
+
+/// Case-insensitive substring search without allocating.
+inline bool icontains(const std::string& hay, const char* needle) {
+  size_t nlen = strlen(needle);
+  if (nlen == 0) return true;
+  if (hay.size() < nlen) return false;
+  for (size_t i = 0; i + nlen <= hay.size(); i++) {
+    bool hit = true;
+    for (size_t j = 0; j < nlen; j++) {
+      if (toLowerAscii(hay[i + j]) != toLowerAscii(needle[j])) {
+        hit = false;
+        break;
+      }
+    }
+    if (hit) return true;
+  }
+  return false;
+}
 
 std::string lower(std::string s) {
   std::transform(s.begin(), s.end(), s.begin(),
@@ -128,9 +162,9 @@ ParsedHead parseHead(const std::string& raw, size_t headEnd) {
 }
 
 const Header* findHeader(const std::vector<Header>& hs, const char* name) {
-  const std::string want = lower(name);
-  for (const auto& h : hs)
-    if (lower(h.name) == want) return &h;
+  for (const auto& h : hs) {
+    if (iequals(h.name, name)) return &h;
+  }
   return nullptr;
 }
 
@@ -142,10 +176,10 @@ bool clientWantsKeepAlive(const ParsedHead& head) {
   const bool is10 = head.version == "HTTP/1.0";
   if (!is11 && !is10) return false;
   const Header* conn = findHeader(head.headers, "connection");
-  const std::string value = conn ? lower(conn->value) : "";
-  if (value.find("close") != std::string::npos) return false;
+  if (!conn) return is11;
+  if (icontains(conn->value, "close")) return false;
   if (is11) return true;
-  return value.find("keep-alive") != std::string::npos;
+  return icontains(conn->value, "keep-alive");
 }
 
 }  // namespace
@@ -267,9 +301,13 @@ StatusResult ServerInstance::start() {
   }
   listenFd_ = (int)fd;
 
-  unsigned workers = cfg.workerThreads > 0 ? (unsigned)cfg.workerThreads
-                                           : std::thread::hardware_concurrency();
-  if (workers == 0) workers = 4;
+  unsigned workers = cfg.workerThreads > 0 ? (unsigned)cfg.workerThreads : 0;
+  if (workers == 0) {
+    // Workers park on Dart's respond, so 1x cores stalls under concurrent
+    // slow handlers. 2x cores (min 8) keeps the accept queue draining.
+    const unsigned cores = std::thread::hardware_concurrency();
+    workers = cores == 0 ? 8 : std::max(8u, cores * 2);
+  }
   {
     auto self = shared_from_this();
     std::lock_guard<std::mutex> lk(acceptMutex_);
@@ -514,7 +552,7 @@ bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served) {
 
   // 100-continue handshake before the client sends a body.
   if (const Header* expect = findHeader(head.headers, "expect")) {
-    if (lower(expect->value).find("100-continue") != std::string::npos) {
+    if (icontains(expect->value, "100-continue")) {
       const char* cont = "HTTP/1.1 100 Continue\r\n\r\n";
       sendAll(fd, (const uint8_t*)cont, strlen(cont));
     }
@@ -530,7 +568,7 @@ bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served) {
     }
   }
   if (const Header* te = findHeader(head.headers, "transfer-encoding")) {
-    if (lower(te->value).find("chunked") != std::string::npos) chunked = true;
+    if (icontains(te->value, "chunked")) chunked = true;
   }
   if (contentLength < 0) {
     answerDirectly(fd, head.method, 400, "bad content-length");
@@ -698,11 +736,9 @@ bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served) {
   std::string head_out = "HTTP/1.1 " + std::to_string(req->status) + " " +
                          reasonPhrase(req->status) + "\r\n";
   for (const auto& h : req->headers) {
-    // One lowering per header: the pre-change code lowered each name twice
-    // (once per comparison below), allocating two throwaway strings.
-    const std::string lowered = lower(h.name);
-    if (lowered == "content-length") continue;  // We are authoritative.
-    if (lowered == "connection") continue;      // We are authoritative.
+    // Allocation-free skip: we are authoritative for framing headers.
+    if (iequals(h.name, "content-length")) continue;
+    if (iequals(h.name, "connection")) continue;
     head_out += h.name + ": " + h.value + "\r\n";
   }
   head_out += "Content-Length: " + std::to_string(req->body.size()) + "\r\n";
@@ -713,19 +749,55 @@ bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served) {
     head_out += "Connection: close\r\n\r\n";
   }
   const bool isHead = head.method == Method::Head;
+  const bool hasResponseBody = !isHead && !req->body.empty();
   bool sent;
+#ifdef _WIN32
   // Small bodies ride in the same send() as the headers: the hello-world case
   // was two syscalls (header ~100 B, body ~12 B). Above 128 KiB the copy
   // costs more than the syscall, so large bodies keep the two-send path.
   static constexpr size_t kCoalesceLimit = 128 * 1024;
-  if (!isHead && !req->body.empty() && req->body.size() <= kCoalesceLimit) {
+  if (hasResponseBody && req->body.size() <= kCoalesceLimit) {
     head_out.append((const char*)req->body.data(), req->body.size());
     sent = sendAll(fd, (const uint8_t*)head_out.data(), head_out.size());
   } else {
     sent = sendAll(fd, (const uint8_t*)head_out.data(), head_out.size());
-    if (sent && !isHead && !req->body.empty())
+    if (sent && hasResponseBody)
       sent = sendAll(fd, req->body.data(), req->body.size());
   }
+#else
+  // POSIX: writev sends headers + body in one syscall with zero copies —
+  // strictly better than both the coalesce-copy and the two-send paths.
+  if (hasResponseBody) {
+    struct iovec iov[2];
+    iov[0].iov_base = head_out.data();
+    iov[0].iov_len = head_out.size();
+    iov[1].iov_base = req->body.data();
+    iov[1].iov_len = req->body.size();
+    size_t toSend = head_out.size() + req->body.size();
+    size_t done = 0;
+    sent = true;
+    int base = 0;  // first non-empty iov
+    while (done < toSend) {
+      ssize_t r = writev(fd, iov + base, 2 - base);
+      if (r <= 0) {
+        sent = false;
+        break;
+      }
+      done += (size_t)r;
+      ssize_t left = r;
+      while (base < 2 && left >= (ssize_t)iov[base].iov_len) {
+        left -= (ssize_t)iov[base].iov_len;
+        base++;
+      }
+      if (base < 2 && left > 0) {
+        iov[base].iov_base = (char*)iov[base].iov_base + left;
+        iov[base].iov_len -= (size_t)left;
+      }
+    }
+  } else {
+    sent = sendAll(fd, (const uint8_t*)head_out.data(), head_out.size());
+  }
+#endif
 
   pending_.erase(requestId);
   served++;

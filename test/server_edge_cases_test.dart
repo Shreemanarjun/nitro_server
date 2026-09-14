@@ -1363,6 +1363,15 @@ void main() {
       expect(session.sendText('late'), -1);
     });
 
+    test('a bridge failure on send reads as -1, never a throw', () async {
+      final session = await openSession(642);
+      fake.wsSendThrows = true;
+      expect(session.sendText('x'), -1);
+      expect(session.bufferedBytes, -1);
+      fake.wsSendThrows = false;
+      await session.close();
+    });
+
     test('a negotiated session compresses long sends', () async {
       runner.addWsRoute('/z', (s) async {
         s.sendText('a' * 1000);

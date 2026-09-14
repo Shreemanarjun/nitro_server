@@ -409,8 +409,11 @@ class ServerRunner {
     } catch (_) {
       return; // Never started: nothing to drain.
     }
+    // The engine closes idle connections itself once draining, so the live
+    // count converges on the requests still being answered.
     final end = DateTime.now().add(deadline);
-    while (_native.inFlightRequests() > 0 && DateTime.now().isBefore(end)) {
+    while ((_native.inFlightRequests() > 0 || _native.liveConnections() > 0) &&
+        DateTime.now().isBefore(end)) {
       await Future<void>.delayed(const Duration(milliseconds: 10));
     }
   }

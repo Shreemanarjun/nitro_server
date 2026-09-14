@@ -94,6 +94,12 @@ public:
         // return 0;
     }
 
+    int64_t liveConnections() override {
+        // TODO: implement liveConnections
+        throw std::runtime_error("Not implemented: liveConnections");
+        // return 0;
+    }
+
     void respondFile(int64_t requestId, int64_t status, NitroCppBuffer headers, const std::string& path, int64_t offset, int64_t length) override {
         // TODO: implement respondFile
         throw std::runtime_error("Not implemented: respondFile");

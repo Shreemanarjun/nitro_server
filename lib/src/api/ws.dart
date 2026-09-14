@@ -3,7 +3,7 @@ library;
 
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io' show ZLibDecoder, ZLibEncoder;
+import 'dart:io' show RawZLibFilter;
 import 'dart:typed_data';
 
 import 'context.dart';
@@ -118,34 +118,35 @@ typedef WsHandler = FutureOr<void> Function(WsSession session);
 Uint8List wsTextBytes(String text) => Uint8List.fromList(utf8.encode(text));
 
 /// One permessage-deflate message body (RFC 7692 §7.2.1, no context
-/// takeover): a raw-deflate stream ending in a sync flush, minus the
-/// trailing `00 00 ff ff`. `dart:io`'s zlib does the compressing.
+/// takeover): a raw-deflate stream ended with a sync flush, minus the
+/// trailing `00 00 ff ff`. `dart:io`'s zlib does the work; the raw filter
+/// is the one API that exposes the sync flush the extension needs.
 Uint8List wsDeflate(Uint8List payload) {
-  final out = BytesBuilder(copy: false);
-  final sink = ZLibEncoder(
-    raw: true,
-  ).startChunkedConversion(ByteConversionSink.withCallback(out.add));
-  // A chunked add ends with Z_SYNC_FLUSH — the empty stored block the
-  // extension expects — where a one-shot convert would finish the stream.
-  sink.add(payload);
-  final flushed = out.takeBytes();
-  sink.close();
+  final filter = RawZLibFilter.deflateFilter(raw: true);
+  filter.process(payload, 0, payload.length);
+  final flushed = _drainFilter(filter);
   final end = flushed.length >= 4 ? flushed.length - 4 : flushed.length;
   return Uint8List.sublistView(flushed, 0, end);
 }
 
 /// Inverse of [wsDeflate]: appends the sync-flush tail and inflates.
+/// Throws on data that is not a deflate stream.
 Uint8List wsInflate(Uint8List payload) {
+  final filter = RawZLibFilter.inflateFilter(raw: true);
+  final tailed = Uint8List(payload.length + 4)
+    ..setRange(0, payload.length, payload)
+    ..setRange(payload.length, payload.length + 4, const [0, 0, 0xff, 0xff]);
+  filter.process(tailed, 0, tailed.length);
+  return _drainFilter(filter);
+}
+
+/// Everything the filter has produced after a sync flush.
+Uint8List _drainFilter(RawZLibFilter filter) {
   final out = BytesBuilder(copy: false);
-  final sink = ZLibDecoder(
-    raw: true,
-  ).startChunkedConversion(ByteConversionSink.withCallback(out.add));
-  sink.add(Uint8List.fromList([...payload, 0, 0, 0xff, 0xff]));
-  final inflated = out.takeBytes();
-  try {
-    sink.close();
-  } on Object {
-    // A truncated final block is expected: the stream never finished.
+  while (true) {
+    final chunk = filter.processed(flush: true, end: false);
+    if (chunk == null) break;
+    out.add(chunk);
   }
-  return inflated;
+  return out.takeBytes();
 }

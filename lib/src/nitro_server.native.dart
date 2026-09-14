@@ -418,6 +418,11 @@ abstract class NitroServerNative extends HybridObject {
   /// Requests dispatched but not yet fully answered on the wire.
   int inFlightRequests();
 
+  /// Connections accepted and not yet closed (queued, idle or serving).
+  /// During a drain the engine closes idle ones itself, so this converges
+  /// on the in-flight count.
+  int liveConnections();
+
   /// Answers a pending request with [length] bytes of the file at [path]
   /// starting at [offset] (`length` `< 0` means to the end). The status
   /// line and [headers] go out from the calling thread; the file bytes are

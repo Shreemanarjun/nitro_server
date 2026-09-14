@@ -167,6 +167,9 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   /// Requests dispatched and not yet fully answered.
   int64_t inFlightRequests();
 
+  /// Accepted connections not yet closed.
+  int64_t liveConnections() { return liveConnections_.load(); }
+
   /// Answers with a file: head from the caller's thread, bytes by the
   /// worker (`sendfile` on POSIX). `length < 0` means to the end. A file
   /// that cannot be opened answers 404.

@@ -211,6 +211,8 @@ class HybridNitroServerImpl final : public HybridNitroServerNative {
 
   int64_t inFlightRequests() override { return server_->inFlightRequests(); }
 
+  int64_t liveConnections() override { return server_->liveConnections(); }
+
   void respondFile(int64_t requestId, int64_t status, NitroCppBuffer headers,
                    const std::string& path, int64_t offset,
                    int64_t length) override {

@@ -373,13 +373,29 @@ ssize_t recvWait(Fd fd, void* buf, size_t n, int64_t timeoutMs) {
 /// first). Surplus bytes after the head stay in [buf] for the body reader
 /// and the next pipelined request. Returns false on EOF, timeout or
 /// oversize.
-bool readHead(Fd fd, std::string& buf, int64_t idleMs) {
+/// [draining] is checked between slices: an idle connection (no request
+/// bytes yet) is closed once a drain begins, after one slice of grace so a
+/// request already on its way still lands.
+bool readHead(Fd fd, std::string& buf, int64_t idleMs,
+              const std::atomic<bool>* draining = nullptr) {
   char tmp[8192];
+  static constexpr int64_t kSliceMs = 200;
+  int64_t left = idleMs;
   while (buf.size() < kMaxHeadBytes) {
     if (buf.find("\r\n\r\n") != std::string::npos) return true;
-    const ssize_t n = recvWait(fd, tmp, sizeof(tmp), idleMs);
-    if (n <= 0) return false;
-    buf.append(tmp, (size_t)n);
+    const bool drainingNow = draining != nullptr && draining->load();
+    const int64_t slice = drainingNow ? std::min(left, kSliceMs) : left;
+    const ssize_t n = recvWait(fd, tmp, sizeof(tmp), slice);
+    if (n > 0) {
+      buf.append(tmp, (size_t)n);
+      continue;
+    }
+    if (n == 0) return false;  // EOF.
+    if (!drainingNow) return false;  // Idle timeout or error.
+    // Draining and still nothing: this connection is idle. Close it.
+    if (buf.empty()) return false;
+    left -= slice;
+    if (left <= 0) return false;
   }
   return buf.find("\r\n\r\n") != std::string::npos;
 }
@@ -1411,11 +1427,17 @@ bool ServerInstance::awaitAnswer(int fd, const Wake& wake,
       return false;
     }
     if (hasTail) {
-      flushTail(fd, req, writeMs);
+      if (!flushTail(fd, req, writeMs)) {
+        emitter->emitEvent(ServerEventKind::ClientError, requestId,
+                           "write timed out or failed");
+      }
       continue;
     }
     if (hasFile) {
-      sendFile(fd, req, writeMs);
+      if (!sendFile(fd, req, writeMs)) {
+        emitter->emitEvent(ServerEventKind::ClientError, requestId,
+                           "write timed out or failed");
+      }
       continue;
     }
     // ── Park ───────────────────────────────────────────────────────────
@@ -1481,7 +1503,7 @@ bool ServerInstance::serveOne(int fd, const Wake& wake, std::string& carry,
   // keep-alive connection between requests gets the idle timeout.
   const int64_t headMs =
       served == 0 && cfg.headerTimeoutMs > 0 ? cfg.headerTimeoutMs : idleMs;
-  if (!readHead(sock, carry, headMs)) return false;  // EOF, idle, oversize.
+  if (!readHead(sock, carry, headMs, &draining_)) return false;  // EOF, idle.
   const size_t headEnd = carry.find("\r\n\r\n");
   size_t bodyStart = headEnd + 4;
   ParsedHead head = parseHead(carry, headEnd);
@@ -1632,7 +1654,10 @@ bool ServerInstance::serveOne(int fd, const Wake& wake, std::string& carry,
         const ssize_t n = recvWait(sock, buf, sizeof(buf), idleMs);
         if (n <= 0) return false;
         carry.append(buf, (size_t)n);
-        if (carry.size() > (size_t)maxBody + 1024) return false;
+        if (carry.size() > (size_t)maxBody + 1024) {
+          tooLarge = true;  // Over the cap before the size line said so.
+          return false;
+        }
       }
       return true;
     };

@@ -124,6 +124,12 @@ class FakeNitroServerNative extends NitroServerNative {
   @override
   int inFlightRequests() => inFlight > 0 ? inFlight-- : 0;
 
+  /// Live connections the drain also waits on (counts down like inFlight).
+  int live = 0;
+
+  @override
+  int liveConnections() => live > 0 ? live-- : 0;
+
   /// File answers by request id: (status, headers, path, offset, length).
   final filesResponded = <int, (int, Map<String, String>, String, int, int)>{};
 
@@ -179,6 +185,9 @@ class FakeNitroServerNative extends NitroServerNative {
   /// What `wsSend` reports as still buffered (tests script backpressure).
   int wsBuffered = 0;
 
+  /// When set, `wsSend` throws like a bridge call on a disposed instance.
+  bool wsSendThrows = false;
+
   @override
   Stream<RawWsMessage> get wsMessages => wsOut.stream;
 
@@ -189,6 +198,7 @@ class FakeNitroServerNative extends NitroServerNative {
     bool binary,
     bool compressed,
   ) {
+    if (wsSendThrows) throw StateError('bridge gone');
     wsSent.add((connectionId, Uint8List.fromList(payload), binary));
     if (compressed) wsSentCompressed.add(wsSent.length - 1);
     return wsBuffered;

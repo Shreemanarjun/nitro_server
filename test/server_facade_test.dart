@@ -374,9 +374,11 @@ void main() {
       'close(drain:) drains until in-flight reaches zero, then stops',
       () async {
         fake.inFlight = 3;
+        fake.live = 5;
         await server.close(drain: const Duration(seconds: 2));
         expect(fake.drained, isTrue);
         expect(fake.inFlight, 0);
+        expect(fake.live, 0);
         expect(fake.stopCalls, 1);
       },
     );

@@ -441,6 +441,9 @@ class _InMemoryNative extends NitroServerNative {
 
   @override
   int inFlightRequests() => 0;
+
+  @override
+  int liveConnections() => 0;
   // coverage:ignore-end
 
   /// File answers are read here and delivered as plain bodies — the engine

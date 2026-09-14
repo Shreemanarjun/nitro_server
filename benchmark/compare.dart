@@ -886,6 +886,31 @@ Future<({String row, Map<String, Object?> json})> _phase(
   final seq = await Isolate.run(() => _sequential(opKey, port));
   final lat = _summarize(seq.samplesUs);
 
+  if (connections == 0) {
+    // No load sweep (close mode by default): the sequential columns are
+    // the measurement, the rest reads as absent.
+    print(
+      '$label(RunTime): ${seq.meanUs.toStringAsFixed(4)} us. '
+      '(n=${seq.samplesUs.length})',
+    );
+    return (
+      row:
+          '| $label | ${lat['p50']!.toStringAsFixed(0)} | '
+          '${lat['p99']!.toStringAsFixed(0)} | — | — | — |',
+      json: {
+        'case': label,
+        'seq_mean_us': double.parse(seq.meanUs.toStringAsFixed(1)),
+        'seq_p50_us': lat['p50'],
+        'seq_p99_us': lat['p99'],
+        'load_p50_us': null,
+        'load_p99_us': null,
+        'req_per_s': null,
+        'n': seq.samplesUs.length,
+        'connections': 0,
+      },
+    );
+  }
+
   final perClient = connections ~/ clients;
   final loads = await Future.wait([
     for (var i = 0; i < clients; i++)
@@ -942,10 +967,23 @@ Future<void> main(List<String> args) async {
   final quick = args.contains('--quick');
   _keepAlive = args.contains('--keep-alive');
   _batchEvents = args.contains('--batch-events');
-  final connections = _flagInt(args, '--connections', quick ? 32 : 64);
+  // Close mode opens a connection per request, and each one parks an
+  // ephemeral port in TIME_WAIT (30 s on macOS, ~16k ports): a load sweep
+  // there measures the port budget, not the server. So close mode runs the
+  // sequential phase only, one round, with a cooldown between sides so
+  // every side starts with a recovered budget. Pass --connections to force
+  // a sweep anyway.
+  final connections = _flagInt(
+    args,
+    '--connections',
+    !_keepAlive ? 0 : (quick ? 32 : 64),
+  );
   final clients = _flagInt(args, '--clients', 4);
   final millis = _flagInt(args, '--seconds', quick ? 1 : 3) * 1000;
-  final rounds = quick ? 1 : 2;
+  final rounds = quick || !_keepAlive ? 1 : 2;
+  final cooldown = Duration(
+    seconds: _flagInt(args, '--cooldown', _keepAlive || quick ? 0 : 30),
+  );
   final only = _flagStr(args, '--only');
   final raw = args.contains('--raw');
   _workers = _flagInt(args, '--workers', 0);
@@ -967,13 +1005,14 @@ Future<void> main(List<String> args) async {
     '${_batchEvents ? '; --batch-events' : ''}'
     '${_workers > 0 ? '; --workers $_workers' : ''}'
     '${_isolates != 1 ? '; --isolates $_isolates' : ''}'
-    '${raw ? '; --raw' : ''})',
+    '${raw ? '; --raw' : ''}'
+    '${cooldown > Duration.zero ? '; --cooldown ${cooldown.inSeconds}' : ''})',
   );
   print('');
   print(
     'Sequential latency via package:benchmark_harness (AsyncBenchmarkBase, '
-    '~2 s per case) from one client isolate; load: $connections connections '
-    'across $clients client isolates for ${millis ~/ 1000} s per case.',
+    '~2 s per case) from one client isolate; load: '
+    '${connections == 0 ? 'none (sequential only)' : '$connections connections across $clients client isolates for ${millis ~/ 1000} s per case'}.',
   );
   print('');
 
@@ -1011,6 +1050,7 @@ Future<void> main(List<String> args) async {
       '| ---- | ---------- | ---------- | ----------- | ----------- | --- |',
     );
     for (final (label, opKey, port) in cases) {
+      if (cooldown > Duration.zero) await Future<void>.delayed(cooldown);
       final result = await _phase(
         label,
         opKey,

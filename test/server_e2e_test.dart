@@ -625,7 +625,9 @@ void main() {
         'ws://127.0.0.1:${server!.port}/deflate',
         compression: CompressionOptions.compressionDefault,
       );
-      expect(socket.extensions, contains('permessage-deflate'));
+      // dart:io's `WebSocket.extensions` is always empty; the proof that
+      // deflate is on is the handler's `compressed` check plus the bytes
+      // surviving dart:io's compressor and our inflater in both directions.
       socket.add(big);
       socket.add('tiny');
       final replies = await socket.take(2).toList();
@@ -645,7 +647,6 @@ void main() {
         'ws://127.0.0.1:${server!.port}/plain',
         compression: CompressionOptions.compressionDefault,
       );
-      expect(socket.extensions, isNot(contains('permessage-deflate')));
       socket.add('p');
       expect(await socket.first, 'p');
       await socket.close();
@@ -720,15 +721,14 @@ void main() {
         '/huge',
         (_) => ResponseContext.bytes(Uint8List(8 * 1024 * 1024)),
       );
+      final dropped = server!.events
+          .firstWhere((e) => e.kind == ServerEventKind.clientError)
+          .timeout(const Duration(seconds: 5));
       final raw = await Socket.connect('127.0.0.1', server!.port);
       raw.add(ascii.encode('GET /huge HTTP/1.1\r\nHost: x\r\n\r\n'));
-      // Never read: the engine gives up on the stalled write and closes.
-      final started = DateTime.now();
-      await raw
-          .drain<void>()
-          .timeout(const Duration(seconds: 5))
-          .catchError((_) {});
-      expect(DateTime.now().difference(started).inSeconds, lessThan(5));
+      // Never read: the engine gives up on the stalled write and says so.
+      final event = await dropped;
+      expect(event.message, contains('write timed out'));
       raw.destroy();
     }, skip: skipReason);
 
@@ -736,11 +736,11 @@ void main() {
       server = await NitroServer.bind();
       await server!.get('/x', (_) => ResponseContext.text('served'));
       final port = server!.port;
-      // Connect (kernel handshake completes) and drain at once: the sweep
-      // accepts the queued connection before the listener closes.
+      // Connect, send, and drain at once: the sweep accepts the queued
+      // connection before the listener closes, and the drain waits for it.
       final raw = await Socket.connect('127.0.0.1', port);
-      final closing = server!.close(drain: const Duration(seconds: 5));
       raw.add(ascii.encode('GET /x HTTP/1.1\r\nHost: x\r\n\r\n'));
+      final closing = server!.close(drain: const Duration(seconds: 5));
       final response = await raw.fold<List<int>>([], (b, d) => b..addAll(d));
       expect(ascii.decode(response), contains('served'));
       raw.destroy();

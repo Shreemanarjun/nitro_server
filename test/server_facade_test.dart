@@ -103,6 +103,164 @@ void main() {
     });
   });
 
+  group('route groups', () {
+    test('verbs join the prefix', () async {
+      Future<ResponseContext> ok(RequestContext _) async {
+        return const ResponseContext();
+      }
+      final api = server.group('/api');
+      await api.get('/users', ok);
+      await api.post('/users', ok);
+      await api.all('/wild', ok);
+
+      expect(
+        {for (final r in fake.registered) r.pattern: r.method},
+        {
+          '/api/users': RawServerMethod.post,
+          '/api/wild': RawServerMethod.all,
+        },
+      );
+    });
+
+    test('nesting appends, slashes collapse, root is identity', () async {
+      Future<ResponseContext> ok(RequestContext _) async {
+        return const ResponseContext();
+      }
+      final v2 = server.group('/api').group('/v2');
+      expect(v2.prefix, '/api/v2');
+      await v2.get('/x', ok);
+      await server.group('/').get('/root', ok);
+      await server.group('/trail/').get('/x', ok);
+
+      expect(
+        {for (final r in fake.registered) r.pattern},
+        {'/api/v2/x', '/root', '/trail/x'},
+      );
+    });
+
+    test('a bare prefix throws before touching native', () {
+      expect(() => server.group('api'), throwsArgumentError);
+      expect(fake.registered, isEmpty);
+    });
+
+    test('grouped routes dispatch and unroute by prefixed pattern',
+        () async {
+      final api = server.group('/api');
+      await api.get('/users/:id', (request) async {
+        return ResponseContext.text('user ${request.param('id')}');
+      });
+      final response = await driveRequest(
+        fake,
+        requestId: 40,
+        path: '/api/users/7',
+        routePattern: '/api/users/:id',
+        params: const [RawRouteParam(name: 'id', value: '7')],
+      );
+      expect(String.fromCharCodes(response.body), 'user 7');
+
+      await api.unroute(HttpMethod.get, '/users/:id');
+      expect(fake.unregistered, [('GET', '/api/users/:id')]);
+    });
+  });
+
+  group('fallbacks', () {
+    test('unknown routes answer empty 404 by default', () async {
+      final response = await driveRequest(
+        fake,
+        requestId: 41,
+        path: '/ghost',
+        routePattern: '/ghost',
+      );
+      expect(response.status, 404);
+      expect(response.body, isEmpty);
+    });
+
+    test('custom sync and async not-found pages see the request', () async {
+      server.notFoundHandler =
+          (request) => ResponseContext.text('lost: ${request.path}', status: 404);
+      var response = await driveRequest(
+        fake,
+        requestId: 42,
+        path: '/a',
+        routePattern: '/a',
+      );
+      expect(String.fromCharCodes(response.body), 'lost: /a');
+
+      server.notFoundHandler = (request) async =>
+          ResponseContext.text('async lost', status: 404);
+      response = await driveRequest(
+        fake,
+        requestId: 43,
+        path: '/b',
+        routePattern: '/b',
+      );
+      expect(response.status, 404);
+      expect(String.fromCharCodes(response.body), 'async lost');
+    });
+
+    test('a throwing not-found fallback degrades to empty 404', () async {
+      server.notFoundHandler = (_) => throw StateError('no page');
+      final response = await driveRequest(
+        fake,
+        requestId: 44,
+        path: '/c',
+        routePattern: '/c',
+      );
+      expect(response.status, 404);
+      expect(response.body, isEmpty);
+    });
+
+    test('a throwing handler is a 500 naming the error', () async {
+      await server.get('/boom', (_) async => throw StateError('kaput'));
+      final response = await driveRequest(
+        fake,
+        requestId: 45,
+        path: '/boom',
+        routePattern: '/boom',
+      );
+      expect(response.status, 500);
+      expect(String.fromCharCodes(response.body), contains('kaput'));
+    });
+
+    test('custom error pages see the error, sync or async', () async {
+      await server.get('/sync-boom', (_) => throw StateError('sync'));
+      await server.get('/async-boom', (_) async => throw StateError('async'));
+      server.errorHandler = (error, request) =>
+          ResponseContext.text('oops $error @ ${request.path}', status: 500);
+
+      var response = await driveRequest(
+        fake,
+        requestId: 46,
+        path: '/sync-boom',
+        routePattern: '/sync-boom',
+      );
+      expect(String.fromCharCodes(response.body), contains('sync'));
+
+      server.errorHandler = (error, _) async =>
+          ResponseContext.text('async oops', status: 500);
+      response = await driveRequest(
+        fake,
+        requestId: 47,
+        path: '/async-boom',
+        routePattern: '/async-boom',
+      );
+      expect(String.fromCharCodes(response.body), 'async oops');
+    });
+
+    test('a throwing error fallback degrades to the default 500', () async {
+      await server.get('/boom2', (_) async => throw StateError('kaput'));
+      server.errorHandler = (error, _) => throw StateError('worse');
+      final response = await driveRequest(
+        fake,
+        requestId: 48,
+        path: '/boom2',
+        routePattern: '/boom2',
+      );
+      expect(response.status, 500);
+      expect(String.fromCharCodes(response.body), contains('kaput'));
+    });
+  });
+
   group('value types', () {
     test('TlsConfig.enabled', () {
       expect(const TlsConfig().enabled, isFalse);

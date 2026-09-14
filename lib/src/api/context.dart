@@ -1,6 +1,7 @@
 /// Request/response types for route handlers.
 library;
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -113,8 +114,17 @@ class RequestContext {
     return values == null || values.isEmpty ? null : values.first;
   }
 
+  /// First value of the query parameter [name], or null.
+  String? queryParam(String name) => queryParameters[name];
+
   /// The `:param` capture [name], or null when the route has no such segment.
   String? param(String name) => params[name];
+
+  /// The body decoded as UTF-8 text.
+  String text() => utf8.decode(body);
+
+  /// The body decoded as JSON (`jsonDecode` of [text]).
+  dynamic json() => jsonDecode(text());
 }
 
 /// The answer a [RequestHandler] returns. There is no streaming-response half:
@@ -160,6 +170,35 @@ class ResponseContext {
     );
   }
 
+  /// Encodes [data] with `jsonEncode` and answers it as JSON. Prefer this
+  /// over [json] with a hand-encoded string: one call, no forgotten
+  /// `jsonEncode`, same bytes on the wire.
+  factory ResponseContext.jsonMap(
+    Map<String, Object?> data, {
+    int status = 200,
+    Map<String, String> headers = const {},
+  }) {
+    return ResponseContext.json(
+      jsonEncode(data),
+      status: status,
+      headers: headers,
+    );
+  }
+
+  /// Answers an HTML page.
+  factory ResponseContext.html(
+    String html, {
+    int status = 200,
+    Map<String, String> headers = const {},
+  }) {
+    return ResponseContext.text(
+      html,
+      status: status,
+      headers: headers,
+      contentType: 'text/html; charset=utf-8',
+    );
+  }
+
   factory ResponseContext.bytes(
     Uint8List body, {
     int status = 200,
@@ -181,5 +220,18 @@ class ResponseContext {
 /// that outlives its deadline loses: the client already got a 408 and the
 /// late value is dropped, never sent twice.
 typedef RequestHandler = Future<ResponseContext> Function(
+  RequestContext request,
+);
+
+/// Answers a request no route matched. Sync or async; throwing falls back to
+/// an empty 404 — a custom page must never wedge dispatch.
+typedef NotFoundHandler = FutureOr<ResponseContext> Function(
+  RequestContext request,
+);
+
+/// Answers a request whose handler threw. Sync or async; throwing falls back
+/// to the default 500 text body.
+typedef ErrorHandler = FutureOr<ResponseContext> Function(
+  Object error,
   RequestContext request,
 );

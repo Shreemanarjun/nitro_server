@@ -88,6 +88,19 @@ class ServerRunner {
   final _middlewares = <Middleware>[];
   final _events = StreamController<ServerEvent>.broadcast();
 
+  /// Answers unmatched requests. Defaults to an empty 404.
+  NotFoundHandler _notFoundHandler = (_) => const ResponseContext(status: 404);
+
+  /// Answers requests whose handler threw. Defaults to a 500 text body.
+  ErrorHandler _errorHandler =
+      (error, _) => ResponseContext.text('handler error: $error', status: 500);
+
+  /// Overrides the 404 answer. A throwing handler falls back to empty 404.
+  set notFoundHandler(NotFoundHandler handler) => _notFoundHandler = handler;
+
+  /// Overrides the 500 answer. A throwing handler falls back to the default.
+  set errorHandler(ErrorHandler handler) => _errorHandler = handler;
+
   StreamSubscription<RawIncomingRequest>? _heads;
   StreamSubscription<RawBodyChunk>? _chunks;
   StreamSubscription<RawServerEvent>? _serverEvents;
@@ -327,22 +340,8 @@ class ServerRunner {
     var handler = _handlers[handlerKey(method, custom, head.routePattern)];
     handler ??=
         _handlers[handlerKey(HttpMethod.all, '', head.routePattern)];
-    if (handler == null) {
-      _answer(head.requestId, const ResponseContext(status: 404));
-      _complete(head.requestId);
-      return;
-    }
-    // The common case (no middleware) skips the fold entirely: `reversed`
-    // allocates a lazy iterable on every request otherwise.
-    final RequestHandler piped;
-    if (_middlewares.isEmpty) {
-      piped = handler;
-    } else {
-      piped = _middlewares.reversed.fold<RequestHandler>(
-        handler,
-        (next, middleware) => (request) => middleware(request, next),
-      );
-    }
+    // The context is built before the branch: both the handler and the
+    // not-found fallback receive it.
     final context = RequestContext(
       method: method,
       customMethod: custom,
@@ -358,19 +357,32 @@ class ServerRunner {
       // allocating per request.
       body: pending.body.isEmpty ? _emptyBody : pending.body.toBytes(),
     );
+    if (handler == null) {
+      _guardedNotFound(context).then((response) {
+        _answer(head.requestId, response);
+        _complete(head.requestId);
+      });
+      return;
+    }
+    // The common case (no middleware) skips the fold entirely: `reversed`
+    // allocates a lazy iterable on every request otherwise.
+    final RequestHandler piped;
+    if (_middlewares.isEmpty) {
+      piped = handler;
+    } else {
+      piped = _middlewares.reversed.fold<RequestHandler>(
+        handler,
+        (next, middleware) => (request) => middleware(request, next),
+      );
+    }
     // Invoke inline rather than via `Future(() => ...)`: that constructor
     // costs an extra event-loop turn per request. A synchronously-throwing
-    // handler is still a 500, caught here instead of by the future.
+    // handler still ends as a 500, via the guarded error path below.
     Future<ResponseContext> future;
     try {
       future = piped(context);
     } catch (error) {
-      _answer(
-        head.requestId,
-        ResponseContext.text('handler error: $error', status: 500),
-      );
-      _complete(head.requestId);
-      return;
+      future = _guardedError(error, context);
     }
     future.then(
       (response) {
@@ -378,13 +390,37 @@ class ServerRunner {
         _complete(head.requestId);
       },
       onError: (Object error) {
-        _answer(
-          head.requestId,
-          ResponseContext.text('handler error: $error', status: 500),
-        );
-        _complete(head.requestId);
+        // The handler's future failed: the custom error page (guarded, so it
+        // cannot throw) answers instead of the default 500.
+        _guardedError(error, context).then((response) {
+          _answer(head.requestId, response);
+          _complete(head.requestId);
+        });
       },
     );
+  }
+
+  /// Runs the not-found fallback. A throwing fallback degrades to an empty
+  /// 404 rather than wedging dispatch.
+  Future<ResponseContext> _guardedNotFound(RequestContext context) async {
+    try {
+      return await _notFoundHandler(context);
+    } catch (_) {
+      return const ResponseContext(status: 404);
+    }
+  }
+
+  /// Runs the error fallback. A throwing fallback degrades to the default
+  /// 500 text body.
+  Future<ResponseContext> _guardedError(
+    Object error,
+    RequestContext context,
+  ) async {
+    try {
+      return await _errorHandler(error, context);
+    } catch (_) {
+      return ResponseContext.text('handler error: $error', status: 500);
+    }
   }
 
   static Map<String, List<String>> _foldHeaders(List<RawHeader> headers) {

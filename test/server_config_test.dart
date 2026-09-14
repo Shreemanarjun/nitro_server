@@ -1,5 +1,6 @@
 // Unit tests for the public value types and the wire mapping tables.
 // No native library needed: everything here runs against fakes and pure data.
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:test/test.dart';
@@ -111,8 +112,28 @@ void main() {
         contains('application/json'),
       );
       expect(
+        ResponseContext.jsonMap({'id': 42}).headers['content-type'],
+        contains('application/json'),
+      );
+      expect(
+        ResponseContext.html('<h1>hi</h1>').headers['content-type'],
+        contains('text/html'),
+      );
+      expect(
         ResponseContext.bytes(Uint8List(0)).headers['content-type'],
         contains('octet-stream'),
+      );
+    });
+
+    test('jsonMap encodes its argument', () {
+      final response = ResponseContext.jsonMap({
+        'id': 42,
+        'name': 'nitro',
+      });
+      expect(response.status, 200);
+      expect(
+        jsonDecode(utf8.decode(response.bodyBytes)),
+        {'id': 42, 'name': 'nitro'},
       );
     });
 
@@ -144,6 +165,25 @@ void main() {
       expect(context.header('Content-Type'), 'application/json');
       expect(context.param('id'), '42');
       expect(context.param('missing'), isNull);
+    });
+
+    test('queryParam, text and json read the request', () {
+      final context = RequestContext(
+        method: HttpMethod.post,
+        customMethod: '',
+        path: '/echo',
+        query: 'a=1&b=two',
+        queryParameters: const {'a': '1', 'b': 'two'},
+        headers: const {},
+        params: const {},
+        routePattern: '/echo',
+        body: Uint8List.fromList(utf8.encode('{"ok":true}')),
+      );
+      expect(context.queryParam('a'), '1');
+      expect(context.queryParam('b'), 'two');
+      expect(context.queryParam('missing'), isNull);
+      expect(context.text(), '{"ok":true}');
+      expect(context.json(), {'ok': true});
     });
   });
 }

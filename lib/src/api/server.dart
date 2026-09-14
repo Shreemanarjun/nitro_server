@@ -9,6 +9,7 @@ import '../internal/server_runner.dart';
 import 'context.dart';
 import 'event.dart';
 import 'http_method.dart';
+import 'route_group.dart';
 
 /// A bound HTTP server backed by the native multithreaded engine.
 ///
@@ -158,6 +159,23 @@ class NitroServer {
     Duration? timeout,
   }) =>
       route(HttpMethod.all, pattern, handler, timeout: timeout);
+
+  /// A path-prefixed view of this server: `server.group('/api').get(...)`
+  /// registers `/api/...`. Groups nest; middleware stays server-global.
+  RouteGroup group(String prefix) =>
+      RouteGroup(server: this, prefix: prefix);
+
+  /// Overrides the answer for unmatched routes (default: empty 404). May be
+  /// sync or async; a throwing fallback degrades to the default.
+  set notFoundHandler(NotFoundHandler handler) {
+    _runner.notFoundHandler = handler;
+  }
+
+  /// Overrides the answer for throwing handlers (default: 500 text). May be
+  /// sync or async; a throwing fallback degrades to the default.
+  set errorHandler(ErrorHandler handler) {
+    _runner.errorHandler = handler;
+  }
 
   /// Stops accepting and answers every parked request with 503. Idempotent.
   Future<void> close() => _runner.close();

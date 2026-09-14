@@ -121,8 +121,6 @@ MatchResult Router::match(Method method, const std::string& customMethod,
   MatchResult out;
   const auto segs = split(path);
 
-  // Method keys computed once per request (not per visited node): the old
-  // pickEntry built a fresh std::string on every node visit.
   const std::string mkey = methodKey(method, customMethod);
   const std::string akey = methodKey(Method::All, "");
   const bool allowAll =
@@ -150,59 +148,39 @@ MatchResult Router::match(Method method, const std::string& customMethod,
     }
   };
 
-  // Depth-first search with static > param > wildcard precedence. The first
-  // hit in that order wins; an All-route only counts when no method-specific
-  // route matched anywhere at equal-or-better specificity.
-  //
-  // Frames are parent-linked (not param-vector-carrying): each frame holds
-  // only the single :param it captured on entry, plus its parent's arena
-  // index. Branching therefore moves two small structs instead of copying a
-  // params vector per frame; the winning chain is walked once at the end.
   struct Frame {
     const Node* node;
     size_t idx;
-    int parent;  // arena index, -1 for the root.
+    int parent;
     bool hasParam;
     std::string paramName;
     std::string paramValue;
-    int specificity;  // higher = more specific.
+    int specificity;
   };
-  // Specificity of a candidate is compared across the whole search, so a
-  // static match deeper in one branch beats a param match in another.
+
+  // Thread-local reusable buffers: zero heap allocations on the hot path
+  // after the first call per thread. clear() doesn't free memory.
+  thread_local std::vector<Frame> arena;
+  thread_local std::vector<int> stack;
+  arena.clear();
+  stack.clear();
+
   const RouteEntry* best = nullptr;
   int bestFrame = -1;
   int bestSpec = -1;
   bool bestIsAll = true;
 
-  std::vector<Frame> arena;
-  arena.reserve(2 * (segs.size() + 1));
-  std::vector<int> stack;
-  stack.reserve(2 * (segs.size() + 1));
   arena.push_back({&root_, 0, -1, false, {}, {}, 0});
   stack.push_back(0);
-  auto pushChild = [&](const Node* node, size_t idx, int parent,
-                       const std::string& paramName, const std::string_view seg,
-                       int specificity) {
-    const bool hasParam = !paramName.empty();
-    const std::string paramValue =
-        hasParam ? std::string(seg.data(), seg.size()) : std::string();
-    arena.push_back(
-        {node, idx, parent, hasParam, paramName, paramValue, specificity});
-    stack.push_back((int)arena.size() - 1);
-  };
   while (!stack.empty()) {
     const int id = stack.back();
     stack.pop_back();
-    // Hoisted: pushChild appends to arena (may reallocate), so nothing may
-    // hold a reference into it across a push.
     const Node* node = arena[(size_t)id].node;
     const size_t idx = arena[(size_t)id].idx;
     const int spec = arena[(size_t)id].specificity;
 
     if (idx == segs.size()) {
-      consider(pick(node), id, spec, best, bestFrame, bestSpec,
-               bestIsAll);
-      // A trailing wildcard also matches the empty remainder.
+      consider(pick(node), id, spec, best, bestFrame, bestSpec, bestIsAll);
       if (node->wildcard) {
         consider(pick(node->wildcard.get()), id, spec, best,
                  bestFrame, bestSpec, bestIsAll);
@@ -211,9 +189,7 @@ MatchResult Router::match(Method method, const std::string& customMethod,
     }
 
     const std::string_view seg = segs[idx];
-    // Push in reverse precedence so static pops first.
     if (node->wildcard) {
-      // Wildcard consumes the rest of the path.
       consider(pick(node->wildcard.get()), id, spec, best,
                bestFrame, bestSpec, bestIsAll);
     }
@@ -221,25 +197,32 @@ MatchResult Router::match(Method method, const std::string& customMethod,
     auto sit = node->statik.find(seg);
     const bool hasStatic = (sit != node->statik.end());
     if (hasParam && hasStatic) {
-      // Two children: static pops first. No vector is copied either way —
-      // each child links back to this frame.
-      pushChild(node->param.get(), idx + 1, id, node->paramName, seg,
-                spec + 1);
-      pushChild(sit->second.get(), idx + 1, id, {}, seg,
-                spec + 2);
+      const bool hasP = !node->paramName.empty();
+      arena.push_back({node->param.get(), idx + 1, id, hasP,
+                       hasP ? node->paramName : std::string(),
+                       hasP ? std::string(seg.data(), seg.size()) : std::string(),
+                       spec + 1});
+      stack.push_back((int)arena.size() - 1);
+      arena.push_back({sit->second.get(), idx + 1, id, false, {}, {},
+                       spec + 2});
+      stack.push_back((int)arena.size() - 1);
     } else if (hasParam) {
-      pushChild(node->param.get(), idx + 1, id, node->paramName, seg,
-                spec + 1);
+      const bool hasP = !node->paramName.empty();
+      arena.push_back({node->param.get(), idx + 1, id, hasP,
+                       hasP ? node->paramName : std::string(),
+                       hasP ? std::string(seg.data(), seg.size()) : std::string(),
+                       spec + 1});
+      stack.push_back((int)arena.size() - 1);
     } else if (hasStatic) {
-      pushChild(sit->second.get(), idx + 1, id, {}, seg,
-                spec + 2);
+      arena.push_back({sit->second.get(), idx + 1, id, false, {}, {},
+                       spec + 2});
+      stack.push_back((int)arena.size() - 1);
     }
   }
 
   if (best) {
     out.matched = true;
     out.route = *best;
-    // Walk the winning chain once, deepest first, then reverse.
     std::vector<RouteParam> ps;
     for (int id = bestFrame; id > 0; id = arena[(size_t)id].parent) {
       const Frame& fr = arena[(size_t)id];

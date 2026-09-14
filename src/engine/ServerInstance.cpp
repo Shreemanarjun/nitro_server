@@ -247,7 +247,7 @@ Emitter* ServerInstance::lockedEmitter() {
 }
 
 void ServerInstance::configure(const ServerConfig& config) {
-  std::lock_guard<std::mutex> lk(configMutex_);
+  std::unique_lock lk(configMutex_);
   config_ = config;
 }
 
@@ -256,7 +256,7 @@ StatusResult ServerInstance::registerRoute(Method method,
                                            const std::string& pattern,
                                            int64_t timeoutMs,
                                            bool isWebSocket) {
-  std::lock_guard<std::mutex> lk(configMutex_);
+  std::unique_lock lk(configMutex_);
   RouteEntry e{method, customMethod, pattern, timeoutMs, isWebSocket};
   if (!router_.add(e)) {
     return {ErrorKind::BadRequest,
@@ -268,9 +268,9 @@ StatusResult ServerInstance::registerRoute(Method method,
 }
 
 StatusResult ServerInstance::unregisterRoute(Method method,
-                                            const std::string& customMethod,
-                                            const std::string& pattern) {
-  std::lock_guard<std::mutex> lk(configMutex_);
+                                             const std::string& customMethod,
+                                             const std::string& pattern) {
+  std::unique_lock lk(configMutex_);
   if (!router_.remove(method, customMethod, pattern)) {
     return {ErrorKind::RouteNotFound, "no such route: " + pattern, 0};
   }
@@ -281,7 +281,7 @@ StatusResult ServerInstance::start() {
   ensureSockets();
   ServerConfig cfg;
   {
-    std::lock_guard<std::mutex> lk(configMutex_);
+    std::shared_lock lk(configMutex_);
     cfg = config_;
   }
   if (running_.exchange(true)) {
@@ -493,7 +493,7 @@ bool ServerInstance::waitForDrainForTesting(int64_t timeoutMs) {
 void ServerInstance::acceptLoop() {
   int64_t maxQueued;
   {
-    std::lock_guard<std::mutex> lk(configMutex_);
+    std::shared_lock lk(configMutex_);
     maxQueued = config_.backlog > 0 ? config_.backlog : 128;
   }
   while (running_.load()) {
@@ -664,12 +664,10 @@ void ServerInstance::handleConnection(int fd) {
 
   ServerConfig cfg;
   {
-    std::lock_guard<std::mutex> lk(configMutex_);
+    std::shared_lock lk(configMutex_);
     cfg = config_;
   }
-  // The receive timeout doubles as the keep-alive idle deadline and the
-  // first-byte header deadline. Zero disables keep-alive below; the initial
-  // read still needs a bound, so floor it at the route default.
+
   const int64_t idleMs =
       cfg.keepAliveTimeoutMs > 0 ? cfg.keepAliveTimeoutMs : 5000;
 #ifdef _WIN32
@@ -738,7 +736,7 @@ bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served,
 
   MatchResult m;
   {
-    std::lock_guard<std::mutex> lk(configMutex_);
+    std::shared_lock lk(configMutex_);
     m = router_.match(head.method, head.customMethod, path);
   }
   if (!m.matched) {
@@ -787,11 +785,9 @@ bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served,
   int64_t contentLength = 0;
   bool chunked = false;
   if (const Header* cl = findHeader(head.headers, "content-length")) {
-    try {
-      contentLength = std::stoll(cl->value);
-    } catch (...) {
-      contentLength = -1;
-    }
+    char* end = nullptr;
+    contentLength = std::strtoll(cl->value.c_str(), &end, 10);
+    if (end == cl->value.c_str() || contentLength < 0) contentLength = -1;
   }
   if (const Header* te = findHeader(head.headers, "transfer-encoding")) {
     if (icontains(te->value, "chunked")) chunked = true;
@@ -1020,22 +1016,30 @@ bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served,
   const bool keepAlive = keepPeer && !expired &&
                          cfg.keepAliveTimeoutMs > 0 && running_.load() &&
                          underBudget;
-  std::string head_out = "HTTP/1.1 " + std::to_string(req->status) + " " +
-                         reasonPhrase(req->status) + "\r\n";
+  std::string head_out;
+  head_out.reserve(256);
+  head_out.append("HTTP/1.1 ");
+  head_out.append(std::to_string(req->status));
+  head_out.append(" ");
+  head_out.append(reasonPhrase(req->status));
+  head_out.append("\r\n");
   for (const auto& h : req->headers) {
-    // Allocation-free skip: we are authoritative for framing headers.
     if (iequals(h.name, "content-length")) continue;
     if (iequals(h.name, "connection")) continue;
-    head_out += h.name + ": " + h.value + "\r\n";
+    head_out.append(h.name);
+    head_out.append(": ");
+    head_out.append(h.value);
+    head_out.append("\r\n");
   }
-  head_out += "Content-Length: " + std::to_string(req->body.size()) + "\r\n";
+  head_out.append("Content-Length: ");
+  head_out.append(std::to_string(req->body.size()));
+  head_out.append("\r\n");
   if (keepAlive) {
-    // Round up: a 250 ms deadline must not advertise `timeout=0`.
-    head_out += "Connection: keep-alive\r\nKeep-Alive: timeout=" +
-                std::to_string((cfg.keepAliveTimeoutMs + 999) / 1000) +
-                "\r\n\r\n";
+    head_out.append("Connection: keep-alive\r\nKeep-Alive: timeout=");
+    head_out.append(std::to_string((cfg.keepAliveTimeoutMs + 999) / 1000));
+    head_out.append("\r\n\r\n");
   } else {
-    head_out += "Connection: close\r\n\r\n";
+    head_out.append("Connection: close\r\n\r\n");
   }
   const bool isHead = head.method == Method::Head;
   const bool hasResponseBody = !isHead && !req->body.empty();

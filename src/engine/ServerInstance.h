@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -225,7 +226,7 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
 
   Emitter* emitter_ = nullptr;
   std::mutex emitterMutex_;
-  std::mutex configMutex_;
+  mutable std::shared_mutex configMutex_;
   ServerConfig config_;
   Router router_;
 

@@ -14,8 +14,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # -fomit-frame-pointer: free up a register on x86_64
 # -funroll-loops: unroll hot loops (parser, header scan)
 # -ffast-math: allow reordering FP ops (no NaN/Inf sensitivity in HTTP)
-set(CMAKE_C_FLAGS_RELEASE   "-O3 -march=native -mtune=native -DNDEBUG -fomit-frame-pointer -funroll-loops -ffast-math")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -mtune=native -DNDEBUG -fomit-frame-pointer -funroll-loops -ffast-math")
+set(CMAKE_C_FLAGS_RELEASE   "-O3 -march=native -mtune=native -DNDEBUG -fomit-frame-pointer -funroll-loops -ffast-math -fno-rtti")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -mtune=native -DNDEBUG -fomit-frame-pointer -funroll-loops -ffast-math -fno-rtti")
 # Link-time optimization at the linker level (requires matching compile flags).
 set(CMAKE_EXE_LINKER_FLAGS_RELEASE  "-flto -O3")
 set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "-flto -O3")
@@ -29,8 +29,8 @@ set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "-flto -O3")
 # unoptimized native code. Give any non-standard config Release-grade flags.
 string(TOUPPER "${CMAKE_BUILD_TYPE}" _NITRO_CFG)
 if(NOT "${_NITRO_CFG}" MATCHES "^(DEBUG|RELEASE|RELWITHDEBINFO|MINSIZEREL|)$")
-  set(CMAKE_C_FLAGS_${_NITRO_CFG} "-O3 -march=native -mtune=native -DNDEBUG -fomit-frame-pointer -funroll-loops -ffast-math")
-  set(CMAKE_CXX_FLAGS_${_NITRO_CFG} "-O3 -march=native -mtune=native -DNDEBUG -fomit-frame-pointer -funroll-loops -ffast-math")
+  set(CMAKE_C_FLAGS_${_NITRO_CFG} "-O3 -march=native -mtune=native -DNDEBUG -fomit-frame-pointer -funroll-loops -ffast-math -fno-rtti")
+  set(CMAKE_CXX_FLAGS_${_NITRO_CFG} "-O3 -march=native -mtune=native -DNDEBUG -fomit-frame-pointer -funroll-loops -ffast-math -fno-rtti")
 endif()
 
 set(NITRO_NATIVE "${CMAKE_CURRENT_SOURCE_DIR}/native")

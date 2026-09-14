@@ -560,17 +560,27 @@ class ServerRunner {
     // the last `use()`): dispatch is a single call through it — no fold, no
     // per-request closure allocation.
     final piped = entry.piped;
-    // Future.sync: a sync handler (RequestHandler may return the response
-    // directly) answers without an extra event-loop turn, and a
-    // synchronously-throwing handler still lands in onError below — no
-    // separate try/catch needed.
-    Future<ResponseContext>.sync(() => piped(context)).then(
+    // A handler that returns its response directly is answered inline: no
+    // Future, no microtask, no event-loop turn. Async handlers continue in
+    // `then`; a throw either way lands on the (guarded) error page.
+    final FutureOr<ResponseContext> result;
+    try {
+      result = piped(context);
+    } catch (error) {
+      _guardedError(error, context).then((response) {
+        _deliver(head.requestId, response);
+      });
+      return;
+    }
+    if (result is ResponseContext) {
+      _deliver(head.requestId, result);
+      return;
+    }
+    result.then(
       (response) {
         _deliver(head.requestId, response);
       },
       onError: (Object error) {
-        // The handler's future failed: the custom error page (guarded, so it
-        // cannot throw) answers instead of the default 500.
         _guardedError(error, context).then((response) {
           _deliver(head.requestId, response);
         });

@@ -140,15 +140,14 @@ MatchResult Router::match(Method method, const std::string& customMethod,
     }
     return nullptr;
   };
-  auto consider = [&](const RouteEntry* e, const std::vector<RouteParam>& ps,
-                      int spec, const RouteEntry*& best,
-                      std::vector<RouteParam>& bestParams, int& bestSpec,
-                      bool& bestIsAll) {
+  auto consider = [&](const RouteEntry* e, int frameId, int spec,
+                       const RouteEntry*& best, int& bestFrame,
+                       int& bestSpec, bool& bestIsAll) {
     if (!e) return;
     const bool isAll = (e->method == Method::All);
     if (spec > bestSpec || (spec == bestSpec && bestIsAll && !isAll)) {
       best = e;
-      bestParams = ps;
+      bestFrame = frameId;
       bestSpec = spec;
       bestIsAll = isAll;
     }
@@ -157,71 +156,97 @@ MatchResult Router::match(Method method, const std::string& customMethod,
   // Depth-first search with static > param > wildcard precedence. The first
   // hit in that order wins; an All-route only counts when no method-specific
   // route matched anywhere at equal-or-better specificity.
+  //
+  // Frames are parent-linked (not param-vector-carrying): each frame holds
+  // only the single :param it captured on entry, plus its parent's arena
+  // index. Branching therefore moves two small structs instead of copying a
+  // params vector per frame; the winning chain is walked once at the end.
   struct Frame {
     const Node* node;
     size_t idx;
-    std::vector<RouteParam> params;
+    int parent;  // arena index, -1 for the root.
+    bool hasParam;
+    std::string paramName;
+    std::string paramValue;
     int specificity;  // higher = more specific.
   };
   // Specificity of a candidate is compared across the whole search, so a
   // static match deeper in one branch beats a param match in another.
   const RouteEntry* best = nullptr;
-  std::vector<RouteParam> bestParams;
+  int bestFrame = -1;
   int bestSpec = -1;
   bool bestIsAll = true;
 
-  std::vector<Frame> stack;
-  stack.reserve(segs.size() + 1);
-  stack.push_back({&root_, 0, {}, 0});
+  std::vector<Frame> arena;
+  arena.reserve(2 * (segs.size() + 1));
+  std::vector<int> stack;
+  stack.reserve(2 * (segs.size() + 1));
+  arena.push_back({&root_, 0, -1, false, {}, {}, 0});
+  stack.push_back(0);
+  auto pushChild = [&](const Node* node, size_t idx, int parent,
+                       const std::string& paramName, const std::string& seg,
+                       int specificity) {
+    const bool hasParam = !paramName.empty();
+    arena.push_back({node, idx, parent, hasParam, paramName,
+                     hasParam ? seg : std::string(), specificity});
+    stack.push_back((int)arena.size() - 1);
+  };
   while (!stack.empty()) {
-    Frame fr = std::move(stack.back());
+    const int id = stack.back();
     stack.pop_back();
-    const Node* node = fr.node;
+    // Hoisted: pushChild appends to arena (may reallocate), so nothing may
+    // hold a reference into it across a push.
+    const Node* node = arena[(size_t)id].node;
+    const size_t idx = arena[(size_t)id].idx;
+    const int spec = arena[(size_t)id].specificity;
 
-    if (fr.idx == segs.size()) {
-      consider(pick(node), fr.params, fr.specificity, best, bestParams,
-               bestSpec, bestIsAll);
+    if (idx == segs.size()) {
+      consider(pick(node), id, spec, best, bestFrame, bestSpec,
+               bestIsAll);
       // A trailing wildcard also matches the empty remainder.
       if (node->wildcard) {
-        consider(pick(node->wildcard.get()), fr.params, fr.specificity, best,
-                 bestParams, bestSpec, bestIsAll);
+        consider(pick(node->wildcard.get()), id, spec, best,
+                 bestFrame, bestSpec, bestIsAll);
       }
       continue;
     }
 
-    const std::string& seg = segs[fr.idx];
+    const std::string& seg = segs[idx];
     // Push in reverse precedence so static pops first.
     if (node->wildcard) {
       // Wildcard consumes the rest of the path.
-      consider(pick(node->wildcard.get()), fr.params, fr.specificity, best,
-               bestParams, bestSpec, bestIsAll);
+      consider(pick(node->wildcard.get()), id, spec, best,
+               bestFrame, bestSpec, bestIsAll);
     }
     const bool hasParam = (node->param != nullptr);
     auto sit = node->statik.find(seg);
     const bool hasStatic = (sit != node->statik.end());
     if (hasParam && hasStatic) {
-      // Two children: move into one, copy into the other. Static pops first
-      // so it gets the moved vector.
-      Frame paramFr{node->param.get(), fr.idx + 1, fr.params,
-                    fr.specificity + 1};
-      paramFr.params.push_back({node->paramName, seg});
-      stack.push_back(std::move(paramFr));
-      stack.push_back({sit->second.get(), fr.idx + 1, std::move(fr.params),
-                       fr.specificity + 2});
+      // Two children: static pops first. No vector is copied either way —
+      // each child links back to this frame.
+      pushChild(node->param.get(), idx + 1, id, node->paramName, seg,
+                spec + 1);
+      pushChild(sit->second.get(), idx + 1, id, {}, seg,
+                spec + 2);
     } else if (hasParam) {
-      fr.params.push_back({node->paramName, seg});
-      stack.push_back({node->param.get(), fr.idx + 1, std::move(fr.params),
-                       fr.specificity + 1});
+      pushChild(node->param.get(), idx + 1, id, node->paramName, seg,
+                spec + 1);
     } else if (hasStatic) {
-      stack.push_back({sit->second.get(), fr.idx + 1, std::move(fr.params),
-                       fr.specificity + 2});
+      pushChild(sit->second.get(), idx + 1, id, {}, seg,
+                spec + 2);
     }
   }
 
   if (best) {
     out.matched = true;
     out.route = *best;
-    out.params = std::move(bestParams);
+    // Walk the winning chain once, deepest first, then reverse.
+    std::vector<RouteParam> ps;
+    for (int id = bestFrame; id > 0; id = arena[(size_t)id].parent) {
+      const Frame& fr = arena[(size_t)id];
+      if (fr.hasParam) ps.push_back({fr.paramName, fr.paramValue});
+    }
+    out.params.assign(ps.rbegin(), ps.rend());
   }
   return out;
 }

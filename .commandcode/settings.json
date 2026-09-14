@@ -8,7 +8,12 @@
       "Shell(./build/tests/nitro_server_tests/nitro_server_engine_tests:*)",
       "Shell(ls -d ~/.pub-cache/hosted/pub.dev/nitro-* ~/.pub-cache/hosted/pub.dev/nitro_annotations-* 2>/dev/null; echo ---; for d in ~/.pub-cache/hosted/pub.dev/nitro-*/; do echo \"== $d\"; sed -n '1,60p' \"$d/pubspec.yaml\" 2>/dev/null; done)",
       "Shell(python3 -c import json;d=json.load(open('.dart_tool/package_config.json'));[print(p['name'],'->',p['rootUri']) for p in d['packages'] if p['name'].startswith('nitro')])",
-      "Shell(dart --version 2>&1; echo \"=== which ===\"; which -a dart flutter 2>&1; echo \"=== pub get (dry) ===\"; dart pub get --offline 2>&1 | tail -15)"
+      "Shell(dart --version 2>&1; echo \"=== which ===\"; which -a dart flutter 2>&1; echo \"=== pub get (dry) ===\"; dart pub get --offline 2>&1 | tail -15)",
+      "Shell(dart:*)",
+      "Shell(dart run tool/repro/ka_first.dart 2>&1; echo \"=== e2e rerun ===\"; dart test test/server_e2e_test.dart --plain-name \"native server idle keep-alive connections close after the timeout\" 2>&1 | tail -8)",
+      "Shell(grep:*)",
+      "Shell(echo:*)",
+      "Shell(mkdir -p build/benchmark && dart compile exe benchmark/compare.dart -o build/benchmark/compare >/tmp/aot_compile.log 2>&1 && echo COMPILED && ./build/benchmark/compare 2>&1 | tail -26)"
     ],
     "deny": [],
     "defaultMode": "default"

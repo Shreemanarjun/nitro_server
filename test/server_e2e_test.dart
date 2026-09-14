@@ -404,12 +404,35 @@ void main() {
       final socket = await Socket.connect('127.0.0.1', server!.port);
       addTearDown(() => socket.destroy());
       socket.add(ascii.encode('GET /h HTTP/1.1\r\nHost: x\r\n\r\n'));
-      // Drain the one framed response; the socket must then go quiet…
-      final first = await socket.first.timeout(const Duration(seconds: 5));
+      // Drain the one framed response through a persistent listener; the
+      // socket must then go quiet…
+      //
+      // NOTE: do NOT use `socket.first` here. `first` cancels the stream
+      // subscription after one chunk, which pauses the socket — and a paused
+      // socket never completes `done`, even after the server closes the
+      // connection (verified identical against stock dart:io HttpServer, so
+      // this is a Dart client quirk, not engine behavior). The persistent
+      // listener below keeps the socket resumed so the close is observed.
+      //
+      // NOTE: do NOT await `socket.done` either — that is the IOSink done
+      // future, which completes when THIS side closes its write half, not
+      // when the server closes. The server-side close is observed through
+      // the stream's onDone below.
+      final firstBytes = Completer<List<int>>();
+      final closedByServer = Completer<void>();
+      final sub = socket.listen(
+        (chunk) {
+          if (!firstBytes.isCompleted) firstBytes.complete(chunk);
+        },
+        onDone: closedByServer.complete,
+        onError: closedByServer.completeError,
+      );
+      addTearDown(sub.cancel);
+      final first = await firstBytes.future.timeout(const Duration(seconds: 5));
       expect(ascii.decode(first), contains('200'));
       // …and the server must close it after the idle deadline, not hold it
       // forever and leak the worker.
-      await socket.done.timeout(
+      await closedByServer.future.timeout(
         const Duration(seconds: 5),
         onTimeout: () => throw StateError('idle connection never closed'),
       );
@@ -514,6 +537,26 @@ void main() {
       Ids.resetForTesting();
 
       // First native touch of the new incarnation stops the old listener.
+      //
+      // NOTE: this goes through `resetNative` explicitly, not through the
+      // automatic handshake in `bind`. The handshake skips the reset unless
+      // the isolate is named 'main' (so background isolates can't kill the
+      // root isolate's servers) — and under `dart test` the isolate is named
+      // `test_suite:...`, never 'main'. In production the root isolate is
+      // always 'main', so the automatic path applies there; here we perform
+      // the same touch by hand.
+      NitroServerNative.forKey(kEngineKey).resetNative();
+
+      // A real hot restart kills the old isolate: the old runner, its stream
+      // subscriptions and its handler table die with it — only native state
+      // survives until the reset above stops it. Detach the old runner the
+      // same way here (stop is idempotent and already done), or its still-
+      // subscribed handler table answers for the reborn server and the
+      // recycled 's:1' key routes both runners' responds at one instance.
+      await server!.close();
+      server = null;
+
+      // First native touch of the new incarnation stops the old listener.
       final reborn = await NitroServer.bind();
       addTearDown(reborn.close);
       await reborn.route(
@@ -524,8 +567,6 @@ void main() {
       expect((await _get(reborn.port, '/')).body, 'two');
 
       // The straggler is gone: the old port refuses connections now.
-      await server!.close();
-      server = null;
       await expectLater(_get(firstPort, '/'), throwsA(isA<Exception>()));
     }, skip: skipReason);
   });

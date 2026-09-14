@@ -64,6 +64,34 @@ class ServerConfig {
   /// Native worker threads serving connections. `0` means one per CPU core.
   final int workerThreads;
   final TlsConfig tls;
+
+  /// A copy with any of [host], [port], [backlog], [maxBodyBytes],
+  /// [defaultTimeout], [keepAliveTimeout], [maxRequestsPerConnection],
+  /// [workerThreads] or [tls] replaced.
+  ServerConfig copyWith({
+    String? host,
+    int? port,
+    int? backlog,
+    int? maxBodyBytes,
+    Duration? defaultTimeout,
+    Duration? keepAliveTimeout,
+    int? maxRequestsPerConnection,
+    int? workerThreads,
+    TlsConfig? tls,
+  }) {
+    return ServerConfig(
+      host: host ?? this.host,
+      port: port ?? this.port,
+      backlog: backlog ?? this.backlog,
+      maxBodyBytes: maxBodyBytes ?? this.maxBodyBytes,
+      defaultTimeout: defaultTimeout ?? this.defaultTimeout,
+      keepAliveTimeout: keepAliveTimeout ?? this.keepAliveTimeout,
+      maxRequestsPerConnection:
+          maxRequestsPerConnection ?? this.maxRequestsPerConnection,
+      workerThreads: workerThreads ?? this.workerThreads,
+      tls: tls ?? this.tls,
+    );
+  }
 }
 
 /// Wraps a [RequestHandler]: logging, auth, CORS, compression — anything that
@@ -79,7 +107,7 @@ class ServerConfig {
 ///   }
 /// });
 /// ```
-typedef Middleware = Future<ResponseContext> Function(
+typedef Middleware = FutureOr<ResponseContext> Function(
   RequestContext request,
   RequestHandler next,
 );
@@ -178,11 +206,32 @@ class ResponseContext {
     int status = 200,
     Map<String, String> headers = const {},
   }) {
+    return ResponseContext.jsonBody(data, status: status, headers: headers);
+  }
+
+  /// Encodes any JSON-encodable [data] (maps, lists, nested values) and
+  /// answers it as JSON. The general form of [jsonMap].
+  factory ResponseContext.jsonBody(
+    Object data, {
+    int status = 200,
+    Map<String, String> headers = const {},
+  }) {
     return ResponseContext.json(
       jsonEncode(data),
       status: status,
       headers: headers,
     );
+  }
+
+  /// Answers a redirect to [url] with an empty body. [status] must be one of
+  /// the redirect codes (301, 302, 303, 307, 308); the default is 302.
+  factory ResponseContext.redirect(String url, {int status = 302}) {
+    assert(
+      status == 301 || status == 302 || status == 303 || status == 307 ||
+          status == 308,
+      'redirect status must be 301/302/303/307/308, got $status',
+    );
+    return ResponseContext(status: status, headers: {'location': url});
   }
 
   /// Answers an HTML page.
@@ -212,14 +261,20 @@ class ResponseContext {
     );
   }
 
-  /// The bytes placed on the wire (empty for a null body).
-  Uint8List get bodyBytes => body ?? Uint8List(0);
+  /// The bytes placed on the wire (empty for a null body). The empty body is
+  /// one shared instance — treat it as immutable.
+  Uint8List get bodyBytes => body ?? _emptyBody;
+
+  static final Uint8List _emptyBody = Uint8List(0);
 }
 
-/// Answers one request. May be async; the route timeout bounds it — a handler
-/// that outlives its deadline loses: the client already got a 408 and the
-/// late value is dropped, never sent twice.
-typedef RequestHandler = Future<ResponseContext> Function(
+/// Answers one request. Sync or async: a handler returning a
+/// [ResponseContext] directly skips an event-loop turn — the runner invokes
+/// it through `Future.sync`, so a synchronously-throwing handler still ends
+/// as a 500. The route timeout bounds it: a handler that outlives its
+/// deadline loses — the client already got a 408 and the late value is
+/// dropped, never sent twice.
+typedef RequestHandler = FutureOr<ResponseContext> Function(
   RequestContext request,
 );
 

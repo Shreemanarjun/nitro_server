@@ -45,6 +45,38 @@ class NitroServer {
     return server;
   }
 
+  /// [bind] with named-argument sugar over a default [ServerConfig]:
+  ///
+  /// ```dart
+  /// final server = await NitroServer.bindWith(port: 8080, host: '0.0.0.0');
+  /// ```
+  ///
+  /// Any argument left null keeps the default; see [ServerConfig.copyWith]
+  /// for the full set.
+  static Future<NitroServer> bindWith({
+    String? host,
+    int? port,
+    int? backlog,
+    int? maxBodyBytes,
+    Duration? defaultTimeout,
+    Duration? keepAliveTimeout,
+    int? maxRequestsPerConnection,
+    int? workerThreads,
+    TlsConfig? tls,
+  }) {
+    return bind(const ServerConfig().copyWith(
+      host: host,
+      port: port,
+      backlog: backlog,
+      maxBodyBytes: maxBodyBytes,
+      defaultTimeout: defaultTimeout,
+      keepAliveTimeout: keepAliveTimeout,
+      maxRequestsPerConnection: maxRequestsPerConnection,
+      workerThreads: workerThreads,
+      tls: tls,
+    ));
+  }
+
   int _port = 0;
 
   /// The actual bound port (== config port unless the config asked for 0).
@@ -53,19 +85,22 @@ class NitroServer {
   /// Engine health and lifecycle observations. Broadcast.
   Stream<ServerEvent> get events => _runner.events;
 
-  /// Registers [handler] for [method] + [pattern].
+  /// Registers [handler] for [method] + [pattern]. Returns `this`, so
+  /// registrations chain: `await server.get(...)` and
+  /// `(await server.get(...)).post(...)` both work.
   ///
   /// Patterns are `/`-rooted with `:param` segments (`/users/:id`) and an
   /// optional trailing `*` wildcard. Static segments win over `:param`, which
-  /// wins over `*`. [timeout] bounds the handler; `-1`… no — pass an explicit
-  /// duration or leave the server default: a null timeout inherits
-  /// [ServerConfig.defaultTimeout].
-  Future<void> route(
+  /// wins over `*`. [timeout] bounds the handler; a null timeout inherits
+  /// [ServerConfig.defaultTimeout]. [middleware] wraps this route only,
+  /// inside the server-global chain (see [use]).
+  Future<NitroServer> route(
     HttpMethod method,
     String pattern,
     RequestHandler handler, {
     Duration? timeout,
     String customMethod = '',
+    List<Middleware>? middleware,
   }) async {
     _requirePattern(pattern);
     if (method == HttpMethod.custom && customMethod.isEmpty) {
@@ -81,21 +116,26 @@ class NitroServer {
       pattern,
       timeout,
       handler,
+      middleware ?? const [],
     );
+    return this;
   }
 
-  /// Appends [middleware] to the chain (outermost first). See [Middleware].
-  Future<void> use(Middleware middleware) async {
+  /// Appends [middleware] to the chain (outermost first). Returns `this` for
+  /// chaining. See [Middleware].
+  Future<NitroServer> use(Middleware middleware) async {
     _runner.use(middleware);
+    return this;
   }
 
   /// Removes a registration. Unknown routes throw [RouteNotFoundException].
-  Future<void> unroute(
+  Future<NitroServer> unroute(
     HttpMethod method,
     String pattern, {
     String customMethod = '',
   }) async {
     _runner.removeRoute(method, customMethod.toUpperCase(), pattern);
+    return this;
   }
 
   /// Shorthands so the common case stays one line:
@@ -103,62 +143,78 @@ class NitroServer {
   /// ```dart
   /// await server.get('/hello', (_) async => ResponseContext.text('hi'));
   /// ```
-  Future<void> get(
+  Future<NitroServer> get(
     String pattern,
     RequestHandler handler, {
     Duration? timeout,
+    List<Middleware>? middleware,
   }) =>
-      route(HttpMethod.get, pattern, handler, timeout: timeout);
+      route(HttpMethod.get, pattern, handler,
+          timeout: timeout, middleware: middleware);
 
-  Future<void> head(
+  Future<NitroServer> head(
     String pattern,
     RequestHandler handler, {
     Duration? timeout,
+    List<Middleware>? middleware,
   }) =>
-      route(HttpMethod.head, pattern, handler, timeout: timeout);
+      route(HttpMethod.head, pattern, handler,
+          timeout: timeout, middleware: middleware);
 
-  Future<void> post(
+  Future<NitroServer> post(
     String pattern,
     RequestHandler handler, {
     Duration? timeout,
+    List<Middleware>? middleware,
   }) =>
-      route(HttpMethod.post, pattern, handler, timeout: timeout);
+      route(HttpMethod.post, pattern, handler,
+          timeout: timeout, middleware: middleware);
 
-  Future<void> put(
+  Future<NitroServer> put(
     String pattern,
     RequestHandler handler, {
     Duration? timeout,
+    List<Middleware>? middleware,
   }) =>
-      route(HttpMethod.put, pattern, handler, timeout: timeout);
+      route(HttpMethod.put, pattern, handler,
+          timeout: timeout, middleware: middleware);
 
-  Future<void> delete(
+  Future<NitroServer> delete(
     String pattern,
     RequestHandler handler, {
     Duration? timeout,
+    List<Middleware>? middleware,
   }) =>
-      route(HttpMethod.delete, pattern, handler, timeout: timeout);
+      route(HttpMethod.delete, pattern, handler,
+          timeout: timeout, middleware: middleware);
 
-  Future<void> patch(
+  Future<NitroServer> patch(
     String pattern,
     RequestHandler handler, {
     Duration? timeout,
+    List<Middleware>? middleware,
   }) =>
-      route(HttpMethod.patch, pattern, handler, timeout: timeout);
+      route(HttpMethod.patch, pattern, handler,
+          timeout: timeout, middleware: middleware);
 
-  Future<void> options(
+  Future<NitroServer> options(
     String pattern,
     RequestHandler handler, {
     Duration? timeout,
+    List<Middleware>? middleware,
   }) =>
-      route(HttpMethod.options, pattern, handler, timeout: timeout);
+      route(HttpMethod.options, pattern, handler,
+          timeout: timeout, middleware: middleware);
 
   /// Matches every method — handy for echo, proxy and fallback routes.
-  Future<void> all(
+  Future<NitroServer> all(
     String pattern,
     RequestHandler handler, {
     Duration? timeout,
+    List<Middleware>? middleware,
   }) =>
-      route(HttpMethod.all, pattern, handler, timeout: timeout);
+      route(HttpMethod.all, pattern, handler,
+          timeout: timeout, middleware: middleware);
 
   /// A path-prefixed view of this server: `server.group('/api').get(...)`
   /// registers `/api/...`. Groups nest; middleware stays server-global.

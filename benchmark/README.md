@@ -61,20 +61,40 @@ exactly the contention behavior this plugin exists to improve.
 ## Example run (Apple M-series, loopback, release dylib)
 
 Second round (post-warmup) figures; the first round includes JIT warmup on
-the Dart sides:
+the Dart sides. Both VM modes, same machine, after the D1–D4 dispatch
+optimizations (two-level route table, pre-composed middleware, shared empty
+params/headers/body):
+
+**JIT** (`dart run benchmark/compare.dart`):
 
 ```
 | case                 | mean µs | p50 µs | p99 µs | req/s @32 |
 | -------------------- | ------- | ------ | ------ | --------- |
-| dart:io /hello       |     186 |    162 |    398 |      7868 |
-| shelf   /hello       |     208 |    184 |    424 |      7328 |
-| nitro   /hello       |     171 |    151 |    350 |      9967 |
-| dart:io /json        |     186 |    163 |    399 |      8497 |
-| shelf   /json        |     207 |    182 |    416 |      6951 |
-| nitro   /json        |     167 |    148 |    347 |     11074 |
-| dart:io POST /echo 4k|     206 |    182 |    387 |      7072 |
-| shelf   POST /echo 4k|     227 |    199 |    446 |      6545 |
-| nitro   POST /echo 4k|     186 |    166 |    366 |      9798 |
+| dart:io /hello       |     189 |    170 |    398 |      7427 |
+| shelf   /hello       |     220 |    193 |    476 |      6941 |
+| nitro   /hello       |     187 |    161 |    430 |     10582 |
+| dart:io /json        |     196 |    172 |    413 |      8756 |
+| shelf   /json        |     207 |    183 |    397 |      7303 |
+| nitro   /json        |     168 |    149 |    294 |     11474 |
+| dart:io POST /echo 4k|     201 |    182 |    369 |      7277 |
+| shelf   POST /echo 4k|     222 |    198 |    397 |      6521 |
+| nitro   POST /echo 4k|     190 |    168 |    349 |     10041 |
+```
+
+**AOT** (`dart compile exe` + run):
+
+```
+| case                 | mean µs | p50 µs | p99 µs | req/s @32 |
+| -------------------- | ------- | ------ | ------ | --------- |
+| dart:io /hello       |     186 |    161 |    400 |      9377 |
+| shelf   /hello       |     206 |    174 |    397 |      7573 |
+| nitro   /hello       |     156 |    142 |    275 |     11882 |
+| dart:io /json        |     170 |    154 |    364 |      8484 |
+| shelf   /json        |     188 |    170 |    380 |      8267 |
+| nitro   /json        |     158 |    143 |    277 |     11586 |
+| dart:io POST /echo 4k|     191 |    174 |    362 |      7214 |
+| shelf   POST /echo 4k|     208 |    188 |    386 |      6005 |
+| nitro   POST /echo 4k|     179 |    162 |    349 |     10282 |
 ```
 
 Read it narrowly: on tiny routes the native accept loop and per-connection

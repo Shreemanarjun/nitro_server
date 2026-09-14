@@ -1,0 +1,12 @@
+# Test-runner configuration.
+#
+# concurrency: 1 is REQUIRED, not a tuning knob: the native engine is
+# process-global (one EngineRegistry, one accept-loop pool) and the generated
+# Nitro streams register one Dart port per stream NAME for the whole process —
+# the spec's "exactly one internal subscriber" invariant is per-process, not
+# per-isolate. `dart test` runs files in separate isolates concurrently by
+# default, so a later-subscribing isolate would steal every head, and
+# `resetNative()` (the hot-restart test) stops every server in the process
+# mid-flight for the other files. Production never does this — one isolate
+# owns the engine — so the suite must run serially to match reality.
+concurrency: 1

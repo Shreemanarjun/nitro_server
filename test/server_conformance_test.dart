@@ -565,10 +565,14 @@ void main() {
           int end = headEnd(buffer);
           while (end < 0) {
             await Future<void>.delayed(const Duration(milliseconds: 5));
-            if (done.isCompleted) {
+            // Rescan BEFORE checking `done`: on loopback a fast answer plus
+            // the server's close (pipelined `Connection: close`) can all land
+            // inside one poll window. Checking `done` first throws away
+            // complete responses already sitting in `buffer`.
+            end = headEnd(buffer);
+            if (end < 0 && done.isCompleted) {
               throw StateError('connection closed mid-response');
             }
-            end = headEnd(buffer);
           }
           final head = ascii.decode(buffer.sublist(0, end));
           var contentLength = 0;

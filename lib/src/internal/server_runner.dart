@@ -29,11 +29,29 @@ import '../api/http_method.dart';
 import '../nitro_server.native.dart';
 import 'raw_mapping.dart';
 
-/// Handler lookup key: the method token plus the registered pattern.
-String handlerKey(HttpMethod method, String customToken, String pattern) {
-  final token = method == HttpMethod.custom ? customToken : method.token;
-  return '$token $pattern';
+/// Wire token for a route registration: the custom token for custom methods,
+/// the enum token otherwise (`*` for all-method routes).
+String _tokenOf(HttpMethod method, String customToken) =>
+    method == HttpMethod.custom ? customToken : method.token;
+
+/// One registered route: the user handler plus the same handler pre-wrapped
+/// by the middleware chains. [routeComposer] composes the route-local (and
+/// group) middleware around the handler; [piped] is the route-composed
+/// handler wrapped by the server-global chain on top — request flow is
+/// global → group/route-local → handler. Both are computed at registration
+/// and refreshed on every `use()`, so dispatch never composes per request.
+class _RouteEntry {
+  _RouteEntry(this.handler, this.routeComposer, this.piped);
+
+  final RequestHandler handler;
+  final HandlerComposer routeComposer;
+  RequestHandler piped;
 }
+
+/// The middleware chain as a handler transformer: composes every registered
+/// middleware (outermost first) around the handler it is given. The identity
+/// transform — no middleware — returns the handler untouched.
+typedef HandlerComposer = RequestHandler Function(RequestHandler handler);
 
 class _Pending {
   _Pending(this.head);
@@ -62,6 +80,21 @@ String _lowerHeaderName(String name) {
 class ServerRunner {
   ServerRunner(this._native);
 
+  /// Identity transform: no middleware, the handler runs as registered.
+  static RequestHandler _identity(RequestHandler handler) => handler;
+
+  /// Composes [middlewares] (first = outermost) into one handler transformer.
+  /// The empty list is the identity — no closures allocated.
+  static HandlerComposer _composeAll(List<Middleware> middlewares) {
+    if (middlewares.isEmpty) return _identity;
+    var compose = _identity;
+    for (final middleware in middlewares.reversed) {
+      final next = compose;
+      compose = (handler) => (request) => middleware(request, next(handler));
+    }
+    return compose;
+  }
+
   final NitroServerNative _native;
   final _pending = <int, _Pending>{};
 
@@ -84,8 +117,16 @@ class ServerRunner {
   /// acked the moment it is copied — including chunks that arrive before
   /// their head — so native memory is freed promptly and exactly once.
   final _acked = <int, int>{};
-  final _handlers = <String, RequestHandler>{};
+  /// Handler table, two levels: method token → pattern → route entry. A flat
+  /// `'$token $pattern'` key costs a string allocation on every request;
+  /// this lookup allocates nothing.
+  final _routes = <String, Map<String, _RouteEntry>>{};
   final _middlewares = <Middleware>[];
+
+  /// The composed middleware chain (identity while no middleware is
+  /// registered). Rebuilt on every `use()`; every route entry's [piped]
+  /// handler is refreshed in the same step.
+  HandlerComposer _compose = _identity;
   final _events = StreamController<ServerEvent>.broadcast();
 
   /// Answers unmatched requests. Defaults to an empty 404.
@@ -96,10 +137,23 @@ class ServerRunner {
       (error, _) => ResponseContext.text('handler error: $error', status: 500);
 
   /// Overrides the 404 answer. A throwing handler falls back to empty 404.
-  set notFoundHandler(NotFoundHandler handler) => _notFoundHandler = handler;
+  ///
+  /// Ensures the engine subscription: configuring a fallback without any
+  /// route registered must still dispatch (broadcast streams drop events
+  /// with no listener, so a head emitted before the first `addRoute`/`start`
+  /// would otherwise vanish).
+  set notFoundHandler(NotFoundHandler handler) {
+    _ensureListening();
+    _notFoundHandler = handler;
+  }
 
   /// Overrides the 500 answer. A throwing handler falls back to the default.
-  set errorHandler(ErrorHandler handler) => _errorHandler = handler;
+  ///
+  /// Ensures the engine subscription, same as [notFoundHandler].
+  set errorHandler(ErrorHandler handler) {
+    _ensureListening();
+    _errorHandler = handler;
+  }
 
   StreamSubscription<RawIncomingRequest>? _heads;
   StreamSubscription<RawBodyChunk>? _chunks;
@@ -112,6 +166,13 @@ class ServerRunner {
 
   /// Test seam: ids with an unfinished request.
   Set<int> get pendingIdsForTesting => {..._pending.keys};
+
+  /// Test seam: subscribes the engine streams without touching native state,
+  /// mirroring what `addRoute`/`start` do in production. Needed by tests that
+  /// drive requests against a runner with no routes and no `start()` — the
+  /// fake's broadcast streams drop a head emitted before any subscriber, and
+  /// in production a request can never arrive before `start()` subscribed.
+  void ensureListeningForTesting() => _ensureListening();
 
   /// Marks [requestId] answered: drops the in-flight entry and records the
   /// id so a stale duplicate head can never dispatch again.
@@ -145,8 +206,9 @@ class ServerRunner {
     String customToken,
     String pattern,
     Duration? timeout,
-    RequestHandler handler,
-  ) {
+    RequestHandler handler, [
+    List<Middleware> middleware = const [],
+  ]) {
     _ensureListening();
     final (rawMethod, rawCustom) = rawMethodOf(method, customToken);
     final status = _native.registerRoute(
@@ -159,20 +221,41 @@ class ServerRunner {
       ),
     );
     throwIfFailed(status, operation: 'registerRoute($pattern)');
-    _handlers[handlerKey(method, customToken, pattern)] = handler;
+    // Route-local middleware sits inside the global chain: the entry's
+    // `piped` is global(routeLocal(handler)), matching use()'s refresh.
+    final routeComposer = _composeAll(middleware);
+    final entry =
+        _RouteEntry(handler, routeComposer, _compose(routeComposer(handler)));
+    (_routes[_tokenOf(method, customToken)] ??= {})[pattern] = entry;
   }
 
   /// Appends [middleware] to the chain. Order is registration order: the
   /// first `use` is the outermost wrapper. Applies to routes registered
   /// before AND after — the chain is resolved at dispatch, not at
-  /// registration.
-  void use(Middleware middleware) => _middlewares.add(middleware);
+  /// registration. Re-composes every route entry here, once, so dispatch
+  /// stays a plain call through [HandlerComposer] output.
+  void use(Middleware middleware) {
+    _ensureListening();
+    _middlewares.add(middleware);
+    _recompose();
+  }
+
+  /// Rebuilds [_compose] from [_middlewares] and refreshes every route's
+  /// piped handler. Registration order is outermost-first: iterating the
+  /// reversed list nests each earlier middleware around the later ones.
+  void _recompose() {
+    _compose = _composeAll(_middlewares);
+    for (final byPattern in _routes.values) {
+      for (final entry in byPattern.values) {
+        entry.piped = _compose(entry.routeComposer(entry.handler));
+      }
+    }
+  }
 
   void removeRoute(HttpMethod method, String customToken, String pattern) {
-    final token = method == HttpMethod.custom ? customToken : method.token;
-    final status = _native.unregisterRoute(token, pattern);
+    final status = _native.unregisterRoute(_tokenOf(method, customToken), pattern);
     throwIfFailed(status, operation: 'unregisterRoute($pattern)');
-    _handlers.remove(handlerKey(method, customToken, pattern));
+    _routes[_tokenOf(method, customToken)]?.remove(pattern);
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -333,13 +416,12 @@ class ServerRunner {
       return;
     }
     final (method, custom) = httpMethodOf(head.method, head.customMethod);
-    // Method-specific registrations win; `HttpMethod.all` is the fallback —
-    // mirroring the native router's precedence (specific beats All).
-    // The fallback key is only built on a miss, so the hit path allocates
-    // a single key string.
-    var handler = _handlers[handlerKey(method, custom, head.routePattern)];
-    handler ??=
-        _handlers[handlerKey(HttpMethod.all, '', head.routePattern)];
+    // Method-specific registrations win; `HttpMethod.all` (`*`) is the
+    // fallback — mirroring the native router's precedence (specific beats
+    // All). Two-level lookup: no key string is built on any path.
+    final byPattern = _routes[_tokenOf(method, custom)];
+    final entry =
+        byPattern?[head.routePattern] ?? _routes['*']?[head.routePattern];
     // The context is built before the branch: both the handler and the
     // not-found fallback receive it.
     final context = RequestContext(
@@ -351,40 +433,31 @@ class ServerRunner {
           ? const {}
           : Uri.splitQueryString(head.query),
       headers: _foldHeaders(head.headers),
-      params: {for (final p in head.params) p.name: p.value},
+      // Paramless routes (the common GET hot path) share one empty map.
+      params: head.params.isEmpty
+          ? const {}
+          : {for (final p in head.params) p.name: p.value},
       routePattern: head.routePattern,
       // GET-style heads carry no body: share one empty buffer instead of
       // allocating per request.
       body: pending.body.isEmpty ? _emptyBody : pending.body.toBytes(),
     );
-    if (handler == null) {
+    if (entry == null) {
       _guardedNotFound(context).then((response) {
         _answer(head.requestId, response);
         _complete(head.requestId);
       });
       return;
     }
-    // The common case (no middleware) skips the fold entirely: `reversed`
-    // allocates a lazy iterable on every request otherwise.
-    final RequestHandler piped;
-    if (_middlewares.isEmpty) {
-      piped = handler;
-    } else {
-      piped = _middlewares.reversed.fold<RequestHandler>(
-        handler,
-        (next, middleware) => (request) => middleware(request, next),
-      );
-    }
-    // Invoke inline rather than via `Future(() => ...)`: that constructor
-    // costs an extra event-loop turn per request. A synchronously-throwing
-    // handler still ends as a 500, via the guarded error path below.
-    Future<ResponseContext> future;
-    try {
-      future = piped(context);
-    } catch (error) {
-      future = _guardedError(error, context);
-    }
-    future.then(
+    // The middleware chain was composed into `piped` at registration (or at
+    // the last `use()`): dispatch is a single call through it — no fold, no
+    // per-request closure allocation.
+    final piped = entry.piped;
+    // Future.sync: a sync handler (RequestHandler may return the response
+    // directly) answers without an extra event-loop turn, and a
+    // synchronously-throwing handler still lands in onError below — no
+    // separate try/catch needed.
+    Future<ResponseContext>.sync(() => piped(context)).then(
       (response) {
         _answer(head.requestId, response);
         _complete(head.requestId);
@@ -434,13 +507,18 @@ class ServerRunner {
   void _answer(int requestId, ResponseContext response) {
     if (_closed) return;
     try {
+      // Headerless answers (the common small-response case) share one
+      // canonical empty list instead of allocating a fresh growable one.
+      final headers = response.headers.isEmpty
+          ? const <RawHeader>[]
+          : [
+              for (final entry in response.headers.entries)
+                RawHeader(name: entry.key, value: entry.value),
+            ];
       _native.respond(
         requestId,
         response.status,
-        [
-          for (final entry in response.headers.entries)
-            RawHeader(name: entry.key, value: entry.value),
-        ],
+        headers,
         response.bodyBytes,
       );
     } catch (_) {

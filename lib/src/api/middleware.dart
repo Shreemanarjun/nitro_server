@@ -37,3 +37,40 @@ Middleware accessLog({void Function(String line)? sink}) {
     }
   };
 }
+
+/// Cross-origin resource sharing: answers preflight `OPTIONS` requests with
+/// the given policy (204, no handler call) and stamps the CORS headers on
+/// every other response. Handler-set headers win on collision, so a route
+/// can refine the policy per response.
+///
+/// ```dart
+/// await server.use(cors(allowOrigin: 'https://example.com'));
+/// ```
+Middleware cors({
+  String allowOrigin = '*',
+  String allowMethods = 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS',
+  String allowHeaders = '*',
+  bool allowCredentials = false,
+  Duration? maxAge = const Duration(days: 1),
+}) {
+  final policy = <String, String>{
+    'access-control-allow-origin': allowOrigin,
+    'access-control-allow-methods': allowMethods,
+    'access-control-allow-headers': allowHeaders,
+    if (allowCredentials) 'access-control-allow-credentials': 'true',
+    if (maxAge != null && maxAge > Duration.zero)
+      'access-control-max-age': '${maxAge.inSeconds}',
+  };
+  return (request, next) async {
+    if (request.method == HttpMethod.options) {
+      // Preflight: the policy IS the answer; the route never runs.
+      return ResponseContext(status: 204, headers: policy);
+    }
+    final response = await next(request);
+    return ResponseContext(
+      status: response.status,
+      headers: {...policy, ...response.headers},
+      body: response.body,
+    );
+  };
+}

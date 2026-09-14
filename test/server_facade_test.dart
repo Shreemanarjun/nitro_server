@@ -15,11 +15,13 @@ import 'support/fakes.dart';
 
 void main() {
   late FakeNitroServerNative fake;
+  late ServerRunner runner;
   late NitroServer server;
 
   setUp(() {
     fake = FakeNitroServerNative();
-    server = NitroServer.forRunnerForTesting(ServerRunner(fake));
+    runner = ServerRunner(fake);
+    server = NitroServer.forRunnerForTesting(runner);
   });
 
   tearDown(() async {
@@ -164,6 +166,16 @@ void main() {
   });
 
   group('fallbacks', () {
+    setUp(() {
+      // These tests drive requests with no routes registered and no
+      // `start()`: subscribe here, the way `bind` would in production, or
+      // the fake's broadcast streams drop the head before any listener
+      // exists. (Scoped to this group: the runner-seams tests below create
+      // a second runner on the same fake and assert single-consumer
+      // dispatch and ack invariants.)
+      runner.ensureListeningForTesting();
+    });
+
     test('unknown routes answer empty 404 by default', () async {
       final response = await driveRequest(
         fake,

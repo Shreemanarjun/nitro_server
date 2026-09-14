@@ -760,8 +760,17 @@ bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served) {
 
   // Only a clean cycle keeps alive: the framing past this point is exact, so
   // whatever `carry` holds is the next request, not debris.
+  //
+  // The max-requests budget is honored HERE, in the framing — not just in
+  // handleConnection's loop break. Answering `Connection: keep-alive` on the
+  // last allowed request and then closing anyway tells the client a lie it
+  // may wait on; the final response must say `close`. (`served` counts
+  // completed requests, so this one is number `served + 1`.)
+  const bool underBudget =
+      cfg.maxRequestsPerConn <= 0 || served + 1 < cfg.maxRequestsPerConn;
   const bool keepAlive = keepPeer && !expired &&
-                         cfg.keepAliveTimeoutMs > 0 && running_.load();
+                         cfg.keepAliveTimeoutMs > 0 && running_.load() &&
+                         underBudget;
   std::string head_out = "HTTP/1.1 " + std::to_string(req->status) + " " +
                          reasonPhrase(req->status) + "\r\n";
   for (const auto& h : req->headers) {
@@ -772,8 +781,10 @@ bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served) {
   }
   head_out += "Content-Length: " + std::to_string(req->body.size()) + "\r\n";
   if (keepAlive) {
+    // Round up: a 250 ms deadline must not advertise `timeout=0`.
     head_out += "Connection: keep-alive\r\nKeep-Alive: timeout=" +
-                std::to_string(cfg.keepAliveTimeoutMs / 1000) + "\r\n\r\n";
+                std::to_string((cfg.keepAliveTimeoutMs + 999) / 1000) +
+                "\r\n\r\n";
   } else {
     head_out += "Connection: close\r\n\r\n";
   }

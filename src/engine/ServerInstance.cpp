@@ -221,7 +221,8 @@ class NullEmitter final : public Emitter {
  public:
   void emitHead(int64_t, Method, const std::string&, const std::string&,
                 const std::string&, const std::vector<Header>&, int64_t, bool,
-                const std::string&, const std::vector<RouteParam>&) override {}
+                bool, const std::string&,
+                const std::vector<RouteParam>&) override {}
   void emitBodyData(int64_t, uint8_t* payload, size_t) override {
     // Ownership transferred in: free on drop so the unbound window leaks
     // nothing. (Unreachable in practice — see lockedEmitter.)
@@ -817,7 +818,7 @@ bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served,
 
   emitter->emitHead(requestId, head.method, head.customMethod, path,
                     query, head.headers, chunked ? -1 : contentLength,
-                    hasBody, m.route.pattern, m.params);
+                    hasBody, !hasBody, m.route.pattern, m.params);
 
   // Stream the body. Already-buffered bytes first, then the socket. Anything
   // left in `carry` past the body belongs to the next pipelined request.
@@ -958,28 +959,16 @@ bool ServerInstance::serveOne(int fd, std::string& carry, int64_t& served,
     pending_.erase(requestId);
     return false;
   }
-  // Emit body end: for bodyless requests this is a no-op on the Dart side
-  // (the head callback already dispatched the handler), but sending it
-  // anyway costs an FFI crossing. Skip it to save one NativePort message
-  // and one Dart event-loop turn per bodyless request.
+  // Emit body end: for bodyless requests, the head already had bodyComplete=true
+  // and Dart dispatched immediately — no end marker needed. For body requests,
+  // emit a combined head+complete message instead of a separate end marker:
+  // Dart receives it as a second head with bodyComplete=true, merges early
+  // chunks, sets complete, and dispatches. This saves one NativePort message
+  // and one Dart event-loop turn compared to the old separate end marker.
   if (hasBody) {
-    emitter->emitBodyEnd(requestId);
-  } else {
-    // For bodyless requests, we need to signal completion so the Dart side
-    // knows the body is done. But the Dart _onHead already dispatched when
-    // hasBody was false, so the end marker would be a no-op. We still need
-    // to mark the PendingRequest as having a complete body so the worker
-    // knows it can park (the response may already be queued by Dart).
-    // However, we must NOT park before Dart has a chance to call respond().
-    // The head emission above guarantees the Dart callback is queued; the
-    // worker parks after, so respond() will be called after the head is
-    // processed. This is safe.
-    //
-    // The only remaining use of emitBodyEnd here is for the edge case where
-    // the Dart side receives the head, but hasn't dispatched yet (e.g.,
-    // body chunks arrived before head — the early-dedup path). In that case
-    // the end marker sets pending.complete. Since we're not sending it,
-    // the Dart side relies on hasBody=false in _onHead instead.
+    emitter->emitHead(requestId, head.method, head.customMethod, path,
+                      query, head.headers, contentLength,
+                      true, true, m.route.pattern, m.params);
   }
 
   // Park until Dart answers or the ROUTE's timeout fires. Per-request mutex:
@@ -1267,7 +1256,7 @@ bool ServerInstance::serveUpgrade(int fd, const std::string& carry,
   // The session opens through normal head dispatch, so Dart sees the
   // handshake's pattern, params, query and headers like any request.
   lockedEmitter()->emitHead(connectionId, head.method, head.customMethod,
-                            path, query, head.headers, 0, false,
+                            path, query, head.headers, 0, false, true,
                             m.route.pattern, m.params);
   wsLoop(fd, connectionId, cfg.maxBodyBytes);
   {

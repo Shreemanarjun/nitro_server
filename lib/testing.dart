@@ -144,6 +144,7 @@ class NitroTestClient {
         ],
         contentLength: bodyBytes.length,
         hasBody: bodyBytes.isNotEmpty,
+        bodyComplete: bodyBytes.isEmpty,
         routePattern: match.pattern,
         params: [
           for (final entry in match.params.entries)

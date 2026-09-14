@@ -79,6 +79,7 @@ class Emitter {
                         const std::string& query,
                         const std::vector<Header>& headers,
                         int64_t contentLength, bool hasBody,
+                        bool bodyComplete,
                         const std::string& routePattern,
                         const std::vector<RouteParam>& params) = 0;
   virtual void emitBodyData(int64_t requestId, uint8_t* payload, size_t n) = 0;

@@ -224,6 +224,7 @@ class RawIncomingRequest {
   final List<RawHeader> headers;
   final int contentLength;
   final bool hasBody;
+  final bool bodyComplete;
   final String routePattern;
   final List<RawRouteParam> params;
 
@@ -236,6 +237,7 @@ class RawIncomingRequest {
     this.headers = const [],
     this.contentLength = 0,
     this.hasBody = false,
+    this.bodyComplete = false,
     this.routePattern = '',
     this.params = const [],
   });

@@ -54,7 +54,7 @@ class BridgeEmitter final : public Emitter {
   void emitHead(int64_t requestId, Method method,
                 const std::string& customMethod, const std::string& path,
                 const std::string& query, const std::vector<Header>& headers,
-                int64_t contentLength, bool hasBody,
+                int64_t contentLength, bool hasBody, bool bodyComplete,
                 const std::string& routePattern,
                 const std::vector<RouteParam>& params) override {
     RawIncomingRequest req;
@@ -71,6 +71,7 @@ class BridgeEmitter final : public Emitter {
     }
     req.contentLength = contentLength;
     req.hasBody = hasBody;
+    req.bodyComplete = bodyComplete;
     req.routePattern = routePattern;
     for (const auto& p : params) {
       RawRouteParam rp;

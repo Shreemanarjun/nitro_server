@@ -309,20 +309,16 @@ void main() {
         await Future<void>.delayed(const Duration(milliseconds: 5));
       }
       final acks = fake.acked.where((a) => a.$1 == 9).toList();
-      expect(acks, [(9, 1), (9, 2), (9, 3)]);
+      expect(acks, [(9, 3)]);
     });
 
-    test('early chunks are acked even before their head lands', () async {
+    test('early chunks are acked when complete', () async {
       runner.addRoute(HttpMethod.post, '', '/e', null, (_) async {
         return const ResponseContext();
       });
       await Future<void>.delayed(Duration.zero);
 
       fake.chunks.add(fakeData(10, [1, 2]));
-      await Future<void>.delayed(const Duration(milliseconds: 20));
-      expect(fake.acked.where((a) => a.$1 == 10), [
-        (10, 1),
-      ], reason: 'the copy was made, so the payload must be released');
       fake.heads.add(
         fakeHead(
           requestId: 10,
@@ -339,6 +335,8 @@ void main() {
         await Future<void>.delayed(const Duration(milliseconds: 5));
       }
       expect(fake.responded.any((r) => r.requestId == 10), isTrue);
+      final acks = fake.acked.where((a) => a.$1 == 10).toList();
+      expect(acks, [(10, 1)]);
     });
   });
 

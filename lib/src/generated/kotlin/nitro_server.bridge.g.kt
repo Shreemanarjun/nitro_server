@@ -480,7 +480,7 @@ data class RawServerStatus(val errorKind: RawServerErrorKind, val errorMessage: 
 }
 
 @androidx.annotation.Keep
-data class RawIncomingRequest(val requestId: Long, val method: RawServerMethod, val customMethod: String, val path: String, val query: String, val headers: List<RawHeader>, val contentLength: Long, val hasBody: Boolean, val routePattern: String, val params: List<RawRouteParam>) {
+data class RawIncomingRequest(val requestId: Long, val method: RawServerMethod, val customMethod: String, val path: String, val query: String, val headers: List<RawHeader>, val contentLength: Long, val hasBody: Boolean, val bodyComplete: Boolean, val routePattern: String, val params: List<RawRouteParam>) {
     companion object {
         @JvmStatic fun decodeFrom(buf: java.nio.ByteBuffer): RawIncomingRequest {
             val requestId = buf.long
@@ -491,9 +491,10 @@ data class RawIncomingRequest(val requestId: Long, val method: RawServerMethod, 
             val headers = (0 until buf.int).map { RawHeader.decodeFrom(buf) }
             val contentLength = buf.long
             val hasBody = (buf.get().toInt() != 0)
+            val bodyComplete = (buf.get().toInt() != 0)
             val routePattern = { val len = buf.int; val b = ByteArray(len); buf.get(b); b.toString(Charsets.UTF_8) }()
             val params = (0 until buf.int).map { RawRouteParam.decodeFrom(buf) }
-            return RawIncomingRequest(requestId, method, customMethod, path, query, headers, contentLength, hasBody, routePattern, params)
+            return RawIncomingRequest(requestId, method, customMethod, path, query, headers, contentLength, hasBody, bodyComplete, routePattern, params)
         }
         @JvmStatic fun decode(bytes: ByteArray): RawIncomingRequest {
             val buf = java.nio.ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN)
@@ -510,6 +511,7 @@ data class RawIncomingRequest(val requestId: Long, val method: RawServerMethod, 
                 headers = @Suppress("UNCHECKED_CAST") (map["headers"] as List<RawHeader>),
                 contentLength = (map["contentLength"] as Number).toLong(),
                 hasBody = map["hasBody"] as Boolean,
+                bodyComplete = map["bodyComplete"] as Boolean,
                 routePattern = map["routePattern"] as String,
                 params = @Suppress("UNCHECKED_CAST") (map["params"] as List<RawRouteParam>)
         )
@@ -533,6 +535,7 @@ data class RawIncomingRequest(val requestId: Long, val method: RawServerMethod, 
         headers.forEach { e -> e.writeFieldsTo(out, buf) }
         writeInt(contentLength.toLong())
         writeBool(hasBody)
+        writeBool(bodyComplete)
         writeString(routePattern)
         writeInt32(params.size)
         params.forEach { e -> e.writeFieldsTo(out, buf) }
@@ -549,7 +552,7 @@ data class RawIncomingRequest(val requestId: Long, val method: RawServerMethod, 
     }
 
     // --- toJson/fromJson for Map<String, RawIncomingRequest> support ---
-    fun toJson(): Map<String, Any?> = mapOf("requestId" to requestId, "method" to method.nativeValue, "customMethod" to customMethod, "path" to path, "query" to query, "headers" to headers, "contentLength" to contentLength, "hasBody" to hasBody, "routePattern" to routePattern, "params" to params)
+    fun toJson(): Map<String, Any?> = mapOf("requestId" to requestId, "method" to method.nativeValue, "customMethod" to customMethod, "path" to path, "query" to query, "headers" to headers, "contentLength" to contentLength, "hasBody" to hasBody, "bodyComplete" to bodyComplete, "routePattern" to routePattern, "params" to params)
 
 }
 

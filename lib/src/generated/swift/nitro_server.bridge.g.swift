@@ -404,10 +404,11 @@ public struct RawIncomingRequest: NitroEncodable {
   public var headers: [RawHeader]
   public var contentLength: Int64
   public var hasBody: Bool
+  public var bodyComplete: Bool
   public var routePattern: String
   public var params: [RawRouteParam]
 
-  public init(requestId: Int64, method: RawServerMethod, customMethod: String, path: String, query: String, headers: [RawHeader], contentLength: Int64, hasBody: Bool, routePattern: String, params: [RawRouteParam]) {
+  public init(requestId: Int64, method: RawServerMethod, customMethod: String, path: String, query: String, headers: [RawHeader], contentLength: Int64, hasBody: Bool, bodyComplete: Bool, routePattern: String, params: [RawRouteParam]) {
     self.requestId = requestId
     self.method = method
     self.customMethod = customMethod
@@ -416,6 +417,7 @@ public struct RawIncomingRequest: NitroEncodable {
     self.headers = headers
     self.contentLength = contentLength
     self.hasBody = hasBody
+    self.bodyComplete = bodyComplete
     self.routePattern = routePattern
     self.params = params
   }
@@ -434,6 +436,7 @@ public struct RawIncomingRequest: NitroEncodable {
       headers: (0..<Int(r.readInt32())).map { _ in RawHeader.fromReader(r) },
       contentLength: r.readInt(),
       hasBody: r.readBool(),
+      bodyComplete: r.readBool(),
       routePattern: r.readString(),
       params: (0..<Int(r.readInt32())).map { _ in RawRouteParam.fromReader(r) }
     )
@@ -449,6 +452,7 @@ public struct RawIncomingRequest: NitroEncodable {
     for e in headers { e.writeFields(writer) }
     writer.writeInt(contentLength)
     writer.writeBool(hasBody)
+    writer.writeBool(bodyComplete)
     writer.writeString(routePattern)
     writer.writeInt32(Int32(params.count))
     for e in params { e.writeFields(writer) }

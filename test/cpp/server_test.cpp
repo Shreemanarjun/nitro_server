@@ -262,7 +262,8 @@ class RecordingEmitter : public Emitter {
   void emitHead(int64_t requestId, Method method,
                 const std::string& /*customMethod*/, const std::string& path,
                 const std::string& query, const std::vector<Header>& headers,
-                int64_t, bool hasBody, const std::string& routePattern,
+                int64_t, bool hasBody, bool bodyComplete,
+                const std::string& routePattern,
                 const std::vector<RouteParam>& params) override {
     std::lock_guard<std::mutex> lk(mutex_);
     Seen& s = partial_[requestId];
@@ -273,8 +274,8 @@ class RecordingEmitter : public Emitter {
     s.routePattern = routePattern;
     s.params = params;
     s.headers = headers;
-    if (!hasBody) {
-      auto [status, body] = answer_(method, path, "");
+    if (!hasBody || bodyComplete) {
+      auto [status, body] = answer_(method, path, s.body);
       jobs_.push_back({requestId, status, body});
       seen_.push_back(s);
       partial_.erase(requestId);

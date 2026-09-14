@@ -201,12 +201,20 @@ class ServerRunner {
   /// in production a request can never arrive before `start()` subscribed.
   void ensureListeningForTesting() => _ensureListening();
 
-  /// Marks [requestId] answered: drops the in-flight entry and records the
-  /// id so a stale duplicate head can never dispatch again.
+  /// Marks [requestId] answered: drops the in-flight entry, records the
+  /// id so a stale duplicate head can never dispatch again, and sends the
+  /// deferred cumulative body ack (one FFI crossing instead of one per chunk).
   void _complete(int requestId) {
     _pending.remove(requestId);
     _completed.add(requestId);
     if (_completed.length > 1024) _completed.remove(_completed.first);
+    // Flush the deferred body ack: one cumulative ackBody call per request
+    // instead of one per 64 KiB body chunk. The native side frees all
+    // payloads with seq < ackedUpTo, so a single cumulative ack is safe.
+    final acked = _acked.remove(requestId);
+    if (acked != null && acked > 0) {
+      _native.ackBody(requestId, acked);
+    }
   }
 
   void _ensureListening() {
@@ -365,33 +373,50 @@ class ServerRunner {
 
   // ── Dispatch ───────────────────────────────────────────────────────────────
 
-  /// Copies a chunk payload out of native memory and acks it in one step.
-  /// Every data/error chunk passes through here exactly once, so every
-  /// payload is freed exactly once.
-  Uint8List _copyAndAck(int requestId, Uint8List view) {
+  /// Copies a chunk payload out of native memory. The ack is deferred until
+  /// [_complete] to batch all body chunks into a single FFI crossing instead
+  /// of one ackBody call per chunk.
+  Uint8List _copyChunk(int requestId, Uint8List view) {
     final copy = Uint8List.fromList(view);
-    final next = (_acked[requestId] ?? 0) + 1;
-    _acked[requestId] = next;
-    _native.ackBody(requestId, next);
+    _acked[requestId] = (_acked[requestId] ?? 0) + 1;
     return copy;
   }
 
   void _onHead(RawIncomingRequest head) {
     if (_closed) return;
-    if (_pending.containsKey(head.requestId) ||
-        _completed.contains(head.requestId)) {
+    final requestId = head.requestId;
+    if (_completed.contains(requestId)) return;
+    final existing = _pending[requestId];
+    if (existing != null) {
+      // Combined head+complete message for a body request: the initial head
+      // arrived earlier (bodyComplete=false), body chunks were buffered, and
+      // now the combined message arrives with bodyComplete=true. Merge early
+      // data, mark complete, and dispatch.
+      if (head.bodyComplete && !existing.complete) {
+        final early = _early.remove(requestId);
+        if (early != null) {
+          for (final bytes in early) {
+            existing.body.add(bytes);
+          }
+        }
+        final earlyError = _earlyErrors.remove(requestId);
+        if (earlyError != null) existing.error = earlyError;
+        existing.complete = true;
+        _dispatch(existing);
+      }
       return;
     }
-    final pending = _pending[head.requestId] = _Pending(head);
-    final early = _early.remove(head.requestId);
+    final pending = _pending[requestId] = _Pending(head);
+    final early = _early.remove(requestId);
     if (early != null) {
       for (final bytes in early) {
         pending.body.add(bytes);
       }
     }
-    final earlyError = _earlyErrors.remove(head.requestId);
+    final earlyError = _earlyErrors.remove(requestId);
     if (earlyError != null) pending.error = earlyError;
-    if (!head.hasBody || _earlyComplete.remove(head.requestId)) {
+    if (!head.hasBody || head.bodyComplete ||
+        _earlyComplete.remove(requestId)) {
       pending.complete = true;
       _dispatch(pending);
     }
@@ -400,26 +425,27 @@ class ServerRunner {
   void _onChunk(RawBodyChunk chunk) {
     if (_closed) return;
     final kind = RawBodyKind.values[chunk.kind];
-    // Switch, exhaustive with no default: a new RawBodyKind breaks
-    // compilation instead of silently falling into end-marker handling.
     switch (kind) {
       case RawBodyKind.data:
-        // Copy FIRST: `bytes` is a view into native memory that the ack frees.
-        final copy = _copyAndAck(chunk.requestId, chunk.bytes);
+        // Already completed? Drop and ack immediately — the payload is
+        // a stale straggler that will never be dispatched.
+        if (_completed.contains(chunk.requestId)) {
+          _native.ackBody(chunk.requestId, 1);
+          return;
+        }
+        // Copy out of native memory. Ack is deferred to [_complete] to
+        // batch all body chunks into one FFI crossing.
+        final copy = _copyChunk(chunk.requestId, chunk.bytes);
         final pending = _pending[chunk.requestId];
         if (pending == null) {
-          // Head has not landed yet: park the COPY (already acked) until it
-          // does. Never the view — it dies with this handler.
           (_early[chunk.requestId] ??= []).add(copy);
           _boundEarly();
         } else if (!pending.complete) {
           pending.body.add(copy);
         }
-      // A chunk for a completed request is a stale duplicate: already acked
-      // above, bytes dropped.
       case RawBodyKind.error:
         final message = String.fromCharCodes(chunk.bytes);
-        _copyAndAck(chunk.requestId, chunk.bytes);
+        _copyChunk(chunk.requestId, chunk.bytes);
         final pending = _pending[chunk.requestId];
         if (pending == null) {
           _earlyErrors[chunk.requestId] = message;
@@ -428,7 +454,9 @@ class ServerRunner {
           pending.error = message;
         }
       case RawBodyKind.end:
-        // End marker: no payload, no sequence consumed, no ack.
+        // Combined head+complete messages replace the separate end marker
+        // for body requests. This path is kept for backward compatibility
+        // with any in-flight messages from the old protocol.
         final pending = _pending[chunk.requestId];
         if (pending == null) {
           _earlyComplete.add(chunk.requestId);
@@ -706,9 +734,10 @@ class ServerRunner {
 
   void _onWsMessage(RawWsMessage message) {
     if (_closed) return;
-    // Copy FIRST then ack: same zero-copy contract as body chunks, keyed by
-    // the connection id (the engine tracks WS payloads under it).
-    final copy = _copyAndAck(message.connectionId, message.payload);
+    // Copy FIRST then ack immediately: WS payloads have no _complete path
+    // so deferred acks would leak native memory.
+    final copy = Uint8List.fromList(message.payload);
+    _native.ackBody(message.connectionId, 1);
     final session = _wsSessions[message.connectionId];
     if (session == null) return; // Stale: already acked above, bytes dropped.
     if (message.kind == 8) {

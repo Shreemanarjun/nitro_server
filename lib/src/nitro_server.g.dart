@@ -448,6 +448,7 @@ extension RawIncomingRequestRecordExt on RawIncomingRequest {
     ),
     contentLength: r.readInt(),
     hasBody: r.readBool(),
+    bodyComplete: r.readBool(),
     routePattern: r.readString(),
     params: List.generate(
       r.readInt32(),
@@ -467,6 +468,7 @@ extension RawIncomingRequestRecordExt on RawIncomingRequest {
     }
     writer.writeInt(contentLength);
     writer.writeBool(hasBody);
+    writer.writeBool(bodyComplete);
     writer.writeString(routePattern);
     writer.writeInt32(params.length);
     for (final e in params) {

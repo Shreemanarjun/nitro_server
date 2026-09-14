@@ -434,6 +434,7 @@ struct RawIncomingRequest {
     std::vector<RawHeader> headers;
     int64_t contentLength;
     bool hasBody;
+    bool bodyComplete;
     std::string routePattern;
     std::vector<RawRouteParam> params;
 
@@ -452,6 +453,7 @@ struct RawIncomingRequest {
         { auto& _target = _obj.headers; int32_t _n = _r.readInt32(); _target.reserve((size_t)_n); for (int32_t _i = 0; _i < _n; _i++) { _target.push_back(RawHeader::fromReader(_r)); } }
         _obj.contentLength = _r.readInt();
         _obj.hasBody = _r.readBool();
+        _obj.bodyComplete = _r.readBool();
         _obj.routePattern = _r.readString();
         { auto& _target = _obj.params; int32_t _n = _r.readInt32(); _target.reserve((size_t)_n); for (int32_t _i = 0; _i < _n; _i++) { _target.push_back(RawRouteParam::fromReader(_r)); } }
         return _obj;
@@ -467,6 +469,7 @@ struct RawIncomingRequest {
         { w.writeInt32((int32_t)headers.size()); for (const auto& _e : headers) { _e.encodeInto(w); } }
         w.writeInt(contentLength);
         w.writeBool(hasBody);
+        w.writeBool(bodyComplete);
         w.writeString(routePattern);
         { w.writeInt32((int32_t)params.size()); for (const auto& _e : params) { _e.encodeInto(w); } }
     }

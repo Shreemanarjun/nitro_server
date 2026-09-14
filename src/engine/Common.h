@@ -70,9 +70,8 @@ struct RouteParam {
   std::string value;
 };
 
-/// Parses an HTTP method token. Unknown tokens become Custom. The
-/// `string_view` overload compares in place so the hot path allocates
-/// nothing; the `string` overload delegates to it.
+/// Parses an HTTP method token in place (no allocation on the hot path).
+/// Unknown tokens become Custom.
 inline Method parseMethod(std::string_view token, std::string& customOut) {
   if (token == "GET") return Method::Get;
   if (token == "HEAD") return Method::Head;
@@ -84,26 +83,6 @@ inline Method parseMethod(std::string_view token, std::string& customOut) {
   if (token == "TRACE") return Method::Trace;
   customOut.assign(token.data(), token.size());
   return Method::Custom;
-}
-
-inline Method parseMethod(const std::string& token, std::string& customOut) {
-  return parseMethod(std::string_view(token), customOut);
-}
-
-inline std::string methodName(Method m, const std::string& custom) {
-  switch (m) {
-    case Method::Get: return "GET";
-    case Method::Head: return "HEAD";
-    case Method::Post: return "POST";
-    case Method::Put: return "PUT";
-    case Method::Delete: return "DELETE";
-    case Method::Patch: return "PATCH";
-    case Method::Options: return "OPTIONS";
-    case Method::Trace: return "TRACE";
-    case Method::All: return "*";
-    case Method::Custom: return custom;
-  }
-  return custom;
 }
 
 inline const char* reasonPhrase(int64_t status) {

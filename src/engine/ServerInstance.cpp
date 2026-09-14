@@ -541,6 +541,10 @@ int64_t msSince(std::chrono::steady_clock::time_point t) {
 
 }  // namespace
 
+ParsedHead parseRequestHead(const std::string& raw, size_t headEnd) {
+  return parseHead(raw, headEnd);
+}
+
 class NullEmitter final : public Emitter {
  public:
   void emitHead(int64_t, Method, const std::string&, const std::string&,
@@ -591,10 +595,19 @@ StatusResult ServerInstance::registerRoute(Method method,
                                            const std::string& pattern,
                                            int64_t timeoutMs,
                                            bool isWebSocket, bool streamBody,
-                                           int64_t maxBodyBytes) {
+                                           int64_t maxBodyBytes,
+                                           const std::string& wsProtocols) {
   std::unique_lock lk(configMutex_);
   RouteEntry e{method, customMethod, pattern, timeoutMs, isWebSocket,
                streamBody, maxBodyBytes};
+  for (size_t b = 0; b <= wsProtocols.size(); ) {
+    size_t c = wsProtocols.find(',', b);
+    if (c == std::string::npos) c = wsProtocols.size();
+    const std::string_view tok =
+        trimSv(std::string_view(wsProtocols).substr(b, c - b));
+    if (!tok.empty()) e.wsProtocols.emplace_back(tok);
+    b = c + 1;
+  }
   if (!router_.add(e)) {
     return {ErrorKind::BadRequest,
             "invalid route pattern (want '/a/:b' with optional trailing '/*'): " +
@@ -708,6 +721,10 @@ StatusResult ServerInstance::start() {
   // listener closes and stop() never waits on a blocked accept.
   setNonBlocking(fd, true);
   listenFd_ = (int)fd;
+  {
+    Fd r, w;
+    if (makeWake(r, w)) acceptWake_ = Wake{(int)r, (int)w};
+  }
 
   // A worker is pinned to its connection for the whole handler wait, so
   // fewer workers than live keep-alive connections means connections cycle
@@ -741,14 +758,17 @@ StatusResult ServerInstance::start() {
 
 void ServerInstance::stop() {
   if (!running_.exchange(false)) return;
+  // The accept loop owns the listener fd until it exits: wake it, join it,
+  // then close. Closing first would race its poll/accept on the fd.
+  joinAcceptLoop();
   if (listenFd_ != -1) {
-    shutdownRdwr((Fd)listenFd_);
     closeFd((Fd)listenFd_);
     listenFd_ = -1;
   }
-  {
-    std::lock_guard<std::mutex> lk(acceptMutex_);
-    if (acceptThread_.joinable()) acceptThread_.join();
+  if (acceptWake_.r != -1) {
+    closeFd((Fd)acceptWake_.r);
+    closeFd((Fd)acceptWake_.w);
+    acceptWake_ = Wake{};
   }
   // Hand every parked request to its worker as a 503, then wake the
   // workers: the pipe byte lands parked ones, SHUT_RD fails blocked reads
@@ -787,14 +807,18 @@ void ServerInstance::beginDrain() {
   // queued (those clients completed a handshake and would otherwise be
   // reset), then exits; only then does the listener close. Workers keep
   // serving, and every answer from now on says `Connection: close`.
-  {
-    std::lock_guard<std::mutex> lk(acceptMutex_);
-    if (acceptThread_.joinable()) acceptThread_.join();
-  }
+  joinAcceptLoop();
   if (listenFd_ != -1) {
     closeFd((Fd)listenFd_);
     listenFd_ = -1;
   }
+}
+
+void ServerInstance::joinAcceptLoop() {
+  std::lock_guard<std::mutex> lk(acceptMutex_);
+  if (!acceptThread_.joinable()) return;
+  if (acceptWake_.w != -1) poke((Fd)acceptWake_.w);
+  acceptThread_.join();
 }
 
 int64_t ServerInstance::inFlightRequests() { return (int64_t)pending_.size(); }
@@ -1067,11 +1091,15 @@ void ServerInstance::acceptLoop() {
       queueCv_.notify_one();
     }
   };
+  const Fd lfd = (Fd)listenFd_;
+  pollfd fds[2] = {{lfd, POLLIN, 0}, {(Fd)acceptWake_.r, POLLIN, 0}};
   while (running_.load() && !draining_.load()) {
-    // A bounded poll keeps the loop responsive to stop()/drain without a
-    // wake pipe of its own; a closed listener errors out and re-checks.
-    const int ev = pollFd((Fd)listenFd_, POLLIN, 100);
-    if (ev > 0 && !sweep()) break;
+    // stop() and beginDrain() poke the wake pipe; the bounded timeout is
+    // only a backstop.
+    fds[0].revents = fds[1].revents = 0;
+    if (::poll(fds, 2, 100) <= 0) continue;
+    if (fds[1].revents != 0) drainWake((Fd)acceptWake_.r);
+    if (fds[0].revents != 0 && !sweep()) break;
   }
   if (running_.load() && draining_.load()) sweep();  // Nothing queued is lost.
 }
@@ -1827,6 +1855,33 @@ bool ServerInstance::serveUpgrade(int fd, const Wake& wake,
     answerDirectly(fd, head.method, 400, "missing sec-websocket-key");
     return false;
   }
+  // Subprotocol: the first of the route's list the client offered. An
+  // offer with no overlap is refused; no offer at all upgrades unselected.
+  std::string protocol;
+  if (!m.route.wsProtocols.empty()) {
+    if (const Header* ph = findHeader(head.headers, "sec-websocket-protocol")) {
+      const std::string_view list(ph->value);
+      auto offers = [&](const std::string& want) {
+        for (size_t b = 0; b <= list.size();) {
+          size_t c = list.find(',', b);
+          if (c == std::string_view::npos) c = list.size();
+          if (trimSv(list.substr(b, c - b)) == want) return true;
+          b = c + 1;
+        }
+        return false;
+      };
+      for (const auto& want : m.route.wsProtocols) {
+        if (offers(want)) {
+          protocol = want;
+          break;
+        }
+      }
+      if (protocol.empty()) {
+        answerDirectly(fd, head.method, 400, "no acceptable subprotocol");
+        return false;
+      }
+    }
+  }
   // permessage-deflate, no context takeover either way: every message is
   // an independent raw-deflate stream, so neither side keeps a window
   // between messages and the Dart side inflates each one on its own.
@@ -1843,6 +1898,7 @@ bool ServerInstance::serveUpgrade(int fd, const Wake& wake,
     shake += "Sec-WebSocket-Extensions: permessage-deflate; "
              "server_no_context_takeover; client_no_context_takeover\r\n";
   }
+  if (!protocol.empty()) shake += "Sec-WebSocket-Protocol: " + protocol + "\r\n";
   shake += "\r\n";
   const int64_t writeMs = cfg.writeTimeoutMs > 0 ? cfg.writeTimeoutMs : 30000;
   if (!sendAll(fd, (const uint8_t*)shake.data(), shake.size(), writeMs)) {

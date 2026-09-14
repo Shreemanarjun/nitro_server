@@ -104,24 +104,6 @@ Router::Node* Router::findNodeMut(const std::vector<std::string_view>& segs) {
   return const_cast<Node*>(const_cast<const Router*>(this)->findNode(segs));
 }
 
-const RouteEntry* Router::pickEntry(const Node* node, Method method,
-                                    const std::string& custom) {
-  if (!node) return nullptr;
-  auto it = node->entries.find(methodKey(method, custom));
-  if (it != node->entries.end()) return &it->second;
-  // HEAD is GET without the body (RFC 9110 §9.3.2): a GET route serves it
-  // when no HEAD route exists; the engine drops the body bytes.
-  if (method == Method::Head) {
-    auto get = node->entries.find(methodKey(Method::Get, ""));
-    if (get != node->entries.end()) return &get->second;
-  }
-  if (method != Method::All && method != Method::Custom) {
-    auto all = node->entries.find(methodKey(Method::All, ""));
-    if (all != node->entries.end()) return &all->second;
-  }
-  return nullptr;
-}
-
 MatchResult Router::match(Method method, const std::string& customMethod,
                           const std::string& path) const {
   MatchResult out;

@@ -83,6 +83,10 @@ struct ParsedHead {
   bool ok = false;
 };
 
+/// Parses one request head; `headEnd` is the offset of its `\r\n\r\n`.
+/// Exposed for the fuzz target; the engine calls the same parser.
+ParsedHead parseRequestHead(const std::string& raw, size_t headEnd);
+
 /// Sink for request dispatch. Production code posts into the Nitro streams;
 /// tests record calls. Payloads passed to emitBodyData are malloc-owned and
 /// transfer to the sink, which must have tracked them first.
@@ -154,7 +158,8 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   StatusResult registerRoute(Method method, const std::string& customMethod,
                              const std::string& pattern, int64_t timeoutMs,
                              bool isWebSocket = false, bool streamBody = false,
-                             int64_t maxBodyBytes = -1);
+                             int64_t maxBodyBytes = -1,
+                             const std::string& wsProtocols = "");
   StatusResult unregisterRoute(Method method, const std::string& customMethod,
                                const std::string& pattern);
   StatusResult start();
@@ -299,6 +304,7 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
               const uint8_t* data, size_t n, int code);
 
   void acceptLoop();
+  void joinAcceptLoop();
   void workerLoop(Wake wake);
   void handleConnection(int fd, const Wake& wake);
   /// Drops the per-peer accounting of a closed fd (caller holds activeMutex_).
@@ -350,6 +356,7 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   std::atomic<int64_t> boundPort_{0};
   int listenFd_ = -1;
   std::thread acceptThread_;
+  Wake acceptWake_;
   std::mutex acceptMutex_;
 
   // Worker pool: bounded queue, auto-scaling detached workers. The accept

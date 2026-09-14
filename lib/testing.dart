@@ -378,7 +378,8 @@ class _InMemoryNative extends NitroServerNative {
   final answered = <int, NitroTestResponse>{};
 
   @override
-  Stream<RawIncomingRequest> get incomingRequests => heads.stream;
+  Stream<RawIncomingBatch> get incomingRequests =>
+      heads.stream.map((h) => RawIncomingBatch(requests: [h]));
 
   @override
   Stream<RawBodyChunk> get bodyChunks => chunks.stream;

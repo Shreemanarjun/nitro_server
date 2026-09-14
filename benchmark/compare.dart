@@ -207,6 +207,11 @@ Future<HttpServer> _startDartServer({int port = 0, bool shared = false}) async {
   server.listen(
     (request) => _withDartMw(request, () async {
       final path = request.uri.path;
+      if (path == '/ws') {
+        final ws = await WebSocketTransformer.upgrade(request);
+        ws.listen(ws.add, onError: (_) {});
+        return;
+      }
       final response = request.response;
       response.headers.set('connection', _connHeader());
       try {
@@ -417,6 +422,15 @@ ServerSetup _nitroSetup(bool batchEvents) {
       '/echo',
       (request) => ResponseContext.bytes(request.body),
     );
+    await server.ws('/ws', (session) async {
+      await for (final message in session.messages) {
+        if (message.isText) {
+          session.sendText(message.text!);
+        } else {
+          session.sendBytes(message.bytes!);
+        }
+      }
+    });
   };
 }
 
@@ -648,6 +662,117 @@ final Map<String, _Op> _ops = {
   'GET /events': _getEvents,
 };
 
+/// WebSocket echo cases: message size, frame type, and whether the client
+/// offers permessage-deflate (both servers accept it when offered). The
+/// deflate payload is compressible text; the binary one is not.
+final Map<String, ({Object message, bool deflate})> _wsCases = {
+  'WS /ws 128B': (message: 'a' * 128, deflate: false),
+  'WS /ws 4k': (message: _echoPayload, deflate: false),
+  'WS /ws 4k deflate': (
+    message: ('the quick brown fox ' * 205).substring(0, 4096),
+    deflate: true,
+  ),
+};
+
+Future<WebSocket> _wsConnect(String opKey, int port) {
+  final c = _wsCases[opKey]!;
+  return WebSocket.connect(
+    'ws://127.0.0.1:$port/ws',
+    compression: c.deflate
+        ? CompressionOptions.compressionDefault
+        : CompressionOptions.compressionOff,
+  );
+}
+
+/// One echo round trip on an open socket. Returns microseconds.
+Future<int> _wsEcho(
+  StreamIterator<dynamic> incoming,
+  WebSocket ws,
+  Object message,
+) async {
+  final stopwatch = Stopwatch()..start();
+  ws.add(message);
+  if (!await incoming.moveNext()) throw StateError('ws: closed');
+  stopwatch.stop();
+  final echoed = incoming.current;
+  final ok = message is String
+      ? echoed == message
+      : echoed is List<int> &&
+            _equals(Uint8List.fromList(echoed), message as Uint8List);
+  if (!ok) throw StateError('ws: echo mismatch');
+  return stopwatch.elapsedMicroseconds;
+}
+
+class _WsBenchmark extends AsyncBenchmarkBase {
+  _WsBenchmark(super.name, this.port);
+
+  final int port;
+  late final WebSocket ws;
+  late final StreamIterator<dynamic> incoming;
+  final samplesUs = <int>[];
+  bool _record = false;
+
+  @override
+  Future<void> setup() async {
+    ws = await _wsConnect(name, port);
+    incoming = StreamIterator(ws);
+  }
+
+  @override
+  Future<void> exercise() async {
+    _record = true;
+    await run();
+    _record = false;
+  }
+
+  @override
+  Future<void> run() async {
+    final us = await _wsEcho(incoming, ws, _wsCases[name]!.message);
+    if (_record) samplesUs.add(us);
+  }
+
+  @override
+  Future<void> teardown() => ws.close();
+}
+
+Future<({double meanUs, List<int> samplesUs})> _wsSequential(
+  String opKey,
+  int port,
+) async {
+  final benchmark = _WsBenchmark(opKey, port);
+  final meanUs = await benchmark.measure();
+  return (meanUs: meanUs, samplesUs: benchmark.samplesUs);
+}
+
+Future<({int done, int elapsedUs, List<int> samplesUs})> _wsLoad(
+  String opKey,
+  int port,
+  int connections,
+  int millis,
+) async {
+  final message = _wsCases[opKey]!.message;
+  final samples = <int>[];
+  final deadline = DateTime.now().add(Duration(milliseconds: millis));
+  final stopwatch = Stopwatch()..start();
+  await Future.wait([
+    for (var w = 0; w < connections; w++)
+      () async {
+        final ws = await _wsConnect(opKey, port);
+        final incoming = StreamIterator<dynamic>(ws);
+        while (DateTime.now().isBefore(deadline)) {
+          samples.add(await _wsEcho(incoming, ws, message));
+        }
+        await ws.close();
+      }(),
+  ]);
+  stopwatch.stop();
+  return (
+    done: samples.length,
+    elapsedUs: stopwatch.elapsedMicroseconds,
+    samplesUs: samples,
+  );
+}
+
 /// Sequential latency, run in its own isolate: one connection, the harness
 /// owns the loop. The server isolate only serves.
 Future<({double meanUs, List<int> samplesUs})> _sequential(
@@ -660,8 +785,8 @@ Future<({double meanUs, List<int> samplesUs})> _sequential(
 }
 
 /// Raw-socket request/expectation for the cases the `--raw` load client
-/// can drive: one-shot bodies with a `Content-Length` (streams and the
-/// megabyte echo stay on `HttpClient`). Returns null for other cases.
+/// can drive: one-shot bodies with a `Content-Length` (streams stay on
+/// `HttpClient`). Returns null for other cases.
 ({List<int> request, Uint8List expected})? _rawCase(
   String opKey,
   bool keepAlive,
@@ -674,6 +799,16 @@ Future<({double meanUs, List<int> samplesUs})> _sequential(
         ),
         expected: body,
       );
+  ({List<int> request, Uint8List expected}) post(Uint8List body) => (
+    request: [
+      ...ascii.encode(
+        'POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: $conn\r\n'
+        'Content-Length: ${body.length}\r\n\r\n',
+      ),
+      ...body,
+    ],
+    expected: body,
+  );
   return switch (opKey) {
     '/hello' => get('/hello', _routes['/hello']!),
     '/json' => get('/json', _routes['/json']!),
@@ -683,16 +818,8 @@ Future<({double meanUs, List<int> samplesUs})> _sequential(
     '/mw' => get('/mw', _routes['/hello']!),
     '/work' => get('/work', _workExpected),
     '/file' => get('/file', _fileExpected),
-    'POST /echo 4k' => (
-      request: [
-        ...ascii.encode(
-          'POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: $conn\r\n'
-          'Content-Length: ${_echoPayload.length}\r\n\r\n',
-        ),
-        ..._echoPayload,
-      ],
-      expected: _echoPayload,
-    ),
+    'POST /echo 4k' => post(_echoPayload),
+    'POST /echo 1m' => post(_bigPayload),
     _ => null,
   };
 }
@@ -746,23 +873,24 @@ Future<void> _rawConnection(
       throw StateError('raw: bad status: ${head.split('\r\n').first}');
     }
     final length = _contentLength(head);
-    final total = headEnd + 4 + length;
-    while (bytes.length < total) {
+    // Body bytes are appended, never re-materialised: a megabyte response
+    // arriving in many chunks costs one copy, not one per chunk.
+    buffer.add(Uint8List.sublistView(bytes, headEnd + 4));
+    var have = bytes.length - headEnd - 4;
+    while (have < length) {
       if (!await chunks!.moveNext()) throw StateError('raw: closed in body');
-      buffer
-        ..add(bytes)
-        ..add(chunks!.current);
-      bytes = buffer.toBytes();
-      buffer.clear();
+      buffer.add(chunks!.current);
+      have += chunks!.current.length;
     }
     stopwatch.stop();
+    final body = buffer.takeBytes();
     if (length != expected.length ||
-        !_equals(Uint8List.sublistView(bytes, headEnd + 4, total), expected)) {
+        !_equals(Uint8List.sublistView(body, 0, length), expected)) {
       throw StateError('raw: body mismatch');
     }
     samples.add(stopwatch.elapsedMicroseconds);
     // Surplus bytes belong to the next response; a closing server ends it.
-    if (bytes.length > total) buffer.add(Uint8List.sublistView(bytes, total));
+    if (body.length > length) buffer.add(Uint8List.sublistView(body, length));
     if (!keepAlive || head.toLowerCase().contains('connection: close')) {
       socket.destroy();
       socket = null;
@@ -883,7 +1011,10 @@ Future<({String row, Map<String, Object?> json})> _phase(
   required bool raw,
   required bool keepAlive,
 }) async {
-  final seq = await Isolate.run(() => _sequential(opKey, port));
+  final ws = _wsCases.containsKey(opKey);
+  final seq = await Isolate.run(
+    () => ws ? _wsSequential(opKey, port) : _sequential(opKey, port),
+  );
   final lat = _summarize(seq.samplesUs);
 
   if (connections == 0) {
@@ -915,14 +1046,16 @@ Future<({String row, Map<String, Object?> json})> _phase(
   final loads = await Future.wait([
     for (var i = 0; i < clients; i++)
       Isolate.run(
-        () => _load(
-          opKey,
-          port,
-          perClient,
-          millis,
-          raw: raw,
-          keepAlive: keepAlive,
-        ),
+        () => ws
+            ? _wsLoad(opKey, port, perClient, millis)
+            : _load(
+                opKey,
+                port,
+                perClient,
+                millis,
+                raw: raw,
+                keepAlive: keepAlive,
+              ),
       ),
   ]);
   final rps = loads.fold(0.0, (s, l) => s + l.done / l.elapsedUs * 1e6);
@@ -1037,6 +1170,10 @@ Future<void> main(List<String> args) async {
     for (final opKey in _ops.keys)
       if (only == null || opKey == only)
         for (final (side, port) in sides) ('$side $opKey', opKey, port),
+    for (final opKey in _wsCases.keys)
+      if (only == null || opKey == only)
+        for (final (side, port) in sides)
+          if (!side.startsWith('shelf')) ('$side $opKey', opKey, port),
   ];
 
   final jsonCases = <Map<String, Object?>>[];

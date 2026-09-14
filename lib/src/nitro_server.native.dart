@@ -111,6 +111,16 @@ class RawHeader {
   const RawHeader({required this.name, required this.value});
 }
 
+/// Heads posted in one message. One per head when the isolate keeps up;
+/// under load the engine combines the heads that arrived while the previous
+/// post was in flight.
+@HybridRecord()
+class RawIncomingBatch {
+  final List<RawIncomingRequest> requests;
+
+  const RawIncomingBatch({this.requests = const []});
+}
+
 /// A route parameter captured from a `:param` segment, e.g. `:id` → `42`.
 @HybridRecord()
 class RawRouteParam {
@@ -223,6 +233,10 @@ class RawRouteConfig {
   /// Per-route request body cap; `-1` inherits `RawServerConfig.maxBodyBytes`.
   final int maxBodyBytes;
 
+  /// WebSocket subprotocols the route accepts, comma-separated in
+  /// preference order; empty accepts any handshake without selecting one.
+  final String wsProtocols;
+
   const RawRouteConfig({
     this.method = RawServerMethod.get,
     this.customMethod = '',
@@ -231,6 +245,7 @@ class RawRouteConfig {
     this.isWebSocket = false,
     this.streamBody = false,
     this.maxBodyBytes = -1,
+    this.wsProtocols = '',
   });
 }
 
@@ -521,7 +536,7 @@ abstract class NitroServerNative extends HybridObject {
   // stops reading.
 
   @NitroStream(backpressure: Backpressure.bufferDrop)
-  Stream<RawIncomingRequest> get incomingRequests;
+  Stream<RawIncomingBatch> get incomingRequests;
 
   @NitroStream(backpressure: Backpressure.bufferDrop)
   Stream<RawBodyChunk> get bodyChunks;

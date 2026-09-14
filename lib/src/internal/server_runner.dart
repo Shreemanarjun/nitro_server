@@ -77,6 +77,17 @@ class _Pending {
   StreamController<Uint8List>? stream;
 }
 
+/// The engine's handshake choice, recomputed for the session: the first of
+/// [accepted] that the client [offered] (comma-separated), else null.
+String? selectWsProtocol(String? offered, List<String> accepted) {
+  if (offered == null || accepted.isEmpty) return null;
+  final offers = {for (final p in offered.split(',')) p.trim()};
+  for (final want in accepted) {
+    if (offers.contains(want)) return want;
+  }
+  return null;
+}
+
 /// Shared empty body for head-only requests: every GET without a body would
 /// otherwise allocate its own zero-length buffer on dispatch.
 final Uint8List _emptyBody = Uint8List(0);
@@ -163,7 +174,7 @@ class ServerRunner {
   /// WebSocket routes by pattern. Disjoint from [_routes] for GET: the
   /// engine holds a single entry per (method, pattern), so registering one
   /// side evicts the other here too (see [addRoute]/[addWsRoute]).
-  final _wsHandlers = <String, WsHandler>{};
+  final _wsHandlers = <String, ({WsHandler handler, List<String> protocols})>{};
 
   /// Live WebSocket sessions by connection id.
   final _wsSessions = <int, _WsSessionImpl>{};
@@ -197,7 +208,7 @@ class ServerRunner {
     _errorHandler = handler;
   }
 
-  StreamSubscription<RawIncomingRequest>? _heads;
+  StreamSubscription<RawIncomingBatch>? _heads;
   StreamSubscription<RawBodyChunk>? _chunks;
   StreamSubscription<RawServerEvent>? _serverEvents;
   StreamSubscription<RawWsMessage>? _wsMessages;
@@ -245,7 +256,10 @@ class ServerRunner {
   void _ensureListening() {
     if (_listening) return;
     _listening = true;
-    _heads = _native.incomingRequests.listen(_onHead, onError: (_) {});
+    _heads = _native.incomingRequests.listen(
+      (batch) => batch.requests.forEach(_onHead),
+      onError: (_) {},
+    );
     _chunks = _native.bodyChunks.listen(_onChunk, onError: (_) {});
     _serverEvents = _native.serverEvents.listen(_onEvent, onError: (_) {});
     _wsMessages = _native.wsMessages.listen(_onWsMessage, onError: (_) {});
@@ -331,7 +345,11 @@ class ServerRunner {
   /// [handler] receives the live session. Evicts a GET HTTP route on the
   /// same pattern (and vice versa in [addRoute]) — the engine holds a
   /// single entry per (method, pattern).
-  void addWsRoute(String pattern, WsHandler handler) {
+  void addWsRoute(
+    String pattern,
+    WsHandler handler, [
+    List<String> protocols = const [],
+  ]) {
     _ensureListening();
     final status = _native.registerRoute(
       RawRouteConfig(
@@ -340,11 +358,12 @@ class ServerRunner {
         pattern: pattern,
         timeoutMs: -1,
         isWebSocket: true,
+        wsProtocols: protocols.join(','),
       ),
     );
     throwIfFailed(status, operation: 'registerRoute($pattern)');
     _routes['GET']?.remove(pattern);
-    _wsHandlers[pattern] = handler;
+    _wsHandlers[pattern] = (handler: handler, protocols: protocols);
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -639,9 +658,9 @@ class ServerRunner {
       bodyStream: pending.stream?.stream,
     );
     if (entry == null) {
-      final wsHandler = _wsHandlers[head.routePattern];
-      if (wsHandler != null) {
-        _dispatchWs(head.requestId, context, wsHandler);
+      final ws = _wsHandlers[head.routePattern];
+      if (ws != null) {
+        _dispatchWs(head.requestId, context, ws.handler, ws.protocols);
         return;
       }
       _guardedNotFound(context).then((response) {
@@ -822,8 +841,7 @@ class ServerRunner {
     } catch (_) {
       // The timeout won before the first byte (or the server went away):
       // drop the stream unopened and mark the id answered.
-      _complete(requestId);
-      return;
+      return _complete(requestId);
     }
     // A positive [streamBufferSize] coalesces events into fewer bridge
     // crossings; zero forwards every event immediately (real-time feeds).
@@ -903,6 +921,7 @@ class ServerRunner {
     int connectionId,
     RequestContext handshake,
     WsHandler handler,
+    List<String> protocols,
   ) {
     final offered =
         handshake
@@ -914,6 +933,7 @@ class ServerRunner {
       handshake,
       _native,
       _wsCompression && offered,
+      selectWsProtocol(handshake.header('sec-websocket-protocol'), protocols),
       () {
         _wsSessions.remove(connectionId);
       },
@@ -974,6 +994,7 @@ class _WsSessionImpl implements WsSession {
     this._handshake,
     this._native,
     this.compressed,
+    this.protocol,
     this._onDone,
   );
 
@@ -988,6 +1009,9 @@ class _WsSessionImpl implements WsSession {
 
   @override
   final bool compressed;
+
+  @override
+  final String? protocol;
 
   @override
   int bufferedBytes = 0;

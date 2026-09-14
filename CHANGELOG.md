@@ -40,6 +40,9 @@ Initial release.
   return the queued byte count; `bufferedBytes`; 1009 past
   `wsMaxBufferBytes`.
 * `permessage-deflate` (RFC 7692, no context takeover).
+* Subprotocol selection: `server.ws(pattern, handler, protocols: [...])`
+  picks the first offered match, refuses a no-overlap offer with 400, and
+  exposes it as `WsSession.protocol`.
 * Sealed `WsMessage`: `WsText`, `WsBinary`.
 
 ### Engine
@@ -58,6 +61,8 @@ Initial release.
   over reusable native buffers (0.18 µs per call vs 0.7 µs generated, AOT).
 * Request headers cross the bridge as one packed string (`packedHeaders`)
   and unpack on first access; `queryParameters` parses on first access.
+* Heads combine per isolate (`RawIncomingBatch`): heads that arrive while
+  the previous bridge post is in flight cross as one message.
 * `sendfile` for file answers.
 
 ### Tooling
@@ -65,6 +70,14 @@ Initial release.
 * Dart-only mode: `loadNitroServerNative()`, `NITRO_SERVER_DYLIB`.
 * `NitroTestClient` (`package:nitro_server/testing.dart`).
 * `benchmark/compare.dart`: dart:io vs shelf vs nitro, client isolates,
-  `--raw`, `--isolates`, `--cooldown`, `--json`.
+  `--raw` (now including `POST /echo 1m`), `--isolates`, `--cooldown`,
+  `--json`; WebSocket echo cases (text, binary, permessage-deflate).
 * `tool/coverage.sh`: 100% line gate over `lib/`, `coverage:ignore`
   markers honoured.
+* `tool/cpp_coverage.sh`: clang source-based line gate over `src/engine`.
+* `-DNITRO_SERVER_SANITIZE=thread|address|undefined`: instrumented engine
+  test build.
+* `tool/fuzz.sh`: libFuzzer targets for the request-head parser, the
+  WebSocket frame parser, and a live socket-level server.
+* `.github/workflows/ci.yml`: suites, both coverage gates, and the thread
+  and address sanitizers on Linux and macOS.

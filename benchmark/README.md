@@ -24,6 +24,7 @@ case asserts exact status and bytes.
 | `POST /echo 4k` | 4 KiB upload and echo |
 | `POST /echo 1m` | 1 MiB upload and echo |
 | `GET /events` | 20-chunk `text/event-stream` |
+| `WS /ws 128B`, `4k`, `4k deflate` | WebSocket echo: text, binary, permessage-deflate |
 
 ## Modes
 
@@ -159,5 +160,14 @@ Additional measurements (`--quick --raw`, 32 connections):
 | `/work`, 1 isolate | 3,413 | 3,464 | 3,347 |
 | `/work`, 4 isolates | 10,929 | 11,298 | 3,058 |
 | `/file` | 24,627 | 11,827 | 10,865 |
+
+WebSocket echo (keep-alive, one message per round trip; shelf has no
+WebSocket):
+
+| case | nitro req/s | dart:io req/s | nitro seq p50 | dart:io seq p50 |
+|------|------------:|--------------:|--------------:|----------------:|
+| `WS /ws 128B` | 62,730 | 42,859 | 55 us | 51 us |
+| `WS /ws 4k` | 58,478 | 41,824 | 59 us | 53 us |
+| `WS /ws 4k deflate` | 20,314 | 20,354 | 111 us | 98 us |
 
 Numbers are machine-specific.

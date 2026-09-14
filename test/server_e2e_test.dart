@@ -612,6 +612,31 @@ void main() {
       expect(metrics.byRoute['/m']!.latency.maxUs, greaterThan(0));
     }, skip: skipReason);
 
+    test('ws protocols: the route\'s first offered subprotocol wins', () async {
+      server = await NitroServer.bind();
+      String? seen;
+      await server!.ws('/p', (session) async {
+        seen = session.protocol;
+        await for (final message in session.messages) {
+          session.sendText(message.text!);
+        }
+      }, protocols: ['graphql-ws', 'json']);
+      final url = 'ws://127.0.0.1:${server!.port}/p';
+      final socket = await WebSocket.connect(
+        url,
+        protocols: ['json', 'graphql-ws'],
+      );
+      expect(socket.protocol, 'graphql-ws');
+      socket.add('x');
+      expect(await socket.first, 'x');
+      await socket.close();
+      expect(seen, 'graphql-ws');
+      await expectLater(
+        WebSocket.connect(url, protocols: ['xml']),
+        throwsA(isA<WebSocketException>()),
+      );
+    }, skip: skipReason);
+
     test('permessage-deflate round-trips with dart:io\'s client', () async {
       server = await NitroServer.bind();
       await server!.ws('/deflate', (session) async {

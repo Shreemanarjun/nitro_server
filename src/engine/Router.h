@@ -26,6 +26,7 @@ struct RouteEntry {
   bool isWebSocket = false;  // RFC 6455 route: handshake upgrades in-engine.
   bool streamBody = false;   // Head first, then chunks: never the inline form.
   int64_t maxBodyBytes = -1;  // -1 = inherit the server cap.
+  std::vector<std::string> wsProtocols;  // Accepted subprotocols, preferred first.
 };
 
 struct MatchResult {
@@ -73,8 +74,6 @@ class Router {
 
   const Node* findNode(const std::vector<std::string_view>& segs) const;
   Node* findNodeMut(const std::vector<std::string_view>& segs);
-  static const RouteEntry* pickEntry(const Node* node, Method method,
-                                     const std::string& custom);
 
   Node root_;
   size_t size_ = 0;

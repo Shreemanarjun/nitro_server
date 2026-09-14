@@ -110,7 +110,6 @@ class PendingTable {
   };
 
   Shard& shard(int64_t id) { return shards_[static_cast<uint64_t>(id) & (kShardCount - 1)]; }
-  const Shard& shard(int64_t id) const { return shards_[static_cast<uint64_t>(id) & (kShardCount - 1)]; }
 
  public:
   std::shared_ptr<PendingRequest> create(int64_t requestId) {
@@ -211,17 +210,6 @@ class PendingTable {
           req->cv.notify_one();
         }
       }
-      s.table.clear();
-      for (auto& kv : s.payloads)
-        for (auto& p : kv.second.payloads) std::free(p.second);
-      s.payloads.clear();
-    }
-  }
-
-  void clear() {
-    for (int i = 0; i < kShardCount; ++i) {
-      auto& s = shards_[i];
-      std::lock_guard<std::mutex> lk(s.mutex);
       s.table.clear();
       for (auto& kv : s.payloads)
         for (auto& p : kv.second.payloads) std::free(p.second);

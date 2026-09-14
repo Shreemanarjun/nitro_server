@@ -17,6 +17,8 @@ FetchContent_MakeAvailable(googletest)
 add_executable(nitro_server_engine_tests
   router_test.cpp
   pending_table_test.cpp
+  combiner_test.cpp
+  engine_units_test.cpp
   wire_test.cpp
   server_test.cpp
   "${CMAKE_CURRENT_SOURCE_DIR}/../../src/engine/Router.cpp"
@@ -40,6 +42,23 @@ if(WIN32)
 else()
   target_link_libraries(nitro_server_engine_tests PRIVATE
     gtest_main pthread)
+endif()
+
+# -DNITRO_SERVER_SANITIZE=thread|address|undefined: instrumented test build.
+set(NITRO_SERVER_SANITIZE "" CACHE STRING "Sanitizer for the engine test build")
+if(NITRO_SERVER_SANITIZE)
+  target_compile_options(nitro_server_engine_tests PRIVATE
+    -fsanitize=${NITRO_SERVER_SANITIZE} -fno-omit-frame-pointer -g -O1)
+  target_link_options(nitro_server_engine_tests PRIVATE
+    -fsanitize=${NITRO_SERVER_SANITIZE})
+endif()
+
+# -DNITRO_SERVER_COVERAGE=ON: clang source-based coverage for tool/cpp_coverage.sh.
+option(NITRO_SERVER_COVERAGE "Instrument the engine test build for llvm-cov" OFF)
+if(NITRO_SERVER_COVERAGE)
+  target_compile_options(nitro_server_engine_tests PRIVATE
+    -fprofile-instr-generate -fcoverage-mapping -O0 -g)
+  target_link_options(nitro_server_engine_tests PRIVATE -fprofile-instr-generate)
 endif()
 
 include(GoogleTest)

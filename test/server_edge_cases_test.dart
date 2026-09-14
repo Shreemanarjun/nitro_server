@@ -211,6 +211,34 @@ void main() {
       expect(calls, 1);
     });
 
+    test('selectWsProtocol: first accepted entry the client offered', () {
+      expect(selectWsProtocol(null, ['a']), isNull);
+      expect(selectWsProtocol('a', []), isNull);
+      expect(selectWsProtocol('b , a', ['a', 'b']), 'a');
+      expect(selectWsProtocol('c', ['a']), isNull);
+    });
+
+    test('a batch dispatches every head it carries', () async {
+      var calls = 0;
+      runner.addRoute(HttpMethod.get, '', '/b', null, (_) async {
+        calls++;
+        return const ResponseContext();
+      });
+      await Future<void>.delayed(Duration.zero);
+
+      fake.batches.add(
+        RawIncomingBatch(
+          requests: [
+            fakeHead(requestId: 11, path: '/b', routePattern: '/b'),
+            fakeHead(requestId: 12, path: '/b', routePattern: '/b'),
+          ],
+        ),
+      );
+      await waitFor(11);
+      await waitFor(12);
+      expect(calls, 2);
+    });
+
     test('hasBody with zero chunks still dispatches on end', () async {
       runner.addRoute(HttpMethod.post, '', '/zb', null, (request) async {
         return ResponseContext.text('n=${request.body.length}');
@@ -1211,24 +1239,20 @@ void main() {
       'a rejected startStream (timeout won) drops the stream cleanly',
       () async {
         fake.startStreamFailures.add(505);
-        runner.addRoute(
-          HttpMethod.get,
-          '',
-          '/late',
-          null,
-          (_) => ResponseContext.stream(Stream.value(Uint8List.fromList([1]))),
-        );
+        var handlerRan = false;
+        runner.addRoute(HttpMethod.get, '', '/late', null, (_) {
+          handlerRan = true;
+          return ResponseContext.stream(Stream.value(Uint8List.fromList([1])));
+        });
         await Future<void>.delayed(Duration.zero);
         fake.heads.add(
           fakeHead(requestId: 505, path: '/late', routePattern: '/late'),
         );
-        for (
-          var i = 0;
-          i < 100 && runner.pendingIdsForTesting.contains(505);
-          i++
-        ) {
+        for (var i = 0; i < 200 && !handlerRan; i++) {
           await Future<void>.delayed(const Duration(milliseconds: 5));
         }
+        expect(handlerRan, isTrue);
+        await Future<void>.delayed(const Duration(milliseconds: 20));
         expect(runner.pendingIdsForTesting, isNot(contains(505)));
         expect(fake.streamsStarted, isNot(contains(505)));
         expect(fake.streamChunks, isNot(contains(505)));

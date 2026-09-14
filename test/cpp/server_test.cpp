@@ -1375,6 +1375,64 @@ TEST(ServerTest, WebSocketHandshakeIs426WithoutDispatch) {
   EXPECT_TRUE(f.emitter.seen().empty());
 }
 
+void sendWsHandshakeWithProtocols(int fd, const std::string& offered) {
+  sendStr(fd, "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n"
+              "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+              "Sec-WebSocket-Version: 13\r\n" +
+              (offered.empty() ? std::string()
+                               : "Sec-WebSocket-Protocol: " + offered + "\r\n") +
+              "\r\n");
+}
+
+TEST(ServerTest, WsSubprotocolPicksTheRoutesFirstOfferedChoice) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "unused");
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "/ws", -1, true, false, -1,
+                                    " graphql-ws ,json,").kind,
+            ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendWsHandshakeWithProtocols(fd, "json , graphql-ws");
+  const std::string head = readHttpHead(fd);
+  EXPECT_EQ(statusOf(head), 101);
+  EXPECT_EQ(headerOf(head, "sec-websocket-protocol"), "graphql-ws");
+  close(fd);
+}
+
+TEST(ServerTest, WsSubprotocolOfferWithoutOverlapIs400) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "unused");
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "/ws", -1, true, false, -1,
+                                    "json").kind,
+            ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendWsHandshakeWithProtocols(fd, "xml");
+  EXPECT_EQ(statusOf(readHttpHead(fd)), 400);
+  close(fd);
+}
+
+TEST(ServerTest, WsSubprotocolAbsentOfferUpgradesUnselected) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "unused");
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "/ws", -1, true, false, -1,
+                                    "json").kind,
+            ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendWsHandshakeWithProtocols(fd, "");
+  const std::string head = readHttpHead(fd);
+  EXPECT_EQ(statusOf(head), 101);
+  EXPECT_EQ(head.find("ec-WebSocket-Protocol"), std::string::npos);
+  close(fd);
+}
+
 TEST(ServerTest, WsHandshakeUpgradesWithRfcVector) {
   Fixture f([](Method, const std::string&, const std::string&) {
     return std::make_pair(200, "unused");
@@ -1800,6 +1858,405 @@ TEST(ServerTest, StreamSurvivesForKeepAlive) {
     EXPECT_EQ(headerOf(got, "connection"), "keep-alive");
   }
   close(fd);
+  server->stop();
+}
+
+// ── Error paths and edge behaviours ───────────────────────────────────────
+
+RecordingEmitter::Answer echoAnswer() {
+  return [](Method, const std::string&, const std::string& body) {
+    return std::make_pair(200, "echo:" + body);
+  };
+}
+
+int64_t startWith(Fixture& f, ServerConfig cfg) {
+  cfg.port = 0;
+  f.server->configure(cfg);
+  EXPECT_EQ(f.server->start().kind, ErrorKind::None);
+  return f.server->boundPort();
+}
+
+/// One framed response on a keep-alive connection (head + Content-Length).
+std::string readOneResponse(int fd) {
+  std::string out = readHttpHead(fd);
+  const size_t end = out.find("\r\n\r\n");
+  if (end == std::string::npos) return out;
+  const size_t need =
+      end + 4 + (size_t)atol(headerOf(out, "content-length").c_str());
+  char buf[4096];
+  while (out.size() < need) {
+    const ssize_t n =
+        recv(fd, buf, std::min(sizeof(buf), need - out.size()), 0);
+    if (n <= 0) break;
+    out.append(buf, (size_t)n);
+  }
+  return out;
+}
+
+const char* kWsHandshakeHead =
+    "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n"
+    "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+    "Sec-WebSocket-Version: 13\r\n\r\n";
+
+/// A masked client frame header claiming [length] bytes, with no payload:
+/// the engine must judge the length before reading any of it.
+void sendWsHeaderOnly(int fd, int opcode, uint64_t length) {
+  std::string out;
+  out.push_back((char)(0x80 | opcode));
+  if (length < 126) {
+    out.push_back((char)(0x80 | length));
+  } else if (length <= 0xffff) {
+    out.push_back((char)(0x80 | 126));
+    out.push_back((char)((length >> 8) & 0xff));
+    out.push_back((char)(length & 0xff));
+  } else {
+    out.push_back((char)(0x80 | 127));
+    for (int i = 7; i >= 0; i--) out.push_back((char)((length >> (8 * i)) & 0xff));
+  }
+  out.append("\x01\x02\x03\x04", 4);
+  sendStr(fd, out);
+}
+
+int wsCloseCode(int fd) {
+  std::string payload;
+  if (readWsFrame(fd, payload) != 0x8 || payload.size() < 2) return -1;
+  return ((uint8_t)payload[0] << 8) | (uint8_t)payload[1];
+}
+
+TEST(ServerTest, RouteTableErrorsAndStartTwice) {
+  Fixture f(echoAnswer());
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "hello", -1).kind,
+            ErrorKind::BadRequest);
+  ASSERT_EQ(f.server->registerRoute(Method::Get, "", "/hello", -1).kind,
+            ErrorKind::None);
+  EXPECT_EQ(f.server->unregisterRoute(Method::Get, "", "/hello").kind,
+            ErrorKind::None);
+  EXPECT_EQ(f.server->unregisterRoute(Method::Get, "", "/hello").kind,
+            ErrorKind::RouteNotFound);
+  const int64_t port = f.startOnEphemeral();
+  EXPECT_EQ(f.server->start().kind, ErrorKind::AlreadyRunning);
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+  EXPECT_EQ(statusOf(readAll(fd)), 404);
+  close(fd);
+}
+
+TEST(ServerTest, ExplicitPortOnTheIpv4WildcardBinds) {
+  const int probe = socket(AF_INET, SOCK_STREAM, 0);
+  sockaddr_in a{};
+  a.sin_family = AF_INET;
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  ASSERT_EQ(bind(probe, (sockaddr*)&a, sizeof(a)), 0);
+  socklen_t len = sizeof(a);
+  ASSERT_EQ(getsockname(probe, (sockaddr*)&a, &len), 0);
+  const int port = ntohs(a.sin_port);
+  close(probe);
+
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/hello", -1);
+  ServerConfig cfg;
+  cfg.port = port;
+  cfg.host = "0.0.0.0";
+  cfg.defaultTimeoutMs = 5000;
+  f.server->configure(cfg);
+  ASSERT_EQ(f.server->start().kind, ErrorKind::None);
+  EXPECT_EQ(f.server->boundPort(), port);
+  EXPECT_EQ(f.server->liveConnections(), 0);
+  const int fd = connectTo(port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+  EXPECT_EQ(statusOf(readAll(fd)), 200);
+  close(fd);
+}
+
+TEST(ServerTest, Http10KeepAliveHeaderKeepsTheConnection) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/hello", -1);
+  const int64_t port = f.startOnEphemeral();
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  for (int i = 0; i < 2; i++) {
+    sendStr(fd, "GET /hello HTTP/1.0\r\nHost: x\r\nConnection: keep-alive\r\n\r\n");
+    EXPECT_EQ(statusOf(readOneResponse(fd)), 200);
+  }
+  close(fd);
+}
+
+TEST(ServerTest, PipelinedRequestsAreAnsweredInOrder) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/hello", -1);
+  const int64_t port = f.startOnEphemeral();
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd,
+          "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n"
+          "GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+  const std::string all = readAll(fd);
+  EXPECT_EQ(statusOf(all), 200);
+  EXPECT_NE(all.find("HTTP/1.1 200", 20), std::string::npos);
+  close(fd);
+}
+
+TEST(ServerTest, ExpectContinueGets100BeforeTheBody) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Post, "", "/echo", -1);
+  const int64_t port = f.startOnEphemeral();
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd,
+          "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n"
+          "Expect: 100-continue\r\nConnection: close\r\n\r\n");
+  EXPECT_EQ(statusOf(readHttpHead(fd)), 100);
+  sendStr(fd, "hello");
+  const std::string rest = readAll(fd);
+  EXPECT_EQ(statusOf(rest), 200);
+  EXPECT_EQ(bodyOf(rest), "echo:hello");
+  close(fd);
+}
+
+TEST(ServerTest, ChunkedUploadReassemblesAcrossWritesAndTrailers) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Post, "", "/echo", -1);
+  const int64_t port = f.startOnEphemeral();
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd,
+          "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
+          "Connection: close\r\n\r\n5\r\nhel");
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  sendStr(fd, "lo\r\n6\r\n world\r\n0\r\nX-Trailer: 1\r\n\r\n");
+  const std::string rest = readAll(fd);
+  EXPECT_EQ(statusOf(rest), 200);
+  EXPECT_EQ(bodyOf(rest), "echo:hello world");
+  ASSERT_EQ(f.emitter.seen().size(), 1u);
+  f.server->ackBody(f.emitter.seen()[0].requestId, 2);
+  close(fd);
+}
+
+TEST(ServerTest, ChunkedUploadOverTheRouteCapIs413) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Post, "", "/small", -1, false, false, 8);
+  const int64_t port = f.startOnEphemeral();
+  {  // A chunk larger than the cap.
+    const int fd = connectTo((int)port);
+    ASSERT_GE(fd, 0);
+    sendStr(fd,
+            "POST /small HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
+            "Connection: close\r\n\r\n14\r\n01234567890123456789\r\n0\r\n\r\n");
+    EXPECT_EQ(statusOf(readAll(fd)), 413);
+    close(fd);
+  }
+  {  // A size line dripped in past the cap: fill()'s recv-side guard trips
+     // (a pre-buffered oversize line is instead read as a truncated 400).
+    const int fd = connectTo((int)port);
+    ASSERT_GE(fd, 0);
+    sendStr(fd, "POST /small HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
+                "Connection: close\r\n\r\n");
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    sendStr(fd, std::string(4096, 'f'));  // no CRLF: an ever-growing size line
+    EXPECT_EQ(statusOf(readAll(fd)), 413);
+    close(fd);
+  }
+}
+
+TEST(ServerTest, TruncatedOrMalformedBodiesAre400) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Post, "", "/echo", -1);
+  const int64_t port = f.startOnEphemeral();
+  const char* shapes[] = {
+      "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel",
+      "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc",
+      "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 200000\r\n\r\nabc",
+      "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n",
+  };
+  for (const char* shape : shapes) {
+    const int fd = connectTo((int)port);
+    ASSERT_GE(fd, 0);
+    sendStr(fd, shape);
+    shutdown(fd, SHUT_WR);
+    EXPECT_EQ(statusOf(readAll(fd)), 400) << shape;
+    close(fd);
+  }
+}
+
+TEST(ServerTest, UpgradeOnAnHttpRouteIs426AndBytesAfterAnUpgradeHeadAre400) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/hello", -1);
+  f.server->registerRoute(Method::Get, "", "/ws", -1, true);
+  const int64_t port = f.startOnEphemeral();
+  {
+    const int fd = connectTo((int)port);
+    ASSERT_GE(fd, 0);
+    std::string head = kWsHandshakeHead;
+    head.replace(head.find("/ws"), 3, "/hello");
+    sendStr(fd, head);
+    EXPECT_EQ(statusOf(readHttpHead(fd)), 426);
+    close(fd);
+  }
+  {
+    const int fd = connectTo((int)port);
+    ASSERT_GE(fd, 0);
+    sendStr(fd, std::string(kWsHandshakeHead) + "XX");
+    EXPECT_EQ(statusOf(readHttpHead(fd)), 400);
+    close(fd);
+  }
+}
+
+TEST(ServerTest, OversizedHeadClosesWithoutAnAnswer) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/hello", -1);
+  const int64_t port = f.startOnEphemeral();
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  std::string head = "GET /hello HTTP/1.1\r\nHost: x\r\n";
+  while (head.size() < 96 * 1024) head += "X-Pad: " + std::string(1000, 'p') + "\r\n";
+  sendStr(fd, head);
+  EXPECT_TRUE(readAll(fd).empty());
+  close(fd);
+}
+
+TEST(ServerTest, KeepAliveIdleTimeoutClosesTheConnection) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/hello", -1);
+  ServerConfig cfg;
+  cfg.keepAliveTimeoutMs = 150;
+  cfg.defaultTimeoutMs = 5000;
+  const int64_t port = startWith(f, cfg);
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n");
+  EXPECT_EQ(statusOf(readOneResponse(fd)), 200);
+  EXPECT_TRUE(readAll(fd).empty());
+  close(fd);
+}
+
+TEST(ServerTest, LargeAnswerToASlowReaderIsFlushedByTheWorker) {
+  const std::string big(4 * 1024 * 1024, 'b');
+  Fixture f([&](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, big);
+  });
+  f.server->registerRoute(Method::Get, "", "/big", -1);
+  const int64_t port = f.startOnEphemeral();
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "GET /big HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  const std::string all = readAll(fd);
+  EXPECT_EQ(statusOf(all), 200);
+  EXPECT_EQ(bodyOf(all).size(), big.size());
+  close(fd);
+}
+
+TEST(ServerTest, WsProtocolErrorsCloseWithTheRightCodes) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/ws", -1, true);
+  ServerConfig cfg;
+  cfg.maxBodyBytes = 100;  // Also the WebSocket message cap.
+  cfg.defaultTimeoutMs = 5000;
+  const int64_t port = startWith(f, cfg);
+  auto open = [&]() {
+    const int fd = connectTo((int)port);
+    EXPECT_GE(fd, 0);
+    sendStr(fd, kWsHandshakeHead);
+    EXPECT_EQ(statusOf(readHttpHead(fd)), 101);
+    return fd;
+  };
+  {  // Continuation with nothing to continue.
+    const int fd = open();
+    sendWsFrame(fd, 0x0, "x");
+    EXPECT_EQ(wsCloseCode(fd), 1002);
+    close(fd);
+  }
+  {  // A new message before the previous one's FIN.
+    const int fd = open();
+    sendWsFrame(fd, 0x1, "ab", false);
+    sendWsFrame(fd, 0x1, "cd");
+    EXPECT_EQ(wsCloseCode(fd), 1002);
+    close(fd);
+  }
+  {  // Text that is not UTF-8.
+    const int fd = open();
+    sendWsFrame(fd, 0x1, "\xff\xfe");
+    EXPECT_EQ(wsCloseCode(fd), 1007);
+    close(fd);
+  }
+  {  // 16-bit and 64-bit lengths over the cap, judged at the header.
+    const int fd = open();
+    sendWsHeaderOnly(fd, 0x2, 200);
+    EXPECT_EQ(wsCloseCode(fd), 1009);
+    close(fd);
+    const int fd2 = open();
+    sendWsHeaderOnly(fd2, 0x2, 70000);
+    EXPECT_EQ(wsCloseCode(fd2), 1009);
+    close(fd2);
+  }
+  {  // Fragments that add up past the cap.
+    const int fd = open();
+    sendWsFrame(fd, 0x1, std::string(60, 'a'), false);
+    sendWsFrame(fd, 0x0, std::string(60, 'a'));
+    EXPECT_EQ(wsCloseCode(fd), 1009);
+    close(fd);
+  }
+}
+
+TEST(ServerTest, WsSendToAPeerThatStoppedReadingFails) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/ws", -1, true);
+  ServerConfig cfg;
+  cfg.writeTimeoutMs = 100;
+  cfg.wsMaxBufferBytes = 64 * 1024 * 1024;
+  cfg.defaultTimeoutMs = 5000;
+  const int64_t port = startWith(f, cfg);
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd, kWsHandshakeHead);
+  ASSERT_EQ(statusOf(readHttpHead(fd)), 101);
+  ASSERT_TRUE(f.waitForSeen(1));
+  const int64_t id = f.emitter.seen()[0].requestId;
+  // Nobody reads: the direct write fills the socket, the queue grows, the
+  // worker's flush stalls past writeTimeoutMs and the session fails.
+  const std::string msg(256 * 1024, 'm');
+  int64_t r = 0;
+  const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (r >= 0 && std::chrono::steady_clock::now() < end) {
+    r = f.server->wsSend(id, (const uint8_t*)msg.data(), msg.size(), true, false);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  EXPECT_LT(r, 0);
+  close(fd);
+}
+
+TEST(ServerTest, StreamEndsWithAnEmptyLastChunk) {
+  // No Fixture: its pump would answer the request before the stream starts.
+  RecordingEmitter emitter(echoAnswer());
+  auto server = std::make_shared<ServerInstance>();
+  server->setEmitter(&emitter);
+  ASSERT_EQ(server->registerRoute(Method::Get, "", "/s", -1).kind, ErrorKind::None);
+  ServerConfig cfg;
+  cfg.port = 0;
+  server->configure(cfg);
+  ASSERT_EQ(server->start().kind, ErrorKind::None);
+  std::string res;
+  std::thread client([&] {
+    const int c = connectTo((int)server->boundPort());
+    if (c < 0) return;
+    sendStr(c, "GET /s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    res = readAll(c);
+    close(c);
+  });
+  int64_t id = 0;
+  for (int i = 0; i < 1000 && id == 0; i++) {
+    auto seen = emitter.seen();
+    if (!seen.empty()) id = seen[0].requestId;
+    if (id == 0) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_NE(id, 0);
+  server->startStream(id, 200, {{"Content-Type", "text/plain"}});
+  server->sendStreamChunk(id, (const uint8_t*)"ab", 2, false);
+  server->sendStreamChunk(id, nullptr, 0, true);
+  client.join();
+  EXPECT_EQ(dechunk(bodyOf(res)), "ab");
   server->stop();
 }
 

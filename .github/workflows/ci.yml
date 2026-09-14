@@ -1,0 +1,47 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y lcov clang llvm
+      - if: runner.os == 'macOS'
+        run: brew install lcov
+      - run: dart pub get
+      - run: dart analyze
+      - run: dart format --output=none --set-exit-if-changed lib test benchmark tool
+      - run: cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release -DNITRO_SERVER_BUILD_TESTS=ON
+      - run: cmake --build build/lib --parallel
+      - run: ./build/lib/nitro_server_tests/nitro_server_engine_tests
+      - run: bash tool/coverage.sh
+      - run: bash tool/cpp_coverage.sh 90
+      - run: dart compile exe benchmark/compare.dart -o build/benchmark/compare
+      - run: ./build/benchmark/compare --quick --keep-alive --raw --only /hello
+
+  sanitize:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        sanitizer: [thread, address]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: >
+          cmake -S src -B build/san -DCMAKE_BUILD_TYPE=Debug
+          -DNITRO_SERVER_BUILD_TESTS=ON -DNITRO_SERVER_SANITIZE=${{ matrix.sanitizer }}
+      - run: cmake --build build/san --parallel --target nitro_server_engine_tests
+      - run: ./build/san/nitro_server_tests/nitro_server_engine_tests
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+          ASAN_OPTIONS: detect_leaks=0

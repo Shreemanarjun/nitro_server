@@ -337,9 +337,18 @@ class NitroServer {
   /// [unroute] removes whichever stands. Global middleware does not wrap
   /// WS handlers — the socket leaves HTTP mode before dispatch could run
   /// it; see [WsHandler] for the auth pattern.
-  Future<NitroServer> ws(String pattern, WsHandler handler) async {
+  ///
+  /// [protocols] lists accepted subprotocols in preference order: the
+  /// handshake selects the first one the client offers (`Sec-WebSocket-
+  /// Protocol`) and exposes it as [WsSession.protocol]; a client that
+  /// offers only others is refused with 400. Empty accepts any handshake.
+  Future<NitroServer> ws(
+    String pattern,
+    WsHandler handler, {
+    List<String> protocols = const [],
+  }) async {
     _requirePattern(pattern);
-    _runner.addWsRoute(pattern, handler);
+    _runner.addWsRoute(pattern, handler, protocols);
     return this;
   }
 

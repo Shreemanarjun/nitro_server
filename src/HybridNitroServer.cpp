@@ -30,6 +30,7 @@
 #include <utility>
 #include <vector>
 
+#include "engine/Combiner.h"
 #include "engine/Common.h"
 #include "engine/EngineRegistry.h"
 #include "engine/ServerInstance.h"
@@ -83,7 +84,13 @@ class BridgeEmitter final : public Emitter {
       rp.value = p.value;
       req.params.push_back(std::move(rp));
     }
-    bridge_->emit_incomingRequests(req.toNativeBuffer());
+    // Heads combine per isolate: one VM post per pass instead of one
+    // contended post per worker thread.
+    heads_.submit(std::move(req), [this](std::vector<RawIncomingRequest>& b) {
+      RawIncomingBatch batch;
+      batch.requests = std::move(b);
+      bridge_->emit_incomingRequests(batch.toNativeBuffer());
+    });
   }
 
   void emitBodyData(int64_t requestId, uint8_t* payload, size_t n) override {
@@ -143,6 +150,7 @@ class BridgeEmitter final : public Emitter {
 
  private:
   HybridNitroServerNative* bridge_;
+  Combiner<RawIncomingRequest> heads_;
 };
 
 class HybridNitroServerImpl final : public HybridNitroServerNative {
@@ -194,7 +202,7 @@ class HybridNitroServerImpl final : public HybridNitroServerNative {
     return toStatus(server_->registerRoute(
         static_cast<Method>(raw.method), raw.customMethod, raw.pattern,
         raw.timeoutMs, raw.isWebSocket, raw.streamBody,
-        raw.maxBodyBytes)).toNativeBuffer();
+        raw.maxBodyBytes, raw.wsProtocols)).toNativeBuffer();
   }
 
   NitroCppBuffer unregisterRoute(const std::string& method,

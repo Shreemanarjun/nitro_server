@@ -17,10 +17,29 @@ variance is about ±10%. Full-length results: `benchmark/README.md`.
 | E′ | pool pinned at 8 | 3,128 | 184 / 433 |
 | F | sync handlers answered inline | 57,809 (`--raw`) | 533 / 1,070 |
 | G | packed request headers, lazy unpack; query parsed on access | 61,891 (`--raw`) | 488 / 1,167 |
+| H | heads combined per isolate under load (`RawIncomingBatch`) | 62,766 (`--raw`) | 488 / 941 |
 | — | dart:io, same run as D | 33,680 | 886 / 1,316 |
 
 G against the `--raw` baseline below (61,464) and, with the `HttpClient`
-driver, 49,006 against 49,489: within run-to-run variance.
+driver, 49,006 against 49,489: within run-to-run variance. H the same on
+`/hello`; it drops the per-head contended bridge post, so its effect shows
+only once the client stops being the bound (below).
+
+## Scaling: 8 client isolates, 64 connections (`--raw`, `/hello`)
+
+The 4-client default leaves the client the bound at this rate. With 8
+client isolates the server saturates:
+
+| server | req/s |
+|--------|------:|
+| dart:io, `shared: true` x4 | 68,581 |
+| nitro, 4 isolates | 57,305 |
+| nitro, 1 isolate | 58,812 |
+
+dart:io scales past nitro here: it drives many sockets per `kevent`, while
+nitro posts once per head per worker thread. Batching (H) cuts the post
+count under load, not the per-connection thread or `poll` wake. Closing
+the gap is the reactor (open item 2), not another bridge tweak.
 
 Other cases across the same steps:
 
@@ -88,6 +107,11 @@ call ~1, bookkeeping ~1, plus the handler.
 4. Pre-encoded response heads for `const` header maps.
 5. `Router::match` returns a pointer instead of copying the `RouteEntry`.
 6. TLS in the engine; HTTP/2 via ALPN afterwards.
+
+Done since: subprotocol selection (`server.ws(protocols:)`), per-isolate
+head batching (step H), the `src/engine` line gate (`tool/cpp_coverage.sh`,
+95%), thread/address sanitizers, and CI across Linux and macOS. libFuzzer
+targets (`tool/fuzz.sh`, `test/fuzz`) are a local, untracked tool.
 
 ## Reproduce
 

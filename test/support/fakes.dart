@@ -43,8 +43,18 @@ class FakeNitroServerNative extends NitroServerNative {
   final streamChunks = <int, List<Uint8List>>{};
   final streamsEnded = <int>{};
 
+  /// Multi-head batches, as the engine posts them under load.
+  final batches = StreamController<RawIncomingBatch>();
+
   @override
-  Stream<RawIncomingRequest> get incomingRequests => heads.stream;
+  Stream<RawIncomingBatch> get incomingRequests {
+    final out = StreamController<RawIncomingBatch>();
+    heads.stream
+        .map((h) => RawIncomingBatch(requests: [h]))
+        .listen(out.add, onError: out.addError);
+    batches.stream.listen(out.add, onError: out.addError);
+    return out.stream;
+  }
 
   @override
   Stream<RawBodyChunk> get bodyChunks => chunks.stream;

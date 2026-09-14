@@ -97,6 +97,11 @@ abstract class WsSession {
   /// frames from the peer are inflated before they reach [messages].
   bool get compressed;
 
+  /// The subprotocol selected at the handshake: the first entry of the
+  /// route's `protocols` (see [NitroServer.ws]) the client offered, or null
+  /// when the route lists none or the client offered none.
+  String? get protocol;
+
   /// Smallest payload worth compressing (shorter ones cost more than they
   /// save); set on [NitroServer.bind]'s config via [ServerConfig.wsCompression]
   /// only as on/off.

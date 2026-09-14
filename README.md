@@ -31,6 +31,9 @@ await server.close();
   chunks and file bodies (`sendfile`) always go through the worker.
 - Request headers cross the bridge as one packed string and are unpacked
   on first access; query parameters parse on first access.
+- Heads combine per isolate: heads that arrive while the previous bridge
+  post is in flight cross as one message, so a burst costs one post per
+  pass rather than one per head.
 - Per-request state lives under its own mutex. No shared bridge lock, no
   callbacks, and the Dart isolate never blocks.
 - Routing: `:param` segments, trailing `*`, static > param > wildcard,
@@ -45,7 +48,7 @@ await server.close();
 | `server.route(method, pattern, handler, {customMethod, …})` | general form, custom verbs |
 | `server.use(middleware)` | server-wide middleware, outermost first |
 | `server.group(prefix)` | path-prefixed view with its own middleware |
-| `server.ws(pattern, handler)` | WebSocket route (RFC 6455); the handler gets a `WsSession` |
+| `server.ws(pattern, handler, {protocols})` | WebSocket route (RFC 6455); the handler gets a `WsSession`; `protocols` selects a subprotocol |
 | `server.notFoundHandler`, `server.errorHandler` | custom 404 and 500 answers |
 | `server.unroute(method, pattern)` | removes a route; `RouteNotFoundException` if absent |
 | `server.events` | lifecycle stream: started, stopped, handler timeout, client error |
@@ -217,7 +220,6 @@ measures the client's ephemeral-port budget):
 - HTTP/1.1 only. No TLS.
 - One native thread per live connection: suited to hundreds of concurrent
   connections, not thousands.
-- WebSocket: no `Sec-WebSocket-Protocol` selection.
 - `close(drain:)` resets connections still in the kernel backlog only if
   they arrive after the drain's final accept sweep.
 
@@ -231,8 +233,22 @@ cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release -DNITRO_SERVER_BUILD_TESTS=
 cmake --build build/lib --parallel
 ./build/lib/nitro_server_tests/nitro_server_engine_tests   # C++ suite
 dart test                                                  # Dart suites
-bash tool/coverage.sh                                      # 100% line gate
+bash tool/coverage.sh                                      # Dart 100% line gate
+bash tool/cpp_coverage.sh 90                               # engine line gate
 ```
+
+Sanitizers and fuzzing (clang):
+
+```sh
+cmake -S src -B build/san -DNITRO_SERVER_BUILD_TESTS=ON -DNITRO_SERVER_SANITIZE=thread
+cmake --build build/san --parallel --target nitro_server_engine_tests
+./build/san/nitro_server_tests/nitro_server_engine_tests   # ThreadSanitizer
+bash tool/fuzz.sh 60                                        # libFuzzer: head, frame, socket
+```
+
+`.github/workflows/ci.yml` runs the suites, both coverage gates, and the
+thread and address sanitizers on Linux and macOS. Fuzzing is a local tool
+(`tool/fuzz.sh`); `test/fuzz` is not tracked.
 
 Tests: `server_config_test` (types, mapping), `runner_test` (dispatch and
 ack protocol, fakes), `server_edge_cases_test`, `server_facade_test`,

@@ -2358,6 +2358,43 @@ TEST(TlsTest, ServesARequestOverTls) {
   EXPECT_EQ(bodyOf(res), "echo:");
 }
 
+TEST(TlsTest, ForcedTls13KeepAliveExchange) {
+  // TLS 1.3 with keep-alive stresses the post-handshake read path (where a
+  // ticket/key-update makes SSL_read want to write). Tickets are disabled and
+  // tlsRead handles the direction, so this must not hang.
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/hello", -1);
+  const int port = startTls(f, nitroserver_test::kTestCertPem,
+                            nitroserver_test::kTestKeyPem);
+  int fd = connectTo(port);
+  ASSERT_GE(fd, 0);
+  timeval tv{5, 0};
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+  SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
+  SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
+  SSL* ssl = SSL_new(ctx);
+  SSL_set_fd(ssl, fd);
+  ASSERT_EQ(SSL_connect(ssl), 1);
+  EXPECT_STREQ(SSL_get_version(ssl), "TLSv1.3");
+  for (int i = 0; i < 3; i++) {
+    const std::string req = "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n";
+    ASSERT_EQ(SSL_write(ssl, req.data(), (int)req.size()), (int)req.size());
+    std::string res;
+    char b[2048];
+    while (res.find("\r\n\r\n") == std::string::npos) {
+      const int n = SSL_read(ssl, b, sizeof(b));
+      if (n <= 0) break;
+      res.append(b, (size_t)n);
+    }
+    EXPECT_EQ(statusOf(res), 200) << "request " << i;
+  }
+  SSL_shutdown(ssl);
+  SSL_free(ssl);
+  SSL_CTX_free(ctx);
+  close(fd);
+}
+
 TEST(TlsTest, KeepAliveServesTwoRequestsOnOneTlsConnection) {
   Fixture f(echoAnswer());
   f.server->registerRoute(Method::Get, "", "/hello", -1);

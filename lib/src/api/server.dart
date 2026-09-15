@@ -335,26 +335,59 @@ class NitroServer {
   /// [body] is the exact response bytes. [contentType], when given, sets
   /// `Content-Type`; [headers] add any others. The engine frames
   /// `Content-Length` and keep-alive `Connection` itself, and answers a `HEAD`
-  /// on the pattern headers-only. Registering here replaces any handler or
-  /// WebSocket route at the same pattern.
+  /// on a GET route headers-only. [method] defaults to GET (the common case);
+  /// pass another verb — or [HttpMethod.custom] with [customMethod] — for a
+  /// fixed answer on it. Registering replaces any handler, WebSocket, or
+  /// static route already at (method, pattern).
   ///
   /// There is no handler, so route [middleware], [timeout] and the error /
-  /// not-found fallbacks never apply. To change the body, register again (or
-  /// [unroute] and re-add). Returns `this` for chaining.
+  /// not-found fallbacks never apply. A request that carries a body closes the
+  /// connection after the answer (a fixed route has no reader for it). To
+  /// change the body, register again (or [unroute] and re-add). Returns `this`
+  /// for chaining.
+  Future<NitroServer> staticRoute(
+    HttpMethod method,
+    String pattern,
+    List<int> body, {
+    int status = 200,
+    String? contentType,
+    Map<String, String> headers = const {},
+    String customMethod = '',
+  }) async {
+    _requirePattern(pattern);
+    if (method == HttpMethod.custom && customMethod.isEmpty) {
+      throw ArgumentError.value(
+        customMethod,
+        'customMethod',
+        'HttpMethod.custom needs an explicit token',
+      );
+    }
+    _runner.addStaticRoute(
+      method,
+      customMethod.toUpperCase(),
+      pattern,
+      status,
+      {'content-type': ?contentType, ...headers},
+      body,
+    );
+    return this;
+  }
+
+  /// GET shorthand for [staticRoute]: `server.getStatic('/health', bytes)`.
   Future<NitroServer> getStatic(
     String pattern,
     List<int> body, {
     int status = 200,
     String? contentType,
     Map<String, String> headers = const {},
-  }) async {
-    _requirePattern(pattern);
-    _runner.addStaticRoute(HttpMethod.get, '', pattern, status, {
-      'content-type': ?contentType,
-      ...headers,
-    }, body);
-    return this;
-  }
+  }) => staticRoute(
+    HttpMethod.get,
+    pattern,
+    body,
+    status: status,
+    contentType: contentType,
+    headers: headers,
+  );
 
   /// Registers a WebSocket route (RFC 6455). Matching handshakes upgrade
   /// in-engine and [handler] receives the live session; anything else on

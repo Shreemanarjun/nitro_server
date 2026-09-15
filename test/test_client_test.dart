@@ -92,6 +92,18 @@ void main() {
     expect(res.text(), 'gone');
   });
 
+  test('staticRoute serves a non-GET method and needs a custom token', () async {
+    await client.server.staticRoute(HttpMethod.post, '/hook', 'ack'.codeUnits);
+    expect((await client.post('/hook', body: 'x')).text(), 'ack');
+    // A POST-only static route does not answer GET (no cross-method fallback).
+    expect((await client.get('/hook')).status, 404);
+    // A custom-method static route needs its token.
+    await expectLater(
+      client.server.staticRoute(HttpMethod.custom, '/c', 'x'.codeUnits),
+      throwsArgumentError,
+    );
+  });
+
   test('getStatic re-registration replaces the fixed body', () async {
     await client.server.getStatic('/v', 'one'.codeUnits);
     expect((await client.get('/v')).text(), 'one');

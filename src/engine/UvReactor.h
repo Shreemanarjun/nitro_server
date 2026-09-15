@@ -133,6 +133,15 @@ class UvReactor {
   void processConn(Conn* c);            // parse + dispatch complete requests
   void wsProcess(Conn* c);              // decode WebSocket frames (loop thread)
   void wsCloseConn(Conn* c, int code);  // send a close frame + close (loop thread)
+#ifdef NITRO_SERVER_TLS
+  // TLS over libuv via OpenSSL memory BIOs: ciphertext moves on the socket,
+  // plaintext through SSL_read/SSL_write. All on the connection's loop thread.
+  StatusResult setupTls();              // build sslCtx_ from cfg_ (once, at start)
+  bool tlsInit(Conn* c);                // new SSL + memory BIOs for [c]
+  void tlsOnRead(Conn* c, const char* data, size_t n);  // decrypt + drive
+  std::string tlsDrain(Conn* c);        // pull ciphertext out of the write BIO
+  void tlsRawWrite(Conn* c, std::string cipher);        // fire-and-forget write
+#endif
   // Loop thread: perform the RFC 6455 handshake, switch [c] to WebSocket mode.
   void wsHandshake(Conn* c, const ParsedHead& head, const MatchResult& m,
                    const std::string& path, const std::string& query);
@@ -154,6 +163,7 @@ class UvReactor {
   std::atomic<int64_t> nextConnId_{1};
   std::atomic<bool> running_{false};
   std::atomic<bool> draining_{false};
+  void* sslCtx_ = nullptr;  // SSL_CTX*; opaque here to keep OpenSSL out of the header
   std::vector<std::unique_ptr<Loop>> loops_;
   PendingTable pending_;  // body-chunk payload logs (freed on ack / stop)
 

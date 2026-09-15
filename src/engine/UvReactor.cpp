@@ -13,10 +13,29 @@
 
 #include "WsCodec.h"
 
+#ifdef NITRO_SERVER_TLS
+#include <openssl/err.h>
+#include <openssl/pem.h>
+#include <openssl/ssl.h>
+#endif
+
 namespace nitroserver {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+
+#ifdef NITRO_SERVER_TLS
+// ALPN: prefer http/1.1 when the client offers it; otherwise no selection.
+int reactorAlpnSelect(SSL*, const unsigned char** out, unsigned char* outlen,
+                      const unsigned char* in, unsigned int inlen, void*) {
+  static const unsigned char h11[] = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+  if (SSL_select_next_proto((unsigned char**)out, outlen, h11, sizeof(h11), in,
+                            inlen) == OPENSSL_NPN_NEGOTIATED) {
+    return SSL_TLSEXT_ERR_OK;
+  }
+  return SSL_TLSEXT_ERR_NOACK;
+}
+#endif
 
 // ── Small HTTP helpers (self-contained; the live engine keeps its own copies
 // until the reactor replaces it, at which point these are the survivors). ─────
@@ -116,6 +135,12 @@ struct UvReactor::Conn {
   std::string wsMsg;      // reassembly buffer for a fragmented message
   int wsMsgOpcode = 0;    // opcode of the message being reassembled
   bool wsClosing = false;  // a close frame was sent; drop further frames
+#ifdef NITRO_SERVER_TLS
+  SSL* ssl = nullptr;        // null on a plaintext connection
+  BIO* rbio = nullptr;       // ciphertext in  (socket → SSL)
+  BIO* wbio = nullptr;       // ciphertext out (SSL → socket)
+  bool tlsHandshakeDone = false;
+#endif
 };
 
 UvReactor::~UvReactor() { stop(); }
@@ -137,6 +162,15 @@ MatchResult UvReactor::match(Method m, const std::string& custom,
 
 StatusResult UvReactor::start(int loops) {
   if (running_.exchange(true)) return {ErrorKind::AlreadyRunning, "running", 0};
+#ifdef NITRO_SERVER_TLS
+  if (cfg_.tlsRequested) {
+    const StatusResult r = setupTls();
+    if (r.kind != ErrorKind::None) {
+      running_.store(false);
+      return r;
+    }
+  }
+#endif
   unsigned cores = std::thread::hardware_concurrency();
   int n = loops > 0 ? loops : (cores == 0 ? 4 : (int)cores);
   boundPort_.store(cfg_.port);
@@ -214,6 +248,13 @@ void UvReactor::onConnection(uv_stream_t* server, int status) {
   }
   uv_tcp_nodelay(&c->handle, 1);
   c->lastActive = Clock::now();
+#ifdef NITRO_SERVER_TLS
+  if (self->sslCtx_ && !self->tlsInit(c)) {
+    c->closing = true;
+    uv_close((uv_handle_t*)&c->handle, &UvReactor::onCloseConn);
+    return;
+  }
+#endif
   lp->conns[c->id] = c;
   self->liveConns_.fetch_add(1);
   uv_read_start((uv_stream_t*)&c->handle, &UvReactor::allocCb,
@@ -241,6 +282,9 @@ void UvReactor::onCloseConn(uv_handle_t* h) {
       self->pending_.dropPayloads(c->id);  // free un-acked WS message payloads
     }
   }
+#ifdef NITRO_SERVER_TLS
+  if (c->ssl) SSL_free(c->ssl);  // frees the attached rbio + wbio too
+#endif
   delete c;
 }
 
@@ -252,6 +296,12 @@ void UvReactor::readCb(uv_stream_t* s, ssize_t nread, const uv_buf_t* b) {
     return;
   }
   if (nread == 0) return;
+#ifdef NITRO_SERVER_TLS
+  if (c->ssl) {
+    c->lp->owner->tlsOnRead(c, b->base, (size_t)nread);  // decrypts + processes
+    return;
+  }
+#endif
   c->buf.append(b->base, (size_t)nread);
   if (c->ws) {
     c->lp->owner->wsProcess(c);
@@ -369,6 +419,19 @@ void UvReactor::processConn(Conn* c) {
 void UvReactor::writeAnswer(Conn* c, std::string bytes, bool keepAlive,
                             bool finish) {
   c->busy = true;
+#ifdef NITRO_SERVER_TLS
+  if (c->ssl) {
+    // Encrypt the plaintext; the memory write-BIO is unbounded, so SSL_write
+    // consumes it all and the ciphertext is what goes on the wire.
+    if (!bytes.empty()) SSL_write(c->ssl, bytes.data(), (int)bytes.size());
+    auto* payload = new std::string(tlsDrain(c));
+    auto* req = new uv_write_t;
+    req->data = new WriteCtx{c, payload, keepAlive, finish};
+    uv_buf_t buf = uv_buf_init((char*)payload->data(), (unsigned)payload->size());
+    uv_write(req, (uv_stream_t*)&c->handle, &buf, 1, &UvReactor::onWrite);
+    return;
+  }
+#endif
   auto* payload = new std::string(std::move(bytes));
   auto* req = new uv_write_t;
   req->data = new WriteCtx{c, payload, keepAlive, finish};
@@ -741,6 +804,142 @@ void UvReactor::wsClose(int64_t connId, int code) {
   uv_async_send(&lp->async);
 }
 
+#ifdef NITRO_SERVER_TLS
+// ── TLS over libuv (OpenSSL memory BIOs) ─────────────────────────────────────
+
+StatusResult UvReactor::setupTls() {
+  auto fail = [](const std::string& what) -> StatusResult {
+    char buf[256] = {0};
+    const unsigned long e = ERR_get_error();
+    if (e) ERR_error_string_n(e, buf, sizeof(buf));
+    return {ErrorKind::TlsError, e ? what + ": " + buf : what, 0};
+  };
+  SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
+  if (!ctx) return fail("SSL_CTX_new failed");
+  SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+  SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE |
+                            SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER |
+                            SSL_MODE_AUTO_RETRY);
+  SSL_CTX_set_options(ctx, SSL_OP_NO_RENEGOTIATION | SSL_OP_NO_TICKET);
+  SSL_CTX_set_num_tickets(ctx, 0);
+  SSL_CTX_set_alpn_select_cb(ctx, reactorAlpnSelect, nullptr);
+
+  if (!cfg_.tlsCertPem.empty()) {
+    BIO* bio = BIO_new_mem_buf(cfg_.tlsCertPem.data(), (int)cfg_.tlsCertPem.size());
+    X509* leaf = PEM_read_bio_X509_AUX(bio, nullptr, nullptr, nullptr);
+    if (!leaf || SSL_CTX_use_certificate(ctx, leaf) != 1) {
+      if (leaf) X509_free(leaf);
+      BIO_free(bio);
+      SSL_CTX_free(ctx);
+      return fail("invalid TLS certificate PEM");
+    }
+    X509_free(leaf);
+    SSL_CTX_clear_chain_certs(ctx);
+    X509* ca;
+    while ((ca = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr)) != nullptr)
+      if (SSL_CTX_add0_chain_cert(ctx, ca) != 1) X509_free(ca);
+    BIO_free(bio);
+  } else if (!cfg_.tlsCertFile.empty()) {
+    if (SSL_CTX_use_certificate_chain_file(ctx, cfg_.tlsCertFile.c_str()) != 1) {
+      SSL_CTX_free(ctx);
+      return fail("cannot load TLS certificate file");
+    }
+  } else {
+    SSL_CTX_free(ctx);
+    return {ErrorKind::TlsError, "TLS requested without a certificate", 0};
+  }
+
+  if (!cfg_.tlsKeyPem.empty()) {
+    BIO* bio = BIO_new_mem_buf(cfg_.tlsKeyPem.data(), (int)cfg_.tlsKeyPem.size());
+    EVP_PKEY* key = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
+    BIO_free(bio);
+    if (!key || SSL_CTX_use_PrivateKey(ctx, key) != 1) {
+      if (key) EVP_PKEY_free(key);
+      SSL_CTX_free(ctx);
+      return fail("invalid TLS private key PEM");
+    }
+    EVP_PKEY_free(key);
+  } else if (!cfg_.tlsKeyFile.empty()) {
+    if (SSL_CTX_use_PrivateKey_file(ctx, cfg_.tlsKeyFile.c_str(),
+                                    SSL_FILETYPE_PEM) != 1) {
+      SSL_CTX_free(ctx);
+      return fail("cannot load TLS private key file");
+    }
+  } else {
+    SSL_CTX_free(ctx);
+    return {ErrorKind::TlsError, "TLS requested without a private key", 0};
+  }
+  if (SSL_CTX_check_private_key(ctx) != 1) {
+    SSL_CTX_free(ctx);
+    return {ErrorKind::TlsError, "certificate and private key do not match", 0};
+  }
+  sslCtx_ = ctx;
+  return {};
+}
+
+bool UvReactor::tlsInit(Conn* c) {
+  c->ssl = SSL_new((SSL_CTX*)sslCtx_);
+  if (!c->ssl) return false;
+  c->rbio = BIO_new(BIO_s_mem());
+  c->wbio = BIO_new(BIO_s_mem());
+  if (!c->rbio || !c->wbio) {
+    SSL_free(c->ssl);  // frees any BIO already attached
+    c->ssl = nullptr;
+    return false;
+  }
+  SSL_set_bio(c->ssl, c->rbio, c->wbio);  // SSL owns the BIOs now
+  SSL_set_accept_state(c->ssl);
+  return true;
+}
+
+std::string UvReactor::tlsDrain(Conn* c) {
+  std::string out;
+  char b[16384];
+  int r;
+  while ((r = BIO_read(c->wbio, b, sizeof(b))) > 0) out.append(b, (size_t)r);
+  return out;
+}
+
+void UvReactor::tlsRawWrite(Conn* c, std::string cipher) {
+  if (cipher.empty()) return;
+  auto* payload = new std::string(std::move(cipher));
+  auto* req = new uv_write_t;
+  req->data = new WriteCtx{c, payload, true, /*finish=*/false};
+  uv_buf_t buf = uv_buf_init((char*)payload->data(), (unsigned)payload->size());
+  uv_write(req, (uv_stream_t*)&c->handle, &buf, 1, &UvReactor::onWrite);
+}
+
+// Loop thread: feed ciphertext into the SSL engine, drive the handshake, then
+// decrypt application data into the plaintext buffer and process it.
+void UvReactor::tlsOnRead(Conn* c, const char* data, size_t n) {
+  BIO_write(c->rbio, data, (int)n);
+  if (!c->tlsHandshakeDone) {
+    const int r = SSL_accept(c->ssl);
+    tlsRawWrite(c, tlsDrain(c));  // ServerHello / handshake flight
+    if (r != 1) {
+      const int e = SSL_get_error(c->ssl, r);
+      if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE) {
+        c->closing = true;
+        if (!uv_is_closing((uv_handle_t*)&c->handle))
+          uv_close((uv_handle_t*)&c->handle, &UvReactor::onCloseConn);
+      }
+      return;  // handshake needs more bytes
+    }
+    c->tlsHandshakeDone = true;
+  }
+  char plain[16384];
+  int r;
+  while ((r = SSL_read(c->ssl, plain, sizeof(plain))) > 0)
+    c->buf.append(plain, (size_t)r);
+  tlsRawWrite(c, tlsDrain(c));  // anything SSL_read produced
+  if (c->ws) {
+    wsProcess(c);
+  } else {
+    processConn(c);
+  }
+}
+#endif  // NITRO_SERVER_TLS
+
 void UvReactor::stop() {
   if (!running_.exchange(false)) return;
   for (auto& lp : loops_) {
@@ -758,6 +957,12 @@ void UvReactor::stop() {
   // Loop threads are gone; free any body-chunk payloads the runner never
   // acked (frees leak-free in production, where ackBody would have).
   pending_.abortAll();
+#ifdef NITRO_SERVER_TLS
+  if (sslCtx_) {
+    SSL_CTX_free((SSL_CTX*)sslCtx_);
+    sslCtx_ = nullptr;
+  }
+#endif
 }
 
 }  // namespace nitroserver

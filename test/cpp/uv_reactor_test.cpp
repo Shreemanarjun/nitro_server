@@ -22,6 +22,12 @@
 #include "UvReactor.h"
 #include "gtest/gtest.h"
 
+#ifdef NITRO_SERVER_TLS
+#include <openssl/ssl.h>
+
+#include "tls_test_cert.h"
+#endif
+
 using namespace nitroserver;
 
 namespace {
@@ -561,5 +567,54 @@ TEST(UvReactorTest, IdleKeepAliveConnectionIsClosed) {
   EXPECT_GE(ms, 100);   // waited out the idle window
   EXPECT_LT(ms, 3000);  // then the engine closed it
 }
+
+#ifdef NITRO_SERVER_TLS
+TEST(UvReactorTest, ServesARequestOverTls) {
+  UvReactor reactor;
+  PumpEmitter em(&reactor, "secure");
+  reactor.setEmitter(&em);
+  ServerConfig cfg;
+  cfg.port = 0;
+  cfg.keepAliveTimeoutMs = 5000;
+  cfg.tlsRequested = true;
+  cfg.tlsCertPem = nitroserver_test::kTestCertPem;
+  cfg.tlsKeyPem = nitroserver_test::kTestKeyPem;
+  reactor.configure(cfg);
+  ASSERT_EQ((int64_t)reactor.registerRoute(httpRoute(Method::Get, "/hello")).kind,
+            (int64_t)ErrorKind::None);
+  ASSERT_EQ((int64_t)reactor.start(2).kind, (int64_t)ErrorKind::None);
+
+  const int fd = connectTo((int)reactor.boundPort());
+  ASSERT_GE(fd, 0);
+  timeval tv{5, 0};
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  SSL_CTX* cctx = SSL_CTX_new(TLS_client_method());
+  SSL* ssl = SSL_new(cctx);
+  SSL_set_fd(ssl, fd);
+  // ALPN: offer http/1.1 to exercise the server's selection callback.
+  const unsigned char alpn[] = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+  SSL_set_alpn_protos(ssl, alpn, sizeof(alpn));
+  ASSERT_EQ(SSL_connect(ssl), 1);
+  const unsigned char* proto = nullptr;
+  unsigned plen = 0;
+  SSL_get0_alpn_selected(ssl, &proto, &plen);
+  EXPECT_EQ(std::string((const char*)proto, plen), "http/1.1");
+
+  const std::string req =
+      "GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+  ASSERT_EQ(SSL_write(ssl, req.data(), (int)req.size()), (int)req.size());
+  std::string res;
+  char buf[4096];
+  int n;
+  while ((n = SSL_read(ssl, buf, sizeof(buf))) > 0) res.append(buf, (size_t)n);
+  SSL_shutdown(ssl);
+  SSL_free(ssl);
+  SSL_CTX_free(cctx);
+  close(fd);
+  reactor.stop();
+  EXPECT_EQ(statusOf(res), 200);
+  EXPECT_EQ(bodyOf(res), "secure");
+}
+#endif  // NITRO_SERVER_TLS
 
 #endif  // NITRO_SERVER_LIBUV

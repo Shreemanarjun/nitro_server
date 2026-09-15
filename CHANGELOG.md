@@ -6,6 +6,9 @@ Initial release.
 
 * HTTP/1.1 with keep-alive, pipelining, `Expect: 100-continue`, chunked
   uploads, chunked and file responses.
+* Request-smuggling defense (RFC 9112 §6.1/§6.3.3/§3.2): rejects
+  Content-Length with Transfer-Encoding, duplicated Content-Length, and a
+  missing or duplicated Host on HTTP/1.1 with 400 before routing.
 * Trie routing: `:param`, trailing `*`, static > param > wildcard,
   method-specific > `all`, HEAD falls back to GET.
 * Per-route `timeout`, `maxBodyBytes`, `middleware`, `streamBody`.

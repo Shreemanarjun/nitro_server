@@ -2067,6 +2067,42 @@ TEST(ServerTest, ChunkedUploadOverTheRouteCapIs413) {
   }
 }
 
+TEST(ServerTest, RequestSmugglingVectorsAre400) {
+  // RFC 9112 §6.1/§6.3.3/§3.2: ambiguous framing is rejected before routing.
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Post, "", "/echo", -1);
+  f.server->registerRoute(Method::Get, "", "/hello", -1);
+  const int64_t port = f.startOnEphemeral();
+  const char* shapes[] = {
+      // Content-Length + Transfer-Encoding.
+      "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n"
+      "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n",
+      // Conflicting duplicate Content-Length.
+      "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n"
+      "Content-Length: 6\r\nConnection: close\r\n\r\nhello",
+      // Equal duplicate Content-Length (still ambiguous).
+      "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n"
+      "Content-Length: 5\r\nConnection: close\r\n\r\nhello",
+      // HTTP/1.1 without Host.
+      "GET /hello HTTP/1.1\r\nConnection: close\r\n\r\n",
+      // Duplicate Host.
+      "GET /hello HTTP/1.1\r\nHost: a\r\nHost: b\r\nConnection: close\r\n\r\n",
+  };
+  for (const char* shape : shapes) {
+    const int fd = connectTo((int)port);
+    ASSERT_GE(fd, 0);
+    sendStr(fd, shape);
+    EXPECT_EQ(statusOf(readAll(fd)), 400) << shape;
+    close(fd);
+  }
+  // HTTP/1.0 without Host is allowed (no §3.2 rule).
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "GET /hello HTTP/1.0\r\nConnection: close\r\n\r\n");
+  EXPECT_EQ(statusOf(readAll(fd)), 200);
+  close(fd);
+}
+
 TEST(ServerTest, TruncatedOrMalformedBodiesAre400) {
   Fixture f(echoAnswer());
   f.server->registerRoute(Method::Post, "", "/echo", -1);

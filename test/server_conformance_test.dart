@@ -483,6 +483,61 @@ void main() {
       }, skip: skipReason);
     });
 
+    group('request smuggling defense (RFC 9112 §6.1, §6.3.3, §3.2)', () {
+      test('Content-Length with Transfer-Encoding is a 400', () async {
+        final raw = await _raw(
+          port,
+          ascii.encode(
+            'POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n'
+            'Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n'
+            '0\r\n\r\n',
+          ),
+        );
+        expect(_statusOf(raw), 400);
+      }, skip: skipReason);
+
+      test('conflicting duplicate Content-Length is a 400', () async {
+        final raw = await _raw(
+          port,
+          ascii.encode(
+            'POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n'
+            'Content-Length: 6\r\nConnection: close\r\n\r\nhello',
+          ),
+        );
+        expect(_statusOf(raw), 400);
+      }, skip: skipReason);
+
+      test('duplicate Content-Length is a 400 even when equal', () async {
+        final raw = await _raw(
+          port,
+          ascii.encode(
+            'POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n'
+            'Content-Length: 5\r\nConnection: close\r\n\r\nhello',
+          ),
+        );
+        expect(_statusOf(raw), 400);
+      }, skip: skipReason);
+
+      test('HTTP/1.1 without a Host header is a 400', () async {
+        final raw = await _raw(
+          port,
+          ascii.encode('GET /hello HTTP/1.1\r\nConnection: close\r\n\r\n'),
+        );
+        expect(_statusOf(raw), 400);
+      }, skip: skipReason);
+
+      test('duplicate Host header is a 400', () async {
+        final raw = await _raw(
+          port,
+          ascii.encode(
+            'GET /hello HTTP/1.1\r\nHost: a\r\nHost: b\r\n'
+            'Connection: close\r\n\r\n',
+          ),
+        );
+        expect(_statusOf(raw), 400);
+      }, skip: skipReason);
+    });
+
     group('framing robustness (RFC 9112 §2-3)', () {
       test('a request split across TCP segments still parses', () async {
         final socket = await Socket.connect('127.0.0.1', port);

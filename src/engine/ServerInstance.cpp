@@ -37,6 +37,7 @@ using ssize_t = long long;
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <cerrno>
+#include <cstdlib>
 #endif
 
 namespace nitroserver {
@@ -82,6 +83,8 @@ TlsSockets g_tls;
 // before it can return app data (a TLS 1.3 post-handshake message, e.g. a
 // session ticket or key update). The caller only knows to poll for reads, so
 // wait for writability here and retry — otherwise the read hangs forever.
+void tlsTrace(const char* what, int64_t id, long detail);
+
 ssize_t tlsRead(SSL* ssl, void* buf, size_t n) {
   const int fd = SSL_get_fd(ssl);
   for (;;) {
@@ -95,6 +98,7 @@ ssize_t tlsRead(SSL* ssl, void* buf, size_t n) {
       return -1;
     }
     if (e == SSL_ERROR_WANT_WRITE) {
+      tlsTrace("read-wants-write", 0, 0);
       struct pollfd p {fd, POLLOUT, 0};
       if (::poll(&p, 1, 5000) <= 0) {
         errno = EWOULDBLOCK;
@@ -102,6 +106,7 @@ ssize_t tlsRead(SSL* ssl, void* buf, size_t n) {
       }
       continue;
     }
+    tlsTrace("read-error", 0, e);
     errno = ECONNRESET;
     return -1;
   }
@@ -124,10 +129,12 @@ ssize_t tlsWrite(SSL* ssl, const uint8_t* const* bufs, const size_t* lens,
       const int e = SSL_get_error(ssl, r);
       if (e == SSL_ERROR_WANT_WRITE) return 0;
       if (e == SSL_ERROR_WANT_READ) {
+        tlsTrace("write-wants-read", 0, 0);
         struct pollfd p {fd, POLLIN, 0};
         if (::poll(&p, 1, 5000) <= 0) return 0;
         continue;
       }
+      tlsTrace("write-error", 0, e);
       return -1;
     }
   }
@@ -144,6 +151,20 @@ int tlsAlpnSelect(SSL*, const unsigned char** out, unsigned char* outlen,
     return SSL_TLSEXT_ERR_NOACK;  // No overlap: proceed without ALPN.
   }
   return SSL_TLSEXT_ERR_OK;
+}
+
+// Opt-in TLS tracing (NITRO_TLS_DEBUG=1). Off by default; used to pinpoint a
+// platform-specific stall on CI. Cheap: one getenv, cached.
+bool tlsDebug() {
+  static const bool on = [] {
+    const char* v = ::getenv("NITRO_TLS_DEBUG");
+    return v && v[0] && v[0] != '0';
+  }();
+  return on;
+}
+void tlsTrace(const char* what, int64_t id, long detail) {
+  if (tlsDebug()) fprintf(stderr, "[nitro-tls] %s id=%lld d=%ld\n", what,
+                          (long long)id, detail);
 }
 #endif  // NITRO_SERVER_TLS
 
@@ -583,6 +604,36 @@ const Header* findHeader(const std::vector<Header>& hs, const char* name) {
   return nullptr;
 }
 
+// RFC 9112 request-framing validity (smuggling defense). Returns a 400 reason
+// or nullptr when the framing is unambiguous. Content-Length together with
+// Transfer-Encoding, or a duplicated Content-Length, are the classic
+// request-smuggling vectors (§6.1, §6.3.3): reject rather than guess which
+// length a downstream will trust. HTTP/1.1 also requires exactly one Host
+// (§3.2).
+const char* httpFramingError(const ParsedHead& head) {
+  const std::string* cl = nullptr;
+  bool hasTe = false, hasHost = false, dupHost = false, dupCl = false;
+  for (const auto& h : head.headers) {
+    if (iequals(h.name, "content-length")) {
+      if (cl && trimSv(*cl) != trimSv(h.value)) return "conflicting content-length";
+      if (cl) dupCl = true;
+      cl = &h.value;
+    } else if (iequals(h.name, "transfer-encoding")) {
+      hasTe = true;
+    } else if (iequals(h.name, "host")) {
+      dupHost = dupHost || hasHost;
+      hasHost = true;
+    }
+  }
+  if (dupCl) return "duplicate content-length";
+  if (cl && hasTe) return "content-length with transfer-encoding";
+  if (head.version == "HTTP/1.1") {
+    if (!hasHost) return "missing host header";
+    if (dupHost) return "duplicate host header";
+  }
+  return nullptr;
+}
+
 /// HTTP/1.1 keeps alive unless asked to close; 1.0 closes unless asked to
 /// keep. Anything else (including a missing version) closes — a client that
 /// cannot name its protocol does not get connection reuse.
@@ -833,13 +884,17 @@ StatusResult ServerInstance::setupTls(const ServerConfig& cfg) {
 // wants until the handshake completes or [timeoutMs] elapses.
 bool ServerInstance::tlsHandshake(int fd, void* sslv, int64_t timeoutMs) {
   SSL* ssl = (SSL*)sslv;
+  tlsTrace("handshake-start", fd, timeoutMs);
   const int64_t budget = timeoutMs > 0 ? timeoutMs : 10000;
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(budget);
   while (running_.load()) {
     ERR_clear_error();
     const int r = SSL_accept(ssl);
-    if (r == 1) return true;
+    if (r == 1) {
+      tlsTrace("handshake-ok", fd, 0);
+      return true;
+    }
     const int e = SSL_get_error(ssl, r);
     short want;
     if (e == SSL_ERROR_WANT_READ) {
@@ -847,6 +902,7 @@ bool ServerInstance::tlsHandshake(int fd, void* sslv, int64_t timeoutMs) {
     } else if (e == SSL_ERROR_WANT_WRITE) {
       want = POLLOUT;
     } else {
+      tlsTrace("handshake-fail", fd, SSL_get_error(ssl, r));
       return false;
     }
     const int64_t left = (int64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1890,6 +1946,12 @@ bool ServerInstance::serveOne(int fd, const Wake& wake, std::string& carry,
   ParsedHead head = parseHead(carry, headEnd);
   if (!head.ok) {
     answerDirectly(fd, Method::Get, 400, "bad request");
+    return false;
+  }
+  // Reject ambiguous framing (request smuggling, RFC 9112 §6.1/§6.3.3/§3.2)
+  // before routing, so a bad-framing request is a 400 regardless of path.
+  if (const char* framingErr = httpFramingError(head)) {
+    answerDirectly(fd, head.method, 400, framingErr);
     return false;
   }
   const bool keepPeer = clientWantsKeepAlive(head) && running_.load();

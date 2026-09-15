@@ -75,6 +75,10 @@ class _Pending {
   /// Set once a `streamBody` handler is running: chunks go here instead of
   /// [body], and are acked as they are copied rather than at completion.
   StreamController<Uint8List>? stream;
+
+  /// Metrics bucket, resolved once at dispatch so `_record` need not repeat
+  /// the route lookup on the answer path.
+  String? metricsPattern;
 }
 
 /// The engine's handshake choice, recomputed for the session: the first of
@@ -639,6 +643,13 @@ class ServerRunner {
     // `HttpMethod.all` (`*`) is the last resort — mirroring the native
     // router's precedence. Two-level lookup: no key string is built.
     final entry = _entryFor(head);
+    // Resolve the metrics bucket here, where the match is already known, so
+    // the answer path (`_record`) does not repeat the route lookup.
+    pending.metricsPattern =
+        head.routePattern.isEmpty ||
+            (entry == null && !_wsHandlers.containsKey(head.routePattern))
+        ? '*unmatched*'
+        : head.routePattern;
     // The context is built before the branch: both the handler and the
     // not-found fallback receive it.
     final context = RequestContext.packed(
@@ -720,12 +731,7 @@ class ServerRunner {
   void _record(int requestId, int status) {
     final pending = _pending[requestId];
     if (pending == null) return;
-    final pattern =
-        pending.head.routePattern.isEmpty ||
-            _entryFor(pending.head) == null &&
-                !_wsHandlers.containsKey(pending.head.routePattern)
-        ? '*unmatched*'
-        : pending.head.routePattern;
+    final pattern = pending.metricsPattern ?? '*unmatched*';
     final acc = _metrics[pattern] ??= MetricsAccumulator(pattern);
     acc.record(_clock.elapsedMicroseconds - pending.startedUs, status);
     _answered++;

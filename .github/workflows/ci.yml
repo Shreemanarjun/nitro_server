@@ -30,7 +30,7 @@ jobs:
       - run: ./build/lib/nitro_server_tests/nitro_server_engine_tests
       - run: bash tool/coverage.sh
       - run: bash tool/cpp_coverage.sh 90
-      - run: dart compile exe benchmark/compare.dart -o build/benchmark/compare
+      - run: mkdir -p build/benchmark && dart compile exe benchmark/compare.dart -o build/benchmark/compare
       - run: ./build/benchmark/compare --quick --keep-alive --raw --only /hello
 
   sanitize:

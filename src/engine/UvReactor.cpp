@@ -1179,12 +1179,28 @@ void UvReactor::onAsync(uv_async_t* async) {
     batch.swap(lp->queue);
     stopping = lp->stopping;
   }
-  for (auto& p : batch) {
-    auto it = lp->conns.find(p.connId);
+  // Coalesce consecutive entries for the same connection into one write: a
+  // stream that bursts N chunks between loop wakes then costs one uv_write
+  // (and one send syscall), not N. Merging stops at — and includes — the
+  // entry that finishes the response, so keep-alive framing is unchanged.
+  for (size_t i = 0; i < batch.size();) {
+    const int64_t cid = batch[i].connId;
+    std::string merged = std::move(batch[i].bytes);
+    bool keepAlive = batch[i].keepAlive;
+    bool finish = batch[i].finish;
+    size_t j = i + 1;
+    while (!finish && j < batch.size() && batch[j].connId == cid) {
+      merged.append(batch[j].bytes);
+      keepAlive = batch[j].keepAlive;
+      finish = batch[j].finish;
+      ++j;
+    }
+    i = j;
+    auto it = lp->conns.find(cid);
     if (it == lp->conns.end()) continue;  // closed before the answer landed
     Conn* c = it->second;
     if (c->closing) continue;
-    lp->owner->writeAnswer(c, std::move(p.bytes), p.keepAlive, p.finish);
+    lp->owner->writeAnswer(c, std::move(merged), keepAlive, finish);
   }
   if (stopping) {
     if (!uv_is_closing((uv_handle_t*)&lp->server))

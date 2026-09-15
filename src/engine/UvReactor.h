@@ -53,8 +53,13 @@ class UvReactor {
   /// serving. boundPort() is valid after this returns None.
   StatusResult start(int loops = 0);
   void stop();
+  /// Graceful shutdown phase one: stop accepting, mark later answers
+  /// `Connection: close`; in-flight requests finish. Poll inFlightRequests().
+  void beginDrain();
   int64_t boundPort() const { return boundPort_.load(); }
   int64_t liveConnections() const { return liveConns_.load(); }
+  /// Handler requests dispatched but not yet answered.
+  int64_t inFlightRequests();
 
   /// Answers request [id] from any thread. No-op if the connection is gone.
   void respond(int64_t id, int64_t status, const std::vector<Header>& headers,
@@ -76,6 +81,7 @@ class UvReactor {
     uv_loop_t loop{};
     uv_async_t async{};
     uv_tcp_t server{};
+    uv_timer_t sweep{};  // periodic idle/request-deadline sweep (loop thread)
     int fd = -1;
     std::thread thread;
     // Loop-thread-owned: live connections by id.
@@ -111,6 +117,7 @@ class UvReactor {
 
   static void onConnection(uv_stream_t* server, int status);
   static void onAsync(uv_async_t* async);
+  static void onSweep(uv_timer_t* timer);  // idle/deadline sweep (loop thread)
   static void allocCb(uv_handle_t* h, size_t suggested, uv_buf_t* b);
   static void readCb(uv_stream_t* s, ssize_t nread, const uv_buf_t* b);
   static void onWrite(uv_write_t* req, int status);
@@ -134,6 +141,7 @@ class UvReactor {
   std::atomic<int64_t> nextReqId_{1};
   std::atomic<int64_t> nextConnId_{1};
   std::atomic<bool> running_{false};
+  std::atomic<bool> draining_{false};
   std::vector<std::unique_ptr<Loop>> loops_;
   PendingTable pending_;  // body-chunk payload logs (freed on ack / stop)
 

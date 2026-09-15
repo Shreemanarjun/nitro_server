@@ -8,10 +8,13 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstring>
 
 namespace nitroserver {
 namespace {
+
+using Clock = std::chrono::steady_clock;
 
 // ── Small HTTP helpers (self-contained; the live engine keeps its own copies
 // until the reactor replaces it, at which point these are the survivors). ─────
@@ -101,6 +104,11 @@ struct UvReactor::Conn {
   std::string buf;   // accumulated request bytes
   bool busy = false;  // a request is awaiting its answer (ordered per conn)
   bool closing = false;
+  int64_t served = 0;  // completed requests (header vs keep-alive timeout)
+  int64_t reqIdInFlight = -1;  // dispatched handler awaiting respond (for 408)
+  std::chrono::steady_clock::time_point lastActive;   // idle-timeout anchor
+  std::chrono::steady_clock::time_point reqDeadline;  // valid while busy+handler
+  bool hasDeadline = false;
 };
 
 UvReactor::~UvReactor() { stop(); }
@@ -132,6 +140,9 @@ StatusResult UvReactor::start(int loops) {
     uv_loop_init(&lp->loop);
     lp->async.data = lp.get();
     uv_async_init(&lp->loop, &lp->async, &UvReactor::onAsync);
+    lp->sweep.data = lp.get();
+    uv_timer_init(&lp->loop, &lp->sweep);
+    uv_timer_start(&lp->sweep, &UvReactor::onSweep, 100, 100);  // every 100ms
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     int one = 1;
@@ -175,20 +186,31 @@ void UvReactor::runLoop(Loop* lp) { uv_run(&lp->loop, UV_RUN_DEFAULT); }
 void UvReactor::onConnection(uv_stream_t* server, int status) {
   if (status < 0) return;
   Loop* lp = (Loop*)server->data;
+  UvReactor* self = lp->owner;
   Conn* c = new Conn();
   c->lp = lp;
-  c->id = lp->owner->nextConnId_.fetch_add(1);
+  c->id = self->nextConnId_.fetch_add(1);
   c->handle.data = c;
   uv_tcp_init(&lp->loop, &c->handle);
-  if (uv_accept(server, (uv_stream_t*)&c->handle) == 0) {
-    uv_tcp_nodelay(&c->handle, 1);
-    lp->conns[c->id] = c;
-    lp->owner->liveConns_.fetch_add(1);
-    uv_read_start((uv_stream_t*)&c->handle, &UvReactor::allocCb,
-                  &UvReactor::readCb);
-  } else {
+  if (uv_accept(server, (uv_stream_t*)&c->handle) != 0) {
     uv_close((uv_handle_t*)&c->handle, &UvReactor::onCloseConn);
+    return;
   }
+  // Refuse over the connection cap (or while draining): accept then close so
+  // the backlog drains instead of wedging.
+  const int64_t maxConn = self->cfg_.maxConnections;
+  if (self->draining_.load() ||
+      (maxConn > 0 && self->liveConns_.load() >= maxConn)) {
+    c->closing = true;
+    uv_close((uv_handle_t*)&c->handle, &UvReactor::onCloseConn);
+    return;
+  }
+  uv_tcp_nodelay(&c->handle, 1);
+  c->lastActive = Clock::now();
+  lp->conns[c->id] = c;
+  self->liveConns_.fetch_add(1);
+  uv_read_start((uv_stream_t*)&c->handle, &UvReactor::allocCb,
+                &UvReactor::readCb);
 }
 
 void UvReactor::allocCb(uv_handle_t* h, size_t suggested, uv_buf_t* b) {
@@ -259,13 +281,15 @@ void UvReactor::processConn(Conn* c) {
     if (q != std::string::npos) { query = path.substr(q + 1); path = path.substr(0, q); }
     if (path.empty()) path = "/";
 
-    const bool keepAlive = uvClientWantsKeepAlive(head) && cfg_.keepAliveTimeoutMs > 0;
+    const bool keepAlive = uvClientWantsKeepAlive(head) &&
+                           cfg_.keepAliveTimeoutMs > 0 && !draining_.load();
     const int64_t kaSecs = (cfg_.keepAliveTimeoutMs + 999) / 1000;
     MatchResult m = match(head.method, head.customMethod, path);
     // Capture the body before consuming the request from the buffer.
     std::string bodyBytes = clen > 0 ? c->buf.substr(headEnd + 4, (size_t)clen)
                                      : std::string();
     c->buf.erase(0, reqEnd);  // consume this request
+    c->lastActive = Clock::now();
 
     if (!m.matched) {
       writeAnswer(c, uvBuildHead(404, {}, 0, keepAlive, kaSecs), keepAlive, true);
@@ -289,6 +313,15 @@ void UvReactor::processConn(Conn* c) {
       reqLoc_[reqId] = {loopIdx, c->id, head.method == Method::Head, keepAlive};
     }
     c->busy = true;
+    c->reqIdInFlight = reqId;
+    {
+      const int64_t timeoutMs =
+          m.route.timeoutMs >= 0 ? m.route.timeoutMs : cfg_.defaultTimeoutMs;
+      if (timeoutMs > 0) {
+        c->reqDeadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
+        c->hasDeadline = true;
+      }
+    }
     if (emitter_) {
       const bool hasBody = !bodyBytes.empty();
       if (hasBody) {
@@ -336,6 +369,10 @@ void UvReactor::onWrite(uv_write_t* req, int status) {
     return;
   }
   if (!finish) return;  // a chunked stream continues; stay busy for the rest
+  c->served++;
+  c->hasDeadline = false;
+  c->reqIdInFlight = -1;
+  c->lastActive = Clock::now();
   if (!keepAlive || c->closing) {
     if (!uv_is_closing((uv_handle_t*)&c->handle)) {
       c->closing = true;
@@ -466,8 +503,62 @@ void UvReactor::onAsync(uv_async_t* async) {
     }
     if (!uv_is_closing((uv_handle_t*)&lp->async))
       uv_close((uv_handle_t*)&lp->async, nullptr);
+    if (!uv_is_closing((uv_handle_t*)&lp->sweep))
+      uv_close((uv_handle_t*)&lp->sweep, nullptr);
     // uv_run returns once every handle's close callback has fired.
   }
+}
+
+// Loop thread: close idle keep-alive connections and time out slow handlers.
+void UvReactor::onSweep(uv_timer_t* timer) {
+  Loop* lp = (Loop*)timer->data;
+  UvReactor* self = lp->owner;
+  const auto now = Clock::now();
+  std::vector<Conn*> idle;
+  std::vector<int64_t> timedOut;  // reqIds whose handler missed its deadline
+  for (auto& kv : lp->conns) {
+    Conn* c = kv.second;
+    if (c->closing) continue;
+    if (c->busy) {
+      if (c->hasDeadline && now >= c->reqDeadline && c->reqIdInFlight >= 0)
+        timedOut.push_back(c->id);
+    } else {
+      const int64_t idleMs =
+          (c->served == 0 && self->cfg_.headerTimeoutMs > 0)
+              ? self->cfg_.headerTimeoutMs
+              : self->cfg_.keepAliveTimeoutMs;
+      if (idleMs > 0 &&
+          now - c->lastActive >= std::chrono::milliseconds(idleMs))
+        idle.push_back(c);
+    }
+  }
+  for (Conn* c : idle) {
+    c->closing = true;
+    if (!uv_is_closing((uv_handle_t*)&c->handle))
+      uv_close((uv_handle_t*)&c->handle, &UvReactor::onCloseConn);
+  }
+  for (int64_t connId : timedOut) {
+    auto it = lp->conns.find(connId);
+    if (it == lp->conns.end()) continue;
+    Conn* c = it->second;
+    ReqLoc loc;
+    // Drop the reqLoc so the handler's late respond is a no-op, then 408+close.
+    if (self->lookupReq(c->reqIdInFlight, loc, /*erase=*/true)) {
+      c->hasDeadline = false;
+      c->reqIdInFlight = -1;
+      self->writeAnswer(c, uvBuildHead(408, {}, 0, false, 0), false, true);
+    }
+  }
+}
+
+// Stop accepting (onConnection refuses while draining) and mark later answers
+// close (processConn's keepAlive checks draining_). In-flight requests finish;
+// stop() reaps idle keep-alive connections.
+void UvReactor::beginDrain() { draining_.store(true); }
+
+int64_t UvReactor::inFlightRequests() {
+  std::lock_guard<std::mutex> lk(reqMutex_);
+  return (int64_t)reqLoc_.size();
 }
 
 void UvReactor::stop() {

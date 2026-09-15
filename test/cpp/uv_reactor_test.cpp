@@ -352,4 +352,86 @@ TEST(UvReactorTest, UnroutedPathIs404) {
   close(fd);
 }
 
+// Never answers: exercises the route-timeout path.
+class SilentEmitter final : public Emitter {
+ public:
+  void emitHead(int64_t, Method, const std::string&, const std::string&,
+                const std::string&, const std::vector<Header>&, int64_t, bool,
+                bool, const std::string&, const std::vector<RouteParam>&) override {}
+  void emitBodyData(int64_t, uint8_t*, size_t) override {}
+  void emitBodyEnd(int64_t) override {}
+  void emitBodyError(int64_t, uint8_t*, size_t, ErrorKind) override {}
+  void emitWsMessage(int64_t, uint8_t*, size_t, int, int) override {}
+  void emitEvent(ServerEventKind, int64_t, const std::string&) override {}
+};
+
+TEST(UvReactorTest, RouteTimeoutAnswers408) {
+  UvReactor reactor;
+  SilentEmitter em;
+  reactor.setEmitter(&em);
+  ServerConfig cfg;
+  cfg.port = 0;
+  cfg.keepAliveTimeoutMs = 5000;
+  cfg.defaultTimeoutMs = 30000;
+  reactor.configure(cfg);
+  RouteEntry e = httpRoute(Method::Get, "/slow");
+  e.timeoutMs = 100;
+  ASSERT_EQ((int64_t)reactor.registerRoute(e).kind, (int64_t)ErrorKind::None);
+  ASSERT_EQ((int64_t)reactor.start(2).kind, (int64_t)ErrorKind::None);
+  const int fd = connectTo((int)reactor.boundPort());
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "GET /slow HTTP/1.1\r\nHost: x\r\n\r\n");
+  const std::string r = readHead(fd);
+  close(fd);
+  reactor.stop();
+  EXPECT_EQ(statusOf(r), 408);
+}
+
+TEST(UvReactorTest, DrainMarksNextAnswerClose) {
+  Fixture f;
+  ASSERT_EQ((int64_t)f.reactor.registerStaticRoute(staticRoute("/x", "ok")).kind,
+            (int64_t)ErrorKind::None);
+  f.start();
+  const int fd = connectTo(f.port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "GET /x HTTP/1.1\r\nHost: x\r\n\r\n");
+  EXPECT_EQ(headerOf(readHead(fd), "Connection"), "keep-alive");
+  f.reactor.beginDrain();
+  sendStr(fd, "GET /x HTTP/1.1\r\nHost: x\r\n\r\n");
+  std::string r;
+  char buf[256];
+  ssize_t n;
+  while ((n = recv(fd, buf, sizeof(buf), 0)) > 0) r.append(buf, (size_t)n);
+  close(fd);
+  EXPECT_EQ(headerOf(r, "Connection"), "close");
+}
+
+TEST(UvReactorTest, IdleKeepAliveConnectionIsClosed) {
+  UvReactor reactor;
+  SilentEmitter em;
+  reactor.setEmitter(&em);
+  ServerConfig cfg;
+  cfg.port = 0;
+  cfg.keepAliveTimeoutMs = 150;  // short idle window
+  reactor.configure(cfg);
+  ASSERT_EQ((int64_t)reactor.registerStaticRoute(staticRoute("/x", "ok")).kind,
+            (int64_t)ErrorKind::None);
+  ASSERT_EQ((int64_t)reactor.start(2).kind, (int64_t)ErrorKind::None);
+  const int fd = connectTo((int)reactor.boundPort());
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "GET /x HTTP/1.1\r\nHost: x\r\n\r\n");
+  readHead(fd);  // keep-alive response; now stay silent
+  const auto t0 = std::chrono::steady_clock::now();
+  char buf[64];
+  while (recv(fd, buf, sizeof(buf), 0) > 0) {
+  }
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0)
+                      .count();
+  close(fd);
+  reactor.stop();
+  EXPECT_GE(ms, 100);   // waited out the idle window
+  EXPECT_LT(ms, 3000);  // then the engine closed it
+}
+
 #endif  // NITRO_SERVER_LIBUV

@@ -64,6 +64,12 @@ class UvReactor {
   /// cumulative ack). Frees native memory; safe from any thread.
   void ackBody(int64_t id, int64_t ackedChunks) { pending_.ack(id, ackedChunks); }
 
+  /// Starts a chunked response (Transfer-Encoding: chunked). Cross-thread.
+  void startStream(int64_t id, int64_t status, const std::vector<Header>& headers);
+  /// Writes one chunk frame; [last] appends the terminal chunk and finishes
+  /// the request. Cross-thread. An empty non-terminal chunk is skipped.
+  void sendStreamChunk(int64_t id, const uint8_t* chunk, size_t n, bool last);
+
  private:
   struct Conn;
   struct Loop {
@@ -80,6 +86,7 @@ class UvReactor {
       int64_t connId;
       std::string bytes;
       bool keepAlive;
+      bool finish;  // true = last write of the answer (resume/close after)
     };
     std::vector<Pending> queue;
     bool stopping = false;  // set cross-thread; acted on by onAsync (loop thread)
@@ -91,6 +98,7 @@ class UvReactor {
     Conn* c;
     std::string* payload;
     bool keepAlive;
+    bool finish;  // resume reading / close once this write lands
   };
 
   // Where a request lives, for respond() to route the answer to its loop.
@@ -109,7 +117,12 @@ class UvReactor {
   static void onCloseConn(uv_handle_t* h);
   void runLoop(Loop* lp);
   void processConn(Conn* c);            // parse + dispatch complete requests
-  void writeAnswer(Conn* c, std::string bytes, bool keepAlive);  // loop thread
+  // Loop thread: write bytes; when done, resume reading / close iff `finish`.
+  void writeAnswer(Conn* c, std::string bytes, bool keepAlive, bool finish);
+  // Any thread: hand [bytes] to [loc]'s loop for writing (async wake).
+  void pushWrite(const ReqLoc& loc, std::string bytes, bool finish);
+  // Any thread: look up request [id]; erases the reqLoc when [erase].
+  bool lookupReq(int64_t id, ReqLoc& out, bool erase);
   MatchResult match(Method m, const std::string& custom,
                     const std::string& path) const;
 

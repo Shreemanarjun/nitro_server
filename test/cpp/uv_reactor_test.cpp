@@ -266,6 +266,82 @@ TEST(UvReactorTest, OversizeBodyIs413) {
   close(fd);
 }
 
+// Streams "Hello " + "world" via startStream/sendStreamChunk on any request.
+class StreamEmitter final : public Emitter {
+ public:
+  explicit StreamEmitter(UvReactor* r) : r_(r) {
+    th_ = std::thread([this] {
+      while (run_.load()) {
+        int64_t id = -1;
+        {
+          std::lock_guard<std::mutex> lk(m_);
+          if (!ids_.empty()) { id = ids_.front(); ids_.pop_front(); }
+        }
+        if (id >= 0) {
+          r_->startStream(id, 200, {{"Content-Type", "text/plain"}});
+          r_->sendStreamChunk(id, (const uint8_t*)"Hello ", 6, false);
+          r_->sendStreamChunk(id, (const uint8_t*)"world", 5, false);
+          r_->sendStreamChunk(id, nullptr, 0, true);
+        } else {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+      }
+    });
+  }
+  ~StreamEmitter() override {
+    run_.store(false);
+    if (th_.joinable()) th_.join();
+  }
+  void emitHead(int64_t id, Method, const std::string&, const std::string&,
+                const std::string&, const std::vector<Header>&, int64_t, bool,
+                bool, const std::string&, const std::vector<RouteParam>&) override {
+    std::lock_guard<std::mutex> lk(m_);
+    ids_.push_back(id);
+  }
+  void emitBodyData(int64_t, uint8_t*, size_t) override {}
+  void emitBodyEnd(int64_t) override {}
+  void emitBodyError(int64_t, uint8_t*, size_t, ErrorKind) override {}
+  void emitWsMessage(int64_t, uint8_t*, size_t, int, int) override {}
+  void emitEvent(ServerEventKind, int64_t, const std::string&) override {}
+
+ private:
+  UvReactor* r_;
+  std::thread th_;
+  std::atomic<bool> run_{true};
+  std::mutex m_;
+  std::deque<int64_t> ids_;
+};
+
+TEST(UvReactorTest, ChunkedStreamResponse) {
+  UvReactor reactor;
+  StreamEmitter em(&reactor);
+  reactor.setEmitter(&em);
+  ServerConfig cfg;
+  cfg.port = 0;
+  cfg.keepAliveTimeoutMs = 5000;
+  reactor.configure(cfg);
+  ASSERT_EQ((int64_t)reactor.registerRoute(httpRoute(Method::Get, "/stream")).kind,
+            (int64_t)ErrorKind::None);
+  ASSERT_EQ((int64_t)reactor.start(2).kind, (int64_t)ErrorKind::None);
+  const int port = (int)reactor.boundPort();
+  ASSERT_GT(port, 0);
+
+  const int fd = connectTo(port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "GET /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+  std::string r;
+  char buf[512];
+  ssize_t n;
+  while ((n = recv(fd, buf, sizeof(buf), 0)) > 0) r.append(buf, (size_t)n);
+  close(fd);
+  reactor.stop();
+  EXPECT_EQ(statusOf(r), 200);
+  EXPECT_EQ(headerOf(r, "Transfer-Encoding"), "chunked");
+  EXPECT_NE(r.find("6\r\nHello \r\n"), std::string::npos);
+  EXPECT_NE(r.find("5\r\nworld\r\n"), std::string::npos);
+  EXPECT_NE(r.find("0\r\n\r\n"), std::string::npos);
+}
+
 TEST(UvReactorTest, UnroutedPathIs404) {
   Fixture f;
   f.start();

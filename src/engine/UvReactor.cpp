@@ -232,7 +232,7 @@ void UvReactor::processConn(Conn* c) {
     }
     ParsedHead head = parseRequestHead(c->buf, headEnd);
     if (!head.ok) {
-      writeAnswer(c, uvBuildHead(400, {}, 0, false, 0), false);
+      writeAnswer(c, uvBuildHead(400, {}, 0, false, 0), false, true);
       return;
     }
     // Body: Content-Length is read whole into the connection buffer, then
@@ -242,12 +242,12 @@ void UvReactor::processConn(Conn* c) {
     if (const Header* cl = uvFindHeader(head.headers, "content-length"))
       clen = std::strtoll(cl->value.c_str(), nullptr, 10);
     if (clen < 0) {  // malformed Content-Length
-      writeAnswer(c, uvBuildHead(400, {}, 0, false, 0), false);
+      writeAnswer(c, uvBuildHead(400, {}, 0, false, 0), false, true);
       return;
     }
     const int64_t maxBody = cfg_.maxBodyBytes > 0 ? cfg_.maxBodyBytes : (10 << 20);
     if (clen > maxBody) {  // over the cap: refuse before buffering the rest
-      writeAnswer(c, uvBuildHead(413, {}, 0, false, 0), false);
+      writeAnswer(c, uvBuildHead(413, {}, 0, false, 0), false, true);
       return;
     }
     const size_t reqEnd = headEnd + 4 + (size_t)clen;
@@ -268,7 +268,7 @@ void UvReactor::processConn(Conn* c) {
     c->buf.erase(0, reqEnd);  // consume this request
 
     if (!m.matched) {
-      writeAnswer(c, uvBuildHead(404, {}, 0, keepAlive, kaSecs), keepAlive);
+      writeAnswer(c, uvBuildHead(404, {}, 0, keepAlive, kaSecs), keepAlive, true);
       continue;
     }
     if (m.route.staticResponse) {
@@ -276,7 +276,7 @@ void UvReactor::processConn(Conn* c) {
       std::string out = uvBuildHead(sr.status, sr.headers,
                                   (int64_t)sr.body.size(), keepAlive, kaSecs);
       if (head.method != Method::Head) out.append(sr.body);
-      writeAnswer(c, std::move(out), keepAlive);
+      writeAnswer(c, std::move(out), keepAlive, true);
       continue;
     }
     // Handler route: dispatch to Dart, one in flight, answered via respond().
@@ -309,12 +309,13 @@ void UvReactor::processConn(Conn* c) {
   }
 }
 
-// Loop thread: write an answer and, when it lands, resume or close.
-void UvReactor::writeAnswer(Conn* c, std::string bytes, bool keepAlive) {
+// Loop thread: write bytes; when it lands, resume/close only if `finish`.
+void UvReactor::writeAnswer(Conn* c, std::string bytes, bool keepAlive,
+                            bool finish) {
   c->busy = true;
   auto* payload = new std::string(std::move(bytes));
   auto* req = new uv_write_t;
-  req->data = new WriteCtx{c, payload, keepAlive};
+  req->data = new WriteCtx{c, payload, keepAlive, finish};
   uv_buf_t buf = uv_buf_init((char*)payload->data(), (unsigned)payload->size());
   uv_write(req, (uv_stream_t*)&c->handle, &buf, 1, &UvReactor::onWrite);
 }
@@ -323,10 +324,19 @@ void UvReactor::onWrite(uv_write_t* req, int status) {
   auto* ctx = (WriteCtx*)req->data;
   Conn* c = ctx->c;
   const bool keepAlive = ctx->keepAlive;
+  const bool finish = ctx->finish;
   delete ctx->payload;
   delete ctx;
   delete req;
-  if (status < 0 || !keepAlive || c->closing) {
+  if (status < 0) {
+    if (!uv_is_closing((uv_handle_t*)&c->handle)) {
+      c->closing = true;
+      uv_close((uv_handle_t*)&c->handle, &UvReactor::onCloseConn);
+    }
+    return;
+  }
+  if (!finish) return;  // a chunked stream continues; stay busy for the rest
+  if (!keepAlive || c->closing) {
     if (!uv_is_closing((uv_handle_t*)&c->handle)) {
       c->closing = true;
       uv_close((uv_handle_t*)&c->handle, &UvReactor::onCloseConn);
@@ -337,28 +347,90 @@ void UvReactor::onWrite(uv_write_t* req, int status) {
   c->lp->owner->processConn(c);  // any pipelined request buffered already
 }
 
-// Any thread: enqueue the answer and wake the connection's loop.
+bool UvReactor::lookupReq(int64_t id, ReqLoc& out, bool erase) {
+  std::lock_guard<std::mutex> lk(reqMutex_);
+  auto it = reqLoc_.find(id);
+  if (it == reqLoc_.end()) return false;
+  out = it->second;
+  if (erase) reqLoc_.erase(it);
+  return true;
+}
+
+void UvReactor::pushWrite(const ReqLoc& loc, std::string bytes, bool finish) {
+  Loop* lp = loops_[loc.loopIdx].get();
+  {
+    std::lock_guard<std::mutex> lk(lp->qMutex);
+    lp->queue.push_back({loc.connId, std::move(bytes), loc.keepAlive, finish});
+  }
+  uv_async_send(&lp->async);
+}
+
+// Any thread: build the whole answer and hand it to the connection's loop.
 void UvReactor::respond(int64_t id, int64_t status,
                         const std::vector<Header>& headers, const uint8_t* body,
                         size_t bodyLen) {
   ReqLoc loc;
-  {
-    std::lock_guard<std::mutex> lk(reqMutex_);
-    auto it = reqLoc_.find(id);
-    if (it == reqLoc_.end()) return;  // unknown/already answered
-    loc = it->second;
-    reqLoc_.erase(it);
-  }
+  if (!lookupReq(id, loc, /*erase=*/true)) return;  // unknown/already answered
   const int64_t kaSecs = (cfg_.keepAliveTimeoutMs + 999) / 1000;
   std::string out = uvBuildHead(status, headers, (int64_t)bodyLen, loc.keepAlive,
-                              kaSecs);
+                                kaSecs);
   if (!loc.isHead && body && bodyLen) out.append((const char*)body, bodyLen);
-  Loop* lp = loops_[loc.loopIdx].get();
-  {
-    std::lock_guard<std::mutex> lk(lp->qMutex);
-    lp->queue.push_back({loc.connId, std::move(out), loc.keepAlive});
+  pushWrite(loc, std::move(out), /*finish=*/true);
+}
+
+// Any thread: chunked response head (Transfer-Encoding: chunked). The reqLoc
+// stays until the terminal chunk (see sendStreamChunk).
+void UvReactor::startStream(int64_t id, int64_t status,
+                            const std::vector<Header>& headers) {
+  ReqLoc loc;
+  if (!lookupReq(id, loc, /*erase=*/false)) return;
+  std::string out;
+  out.reserve(160);
+  out.append("HTTP/1.1 ");
+  out.append(std::to_string(status));
+  out.push_back(' ');
+  out.append(reasonPhrase(status));
+  out.append("\r\n");
+  for (const auto& h : headers) {
+    if (uvIequals(h.name, "content-length")) continue;
+    if (uvIequals(h.name, "connection")) continue;
+    if (uvIequals(h.name, "transfer-encoding")) continue;
+    out.append(h.name);
+    out.append(": ");
+    out.append(h.value);
+    out.append("\r\n");
   }
-  uv_async_send(&lp->async);
+  out.append("Transfer-Encoding: chunked\r\n");
+  const int64_t kaSecs = (cfg_.keepAliveTimeoutMs + 999) / 1000;
+  if (loc.keepAlive) {
+    out.append("Connection: keep-alive\r\nKeep-Alive: timeout=");
+    out.append(std::to_string(kaSecs));
+    out.append("\r\n\r\n");
+  } else {
+    out.append("Connection: close\r\n\r\n");
+  }
+  // HEAD: headers only; the terminal chunk finishes it with no body.
+  pushWrite(loc, std::move(out), /*finish=*/loc.isHead);
+  if (loc.isHead) lookupReq(id, loc, /*erase=*/true);
+}
+
+// Any thread: one chunk frame; `last` appends the terminal chunk and finishes.
+void UvReactor::sendStreamChunk(int64_t id, const uint8_t* chunk, size_t n,
+                                bool last) {
+  if (chunk == nullptr) n = 0;
+  if (n == 0 && !last) return;  // empty non-terminal chunk: nothing to send
+  ReqLoc loc;
+  if (!lookupReq(id, loc, /*erase=*/last)) return;
+  std::string out;
+  if (n > 0) {
+    char sz[32];
+    int m = std::snprintf(sz, sizeof(sz), "%zx\r\n", n);
+    out.append(sz, (size_t)m);
+    out.append((const char*)chunk, n);
+    out.append("\r\n");
+  }
+  if (last) out.append("0\r\n\r\n");
+  pushWrite(loc, std::move(out), /*finish=*/last);
 }
 
 // Loop thread: drain queued answers, writing each to its (still-live) conn.
@@ -377,7 +449,7 @@ void UvReactor::onAsync(uv_async_t* async) {
     if (it == lp->conns.end()) continue;  // closed before the answer landed
     Conn* c = it->second;
     if (c->closing) continue;
-    lp->owner->writeAnswer(c, std::move(p.bytes), p.keepAlive);
+    lp->owner->writeAnswer(c, std::move(p.bytes), p.keepAlive, p.finish);
   }
   if (stopping) {
     if (!uv_is_closing((uv_handle_t*)&lp->server))

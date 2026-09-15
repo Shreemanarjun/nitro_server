@@ -123,10 +123,19 @@ class NitroTestClient {
     if (path.isEmpty) path = '/';
 
     // Static routes are answered by the engine directly — no head, no
-    // dispatch. The tester mirrors that, serving the fixed answer by exact
-    // path before any routing.
-    final staticHit = _native.staticResponses['$token $path'];
-    if (staticHit != null) return staticHit;
+    // dispatch. The tester mirrors that, matching (with engine precedence and
+    // HEAD→GET fallback) and serving the fixed answer before any routing.
+    final staticHit = _native.matchStatic(token, path);
+    if (staticHit != null) {
+      // HEAD carries no body: the engine sets the length but ships no bytes.
+      return token == 'HEAD'
+          ? NitroTestResponse(
+              status: staticHit.status,
+              headers: staticHit.headers,
+              body: Uint8List(0),
+            )
+          : staticHit;
+    }
 
     final match = _native.matchRoute(token, path);
     if (match == null) {
@@ -383,10 +392,12 @@ class _InMemoryNative extends NitroServerNative {
   final routes = <RawRouteConfig>[];
   final answered = <int, NitroTestResponse>{};
 
-  /// Static routes, keyed `'<TOKEN> <pattern>'`. The engine answers these
-  /// itself and never emits a head, so the tester serves them directly (by
-  /// exact path) before dispatch — no runner, no handler.
-  final staticResponses = <String, NitroTestResponse>{};
+  /// Static routes as (method token, pattern, fixed answer). The engine
+  /// answers these itself and never emits a head, so the tester matches and
+  /// serves them directly — with engine precedence and HEAD→GET fallback —
+  /// before any dispatch. No runner, no handler.
+  final staticRoutes =
+      <({String token, String pattern, NitroTestResponse response})>[];
 
   @override
   Stream<RawIncomingBatch> get incomingRequests =>
@@ -428,11 +439,18 @@ class _InMemoryNative extends NitroServerNative {
     List<RawHeader> headers,
     Uint8List body,
   ) {
-    staticResponses['${method.toUpperCase()} $pattern'] = NitroTestResponse(
-      status: status,
-      headers: {for (final h in headers) h.name: h.value},
-      body: Uint8List.fromList(body),
-    );
+    final token = method.toUpperCase();
+    // One entry per (method, pattern): a re-register replaces, like the engine.
+    staticRoutes.removeWhere((r) => r.token == token && r.pattern == pattern);
+    staticRoutes.add((
+      token: token,
+      pattern: pattern,
+      response: NitroTestResponse(
+        status: status,
+        headers: {for (final h in headers) h.name: h.value},
+        body: Uint8List.fromList(body),
+      ),
+    ));
     return const RawServerStatus(errorKind: RawServerErrorKind.none);
   }
 
@@ -627,6 +645,30 @@ class _InMemoryNative extends NitroServerNative {
         best = _RouteMatch(route.pattern, scored.$2);
         bestSpec = scored.$1;
         bestMethod = methodScore;
+      }
+    }
+    return best;
+  }
+
+  /// The fixed answer a static route serves for [methodToken] + [path], or
+  /// null when none matches. Path precedence is `_matchPath`'s (static >
+  /// `:param` > `*`); a HEAD request is served by a GET static route, like the
+  /// engine's router. `getStatic` registers GET routes, so no other method
+  /// reaches them.
+  NitroTestResponse? matchStatic(String methodToken, String path) {
+    final pathSegs = _split(path);
+    NitroTestResponse? best;
+    var bestSpec = -1;
+    for (final route in staticRoutes) {
+      if (route.token != methodToken &&
+          !(methodToken == 'HEAD' && route.token == 'GET')) {
+        continue;
+      }
+      final scored = _matchPath(route.pattern, pathSegs);
+      if (scored == null) continue;
+      if (scored.$1 > bestSpec) {
+        best = route.response;
+        bestSpec = scored.$1;
       }
     }
     return best;

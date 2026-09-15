@@ -239,6 +239,11 @@ void main() {
         contentType: 'application/json',
         headers: const {'cache-control': 'max-age=60'},
       );
+      server.getStatic(
+        '/cached/:id',
+        'cached'.codeUnits,
+        contentType: 'text/plain',
+      );
     });
 
     tearDownAll(() async {
@@ -795,6 +800,28 @@ void main() {
           expectStatus: 200,
         );
         expect(jsonDecode(utf8.decode(body)), {'static': true});
+      }, skip: skipReason);
+
+      test('a :param static route matches, other methods do not', () async {
+        // The engine's own router resolves the capture; the fixed body is
+        // served whatever the id.
+        expect(
+          utf8.decode(await _clientBody(port, 'GET', '/cached/42')),
+          'cached',
+        );
+        expect(
+          utf8.decode(await _clientBody(port, 'GET', '/cached/anything')),
+          'cached',
+        );
+        // GET-only: a POST to the same path is an engine 404 (no All fallback).
+        final raw = await _raw(
+          port,
+          ascii.encode(
+            'POST /cached/42 HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n'
+            'Connection: close\r\n\r\n',
+          ),
+        );
+        expect(_statusOf(raw), 404);
       }, skip: skipReason);
 
       test('HEAD is answered headers-only with the entity length', () async {

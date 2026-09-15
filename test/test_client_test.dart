@@ -92,6 +92,30 @@ void main() {
     expect(res.text(), 'gone');
   });
 
+  test('getStatic re-registration replaces the fixed body', () async {
+    await client.server.getStatic('/v', 'one'.codeUnits);
+    expect((await client.get('/v')).text(), 'one');
+    await client.server.getStatic('/v', 'two'.codeUnits);
+    expect((await client.get('/v')).text(), 'two');
+  });
+
+  test('getStatic matches params, serves HEAD headers-only, rejects other '
+      'methods', () async {
+    await client.server.getStatic('/health', 'OK'.codeUnits);
+    await client.server.getStatic('/u/:id', 'user'.codeUnits);
+
+    // A `:param` static route matches with engine precedence.
+    expect((await client.get('/u/42')).text(), 'user');
+
+    // HEAD falls back to the GET static route: status held, body dropped.
+    final head = await client.head('/health');
+    expect(head.status, 200);
+    expect(head.body, isEmpty);
+
+    // A GET-only static route does not answer other methods (no All fallback).
+    expect((await client.post('/health', body: 'x')).status, 404);
+  });
+
   test('a custom method needs its token, a body needs a known type', () async {
     await client.server.post('/x', (_) => const ResponseContext());
     await expectLater(

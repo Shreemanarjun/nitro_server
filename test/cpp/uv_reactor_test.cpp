@@ -15,6 +15,7 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <tuple>
 #include <string>
 #include <thread>
 
@@ -142,6 +143,49 @@ class PumpEmitter final : public Emitter {
   std::map<int64_t, std::string> bodies_;
   std::string lastPath_;
 };
+
+// Sends one masked client WebSocket frame.
+void sendWsFrame(int fd, int opcode, const std::string& payload) {
+  std::string out;
+  out.push_back((char)(0x80 | opcode));  // FIN + opcode
+  const size_t n = payload.size();
+  if (n < 126) {
+    out.push_back((char)(0x80 | n));  // MASK + len
+  } else {
+    out.push_back((char)(0x80 | 126));
+    out.push_back((char)((n >> 8) & 0xff));
+    out.push_back((char)(n & 0xff));
+  }
+  const char mask[4] = {0x21, 0x43, 0x65, 0x07};
+  out.append(mask, 4);
+  for (size_t i = 0; i < n; i++) out.push_back(payload[i] ^ mask[i & 3]);
+  sendStr(fd, out);
+}
+
+// Reads one server frame (never masked). Returns opcode, fills payload.
+int readWsFrame(int fd, std::string& payload) {
+  auto recvAll = [&](uint8_t* d, size_t k) {
+    size_t got = 0;
+    while (got < k) {
+      ssize_t r = recv(fd, (char*)d + got, k - got, 0);
+      if (r <= 0) return false;
+      got += (size_t)r;
+    }
+    return true;
+  };
+  uint8_t h[2];
+  if (!recvAll(h, 2)) return -1;
+  const int opcode = h[0] & 0x0f;
+  uint64_t len = h[1] & 0x7f;
+  if (len == 126) {
+    uint8_t e[2];
+    if (!recvAll(e, 2)) return -1;
+    len = ((uint64_t)e[0] << 8) | e[1];
+  }
+  payload.assign(len, '\0');
+  if (len && !recvAll((uint8_t*)payload.data(), (size_t)len)) return -1;
+  return opcode;
+}
 
 RouteEntry httpRoute(Method m, const std::string& pattern) {
   RouteEntry e;
@@ -364,6 +408,90 @@ class SilentEmitter final : public Emitter {
   void emitWsMessage(int64_t, uint8_t*, size_t, int, int) override {}
   void emitEvent(ServerEventKind, int64_t, const std::string&) override {}
 };
+
+// Echoes every WebSocket message back via wsSend from a pump thread (the
+// faithful cross-thread path the Dart runner uses).
+class WsEchoEmitter final : public Emitter {
+ public:
+  explicit WsEchoEmitter(UvReactor* r) : r_(r) {
+    th_ = std::thread([this] {
+      while (run_.load()) {
+        std::tuple<int64_t, std::string, int> msg{-1, "", 0};
+        {
+          std::lock_guard<std::mutex> lk(m_);
+          if (!msgs_.empty()) { msg = msgs_.front(); msgs_.pop_front(); }
+        }
+        if (std::get<0>(msg) >= 0) {
+          const std::string& p = std::get<1>(msg);
+          r_->wsSend(std::get<0>(msg), (const uint8_t*)p.data(), p.size(),
+                     std::get<2>(msg) == 2, false);
+        } else {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+      }
+    });
+  }
+  ~WsEchoEmitter() override {
+    run_.store(false);
+    if (th_.joinable()) th_.join();
+  }
+  void emitHead(int64_t, Method, const std::string&, const std::string&,
+                const std::string&, const std::vector<Header>&, int64_t, bool,
+                bool, const std::string&, const std::vector<RouteParam>&) override {}
+  void emitBodyData(int64_t, uint8_t*, size_t) override {}
+  void emitBodyEnd(int64_t) override {}
+  void emitBodyError(int64_t, uint8_t*, size_t, ErrorKind) override {}
+  void emitWsMessage(int64_t id, uint8_t* payload, size_t n, int opcode,
+                     int) override {
+    if (opcode == 8) return;  // close
+    std::lock_guard<std::mutex> lk(m_);
+    msgs_.emplace_back(id, std::string((const char*)payload, n), opcode);
+  }
+  void emitEvent(ServerEventKind, int64_t, const std::string&) override {}
+
+ private:
+  UvReactor* r_;
+  std::thread th_;
+  std::atomic<bool> run_{true};
+  std::mutex m_;
+  std::deque<std::tuple<int64_t, std::string, int>> msgs_;
+};
+
+TEST(UvReactorTest, WebSocketHandshakeAndEcho) {
+  UvReactor reactor;
+  WsEchoEmitter em(&reactor);
+  reactor.setEmitter(&em);
+  ServerConfig cfg;
+  cfg.port = 0;
+  cfg.keepAliveTimeoutMs = 5000;
+  reactor.configure(cfg);
+  RouteEntry e = httpRoute(Method::Get, "/ws");
+  e.isWebSocket = true;
+  ASSERT_EQ((int64_t)reactor.registerRoute(e).kind, (int64_t)ErrorKind::None);
+  ASSERT_EQ((int64_t)reactor.start(2).kind, (int64_t)ErrorKind::None);
+
+  const int fd = connectTo((int)reactor.boundPort());
+  ASSERT_GE(fd, 0);
+  sendStr(fd,
+          "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n"
+          "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+          "Sec-WebSocket-Version: 13\r\n\r\n");
+  const std::string shake = readHead(fd);
+  EXPECT_EQ(statusOf(shake), 101);
+  EXPECT_EQ(headerOf(shake, "Sec-WebSocket-Accept"),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");  // RFC 6455 §1.3 example
+
+  sendWsFrame(fd, 1, "hello ws");  // text
+  std::string got;
+  EXPECT_EQ(readWsFrame(fd, got), 1);  // text echo
+  EXPECT_EQ(got, "hello ws");
+
+  sendWsFrame(fd, 8, std::string("\x03\xe8", 2));  // close, code 1000
+  std::string cl;
+  EXPECT_EQ(readWsFrame(fd, cl), 8);  // server close frame
+  close(fd);
+  reactor.stop();
+}
 
 TEST(UvReactorTest, RouteTimeoutAnswers408) {
   UvReactor reactor;

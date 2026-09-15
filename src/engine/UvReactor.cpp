@@ -11,6 +11,8 @@
 #include <chrono>
 #include <cstring>
 
+#include "WsCodec.h"
+
 namespace nitroserver {
 namespace {
 
@@ -109,6 +111,11 @@ struct UvReactor::Conn {
   std::chrono::steady_clock::time_point lastActive;   // idle-timeout anchor
   std::chrono::steady_clock::time_point reqDeadline;  // valid while busy+handler
   bool hasDeadline = false;
+  // WebSocket state (set after a successful upgrade).
+  bool ws = false;
+  std::string wsMsg;      // reassembly buffer for a fragmented message
+  int wsMsgOpcode = 0;    // opcode of the message being reassembled
+  bool wsClosing = false;  // a close frame was sent; drop further frames
 };
 
 UvReactor::~UvReactor() { stop(); }
@@ -223,8 +230,16 @@ void UvReactor::allocCb(uv_handle_t* h, size_t suggested, uv_buf_t* b) {
 void UvReactor::onCloseConn(uv_handle_t* h) {
   Conn* c = (Conn*)h;
   if (c->lp) {
+    UvReactor* self = c->lp->owner;
     c->lp->conns.erase(c->id);
-    c->lp->owner->liveConns_.fetch_sub(1);
+    self->liveConns_.fetch_sub(1);
+    if (c->ws) {
+      {
+        std::lock_guard<std::mutex> lk(self->reqMutex_);
+        self->wsConnLoop_.erase(c->id);
+      }
+      self->pending_.dropPayloads(c->id);  // free un-acked WS message payloads
+    }
   }
   delete c;
 }
@@ -238,7 +253,11 @@ void UvReactor::readCb(uv_stream_t* s, ssize_t nread, const uv_buf_t* b) {
   }
   if (nread == 0) return;
   c->buf.append(b->base, (size_t)nread);
-  c->lp->owner->processConn(c);
+  if (c->ws) {
+    c->lp->owner->wsProcess(c);
+  } else {
+    c->lp->owner->processConn(c);
+  }
 }
 
 // Loop thread: dispatch complete buffered requests until one is in flight.
@@ -294,6 +313,10 @@ void UvReactor::processConn(Conn* c) {
     if (!m.matched) {
       writeAnswer(c, uvBuildHead(404, {}, 0, keepAlive, kaSecs), keepAlive, true);
       continue;
+    }
+    if (m.route.isWebSocket) {
+      wsHandshake(c, head, m, path, query);
+      return;  // upgraded (or refused + closed); never serves HTTP again
     }
     if (m.route.staticResponse) {
       const StaticResponse& sr = *m.route.staticResponse;
@@ -559,6 +582,163 @@ void UvReactor::beginDrain() { draining_.store(true); }
 int64_t UvReactor::inFlightRequests() {
   std::lock_guard<std::mutex> lk(reqMutex_);
   return (int64_t)reqLoc_.size();
+}
+
+// ── WebSocket ────────────────────────────────────────────────────────────────
+
+// Loop thread: send a close frame with [code], then close the connection.
+void UvReactor::wsCloseConn(Conn* c, int code) {
+  if (c->wsClosing) return;
+  c->wsClosing = true;
+  {
+    std::lock_guard<std::mutex> lk(reqMutex_);
+    wsConnLoop_.erase(c->id);
+  }
+  uint8_t cc[2] = {(uint8_t)((code >> 8) & 0xff), (uint8_t)(code & 0xff)};
+  std::vector<uint8_t> frame;
+  ws::encodeFrame(ws::kClose, cc, 2, true, frame);
+  writeAnswer(c, std::string(frame.begin(), frame.end()), /*keepAlive=*/false,
+              /*finish=*/true);  // closes once the frame lands
+}
+
+// Loop thread: validate the RFC 6455 upgrade, answer 101, switch to WS mode.
+void UvReactor::wsHandshake(Conn* c, const ParsedHead& head,
+                            const MatchResult& m, const std::string& path,
+                            const std::string& query) {
+  const Header* key = uvFindHeader(head.headers, "sec-websocket-key");
+  const Header* ver = uvFindHeader(head.headers, "sec-websocket-version");
+  if (!key || key->value.empty()) {
+    writeAnswer(c, uvBuildHead(400, {}, 0, false, 0), false, true);
+    return;
+  }
+  if (!ver || ver->value.find("13") == std::string::npos) {
+    writeAnswer(c, uvBuildHead(426, {{"Sec-WebSocket-Version", "13"}}, 0, false, 0),
+                false, true);
+    return;
+  }
+  const std::string accept = ws::acceptKey(key->value);
+  std::string shake =
+      "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+      "Connection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n";
+  writeAnswer(c, std::move(shake), true, /*finish=*/false);  // stay open
+  c->ws = true;
+  int loopIdx = 0;
+  for (size_t i = 0; i < loops_.size(); i++)
+    if (loops_[i].get() == c->lp) { loopIdx = (int)i; break; }
+  {
+    std::lock_guard<std::mutex> lk(reqMutex_);
+    wsConnLoop_[c->id] = loopIdx;
+  }
+  // Session open dispatches like any request head, carrying the handshake's
+  // pattern, params, query and headers.
+  if (emitter_) {
+    emitter_->emitHead(c->id, head.method, head.customMethod, path, query,
+                       head.headers, 0, false, true, m.route.pattern, m.params);
+  }
+  wsProcess(c);  // handle any frames already buffered
+}
+
+// Loop thread: decode buffered WebSocket frames, reassemble, dispatch.
+void UvReactor::wsProcess(Conn* c) {
+  while (!c->closing && !c->wsClosing) {
+    if (c->buf.size() < 2) return;  // header incomplete
+    const uint8_t b0 = (uint8_t)c->buf[0];
+    const int opcode = b0 & 0x0f;
+    const bool badRsv = (b0 & 0x70) != 0;  // no extensions negotiated
+    const bool badOp = opcode != 0 && opcode != 1 && opcode != 2 &&
+                       opcode != 8 && opcode != 9 && opcode != 0xA;
+    const bool masked = (c->buf[1] & 0x80) != 0;
+    if (badRsv || badOp || !masked) {  // client frames MUST be masked
+      wsCloseConn(c, 1002);
+      return;
+    }
+    ws::FrameHeader h;
+    if (!ws::parseHeader((const uint8_t*)c->buf.data(), c->buf.size(), h))
+      return;  // header not fully buffered yet
+    if (c->buf.size() < h.headerSize + h.length) return;  // payload incomplete
+    // Unmask the payload in place into a local buffer.
+    std::string payload(c->buf.data() + h.headerSize, (size_t)h.length);
+    for (size_t i = 0; i < payload.size(); i++)
+      payload[i] = (char)((uint8_t)payload[i] ^ h.mask[i & 3]);
+    c->buf.erase(0, h.headerSize + (size_t)h.length);
+
+    if (h.opcode == ws::kPing) {
+      std::vector<uint8_t> frame;
+      ws::encodeFrame(ws::kPong, (const uint8_t*)payload.data(), payload.size(),
+                      true, frame);
+      writeAnswer(c, std::string(frame.begin(), frame.end()), true, false);
+      continue;
+    }
+    if (h.opcode == ws::kPong) continue;
+    if (h.opcode == ws::kClose) {
+      int code = 1005;
+      if (payload.size() >= 2)
+        code = ((uint8_t)payload[0] << 8) | (uint8_t)payload[1];
+      if (emitter_) emitter_->emitWsMessage(c->id, nullptr, 0, ws::kClose, code);
+      wsCloseConn(c, code == 1005 ? 1000 : code);
+      return;
+    }
+    // Data frame: reassemble across fragments.
+    if (h.opcode == ws::kText || h.opcode == ws::kBinary) {
+      c->wsMsgOpcode = h.opcode;
+      c->wsMsg = std::move(payload);
+    } else {  // continuation
+      c->wsMsg.append(payload);
+    }
+    if (h.fin) {
+      auto* buf = (uint8_t*)std::malloc(c->wsMsg.size() ? c->wsMsg.size() : 1);
+      if (buf) {
+        if (!c->wsMsg.empty()) std::memcpy(buf, c->wsMsg.data(), c->wsMsg.size());
+        pending_.trackPayload(c->id, buf);
+        if (emitter_)
+          emitter_->emitWsMessage(c->id, buf, c->wsMsg.size(), c->wsMsgOpcode, 0);
+      }
+      c->wsMsg.clear();
+    }
+  }
+}
+
+int64_t UvReactor::wsSend(int64_t connId, const uint8_t* payload, size_t n,
+                          bool binary, bool compressed) {
+  (void)compressed;  // permessage-deflate not negotiated yet
+  int loopIdx;
+  {
+    std::lock_guard<std::mutex> lk(reqMutex_);
+    auto it = wsConnLoop_.find(connId);
+    if (it == wsConnLoop_.end()) return -1;
+    loopIdx = it->second;
+  }
+  std::vector<uint8_t> frame;
+  ws::encodeFrame(binary ? ws::kBinary : ws::kText, payload, n, true, frame);
+  Loop* lp = loops_[(size_t)loopIdx].get();
+  {
+    std::lock_guard<std::mutex> lk(lp->qMutex);
+    lp->queue.push_back({connId, std::string(frame.begin(), frame.end()), true,
+                         false});
+  }
+  uv_async_send(&lp->async);
+  return 0;
+}
+
+void UvReactor::wsClose(int64_t connId, int code) {
+  int loopIdx;
+  {
+    std::lock_guard<std::mutex> lk(reqMutex_);
+    auto it = wsConnLoop_.find(connId);
+    if (it == wsConnLoop_.end()) return;
+    loopIdx = it->second;
+    wsConnLoop_.erase(it);
+  }
+  uint8_t cc[2] = {(uint8_t)((code >> 8) & 0xff), (uint8_t)(code & 0xff)};
+  std::vector<uint8_t> frame;
+  ws::encodeFrame(ws::kClose, cc, 2, true, frame);
+  Loop* lp = loops_[(size_t)loopIdx].get();
+  {
+    std::lock_guard<std::mutex> lk(lp->qMutex);
+    lp->queue.push_back({connId, std::string(frame.begin(), frame.end()), false,
+                         true});  // finish=true, keepAlive=false → close after
+  }
+  uv_async_send(&lp->async);
 }
 
 void UvReactor::stop() {

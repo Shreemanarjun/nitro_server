@@ -69,6 +69,13 @@ class UvReactor {
   /// cumulative ack). Frees native memory; safe from any thread.
   void ackBody(int64_t id, int64_t ackedChunks) { pending_.ack(id, ackedChunks); }
 
+  /// Sends one WebSocket message (binary or text) on [connId]. Cross-thread.
+  /// Returns 0 (no backpressure accounting yet); -1 if the connection is gone.
+  int64_t wsSend(int64_t connId, const uint8_t* payload, size_t n, bool binary,
+                 bool compressed);
+  /// Sends a close frame on [connId] and closes it. Cross-thread.
+  void wsClose(int64_t connId, int code);
+
   /// Starts a chunked response (Transfer-Encoding: chunked). Cross-thread.
   void startStream(int64_t id, int64_t status, const std::vector<Header>& headers);
   /// Writes one chunk frame; [last] appends the terminal chunk and finishes
@@ -124,6 +131,11 @@ class UvReactor {
   static void onCloseConn(uv_handle_t* h);
   void runLoop(Loop* lp);
   void processConn(Conn* c);            // parse + dispatch complete requests
+  void wsProcess(Conn* c);              // decode WebSocket frames (loop thread)
+  void wsCloseConn(Conn* c, int code);  // send a close frame + close (loop thread)
+  // Loop thread: perform the RFC 6455 handshake, switch [c] to WebSocket mode.
+  void wsHandshake(Conn* c, const ParsedHead& head, const MatchResult& m,
+                   const std::string& path, const std::string& query);
   // Loop thread: write bytes; when done, resume reading / close iff `finish`.
   void writeAnswer(Conn* c, std::string bytes, bool keepAlive, bool finish);
   // Any thread: hand [bytes] to [loc]'s loop for writing (async wake).
@@ -148,6 +160,8 @@ class UvReactor {
   // reqId -> where to send the answer. Guarded (respond is cross-thread).
   std::mutex reqMutex_;
   std::unordered_map<int64_t, ReqLoc> reqLoc_;
+  // WebSocket connId -> loop index, for cross-thread wsSend/wsClose routing.
+  std::unordered_map<int64_t, int> wsConnLoop_;
 };
 
 }  // namespace nitroserver

@@ -44,10 +44,34 @@ class UvReactor {
   UvReactor() = default;
   ~UvReactor();
 
-  void setEmitter(Emitter* e) { emitter_ = e; }
+  /// Dispatch sinks — one per Dart isolate. Requests are dealt round-robin
+  /// across them; every message of a request goes to the sink that got its head.
+  void setEmitter(Emitter* e);
+  void addEmitter(Emitter* e);
+  void removeEmitter(Emitter* e);
+  size_t emitterCountForTesting();
+
   void configure(const ServerConfig& cfg) { cfg_ = cfg; }
   StatusResult registerRoute(const RouteEntry& e);
   StatusResult registerStaticRoute(const RouteEntry& e);
+  // Bridge-shaped overloads (mirror ServerInstance) so the reactor is a drop-in.
+  StatusResult registerRoute(Method method, const std::string& customMethod,
+                             const std::string& pattern, int64_t timeoutMs,
+                             bool isWebSocket = false, bool streamBody = false,
+                             int64_t maxBodyBytes = -1,
+                             const std::string& wsProtocols = "");
+  StatusResult registerStaticRoute(Method method,
+                                   const std::string& customMethod,
+                                   const std::string& pattern, int64_t status,
+                                   const std::vector<Header>& headers,
+                                   const uint8_t* body, size_t bodyLen);
+  StatusResult unregisterRoute(Method method, const std::string& customMethod,
+                               const std::string& pattern);
+  /// Answers [id] with [length] bytes of the file at [path] from [offset]
+  /// (`length < 0` = to the end). Read on the calling thread, then written like
+  /// a normal response. A file that cannot be opened answers 404.
+  void respondFile(int64_t id, int64_t status, const std::vector<Header>& headers,
+                   const std::string& path, int64_t offset, int64_t length);
 
   /// Binds cfg_.port on `loops` threads (default: CPU cores) and starts
   /// serving. boundPort() is valid after this returns None.
@@ -153,8 +177,11 @@ class UvReactor {
   bool lookupReq(int64_t id, ReqLoc& out, bool erase);
   MatchResult match(Method m, const std::string& custom,
                     const std::string& path) const;
+  Emitter* nextEmitter();  // round-robin pick, or null when none bound
 
-  Emitter* emitter_ = nullptr;
+  std::mutex emitterMutex_;
+  std::vector<Emitter*> emitters_;
+  std::atomic<uint64_t> emitterRr_{0};
   ServerConfig cfg_;
   Router router_;                        // writer: registration; reader: match
   std::atomic<int64_t> boundPort_{0};

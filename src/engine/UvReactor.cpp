@@ -8,7 +8,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 
 #include "WsCodec.h"
@@ -132,6 +134,7 @@ struct UvReactor::Conn {
   bool hasDeadline = false;
   // WebSocket state (set after a successful upgrade).
   bool ws = false;
+  Emitter* wsEmitter = nullptr;  // the sink this session's messages go to
   std::string wsMsg;      // reassembly buffer for a fragmented message
   int wsMsgOpcode = 0;    // opcode of the message being reassembled
   bool wsClosing = false;  // a close frame was sent; drop further frames
@@ -153,6 +156,112 @@ StatusResult UvReactor::registerRoute(const RouteEntry& e) {
 StatusResult UvReactor::registerStaticRoute(const RouteEntry& e) {
   if (!router_.add(e)) return {ErrorKind::BadRequest, "invalid route", 0};
   return {};
+}
+
+StatusResult UvReactor::registerRoute(Method method,
+                                      const std::string& customMethod,
+                                      const std::string& pattern,
+                                      int64_t timeoutMs, bool isWebSocket,
+                                      bool streamBody, int64_t maxBodyBytes,
+                                      const std::string& wsProtocols) {
+  RouteEntry e;
+  e.method = method;
+  e.customMethod = customMethod;
+  e.pattern = pattern;
+  e.timeoutMs = timeoutMs;
+  e.isWebSocket = isWebSocket;
+  e.streamBody = streamBody;
+  e.maxBodyBytes = maxBodyBytes;
+  for (size_t b = 0; b <= wsProtocols.size();) {  // comma-separated, trimmed
+    size_t c = wsProtocols.find(',', b);
+    if (c == std::string::npos) c = wsProtocols.size();
+    size_t s = b, en = c;
+    while (s < en && wsProtocols[s] == ' ') s++;
+    while (en > s && wsProtocols[en - 1] == ' ') en--;
+    if (en > s) e.wsProtocols.emplace_back(wsProtocols.substr(s, en - s));
+    b = c + 1;
+  }
+  return registerRoute(e);
+}
+
+StatusResult UvReactor::registerStaticRoute(
+    Method method, const std::string& customMethod, const std::string& pattern,
+    int64_t status, const std::vector<Header>& headers, const uint8_t* body,
+    size_t bodyLen) {
+  RouteEntry e;
+  e.method = method;
+  e.customMethod = customMethod;
+  e.pattern = pattern;
+  auto sr = std::make_shared<StaticResponse>();
+  sr->status = status;
+  sr->headers = headers;
+  if (body && bodyLen) sr->body.assign((const char*)body, bodyLen);
+  e.staticResponse = std::move(sr);
+  return registerStaticRoute(e);
+}
+
+StatusResult UvReactor::unregisterRoute(Method method,
+                                        const std::string& customMethod,
+                                        const std::string& pattern) {
+  if (!router_.remove(method, customMethod, pattern))
+    return {ErrorKind::RouteNotFound, "no such route: " + pattern, 0};
+  return {};
+}
+
+void UvReactor::setEmitter(Emitter* e) {
+  std::lock_guard<std::mutex> lk(emitterMutex_);
+  emitters_.clear();
+  if (e) emitters_.push_back(e);
+}
+
+void UvReactor::addEmitter(Emitter* e) {
+  std::lock_guard<std::mutex> lk(emitterMutex_);
+  for (Emitter* x : emitters_)
+    if (x == e) return;
+  emitters_.push_back(e);
+}
+
+void UvReactor::removeEmitter(Emitter* e) {
+  std::lock_guard<std::mutex> lk(emitterMutex_);
+  emitters_.erase(std::remove(emitters_.begin(), emitters_.end(), e),
+                  emitters_.end());
+}
+
+size_t UvReactor::emitterCountForTesting() {
+  std::lock_guard<std::mutex> lk(emitterMutex_);
+  return emitters_.size();
+}
+
+Emitter* UvReactor::nextEmitter() {
+  std::lock_guard<std::mutex> lk(emitterMutex_);
+  if (emitters_.empty()) return nullptr;
+  const uint64_t i = emitterRr_.fetch_add(1);
+  return emitters_[i % emitters_.size()];
+}
+
+// Read on the caller's thread (fine — not a loop thread), answer like a body.
+void UvReactor::respondFile(int64_t id, int64_t status,
+                            const std::vector<Header>& headers,
+                            const std::string& path, int64_t offset,
+                            int64_t length) {
+  FILE* f = std::fopen(path.c_str(), "rb");
+  if (!f) {
+    static const char msg[] = "not found";
+    std::vector<Header> h{{"Content-Type", "text/plain"}};
+    respond(id, 404, h, (const uint8_t*)msg, sizeof(msg) - 1);
+    return;
+  }
+  std::fseek(f, 0, SEEK_END);
+  const long size = std::ftell(f);
+  if (offset < 0) offset = 0;
+  if (offset > size) offset = size;
+  const long end = length < 0 ? size : std::min<long>(size, offset + length);
+  const long n = end > offset ? end - offset : 0;
+  std::string body((size_t)n, '\0');
+  std::fseek(f, offset, SEEK_SET);
+  if (n > 0 && std::fread(&body[0], 1, (size_t)n, f) != (size_t)n) body.clear();
+  std::fclose(f);
+  respond(id, status, headers, (const uint8_t*)body.data(), body.size());
 }
 
 MatchResult UvReactor::match(Method m, const std::string& custom,
@@ -395,7 +504,7 @@ void UvReactor::processConn(Conn* c) {
         c->hasDeadline = true;
       }
     }
-    if (emitter_) {
+    if (Emitter* em = nextEmitter()) {
       const bool hasBody = !bodyBytes.empty();
       if (hasBody) {
         // Inline body: the chunk is tracked and emitted first, then the
@@ -404,12 +513,12 @@ void UvReactor::processConn(Conn* c) {
         if (payload) {
           std::memcpy(payload, bodyBytes.data(), bodyBytes.size());
           pending_.trackPayload(reqId, payload);
-          emitter_->emitBodyData(reqId, payload, bodyBytes.size());
+          em->emitBodyData(reqId, payload, bodyBytes.size());
         }
       }
-      emitter_->emitHead(reqId, head.method, head.customMethod, path, query,
-                         head.headers, clen, hasBody, true, m.route.pattern,
-                         m.params);
+      em->emitHead(reqId, head.method, head.customMethod, path, query,
+                   head.headers, clen, hasBody, true, m.route.pattern,
+                   m.params);
     }
     return;  // wait for respond()
   }
@@ -693,10 +802,12 @@ void UvReactor::wsHandshake(Conn* c, const ParsedHead& head,
     wsConnLoop_[c->id] = loopIdx;
   }
   // Session open dispatches like any request head, carrying the handshake's
-  // pattern, params, query and headers.
-  if (emitter_) {
-    emitter_->emitHead(c->id, head.method, head.customMethod, path, query,
-                       head.headers, 0, false, true, m.route.pattern, m.params);
+  // pattern, params, query and headers. The whole session stays on this sink.
+  c->wsEmitter = nextEmitter();
+  if (c->wsEmitter) {
+    c->wsEmitter->emitHead(c->id, head.method, head.customMethod, path, query,
+                           head.headers, 0, false, true, m.route.pattern,
+                           m.params);
   }
   wsProcess(c);  // handle any frames already buffered
 }
@@ -737,7 +848,7 @@ void UvReactor::wsProcess(Conn* c) {
       int code = 1005;
       if (payload.size() >= 2)
         code = ((uint8_t)payload[0] << 8) | (uint8_t)payload[1];
-      if (emitter_) emitter_->emitWsMessage(c->id, nullptr, 0, ws::kClose, code);
+      if (c->wsEmitter) c->wsEmitter->emitWsMessage(c->id, nullptr, 0, ws::kClose, code);
       wsCloseConn(c, code == 1005 ? 1000 : code);
       return;
     }
@@ -753,8 +864,7 @@ void UvReactor::wsProcess(Conn* c) {
       if (buf) {
         if (!c->wsMsg.empty()) std::memcpy(buf, c->wsMsg.data(), c->wsMsg.size());
         pending_.trackPayload(c->id, buf);
-        if (emitter_)
-          emitter_->emitWsMessage(c->id, buf, c->wsMsg.size(), c->wsMsgOpcode, 0);
+        if (c->wsEmitter)          c->wsEmitter->emitWsMessage(c->id, buf, c->wsMsg.size(), c->wsMsgOpcode, 0);
       }
       c->wsMsg.clear();
     }

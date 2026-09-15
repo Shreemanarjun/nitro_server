@@ -1513,6 +1513,18 @@ void ServerInstance::handleConnection(int fd, const Wake& wake) {
     if (ssl) {
       SSL_set_fd(ssl, fd);
       g_tls.add(fd, ssl);
+      // Blocking socket for TLS. OpenSSL then resolves WANT_READ/WANT_WRITE
+      // direction changes internally (a TLS 1.3 post-handshake write during a
+      // read, say), instead of my code polling one direction and stalling —
+      // which some clients (BoringSSL) trigger and others do not. A short
+      // recv timeout keeps the caller's poll-driven deadline authoritative;
+      // the send timeout bounds a peer that stops reading.
+      setNonBlocking(fd, false);
+      const int64_t sndMs = cfg.writeTimeoutMs > 0 ? cfg.writeTimeoutMs : 30000;
+      timeval rcv{0, 200 * 1000};
+      timeval snd{(long)(sndMs / 1000), (int)((sndMs % 1000) * 1000)};
+      setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcv, sizeof(rcv));
+      setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&snd, sizeof(snd));
     }
     const int64_t hsMs = cfg.headerTimeoutMs > 0 ? cfg.headerTimeoutMs
                                                   : (cfg.keepAliveTimeoutMs > 0

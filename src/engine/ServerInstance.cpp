@@ -788,6 +788,27 @@ StatusResult ServerInstance::registerRoute(Method method,
   return {};
 }
 
+StatusResult ServerInstance::registerStaticRoute(
+    Method method, const std::string& customMethod, const std::string& pattern,
+    int64_t status, const std::vector<Header>& headers, const uint8_t* body,
+    size_t bodyLen) {
+  auto sr = std::make_shared<StaticResponse>();
+  sr->status = status;
+  sr->headers = headers;
+  if (body != nullptr && bodyLen > 0)
+    sr->body.assign(reinterpret_cast<const char*>(body), bodyLen);
+  std::unique_lock lk(configMutex_);
+  RouteEntry e{method, customMethod, pattern};
+  e.staticResponse = std::move(sr);
+  if (!router_.add(e)) {
+    return {ErrorKind::BadRequest,
+            "invalid route pattern (want '/a/:b' with optional trailing '/*'): " +
+                pattern,
+            0};
+  }
+  return {};
+}
+
 StatusResult ServerInstance::unregisterRoute(Method method,
                                              const std::string& customMethod,
                                              const std::string& pattern) {
@@ -1509,6 +1530,39 @@ void ServerInstance::answerDirectly(int fd, Method method, int64_t status,
   sendAll(fd, (const uint8_t*)head.data(), head.size());
 }
 
+bool ServerInstance::answerStatic(int fd, const ParsedHead& head,
+                                  const StaticResponse& sr, bool keepPeer,
+                                  int64_t& served, const ServerConfig& cfg,
+                                  std::string& carry, size_t bodyStart) {
+  // A fixed route has no body reader. If the client sent one, answer then
+  // close: unread body bytes are discarded with the socket, so they can't
+  // corrupt the framing of a following request.
+  bool hasBody = false;
+  if (const Header* cl = findHeader(head.headers, "content-length")) {
+    if (std::strtoll(cl->value.c_str(), nullptr, 10) > 0) hasBody = true;
+  }
+  if (const Header* te = findHeader(head.headers, "transfer-encoding")) {
+    if (icontains(te->value, "chunked")) hasBody = true;
+  }
+  const bool underBudget =
+      cfg.maxRequestsPerConn <= 0 || served + 1 < cfg.maxRequestsPerConn;
+  const bool keepAlive = keepPeer && cfg.keepAliveTimeoutMs > 0 &&
+                         underBudget && !draining_.load() && !hasBody;
+  const int64_t keepAliveSecs = (cfg.keepAliveTimeoutMs + 999) / 1000;
+  // Reuse buildHead's keep-alive framing (it supplies Content-Length and
+  // Connection, ignoring any the caller set). One thread-local buffer holds
+  // head+body so the answer is a single write.
+  static thread_local std::string out;
+  out = buildHead(sr.status, sr.headers, false, (int64_t)sr.body.size(),
+                  keepAlive, keepAliveSecs);
+  if (head.method != Method::Head) out.append(sr.body);
+  const bool ok = sendAll(fd, (const uint8_t*)out.data(), out.size(),
+                          cfg.writeTimeoutMs);
+  carry.erase(0, bodyStart);
+  served++;
+  return ok && keepAlive;
+}
+
 void ServerInstance::emitTerminalError(Emitter* emitter, int64_t requestId,
                                         const std::string& message,
                                         ErrorKind kind) {
@@ -1998,6 +2052,13 @@ bool ServerInstance::serveOne(int fd, const Wake& wake, std::string& carry,
     answerDirectly(fd, head.method, 426, "websocket not supported",
                    {{"Sec-WebSocket-Version", "13"}});
     return false;
+  }
+
+  // Static routes answer entirely in-engine: no requestId, no dispatch, no
+  // Dart round-trip. This is why a fixed route runs at raw engine speed.
+  if (m.route.staticResponse) {
+    return answerStatic(fd, head, *m.route.staticResponse, keepPeer, served,
+                        cfg, carry, bodyStart);
   }
 
   const int64_t timeoutMs =

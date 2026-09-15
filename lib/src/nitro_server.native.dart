@@ -422,6 +422,21 @@ abstract class NitroServerNative extends HybridObject {
   /// routes round-trip their token.
   RawServerStatus unregisterRoute(String method, String pattern);
 
+  /// Registers a route whose answer is fixed: the engine serves [status],
+  /// [headers] and [body] entirely on its own thread and never crosses into
+  /// Dart — so a static route runs at raw engine throughput. [method] is the
+  /// uppercase token (`GET`, `POST`, …) or `*`, matching [unregisterRoute].
+  /// The engine frames `Content-Length` and `Connection` itself (any set in
+  /// [headers] are ignored); HEAD is answered headers-only. Replaces any route
+  /// already at (method, pattern).
+  RawServerStatus registerStaticRoute(
+    String method,
+    String pattern,
+    int status,
+    List<RawHeader> headers,
+    @zeroCopy Uint8List body,
+  );
+
   /// Binds and starts the accept loop. `boundPort` in the returned status is
   /// the actual port (== config port unless the config asked for 0).
   RawServerStatus start();

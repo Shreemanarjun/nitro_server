@@ -453,6 +453,111 @@ TEST(ServerTest, ServesARegisteredRoute) {
   EXPECT_EQ(f.emitter.seen()[0].path, "/hello");
 }
 
+// ── Static routes: answered entirely in-engine, never dispatched ─────────────
+
+TEST(ServerTest, StaticRouteServesEntirelyInEngine) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(500, "handler must not run");
+  });
+  const std::string body = "hello world!";
+  const std::vector<Header> hs{{"Content-Type", "text/plain"}};
+  EXPECT_EQ(f.server
+                ->registerStaticRoute(Method::Get, "", "/health", 200, hs,
+                                      (const uint8_t*)body.data(), body.size())
+                .kind,
+            ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+  ASSERT_GT(port, 0);
+
+  // Keep-alive by default and engine-framed (Content-Length, Connection).
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n");
+  const std::string first = readHttpHead(fd);
+  EXPECT_EQ(statusOf(first), 200);
+  EXPECT_EQ(headerOf(first, "content-type"), "text/plain");
+  EXPECT_EQ(headerOf(first, "content-length"), std::to_string(body.size()));
+  EXPECT_EQ(headerOf(first, "connection"), "keep-alive");
+
+  // A second request on the same connection proves keep-alive held.
+  sendStr(fd, "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+  const std::string second = readAll(fd);
+  EXPECT_EQ(statusOf(second), 200);
+  EXPECT_EQ(bodyOf(second), body);
+  EXPECT_EQ(headerOf(second, "connection"), "close");
+  close(fd);
+
+  // The request never crossed into Dart.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_TRUE(f.emitter.seen().empty());
+}
+
+TEST(ServerTest, StaticRouteAnswersHeadOnlyAndReplacesAHandler) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "from handler");
+  });
+  // A handler stands first; a static route at the same (method, pattern)
+  // replaces it — the engine keeps a single entry per route.
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "/asset", -1).kind,
+            ErrorKind::None);
+  const std::string body = "STATIC-BYTES";
+  const std::vector<Header> hs{{"Content-Type", "application/octet-stream"}};
+  EXPECT_EQ(f.server
+                ->registerStaticRoute(Method::Get, "", "/asset", 200, hs,
+                                      (const uint8_t*)body.data(), body.size())
+                .kind,
+            ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+  ASSERT_GT(port, 0);
+
+  // HEAD (router falls HEAD→GET): the length is set but no body bytes go out.
+  int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "HEAD /asset HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+  const std::string headResp = readAll(fd);
+  close(fd);
+  EXPECT_EQ(statusOf(headResp), 200);
+  EXPECT_EQ(headerOf(headResp, "content-length"), std::to_string(body.size()));
+  EXPECT_EQ(bodyOf(headResp), "");
+
+  // GET returns the static body, not the evicted handler's answer.
+  fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "GET /asset HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+  const std::string getResp = readAll(fd);
+  close(fd);
+  EXPECT_EQ(bodyOf(getResp), body);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_TRUE(f.emitter.seen().empty());
+}
+
+TEST(ServerTest, StaticRouteWithRequestBodyAnswersThenCloses) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(500, "handler must not run");
+  });
+  const std::string body = "OK";
+  const std::vector<Header> hs{{"Content-Type", "text/plain"}};
+  EXPECT_EQ(f.server
+                ->registerStaticRoute(Method::Get, "", "/s", 200, hs,
+                                      (const uint8_t*)body.data(), body.size())
+                .kind,
+            ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+  ASSERT_GT(port, 0);
+
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  // A fixed route has no reader for a request body: answer, then close so the
+  // unread bytes can't corrupt a following request's framing.
+  sendStr(fd, "GET /s HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\nbody");
+  const std::string res = readAll(fd);
+  close(fd);
+  EXPECT_EQ(statusOf(res), 200);
+  EXPECT_EQ(bodyOf(res), body);
+  EXPECT_EQ(headerOf(res, "connection"), "close");
+}
+
 TEST(ServerTest, UnroutedPathIs404WithoutDispatch) {
   Fixture f([](Method, const std::string&, const std::string&) {
     return std::make_pair(200, "unreachable");

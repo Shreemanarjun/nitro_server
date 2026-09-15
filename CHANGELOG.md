@@ -11,6 +11,12 @@ Initial release.
   missing or duplicated Host on HTTP/1.1 with 400 before routing.
 * Trie routing: `:param`, trailing `*`, static > param > wildcard,
   method-specific > `all`, HEAD falls back to GET.
+* `getStatic`: a fixed-response route answered entirely inside the engine —
+  the request never crosses into Dart, so it serves at raw engine speed
+  (~122k req/s vs dart:io's ~96k on a saturating load, ~60% over nitro's own
+  handler path). The engine frames `Content-Length`/`Connection` and answers
+  HEAD headers-only; ideal for health checks, static assets, and cached
+  bodies. See `benchmark/README.md`.
 * Per-route `timeout`, `maxBodyBytes`, `middleware`, `streamBody`.
 * `ServerConfig`: `maxBodyBytes`, `keepAliveTimeout`,
   `maxRequestsPerConnection`, `headerTimeout`, `writeTimeout`,

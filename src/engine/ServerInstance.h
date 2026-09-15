@@ -167,6 +167,14 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
                              const std::string& wsProtocols = "");
   StatusResult unregisterRoute(Method method, const std::string& customMethod,
                                const std::string& pattern);
+  /// Registers a route whose answer is fixed: the engine serves [status],
+  /// [headers] and [body] itself and never dispatches to a runner. Replaces
+  /// any route (handler or static) already at (method, pattern).
+  StatusResult registerStaticRoute(Method method,
+                                   const std::string& customMethod,
+                                   const std::string& pattern, int64_t status,
+                                   const std::vector<Header>& headers,
+                                   const uint8_t* body, size_t bodyLen);
   StatusResult start();
   void stop();
 
@@ -338,6 +346,16 @@ class ServerInstance : public std::enable_shared_from_this<ServerInstance> {
   void answerDirectly(int fd, Method method, int64_t status,
                       const std::string& body,
                       const std::vector<Header>& extra = {});
+
+  /// Serves a static route's fixed answer on the worker thread, framed for
+  /// keep-alive like a normal response. A request that carries a body forces
+  /// `Connection: close` (a fixed route has no reader for it). Returns whether
+  /// the connection may keep serving — i.e. the write succeeded, keep-alive is
+  /// in force, and no body was left unread. [carry]'s head bytes are consumed;
+  /// [served] is incremented.
+  bool answerStatic(int fd, const ParsedHead& head, const StaticResponse& sr,
+                    bool keepPeer, int64_t& served, const ServerConfig& cfg,
+                    std::string& carry, size_t bodyStart);
 
   /// Deals the next request's sink: round-robin over the bound sinks, or a
   /// dropping null sink when none is bound. Every message of one request

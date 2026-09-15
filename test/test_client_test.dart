@@ -69,6 +69,29 @@ void main() {
     },
   );
 
+  test('getStatic answers a fixed body with no handler', () async {
+    await client.server.getStatic(
+      '/health',
+      'OK'.codeUnits,
+      contentType: 'text/plain',
+      headers: const {'cache-control': 'max-age=60'},
+    );
+    final res = await client.get('/health');
+    expect(res.status, 200);
+    expect(res.text(), 'OK');
+    expect(res.headers['content-type'], 'text/plain');
+    expect(res.headers['cache-control'], 'max-age=60');
+  });
+
+  test('getStatic takes a status and replaces a handler at its path', () async {
+    await client.server.get('/p', (_) => ResponseContext.text('handler'));
+    expect((await client.get('/p')).text(), 'handler');
+    await client.server.getStatic('/p', 'gone'.codeUnits, status: 410);
+    final res = await client.get('/p');
+    expect(res.status, 410);
+    expect(res.text(), 'gone');
+  });
+
   test('a custom method needs its token, a body needs a known type', () async {
     await client.server.post('/x', (_) => const ResponseContext());
     await expectLater(

@@ -18,6 +18,15 @@
 
 namespace nitroserver {
 
+/// A fixed answer the engine serves entirely on its own thread — the request
+/// never crosses to Dart. Held behind a shared_ptr on the RouteEntry so a
+/// per-request MatchResult copy is one refcount bump, not a body copy.
+struct StaticResponse {
+  int64_t status = 200;
+  std::vector<Header> headers;  // Content-Length/Connection are engine-framed.
+  std::string body;             // raw bytes (HEAD strips them, keeps the length)
+};
+
 struct RouteEntry {
   Method method = Method::Get;
   std::string customMethod;
@@ -27,6 +36,9 @@ struct RouteEntry {
   bool streamBody = false;   // Head first, then chunks: never the inline form.
   int64_t maxBodyBytes = -1;  // -1 = inherit the server cap.
   std::vector<std::string> wsProtocols;  // Accepted subprotocols, preferred first.
+  // Non-null marks a static route: the engine answers it directly and never
+  // dispatches. Copying a RouteEntry copies the pointer, never the bytes.
+  std::shared_ptr<const StaticResponse> staticResponse;
 };
 
 struct MatchResult {

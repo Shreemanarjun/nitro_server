@@ -231,6 +231,14 @@ void main() {
         '/empty',
         (_) async => const ResponseContext(status: 204),
       );
+      // Static routes: the engine answers these itself, never dispatching.
+      server.getStatic('/health', 'OK'.codeUnits, contentType: 'text/plain');
+      server.getStatic(
+        '/static.json',
+        utf8.encode('{"static":true}'),
+        contentType: 'application/json',
+        headers: const {'cache-control': 'max-age=60'},
+      );
     });
 
     tearDownAll(() async {
@@ -753,6 +761,54 @@ void main() {
           ),
         );
         expect(_statusOf(raw), 404);
+      }, skip: skipReason);
+    });
+
+    group('static routes (engine-served, no dispatch)', () {
+      test('serves the fixed body with engine framing', () async {
+        final raw = await _raw(
+          port,
+          ascii.encode(
+            'GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n',
+          ),
+        );
+        expect(_statusOf(raw), 200);
+        expect(_headerOf(raw, 'content-type'), 'text/plain');
+        expect(_headerOf(raw, 'content-length'), '2');
+        expect(_headerOf(raw, 'connection'), 'close');
+        final body = await _clientBody(port, 'GET', '/health');
+        expect(utf8.decode(body), 'OK');
+      }, skip: skipReason);
+
+      test('custom headers and a JSON body ride through', () async {
+        final raw = await _raw(
+          port,
+          ascii.encode(
+            'GET /static.json HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n',
+          ),
+        );
+        expect(_headerOf(raw, 'cache-control'), 'max-age=60');
+        final body = await _clientBody(
+          port,
+          'GET',
+          '/static.json',
+          expectStatus: 200,
+        );
+        expect(jsonDecode(utf8.decode(body)), {'static': true});
+      }, skip: skipReason);
+
+      test('HEAD is answered headers-only with the entity length', () async {
+        // Router falls HEAD→GET in-engine; the length is set, no body ships.
+        final raw = await _raw(
+          port,
+          ascii.encode(
+            'HEAD /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n',
+          ),
+        );
+        expect(_statusOf(raw), 200);
+        expect(_headerOf(raw, 'content-length'), '2');
+        final body = await _clientBody(port, 'HEAD', '/health');
+        expect(body, isEmpty, reason: 'HEAD carries no body');
       }, skip: skipReason);
     });
 

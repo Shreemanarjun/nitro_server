@@ -345,6 +345,28 @@ class ServerRunner {
     if (method == HttpMethod.get) _wsHandlers.remove(pattern);
   }
 
+  /// Registers a static route: the engine answers [status]/[headers]/[body]
+  /// entirely on its own thread and never emits a head to this isolate, so no
+  /// Dart handler is stored. Evicts any handler or WS route at the same
+  /// pattern, mirroring the engine's single entry per (method, pattern).
+  void addStaticRoute(
+    HttpMethod method,
+    String customToken,
+    String pattern,
+    int status,
+    Map<String, String> headers,
+    List<int> body,
+  ) {
+    _ensureListening();
+    final token = _tokenOf(method, customToken);
+    final result = _native.registerStaticRoute(token, pattern, status, [
+      for (final e in headers.entries) RawHeader(name: e.key, value: e.value),
+    ], body is Uint8List ? body : Uint8List.fromList(body));
+    throwIfFailed(result, operation: 'registerStaticRoute($pattern)');
+    _routes[token]?.remove(pattern);
+    if (method == HttpMethod.get) _wsHandlers.remove(pattern);
+  }
+
   /// Registers a WebSocket route: matching handshakes upgrade in-engine and
   /// [handler] receives the live session. Evicts a GET HTTP route on the
   /// same pattern (and vice versa in [addRoute]) — the engine holds a

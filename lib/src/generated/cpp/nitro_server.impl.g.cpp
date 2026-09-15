@@ -72,6 +72,12 @@ public:
         // return { nullptr, 0 };
     }
 
+    NitroCppBuffer registerStaticRoute(const std::string& method, const std::string& pattern, int64_t status, NitroCppBuffer headers, const uint8_t* body, size_t body_length) override {
+        // TODO: implement registerStaticRoute
+        throw std::runtime_error("Not implemented: registerStaticRoute");
+        // return { nullptr, 0 };
+    }
+
     NitroCppBuffer start() override {
         // TODO: implement start
         throw std::runtime_error("Not implemented: start");

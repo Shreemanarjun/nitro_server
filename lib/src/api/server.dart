@@ -327,6 +327,35 @@ class NitroServer {
     middleware: middleware,
   );
 
+  /// Registers a route whose response is fixed and served entirely by the
+  /// engine: the request never crosses into Dart, so it answers at raw engine
+  /// throughput. Ideal for health checks, static assets, and pre-rendered or
+  /// cached bodies.
+  ///
+  /// [body] is the exact response bytes. [contentType], when given, sets
+  /// `Content-Type`; [headers] add any others. The engine frames
+  /// `Content-Length` and keep-alive `Connection` itself, and answers a `HEAD`
+  /// on the pattern headers-only. Registering here replaces any handler or
+  /// WebSocket route at the same pattern.
+  ///
+  /// There is no handler, so route [middleware], [timeout] and the error /
+  /// not-found fallbacks never apply. To change the body, register again (or
+  /// [unroute] and re-add). Returns `this` for chaining.
+  Future<NitroServer> getStatic(
+    String pattern,
+    List<int> body, {
+    int status = 200,
+    String? contentType,
+    Map<String, String> headers = const {},
+  }) async {
+    _requirePattern(pattern);
+    _runner.addStaticRoute(HttpMethod.get, '', pattern, status, {
+      'content-type': ?contentType,
+      ...headers,
+    }, body);
+    return this;
+  }
+
   /// Registers a WebSocket route (RFC 6455). Matching handshakes upgrade
   /// in-engine and [handler] receives the live session; anything else on
   /// the pattern (plain requests, bad handshakes) is answered 426/400 and

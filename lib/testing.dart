@@ -122,6 +122,12 @@ class NitroTestClient {
     }
     if (path.isEmpty) path = '/';
 
+    // Static routes are answered by the engine directly — no head, no
+    // dispatch. The tester mirrors that, serving the fixed answer by exact
+    // path before any routing.
+    final staticHit = _native.staticResponses['$token $path'];
+    if (staticHit != null) return staticHit;
+
     final match = _native.matchRoute(token, path);
     if (match == null) {
       // Engine-consistent: unrouted paths never reach dispatch. The engine
@@ -377,6 +383,11 @@ class _InMemoryNative extends NitroServerNative {
   final routes = <RawRouteConfig>[];
   final answered = <int, NitroTestResponse>{};
 
+  /// Static routes, keyed `'<TOKEN> <pattern>'`. The engine answers these
+  /// itself and never emits a head, so the tester serves them directly (by
+  /// exact path) before dispatch — no runner, no handler.
+  final staticResponses = <String, NitroTestResponse>{};
+
   @override
   Stream<RawIncomingBatch> get incomingRequests =>
       heads.stream.map((h) => RawIncomingBatch(requests: [h]));
@@ -406,6 +417,22 @@ class _InMemoryNative extends NitroServerNative {
   @override
   RawServerStatus registerRoute(RawRouteConfig route) {
     routes.add(route);
+    return const RawServerStatus(errorKind: RawServerErrorKind.none);
+  }
+
+  @override
+  RawServerStatus registerStaticRoute(
+    String method,
+    String pattern,
+    int status,
+    List<RawHeader> headers,
+    Uint8List body,
+  ) {
+    staticResponses['${method.toUpperCase()} $pattern'] = NitroTestResponse(
+      status: status,
+      headers: {for (final h in headers) h.name: h.value},
+      body: Uint8List.fromList(body),
+    );
     return const RawServerStatus(errorKind: RawServerErrorKind.none);
   }
 

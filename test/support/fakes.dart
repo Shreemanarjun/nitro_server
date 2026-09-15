@@ -20,6 +20,16 @@ class FakeNitroServerNative extends NitroServerNative {
   RawServerConfig? lastConfig;
   final registered = <RawRouteConfig>[];
   final unregistered = <(String, String)>[];
+  final staticRegistered =
+      <
+        ({
+          String method,
+          String pattern,
+          int status,
+          List<RawHeader> headers,
+          Uint8List body,
+        })
+      >[];
 
   /// Failures to return per operation, keyed by pattern/token. Empty means
   /// success.
@@ -88,6 +98,25 @@ class FakeNitroServerNative extends NitroServerNative {
   RawServerStatus unregisterRoute(String method, String pattern) {
     unregistered.add((method, pattern));
     return unregisterFailures[pattern] ??
+        const RawServerStatus(errorKind: RawServerErrorKind.none);
+  }
+
+  @override
+  RawServerStatus registerStaticRoute(
+    String method,
+    String pattern,
+    int status,
+    List<RawHeader> headers,
+    Uint8List body,
+  ) {
+    staticRegistered.add((
+      method: method,
+      pattern: pattern,
+      status: status,
+      headers: headers,
+      body: body,
+    ));
+    return registerFailures[pattern] ??
         const RawServerStatus(errorKind: RawServerErrorKind.none);
   }
 

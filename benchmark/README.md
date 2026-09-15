@@ -19,6 +19,7 @@ case asserts exact status and bytes.
 | `/files/*` | trailing wildcard |
 | `/q?a=1&b=two` | query parsing |
 | `/mw` | one pass-through middleware layer |
+| `/static` | `getStatic` fixed response, same bytes as `/hello`: engine-served on nitro (no FFI hop), a plain handler on dart:io and shelf |
 | `/work` | JSON-encoding handler (200 records): handler CPU |
 | `/file` | 64 KiB static file: `File.openRead` on dart:io and shelf, `sendfile` on nitro |
 | `POST /echo 4k` | 4 KiB upload and echo |
@@ -160,6 +161,32 @@ Additional measurements (`--quick --raw`, 32 connections):
 | `/work`, 1 isolate | 3,413 | 3,464 | 3,347 |
 | `/work`, 4 isolates | 10,929 | 11,298 | 3,058 |
 | `/file` | 24,627 | 11,827 | 10,865 |
+
+### Static fast path (`getStatic`)
+
+A `getStatic` route is answered entirely inside the C++ engine — the request
+never crosses the FFI boundary into a Dart handler. On a trivial fixed
+response that boundary is the whole cost, so removing it is where nitro pulls
+ahead of dart:io outright.
+
+The `--raw` Dart client above tops out around 70k req/s and hides this — it
+caps the server, not the reverse. Measured instead with a saturating C++
+keep-alive load generator (64 connections, 4 server isolates, same request on
+every side, two runs each):
+
+| route (4 isolates, C++ loadgen) | server | req/s |
+|---------------------------------|--------|------:|
+| `/static` (engine-served) | nitro | 120,704 / 124,118 |
+| `/hello` (Dart handler) | dart:io | 88,397 / 95,637 |
+| `/hello` (Dart handler) | nitro | 75,682 / 76,317 |
+
+The fixed-response fast path serves ~122k req/s — ~28% over dart:io's ~96k and
+~60% over nitro's own handler path — because it pays neither the per-request
+FFI round-trip nor a Dart event-loop turn. A route backed by a Dart handler
+still pays that round-trip (76k): dart:io runs its handler in the isolate that
+owns the socket, so on a zero-work handler it stays ahead of nitro's handler
+path. Use `getStatic` for health checks, static assets, and pre-rendered or
+cached bodies to serve them at engine speed.
 
 WebSocket echo (keep-alive, one message per round trip; shelf has no
 WebSocket):

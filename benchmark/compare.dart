@@ -253,6 +253,10 @@ Future<HttpServer> _startDartServer({int port = 0, bool shared = false}) async {
           final body = _routes['/hello']!;
           response.contentLength = body.length;
           response.add(body);
+        } else if (request.method == 'GET' && path == '/static') {
+          final body = _routes['/hello']!;
+          response.contentLength = body.length;
+          response.add(body);
         } else if (request.method == 'GET' && path == '/work') {
           final body = _workBody();
           response.headers.contentType = ContentType.json;
@@ -315,6 +319,8 @@ Response _shelfHandler(Request request) {
       jsonEncode(request.url.queryParameters).codeUnits,
     );
   } else if (request.method == 'GET' && path == '/mw') {
+    body = _routes['/hello'];
+  } else if (request.method == 'GET' && path == '/static') {
     body = _routes['/hello'];
   } else if (request.method == 'GET' && path == '/work') {
     body = _workBody();
@@ -391,6 +397,13 @@ ServerSetup _nitroSetup(bool batchEvents) {
       final body = entry.value;
       await server.get(entry.key, (_) => ResponseContext.bytes(body));
     }
+    // A fixed route the engine answers itself — no FFI round-trip. Same bytes
+    // as `/hello`, so `/static` vs `/hello` isolates the fast path.
+    await server.getStatic(
+      '/static',
+      _routes['/hello']!,
+      contentType: 'text/plain',
+    );
     await server.get(
       '/users/:id',
       (request) => ResponseContext.text('user ${request.param('id')}'),
@@ -655,6 +668,7 @@ final Map<String, _Op> _ops = {
   '/files/*': (c, p) => _getExpect(c, p, '/files/a/b/c', _wildExpected),
   '/q?a=1&b=two': (c, p) => _getExpect(c, p, '/q?a=1&b=two', _queryExpected),
   '/mw': (c, p) => _getExpect(c, p, '/mw', _routes['/hello']!),
+  '/static': (c, p) => _getExpect(c, p, '/static', _routes['/hello']!),
   '/work': (c, p) => _getExpect(c, p, '/work', _workExpected),
   '/file': (c, p) => _getExpect(c, p, '/file', _fileExpected),
   'POST /echo 4k': _postEcho,
@@ -816,6 +830,7 @@ Future<({double meanUs, List<int> samplesUs})> _sequential(
     '/files/*' => get('/files/a/b/c', _wildExpected),
     '/q?a=1&b=two' => get('/q?a=1&b=two', _queryExpected),
     '/mw' => get('/mw', _routes['/hello']!),
+    '/static' => get('/static', _routes['/hello']!),
     '/work' => get('/work', _workExpected),
     '/file' => get('/file', _fileExpected),
     'POST /echo 4k' => post(_echoPayload),

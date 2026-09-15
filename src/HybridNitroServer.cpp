@@ -223,6 +223,25 @@ class HybridNitroServerImpl final : public HybridNitroServerNative {
         .toNativeBuffer();
   }
 
+  NitroCppBuffer registerStaticRoute(const std::string& method,
+                                     const std::string& pattern, int64_t status,
+                                     NitroCppBuffer headers, const uint8_t* body,
+                                     size_t body_length) override {
+    std::string custom;
+    const Method m = parseUnregisterMethod(method, custom);
+    std::vector<Header> hs;
+    try {
+      hs = decodeHeaderList(headers);
+    } catch (...) {
+      return toStatus({ErrorKind::BadRequest, "malformed static route headers",
+                       0})
+          .toNativeBuffer();
+    }
+    return toStatus(server_->registerStaticRoute(m, custom, pattern, status, hs,
+                                                 body, body_length))
+        .toNativeBuffer();
+  }
+
   NitroCppBuffer start() override {
     return toStatus(server_->start()).toNativeBuffer();
   }

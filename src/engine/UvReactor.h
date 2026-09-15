@@ -155,6 +155,7 @@ class UvReactor {
   static void onCloseConn(uv_handle_t* h);
   void runLoop(Loop* lp);
   void processConn(Conn* c);            // parse + dispatch complete requests
+  void emitStreamBytes(Conn* c);        // stream a streamBody upload chunk-wise
   void wsProcess(Conn* c);              // decode WebSocket frames (loop thread)
   void wsCloseConn(Conn* c, int code);  // send a close frame + close (loop thread)
 #ifdef NITRO_SERVER_TLS
@@ -171,6 +172,9 @@ class UvReactor {
                    const std::string& path, const std::string& query);
   // Loop thread: write bytes; when done, resume reading / close iff `finish`.
   void writeAnswer(Conn* c, std::string bytes, bool keepAlive, bool finish);
+  // Loop thread: write bytes now without touching request state (100-continue,
+  // TLS handshake flights). TLS-aware.
+  void writeRaw(Conn* c, std::string bytes);
   // Any thread: hand [bytes] to [loc]'s loop for writing (async wake).
   void pushWrite(const ReqLoc& loc, std::string bytes, bool finish);
   // Any thread: look up request [id]; erases the reqLoc when [erase].
@@ -178,6 +182,8 @@ class UvReactor {
   MatchResult match(Method m, const std::string& custom,
                     const std::string& path) const;
   Emitter* nextEmitter();  // round-robin pick, or null when none bound
+  void broadcastEvent(ServerEventKind kind, int64_t requestId,
+                      const std::string& message);  // to every sink
 
   std::mutex emitterMutex_;
   std::vector<Emitter*> emitters_;
@@ -185,6 +191,7 @@ class UvReactor {
   ServerConfig cfg_;
   Router router_;                        // writer: registration; reader: match
   std::atomic<int64_t> boundPort_{0};
+  int reservedPort_ = 0;  // app-level port claim, released on stop()
   std::atomic<int64_t> liveConns_{0};
   std::atomic<int64_t> nextReqId_{1};
   std::atomic<int64_t> nextConnId_{1};

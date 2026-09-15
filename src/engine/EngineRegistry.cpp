@@ -7,13 +7,13 @@ std::mutex& EngineRegistry::mutex() {
   return m;
 }
 
-std::unordered_map<std::string, std::shared_ptr<ServerInstance>>&
+std::unordered_map<std::string, std::shared_ptr<Engine>>&
 EngineRegistry::instances() {
-  static std::unordered_map<std::string, std::shared_ptr<ServerInstance>> map;
+  static std::unordered_map<std::string, std::shared_ptr<Engine>> map;
   return map;
 }
 
-std::shared_ptr<ServerInstance> EngineRegistry::resolve(const std::string& key,
+std::shared_ptr<Engine> EngineRegistry::resolve(const std::string& key,
                                                         Emitter* emitter) {
   std::lock_guard<std::mutex> lk(mutex());
   auto& map = instances();
@@ -22,7 +22,7 @@ std::shared_ptr<ServerInstance> EngineRegistry::resolve(const std::string& key,
     it->second->addEmitter(emitter);
     return it->second;
   }
-  auto inst = std::make_shared<ServerInstance>();
+  auto inst = std::make_shared<Engine>();
   inst->addEmitter(emitter);
   map.emplace(key, inst);
   return inst;

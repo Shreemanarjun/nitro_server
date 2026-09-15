@@ -315,7 +315,7 @@ class HybridNitroServerImpl final : public HybridNitroServerNative {
 
  private:
   BridgeEmitter emitter_;
-  std::shared_ptr<ServerInstance> server_;
+  std::shared_ptr<Engine> server_;  // Engine = UvReactor (libuv reactor)
 };
 
 }  // namespace

@@ -19,9 +19,9 @@ jobs:
         with:
           channel: stable
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y lcov clang llvm libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y lcov clang llvm libssl-dev libuv1-dev
       - if: runner.os == 'macOS'
-        run: brew install lcov openssl@3
+        run: brew install lcov openssl@3 libuv
       - run: flutter pub get
       - run: dart analyze
       - run: dart format --output=none --set-exit-if-changed lib test benchmark tool
@@ -52,9 +52,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev libuv1-dev
       - if: runner.os == 'macOS'
-        run: brew install openssl@3
+        run: brew install openssl@3 libuv
       - run: >
           cmake -S src -B build/san -DCMAKE_BUILD_TYPE=Debug
           -DNITRO_SERVER_BUILD_TESTS=ON -DNITRO_SERVER_SANITIZE=${{ matrix.sanitizer }}

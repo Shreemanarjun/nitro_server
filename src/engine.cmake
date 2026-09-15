@@ -22,6 +22,54 @@ function(nitro_server_attach_tls target)
   endif()
 endfunction()
 
+# ── libuv (reactor I/O core) ─────────────────────────────────────────────────
+# The engine's connection multiplexing runs on a libuv event loop (one per
+# worker), which scales flat to thousands of keep-alive connections where a
+# thread-per-connection pool dips. Found via CMake config or pkg-config;
+# Homebrew installs off the default search path, so hint it first. Building
+# from source (FetchContent) is the path for the Flutter plugin's cross-compiled
+# targets — added when those platforms are wired.
+function(nitro_server_attach_libuv target)
+  find_package(libuv CONFIG QUIET)
+  if(libuv_FOUND)
+    if(TARGET libuv::uv)
+      target_link_libraries(${target} PRIVATE libuv::uv)
+    elseif(TARGET libuv::uv_a)
+      target_link_libraries(${target} PRIVATE libuv::uv_a)
+    endif()
+    target_compile_definitions(${target} PRIVATE NITRO_SERVER_LIBUV=1)
+    message(STATUS "nitro_server: libuv found (CONFIG)")
+    return()
+  endif()
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(LIBUV QUIET libuv)
+    if(LIBUV_FOUND)
+      target_include_directories(${target} PRIVATE ${LIBUV_INCLUDE_DIRS})
+      target_link_libraries(${target} PRIVATE ${LIBUV_LIBRARIES})
+      target_link_directories(${target} PRIVATE ${LIBUV_LIBRARY_DIRS})
+      target_compile_definitions(${target} PRIVATE NITRO_SERVER_LIBUV=1)
+      message(STATUS "nitro_server: libuv found (pkg-config ${LIBUV_VERSION})")
+      return()
+    endif()
+  endif()
+  # Homebrew fallback: hint the well-known prefixes directly.
+  foreach(cand /opt/homebrew /usr/local /opt/homebrew/opt/libuv /usr/local/opt/libuv)
+    if(EXISTS "${cand}/include/uv.h")
+      target_include_directories(${target} PRIVATE "${cand}/include")
+      find_library(NITRO_LIBUV_LIB NAMES uv libuv HINTS "${cand}/lib")
+      if(NITRO_LIBUV_LIB)
+        target_link_libraries(${target} PRIVATE "${NITRO_LIBUV_LIB}")
+        target_compile_definitions(${target} PRIVATE NITRO_SERVER_LIBUV=1)
+        message(STATUS "nitro_server: libuv found at ${cand}")
+        return()
+      endif()
+    endif()
+  endforeach()
+  message(FATAL_ERROR "nitro_server: libuv not found — install libuv "
+    "(brew install libuv / apt install libuv1-dev)")
+endfunction()
+
 # ── nitro_server engine ────────────────────────────────────────────────────
 # Compiles src/engine/*.cpp and links the result into the plugin library.
 # Mirrors nitro_http's engine.cmake: Apple platforms compile the unity TU
@@ -46,6 +94,7 @@ function(nitro_server_attach_engine target)
     "${CMAKE_CURRENT_SOURCE_DIR}/engine"
   )
   nitro_server_attach_tls(${target})
+  nitro_server_attach_libuv(${target})
   if(WIN32)
     target_compile_definitions(${target} PRIVATE
       WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)

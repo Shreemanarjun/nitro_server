@@ -451,7 +451,14 @@ ServerSetup _nitroSetup(bool batchEvents) {
 /// process, returning its process + bound port. Returns null when Go is not
 /// installed or the source is missing, so the run proceeds with the three
 /// Dart sides. Go is excluded from the WebSocket cases (no stdlib WS).
-Future<({Process proc, int port})?> _startGoServer(bool batchEvents) async {
+///
+/// [gomaxprocs] pins Go's core budget to the Dart sides' isolate count, so a
+/// CPU case like `/work` is a same-budget comparison instead of Go's default
+/// all-cores against a fixed isolate pool.
+Future<({Process proc, int port})?> _startGoServer(
+  bool batchEvents,
+  int gomaxprocs,
+) async {
   const src = 'benchmark/compare_go_server.go';
   if (!File(src).existsSync()) return null;
   final bin = '${Directory.systemTemp.path}/compare_go_server';
@@ -464,9 +471,11 @@ Future<({Process proc, int port})?> _startGoServer(bool batchEvents) async {
   } on ProcessException {
     return null; // Go not on PATH: skip the side rather than fail the run.
   }
-  final proc = await Process.start(bin, [
-    if (batchEvents) '--batch-events',
-  ]);
+  final proc = await Process.start(
+    bin,
+    [if (batchEvents) '--batch-events'],
+    environment: {'GOMAXPROCS': '$gomaxprocs'},
+  );
   final portCompleter = Completer<int>();
   final sub = const LineSplitter()
       .bind(utf8.decoder.bind(proc.stdout))
@@ -1215,7 +1224,12 @@ Future<void> main(List<String> args) async {
         );
   final shelfServer = await _startShelfServer();
   final nitroServer = await _startNitroServer();
-  final goServer = await _startGoServer(_batchEvents);
+  // Effective handler parallelism the Dart sides use, so Go's core budget can
+  // match it (a fair `/work` CPU comparison instead of Go's default all-cores).
+  final effectiveWorkers = _isolates == 0
+      ? Platform.numberOfProcessors ~/ 2
+      : _isolates;
+  final goServer = await _startGoServer(_batchEvents, effectiveWorkers);
 
   final sides = <(String, int)>[
     ('dart:io', dartServer.port),

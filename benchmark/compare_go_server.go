@@ -19,6 +19,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"runtime"
 	"strconv"
 	"strings"
 )
@@ -163,6 +165,9 @@ func main() {
 		return
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
+	// Report the effective core budget (GOMAXPROCS, pinned by compare.dart) so
+	// the /work CPU comparison is on the record.
+	fmt.Fprintf(os.Stderr, "go GOMAXPROCS=%d\n", runtime.GOMAXPROCS(0))
 	fmt.Printf("LISTENING %d\n", port)
 	http.Serve(ln, http.HandlerFunc(handler))
 }

@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// EngineRegistry — instance-key → ServerInstance.
+// EngineRegistry — instance-key → Engine (the libuv reactor).
 //
 // One spec class produces one shared library, so roles ride on the key the
 // C++ factory parses: `engine` (capabilities / global reset) and `s:<id>`

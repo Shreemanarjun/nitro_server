@@ -3,7 +3,7 @@
 //
 // Header-only (no build-list changes): SHA-1, base64, the accept-key
 // derivation, frame parse/encode and a UTF-8 validator. The connection loop
-// itself lives in ServerInstance, which owns the socket and the send mutex.
+// itself lives in UvReactor, which owns the socket on its event-loop thread.
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma once
 

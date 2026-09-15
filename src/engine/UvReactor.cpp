@@ -55,7 +55,8 @@ int uvBuildAddr(const std::string& host, int port, sockaddr_storage& ss,
     return AF_INET6;
   }
   in_addr a4;
-  if (inet_pton(AF_INET, host.c_str(), &a4) != 1) a4.s_addr = htonl(INADDR_LOOPBACK);
+  if (inet_pton(AF_INET, host.c_str(), &a4) != 1)
+    return -1;  // neither an IPv4 nor an IPv6 literal → caller reports BindFailed
   auto* s = reinterpret_cast<sockaddr_in*>(&ss);
   s->sin_family = AF_INET;
   s->sin_addr = a4;
@@ -228,13 +229,21 @@ const char* uvFramingError(const ParsedHead& head) {
 // Decodes a chunked request body from [buf] starting at [start].
 // Returns: 1 complete (out = body, end = offset past the terminating CRLF),
 // 0 incomplete (need more bytes), -1 malformed or over [maxBody].
+// Returns 1 complete, 0 need more, -1 malformed (→400), -2 over the cap
+// (→413). The cap is enforced on both the declared chunk size and the raw
+// bytes buffered while waiting, so an ever-growing size line can't stall.
 int decodeChunked(const std::string& buf, size_t start, int64_t maxBody,
                   std::string& out, size_t& end) {
   size_t pos = start;
   out.clear();
+  // Slack over the cap for chunk framing (size lines, CRLFs, a trailer).
+  const auto overCap = [&]() {
+    return (int64_t)(buf.size() - start) > maxBody + 1024;
+  };
   while (true) {
     const size_t eol = buf.find("\r\n", pos);
-    if (eol == std::string::npos) return 0;  // size line not fully buffered
+    if (eol == std::string::npos)  // size line not fully buffered
+      return overCap() ? -2 : 0;
     char* endp = nullptr;
     const long sz = std::strtol(buf.c_str() + pos, &endp, 16);
     if (endp == buf.c_str() + pos || sz < 0) return -1;  // malformed size
@@ -243,7 +252,7 @@ int decodeChunked(const std::string& buf, size_t start, int64_t maxBody,
       size_t t = pos;
       while (true) {
         const size_t e2 = buf.find("\r\n", t);
-        if (e2 == std::string::npos) return 0;
+        if (e2 == std::string::npos) return overCap() ? -2 : 0;
         if (e2 == t) {
           end = t + 2;
           return 1;
@@ -251,9 +260,10 @@ int decodeChunked(const std::string& buf, size_t start, int64_t maxBody,
         t = e2 + 2;  // skip one trailer line
       }
     }
-    if (buf.size() < pos + (size_t)sz + 2) return 0;  // data + CRLF not in yet
+    if ((int64_t)out.size() + sz > maxBody) return -2;  // declared over the cap
+    if (buf.size() < pos + (size_t)sz + 2)  // data + CRLF not in yet
+      return overCap() ? -2 : 0;
     out.append(buf, pos, (size_t)sz);
-    if ((int64_t)out.size() > maxBody) return -1;
     pos += (size_t)sz + 2;
   }
 }
@@ -268,6 +278,8 @@ struct UvReactor::Conn {
   std::string buf;   // accumulated request bytes
   bool busy = false;  // a request is awaiting its answer (ordered per conn)
   bool closing = false;
+  bool counted = false;    // admitted: liveConns_ (+ per-IP) incremented for it
+  std::string peerIp;      // remote IP, for the per-IP cap (empty = not counted)
   int64_t served = 0;  // completed requests (header vs keep-alive timeout)
   int64_t reqIdInFlight = -1;  // dispatched handler awaiting respond (for 408)
   bool continueSent = false;   // sent 100 Continue for the current request
@@ -288,7 +300,7 @@ struct UvReactor::Conn {
   bool ws = false;
   Emitter* wsEmitter = nullptr;  // the sink this session's messages go to
   std::string wsMsg;      // reassembly buffer for a fragmented message
-  int wsMsgOpcode = 0;    // opcode of the message being reassembled
+  int wsMsgOpcode = -1;   // opcode being reassembled; -1 = no message in flight
   bool wsMsgCompressed = false;  // the message's first frame had RSV1 (deflate)
   bool wsClosing = false;  // a close frame was sent; drop further frames
   bool deflate = false;    // permessage-deflate negotiated on this session
@@ -414,7 +426,13 @@ void UvReactor::respondFile(int64_t id, int64_t status,
   std::fseek(f, 0, SEEK_END);
   const long size = std::ftell(f);
   if (offset < 0) offset = 0;
-  if (offset > size) offset = size;
+  if (offset > size) {  // a range that starts past the end has no bytes → 404
+    std::fclose(f);
+    static const char msg[] = "not found";
+    std::vector<Header> h{{"Content-Type", "text/plain"}};
+    respond(id, 404, h, (const uint8_t*)msg, sizeof(msg) - 1);
+    return;
+  }
   const long end = length < 0 ? size : std::min<long>(size, offset + length);
   const long n = end > offset ? end - offset : 0;
   std::string body((size_t)n, '\0');
@@ -475,6 +493,7 @@ StatusResult UvReactor::start(int loops) {
     sockaddr_storage ss;
     socklen_t sslen;
     const int family = uvBuildAddr(cfg_.host, (int)cfg_.port, ss, sslen);
+    if (family < 0) return releaseAndFail(fds, "invalid host");
     int fd = socket(family, SOCK_STREAM, 0);
     if (fd < 0) return releaseAndFail(fds, "socket failed");
     int one = 1;
@@ -539,15 +558,44 @@ void UvReactor::onConnection(uv_stream_t* server, int status) {
     uv_close((uv_handle_t*)&c->handle, &UvReactor::onCloseConn);
     return;
   }
-  // Refuse over the connection cap (or while draining): accept then close so
-  // the backlog drains instead of wedging.
+  // Peer IP, for the per-IP cap.
+  std::string peerIp;
+  {
+    sockaddr_storage ss;
+    int nl = (int)sizeof(ss);
+    if (uv_tcp_getpeername(&c->handle, (sockaddr*)&ss, &nl) == 0) {
+      char ip[64] = {0};
+      if (ss.ss_family == AF_INET6)
+        uv_ip6_name(reinterpret_cast<const sockaddr_in6*>(&ss), ip, sizeof(ip));
+      else
+        uv_ip4_name(reinterpret_cast<const sockaddr_in*>(&ss), ip, sizeof(ip));
+      peerIp = ip;
+    }
+  }
+  // Admit or refuse: over the global cap, while draining, or over the per-IP
+  // cap, accept then close so the backlog drains instead of wedging. Counting
+  // happens here (guarded — accepts land on every loop thread) and is released
+  // in onCloseConn iff `counted`, so every refuse path stays symmetric.
   const int64_t maxConn = self->cfg_.maxConnections;
-  if (self->draining_.load() ||
-      (maxConn > 0 && self->liveConns_.load() >= maxConn)) {
+  const int64_t maxPerIp = self->cfg_.maxConnectionsPerIp;
+  bool refuse = self->draining_.load() ||
+                (maxConn > 0 && self->liveConns_.load() >= maxConn);
+  if (!refuse && maxPerIp > 0 && !peerIp.empty()) {
+    std::lock_guard<std::mutex> lk(self->ipMutex_);
+    if (self->ipCounts_[peerIp] >= maxPerIp) {
+      refuse = true;
+    } else {
+      self->ipCounts_[peerIp] += 1;
+      c->peerIp = peerIp;  // marks the per-IP slot to release on close
+    }
+  }
+  if (refuse) {
     c->closing = true;
     uv_close((uv_handle_t*)&c->handle, &UvReactor::onCloseConn);
     return;
   }
+  c->counted = true;
+  self->liveConns_.fetch_add(1);
   uv_tcp_nodelay(&c->handle, 1);
   c->lastActive = Clock::now();
 #ifdef NITRO_SERVER_TLS
@@ -558,7 +606,6 @@ void UvReactor::onConnection(uv_stream_t* server, int status) {
   }
 #endif
   lp->conns[c->id] = c;
-  self->liveConns_.fetch_add(1);
   uv_read_start((uv_stream_t*)&c->handle, &UvReactor::allocCb,
                 &UvReactor::readCb);
 }
@@ -575,7 +622,13 @@ void UvReactor::onCloseConn(uv_handle_t* h) {
   if (c->lp) {
     UvReactor* self = c->lp->owner;
     c->lp->conns.erase(c->id);
-    self->liveConns_.fetch_sub(1);
+    if (c->counted) self->liveConns_.fetch_sub(1);  // only if admitted
+    if (!c->peerIp.empty()) {                        // release the per-IP slot
+      std::lock_guard<std::mutex> lk(self->ipMutex_);
+      auto it = self->ipCounts_.find(c->peerIp);
+      if (it != self->ipCounts_.end() && --it->second <= 0)
+        self->ipCounts_.erase(it);
+    }
     if (c->ws) {
       {
         std::lock_guard<std::mutex> lk(self->reqMutex_);
@@ -745,7 +798,20 @@ void UvReactor::processConn(Conn* c) {
       writeAnswer(c, uvBuildHead(400, {}, 0, false, 0), false, true);
       return;
     }
-    const int64_t maxBody = cfg_.maxBodyBytes > 0 ? cfg_.maxBodyBytes : (10 << 20);
+    // Route match up front: the body cap is per-route (falling back to the
+    // server cap), so the route must be known before the body is read.
+    std::string path = head.target;
+    std::string query;
+    {
+      const size_t q = path.find('?');
+      if (q != std::string::npos) { query = path.substr(q + 1); path = path.substr(0, q); }
+      if (path.empty()) path = "/";
+    }
+    const MatchResult m = match(head.method, head.customMethod, path);
+    const int64_t serverMax = cfg_.maxBodyBytes > 0 ? cfg_.maxBodyBytes : (10 << 20);
+    const int64_t maxBody = (m.matched && m.route.maxBodyBytes >= 0)
+                                ? m.route.maxBodyBytes
+                                : serverMax;
     if (!chunked && clen > maxBody) {  // over the cap: refuse before buffering
       writeAnswer(c, uvBuildHead(413, {}, 0, false, 0), false, true);
       return;
@@ -764,14 +830,8 @@ void UvReactor::processConn(Conn* c) {
     // streamBody route: dispatch the head now and stream the body (Content-
     // Length or chunked) to the handler as it arrives.
     if (clen > 0 || chunked) {
-      std::string spath = head.target;
-      std::string squery;
-      const size_t sq = spath.find('?');
-      if (sq != std::string::npos) { squery = spath.substr(sq + 1); spath = spath.substr(0, sq); }
-      if (spath.empty()) spath = "/";
-      MatchResult sm = match(head.method, head.customMethod, spath);
-      if (sm.matched && sm.route.streamBody &&
-          !(sm.route.maxBodyBytes >= 0 && clen > sm.route.maxBodyBytes)) {
+      if (m.matched && m.route.streamBody &&
+          !(m.route.maxBodyBytes >= 0 && clen > m.route.maxBodyBytes)) {
         const int64_t reqId = nextReqId_.fetch_add(1);
         int loopIdx = 0;
         for (size_t i = 0; i < loops_.size(); i++)
@@ -787,16 +847,16 @@ void UvReactor::processConn(Conn* c) {
         c->busy = true;
         c->reqIdInFlight = reqId;
         const int64_t timeoutMs =
-            sm.route.timeoutMs >= 0 ? sm.route.timeoutMs : cfg_.defaultTimeoutMs;
+            m.route.timeoutMs >= 0 ? m.route.timeoutMs : cfg_.defaultTimeoutMs;
         if (timeoutMs > 0) {
           c->reqDeadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
           c->hasDeadline = true;
         }
         Emitter* em = nextEmitter();
         if (em)
-          em->emitHead(reqId, head.method, head.customMethod, spath, squery,
+          em->emitHead(reqId, head.method, head.customMethod, path, query,
                        head.headers, clen, /*hasBody=*/true,
-                       /*bodyComplete=*/false, sm.route.pattern, sm.params);
+                       /*bodyComplete=*/false, m.route.pattern, m.params);
         c->streamingBody = true;
         c->streamChunked = chunked;
         c->streamReqId = reqId;
@@ -815,8 +875,12 @@ void UvReactor::processConn(Conn* c) {
       size_t end = 0;
       const int r = decodeChunked(c->buf, headEnd + 4, maxBody, bodyBytes, end);
       if (r == 0) return;  // await the rest of the chunked body
-      if (r == -1) {       // malformed or too large
+      if (r == -1) {       // malformed framing
         writeAnswer(c, uvBuildHead(400, {}, 0, false, 0), false, true);
+        return;
+      }
+      if (r == -2) {       // body (or its framing) over the cap
+        writeAnswer(c, uvBuildHead(413, {}, 0, false, 0), false, true);
         return;
       }
       reqEnd = end;
@@ -827,19 +891,12 @@ void UvReactor::processConn(Conn* c) {
       if (clen > 0) bodyBytes = c->buf.substr(headEnd + 4, (size_t)clen);
     }
 
-    std::string path = head.target;
-    std::string query;
-    const size_t q = path.find('?');
-    if (q != std::string::npos) { query = path.substr(q + 1); path = path.substr(0, q); }
-    if (path.empty()) path = "/";
-
     const bool underBudget =
         cfg_.maxRequestsPerConn <= 0 || c->served + 1 < cfg_.maxRequestsPerConn;
     const bool keepAlive = uvClientWantsKeepAlive(head) &&
                            cfg_.keepAliveTimeoutMs > 0 && !draining_.load() &&
                            underBudget;
     const int64_t kaSecs = (cfg_.keepAliveTimeoutMs + 999) / 1000;
-    MatchResult m = match(head.method, head.customMethod, path);
     c->buf.erase(0, reqEnd);  // consume this request
     c->lastActive = Clock::now();
 
@@ -855,6 +912,20 @@ void UvReactor::processConn(Conn* c) {
       continue;
     }
     if (m.route.isWebSocket) {
+      // A non-upgrade request on a WS route is 426, not dispatched to the
+      // handshake (which would misreport a missing key as 400).
+      if (!wsUpgrade) {
+        writeAnswer(c, uvErrorResponse(426, "websocket not supported",
+                                       {{"Sec-WebSocket-Version", "13"}}),
+                    false, true);
+        continue;
+      }
+      // An upgrade must carry no body and no trailing bytes: pipelined or
+      // smuggled data after the handshake head is a framing error (400).
+      if (!bodyBytes.empty() || !c->buf.empty()) {
+        writeAnswer(c, uvBuildHead(400, {}, 0, false, 0), false, true);
+        return;
+      }
       wsHandshake(c, head, m, path, query);
       return;  // upgraded (or refused + closed); never serves HTTP again
     }
@@ -865,18 +936,15 @@ void UvReactor::processConn(Conn* c) {
                   false, true);
       continue;
     }
-    // Per-route body cap (may be below the server cap): 413.
-    if (m.route.maxBodyBytes >= 0 &&
-        (int64_t)bodyBytes.size() > m.route.maxBodyBytes) {
-      writeAnswer(c, uvBuildHead(413, {}, 0, false, 0), false, true);
-      return;
-    }
     if (m.route.staticResponse) {
       const StaticResponse& sr = *m.route.staticResponse;
+      // A fixed route has no reader for a request body: if one came with the
+      // request, answer then close so the read bytes can't confuse framing.
+      const bool ka = keepAlive && bodyBytes.empty();
       std::string out = uvBuildHead(sr.status, sr.headers,
-                                  (int64_t)sr.body.size(), keepAlive, kaSecs);
+                                  (int64_t)sr.body.size(), ka, kaSecs);
       if (head.method != Method::Head) out.append(sr.body);
-      writeAnswer(c, std::move(out), keepAlive, true);
+      writeAnswer(c, std::move(out), ka, true);
       continue;
     }
     // Handler route: dispatch to Dart, one in flight, answered via respond().
@@ -928,9 +996,15 @@ void UvReactor::writeAnswer(Conn* c, std::string bytes, bool keepAlive,
   std::string* payload;
 #ifdef NITRO_SERVER_TLS
   if (c->ssl) {
-    // Encrypt the plaintext; the memory write-BIO is unbounded, so SSL_write
-    // consumes it all and the ciphertext is what goes on the wire.
-    if (!bytes.empty()) SSL_write(c->ssl, bytes.data(), (int)bytes.size());
+    // Encrypt the plaintext. SSL_MODE_ENABLE_PARTIAL_WRITE means SSL_write can
+    // return after a single record (~16 KiB), so loop until it is all in; the
+    // memory write-BIO is unbounded, so the ciphertext then drains in full.
+    size_t off = 0;
+    while (off < bytes.size()) {
+      const int w = SSL_write(c->ssl, bytes.data() + off, (int)(bytes.size() - off));
+      if (w <= 0) break;
+      off += (size_t)w;
+    }
     payload = new std::string(tlsDrain(c));
   } else
 #endif
@@ -955,7 +1029,12 @@ void UvReactor::writeAnswer(Conn* c, std::string bytes, bool keepAlive,
 void UvReactor::writeRaw(Conn* c, std::string bytes) {
 #ifdef NITRO_SERVER_TLS
   if (c->ssl) {
-    if (!bytes.empty()) SSL_write(c->ssl, bytes.data(), (int)bytes.size());
+    size_t off = 0;  // partial-write mode: loop until all plaintext is in
+    while (off < bytes.size()) {
+      const int w = SSL_write(c->ssl, bytes.data() + off, (int)(bytes.size() - off));
+      if (w <= 0) break;
+      off += (size_t)w;
+    }
     bytes = tlsDrain(c);
   }
 #endif
@@ -1231,11 +1310,12 @@ void UvReactor::wsHandshake(Conn* c, const ParsedHead& head,
     return;
   }
   // Subprotocol negotiation: pick the first the route accepts that the client
-  // offered. A route that lists protocols but matches none refuses with 400.
+  // offered. A client that offers protocols none of which overlap is refused
+  // with 400; a client that offers none upgrades unselected (no header back).
   std::string protocol;
   if (!m.route.wsProtocols.empty()) {
     const Header* offer = uvFindHeader(head.headers, "sec-websocket-protocol");
-    if (offer) {
+    if (offer && !uvTrim(offer->value).empty()) {
       for (const std::string& want : m.route.wsProtocols) {
         // The offer is comma-separated; match on a trimmed token.
         size_t b = 0;
@@ -1248,10 +1328,10 @@ void UvReactor::wsHandshake(Conn* c, const ParsedHead& head,
         }
         if (!protocol.empty()) break;
       }
-    }
-    if (protocol.empty()) {
-      writeAnswer(c, uvBuildHead(400, {}, 0, false, 0), false, true);
-      return;
+      if (protocol.empty()) {  // offered, but nothing the route accepts
+        writeAnswer(c, uvBuildHead(400, {}, 0, false, 0), false, true);
+        return;
+      }
     }
   }
   // permessage-deflate (no context takeover): the Dart runner does the actual
@@ -1308,6 +1388,13 @@ void UvReactor::wsProcess(Conn* c) {
     if (!ws::parseHeader((const uint8_t*)c->buf.data(), c->buf.size(), h,
                          /*allowRsv1=*/c->deflate))
       return;  // header not fully buffered yet
+    // A data frame whose declared length alone exceeds the message cap is
+    // judged here, before waiting for a payload that may never arrive.
+    const int64_t maxMsg = cfg_.maxBodyBytes > 0 ? cfg_.maxBodyBytes : (10 << 20);
+    if (!ws::isControl(h.opcode) && (int64_t)h.length > maxMsg) {
+      wsCloseConn(c, 1009);
+      return;
+    }
     if (c->buf.size() < h.headerSize + h.length) return;  // payload incomplete
     // Unmask the payload in place into a local buffer.
     std::string payload(c->buf.data() + h.headerSize, (size_t)h.length);
@@ -1330,15 +1417,33 @@ void UvReactor::wsProcess(Conn* c) {
       wsCloseConn(c, code);  // emits the close to the runner + echoes the frame
       return;
     }
-    // Data frame: reassemble across fragments.
+    // Data frame or continuation: reassemble across fragments (RFC 6455 §5.4).
     if (h.opcode == ws::kText || h.opcode == ws::kBinary) {
+      if (c->wsMsgOpcode >= 0) {  // a new message before the previous one's FIN
+        wsCloseConn(c, 1002);
+        return;
+      }
       c->wsMsgOpcode = h.opcode;
       c->wsMsgCompressed = h.rsv1;  // deflate marker rides on the first frame
       c->wsMsg = std::move(payload);
     } else {  // continuation
+      if (c->wsMsgOpcode < 0) {  // a continuation with nothing to continue
+        wsCloseConn(c, 1002);
+        return;
+      }
       c->wsMsg.append(payload);
     }
+    if ((int64_t)c->wsMsg.size() > maxMsg) {  // fragments summing past the cap
+      wsCloseConn(c, 1009);
+      return;
+    }
     if (h.fin) {
+      // Compressed text is validated after the runner inflates it, not here.
+      if (c->wsMsgOpcode == ws::kText && !c->wsMsgCompressed &&
+          !ws::validUtf8((const uint8_t*)c->wsMsg.data(), c->wsMsg.size())) {
+        wsCloseConn(c, 1007);
+        return;
+      }
       auto* buf = (uint8_t*)std::malloc(c->wsMsg.size() ? c->wsMsg.size() : 1);
       if (buf) {
         if (!c->wsMsg.empty()) std::memcpy(buf, c->wsMsg.data(), c->wsMsg.size());
@@ -1348,6 +1453,8 @@ void UvReactor::wsProcess(Conn* c) {
                                       c->wsMsgOpcode, c->wsMsgCompressed ? 1 : 0);
       }
       c->wsMsg.clear();
+      c->wsMsgOpcode = -1;  // ready for the next message
+      c->wsMsgCompressed = false;
     }
   }
 }

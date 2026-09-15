@@ -13,9 +13,9 @@
 // monotonic id looked up on the loop thread, so a respond that races a close is
 // dropped, never a use-after-free.
 //
-// Stage: HTTP/1.1 request/response + keep-alive + static fast path. Bodies,
-// streaming, WebSocket and TLS migrate next; until parity it is built and
-// tested alongside the live ServerInstance, not wired to the bridge.
+// This is the engine: HTTP/1.1 request/response, keep-alive, the static fast
+// path, request bodies (Content-Length + chunked), streaming responses,
+// WebSocket (permessage-deflate) and TLS all run here, wired to the bridge.
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma once
 
@@ -33,9 +33,9 @@
 #include <vector>
 
 #include "Common.h"
+#include "EngineTypes.h"     // Emitter, ServerConfig, StatusResult, ParsedHead
 #include "PendingTable.h"    // payload lifecycle (trackPayload / ack)
 #include "Router.h"
-#include "ServerInstance.h"  // Emitter, ServerConfig, StatusResult
 
 namespace nitroserver {
 
@@ -54,7 +54,7 @@ class UvReactor {
   void configure(const ServerConfig& cfg) { cfg_ = cfg; }
   StatusResult registerRoute(const RouteEntry& e);
   StatusResult registerStaticRoute(const RouteEntry& e);
-  // Bridge-shaped overloads (mirror ServerInstance) so the reactor is a drop-in.
+  // Bridge-shaped overloads called straight from HybridNitroServer.cpp.
   StatusResult registerRoute(Method method, const std::string& customMethod,
                              const std::string& pattern, int64_t timeoutMs,
                              bool isWebSocket = false, bool streamBody = false,
@@ -207,6 +207,10 @@ class UvReactor {
   std::unordered_map<int64_t, ReqLoc> reqLoc_;
   // WebSocket connId -> loop index, for cross-thread wsSend/wsClose routing.
   std::unordered_map<int64_t, int> wsConnLoop_;
+  // Live connections per remote IP, for maxConnectionsPerIp. Accepts land on
+  // every loop thread, so this shared map is guarded by its own mutex.
+  std::mutex ipMutex_;
+  std::unordered_map<std::string, int64_t> ipCounts_;
 };
 
 }  // namespace nitroserver

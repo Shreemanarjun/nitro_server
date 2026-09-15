@@ -20,10 +20,9 @@ add_executable(nitro_server_engine_tests
   combiner_test.cpp
   engine_units_test.cpp
   wire_test.cpp
-  server_test.cpp
   uv_reactor_test.cpp
   "${CMAKE_CURRENT_SOURCE_DIR}/../../src/engine/Router.cpp"
-  "${CMAKE_CURRENT_SOURCE_DIR}/../../src/engine/ServerInstance.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../src/engine/HttpParse.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../src/engine/EngineRegistry.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../src/engine/UvReactor.cpp"
 )

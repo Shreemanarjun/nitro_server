@@ -4,7 +4,8 @@
 // This file is deliberately thin. It does exactly four things:
 //
 //   1. Registers a typed factory so each Dart-side instance key produces its
-//      own C++ object with a `shared_ptr<ServerInstance>` (`engine` / `s:<id>`).
+//      own C++ object with a `shared_ptr<Engine>` (the libuv reactor;
+//      `engine` / `s:<id>`).
 //   2. Binds a `BridgeEmitter` that posts request dispatch into the
 //      instance-partitioned Nitro streams. The engine never touches the
 //      generated class; it goes through `Emitter` instead, which also keeps
@@ -33,7 +34,7 @@
 #include "engine/Combiner.h"
 #include "engine/Common.h"
 #include "engine/EngineRegistry.h"
-#include "engine/ServerInstance.h"
+#include "engine/EngineTypes.h"
 #include "engine/Wire.h"
 
 namespace {
@@ -115,7 +116,7 @@ class BridgeEmitter final : public Emitter {
 
   void emitBodyError(int64_t requestId, uint8_t* payload, size_t n,
                      ErrorKind kind) override {
-    // Tracked by ServerInstance before this call, so the runner's cumulative
+    // Tracked by the engine before this call, so the runner's cumulative
     // ack frees it — no leak, no race. The end marker follows immediately.
     RawBodyChunk chunk;
     chunk.bytes = payload;
@@ -128,7 +129,7 @@ class BridgeEmitter final : public Emitter {
 
   void emitWsMessage(int64_t connectionId, uint8_t* payload, size_t n,
                      int opcode, int code) override {
-    // Same ownership as body chunks: tracked by ServerInstance, freed by
+    // Same ownership as body chunks: tracked by the engine, freed by
     // the runner's cumulative ackBody(connectionId, …).
     RawWsMessage msg;
     msg.payload = payload;

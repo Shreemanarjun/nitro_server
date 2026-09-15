@@ -1,9 +1,9 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // nitro_server — shared engine types.
 //
-// Everything here is transport-independent: the day the accept loop moves to
-// oat++'s HttpConnectionHandler, this file, Router and PendingTable move over
-// unchanged. Only ServerInstance (sockets + threads) is transport.
+// Everything here is transport-independent: this file, Router and PendingTable
+// are shared unchanged by the libuv reactor (UvReactor). Only the reactor
+// itself (sockets + event loops) is transport.
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma once
 

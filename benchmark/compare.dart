@@ -447,6 +447,46 @@ ServerSetup _nitroSetup(bool batchEvents) {
   };
 }
 
+/// Builds and starts the Go net/http side (compare_go_server.go) as a child
+/// process, returning its process + bound port. Returns null when Go is not
+/// installed or the source is missing, so the run proceeds with the three
+/// Dart sides. Go is excluded from the WebSocket cases (no stdlib WS).
+Future<({Process proc, int port})?> _startGoServer(bool batchEvents) async {
+  const src = 'benchmark/compare_go_server.go';
+  if (!File(src).existsSync()) return null;
+  final bin = '${Directory.systemTemp.path}/compare_go_server';
+  try {
+    final build = await Process.run('go', ['build', '-o', bin, src]);
+    if (build.exitCode != 0) {
+      stderr.writeln('go build failed: ${build.stderr}');
+      return null;
+    }
+  } on ProcessException {
+    return null; // Go not on PATH: skip the side rather than fail the run.
+  }
+  final proc = await Process.start(bin, [
+    if (batchEvents) '--batch-events',
+  ]);
+  final portCompleter = Completer<int>();
+  final sub = const LineSplitter()
+      .bind(utf8.decoder.bind(proc.stdout))
+      .listen((line) {
+        final m = RegExp(r'LISTENING (\d+)').firstMatch(line);
+        if (m != null && !portCompleter.isCompleted) {
+          portCompleter.complete(int.parse(m.group(1)!));
+        }
+      });
+  unawaited(proc.stderr.drain<void>());
+  final port = await portCompleter.future
+      .timeout(const Duration(seconds: 10), onTimeout: () => -1);
+  await sub.cancel();
+  if (port < 0) {
+    proc.kill();
+    return null;
+  }
+  return (proc: proc, port: port);
+}
+
 Future<NitroServer> _startNitroServer() async {
   // Without `--keep-alive` every response carries `Connection: close`,
   // matching the dart:io and shelf servers below. (The engine default
@@ -1175,11 +1215,13 @@ Future<void> main(List<String> args) async {
         );
   final shelfServer = await _startShelfServer();
   final nitroServer = await _startNitroServer();
+  final goServer = await _startGoServer(_batchEvents);
 
   final sides = <(String, int)>[
     ('dart:io', dartServer.port),
     ('shelf  ', shelfServer.port),
     ('nitro  ', nitroServer.port),
+    if (goServer != null) ('go     ', goServer.port),
   ];
   final cases = <(String, String, int)>[
     for (final opKey in _ops.keys)
@@ -1188,7 +1230,9 @@ Future<void> main(List<String> args) async {
     for (final opKey in _wsCases.keys)
       if (only == null || opKey == only)
         for (final (side, port) in sides)
-          if (!side.startsWith('shelf')) ('$side $opKey', opKey, port),
+          // shelf and Go have no WebSocket side here.
+          if (!side.startsWith('shelf') && !side.startsWith('go'))
+            ('$side $opKey', opKey, port),
   ];
 
   final jsonCases = <Map<String, Object?>>[];
@@ -1241,6 +1285,7 @@ Future<void> main(List<String> args) async {
   }
   await shelfServer.close(force: true);
   await nitroServer.close();
+  goServer?.proc.kill();
   print(
     'Load: $connections connections / $clients client isolates, '
     '${millis ~/ 1000} s per case. Sequential: harness ~2 s per case, '

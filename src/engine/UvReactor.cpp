@@ -273,9 +273,14 @@ struct UvReactor::Conn {
   bool continueSent = false;   // sent 100 Continue for the current request
   // streamBody: the head dispatched, body bytes streamed as they arrive.
   bool streamingBody = false;
+  bool streamChunked = false;  // body is chunked (decode incrementally)
   int64_t streamReqId = 0;
   Emitter* streamEmitter = nullptr;
-  int64_t bodyRemaining = 0;  // Content-Length bytes still to stream
+  int64_t bodyRemaining = 0;    // Content-Length bytes still to stream
+  int64_t chunkRemaining = 0;   // bytes left in the current chunk (chunked)
+  bool chunkNeedCrlf = false;   // consume the CRLF after a chunk's data next
+  int64_t writePending = 0;     // bytes queued to the socket, not yet written
+  std::chrono::steady_clock::time_point writeStartedAt;  // oldest pending write
   std::chrono::steady_clock::time_point lastActive;   // idle-timeout anchor
   std::chrono::steady_clock::time_point reqDeadline;  // valid while busy+handler
   bool hasDeadline = false;
@@ -284,7 +289,9 @@ struct UvReactor::Conn {
   Emitter* wsEmitter = nullptr;  // the sink this session's messages go to
   std::string wsMsg;      // reassembly buffer for a fragmented message
   int wsMsgOpcode = 0;    // opcode of the message being reassembled
+  bool wsMsgCompressed = false;  // the message's first frame had RSV1 (deflate)
   bool wsClosing = false;  // a close frame was sent; drop further frames
+  bool deflate = false;    // permessage-deflate negotiated on this session
 #ifdef NITRO_SERVER_TLS
   SSL* ssl = nullptr;        // null on a plaintext connection
   BIO* rbio = nullptr;       // ciphertext in  (socket → SSL)
@@ -610,7 +617,8 @@ void UvReactor::readCb(uv_stream_t* s, ssize_t nread, const uv_buf_t* b) {
 #endif
   c->buf.append(b->base, (size_t)nread);
   if (c->streamingBody) {
-    c->lp->owner->emitStreamBytes(c);
+    if (c->streamChunked) c->lp->owner->emitStreamChunked(c);
+    else c->lp->owner->emitStreamBytes(c);
   } else if (c->ws) {
     c->lp->owner->wsProcess(c);
   } else {
@@ -636,6 +644,71 @@ void UvReactor::emitStreamBytes(Conn* c) {
   if (c->bodyRemaining == 0) {
     if (c->streamEmitter) c->streamEmitter->emitBodyEnd(c->streamReqId);
     c->streamingBody = false;  // stays busy until respond() lands
+  }
+}
+
+// Loop thread: incrementally decode a chunked streamBody upload, streaming
+// partial chunk data as it arrives (a chunk may be larger than one read) and
+// ending on the terminal 0-chunk. chunkRemaining/chunkNeedCrlf persist across
+// reads.
+void UvReactor::emitStreamChunked(Conn* c) {
+  std::string out;
+  bool done = false, malformed = false;
+  while (true) {
+    if (c->chunkNeedCrlf) {  // trailing CRLF after a chunk's data
+      if (c->buf.size() < 2) break;
+      c->buf.erase(0, 2);
+      c->chunkNeedCrlf = false;
+    }
+    if (c->chunkRemaining == 0) {  // read the next size line
+      const size_t eol = c->buf.find("\r\n");
+      if (eol == std::string::npos) break;
+      char* endp = nullptr;
+      const long sz = std::strtol(c->buf.c_str(), &endp, 16);
+      if (endp == c->buf.c_str() || sz < 0) { malformed = true; break; }
+      if (sz == 0) {  // terminal: consume the size line + trailers to a blank line
+        size_t t = eol + 2;
+        bool ok = false;
+        while (true) {
+          const size_t e2 = c->buf.find("\r\n", t);
+          if (e2 == std::string::npos) break;
+          if (e2 == t) { c->buf.erase(0, t + 2); ok = true; break; }
+          t = e2 + 2;
+        }
+        if (ok) done = true;
+        break;
+      }
+      c->buf.erase(0, eol + 2);  // consume the size line
+      c->chunkRemaining = sz;
+    }
+    if (c->chunkRemaining > 0) {  // stream whatever chunk data is buffered
+      const size_t take =
+          std::min<size_t>(c->buf.size(), (size_t)c->chunkRemaining);
+      if (take == 0) break;
+      out.append(c->buf, 0, take);
+      c->buf.erase(0, take);
+      c->chunkRemaining -= (int64_t)take;
+      if (c->chunkRemaining == 0) c->chunkNeedCrlf = true;
+    }
+  }
+  if (malformed) {
+    c->streamingBody = false;
+    c->closing = true;
+    if (!uv_is_closing((uv_handle_t*)&c->handle))
+      uv_close((uv_handle_t*)&c->handle, &UvReactor::onCloseConn);
+    return;
+  }
+  if (!out.empty() && c->streamEmitter) {
+    auto* payload = (uint8_t*)std::malloc(out.size());
+    if (payload) {
+      std::memcpy(payload, out.data(), out.size());
+      pending_.trackPayload(c->streamReqId, payload);
+      c->streamEmitter->emitBodyData(c->streamReqId, payload, out.size());
+    }
+  }
+  if (done) {
+    if (c->streamEmitter) c->streamEmitter->emitBodyEnd(c->streamReqId);
+    c->streamingBody = false;
   }
 }
 
@@ -688,9 +761,9 @@ void UvReactor::processConn(Conn* c) {
       c->continueSent = true;
     }
 
-    // streamBody route with a Content-Length body: dispatch the head now and
-    // stream the body to the handler chunk by chunk as it arrives.
-    if (clen > 0 && !chunked) {
+    // streamBody route: dispatch the head now and stream the body (Content-
+    // Length or chunked) to the handler as it arrives.
+    if (clen > 0 || chunked) {
       std::string spath = head.target;
       std::string squery;
       const size_t sq = spath.find('?');
@@ -725,12 +798,13 @@ void UvReactor::processConn(Conn* c) {
                        head.headers, clen, /*hasBody=*/true,
                        /*bodyComplete=*/false, sm.route.pattern, sm.params);
         c->streamingBody = true;
+        c->streamChunked = chunked;
         c->streamReqId = reqId;
         c->streamEmitter = em;
-        c->bodyRemaining = clen;
+        c->bodyRemaining = chunked ? 0 : clen;
         c->buf.erase(0, headEnd + 4);  // drop the head; the rest is body
         c->lastActive = Clock::now();
-        emitStreamBytes(c);  // stream whatever body is already buffered
+        if (chunked) emitStreamChunked(c); else emitStreamBytes(c);
         return;
       }
     }
@@ -851,24 +925,30 @@ void UvReactor::processConn(Conn* c) {
 void UvReactor::writeAnswer(Conn* c, std::string bytes, bool keepAlive,
                             bool finish) {
   c->busy = true;
+  std::string* payload;
 #ifdef NITRO_SERVER_TLS
   if (c->ssl) {
     // Encrypt the plaintext; the memory write-BIO is unbounded, so SSL_write
     // consumes it all and the ciphertext is what goes on the wire.
     if (!bytes.empty()) SSL_write(c->ssl, bytes.data(), (int)bytes.size());
-    auto* payload = new std::string(tlsDrain(c));
-    auto* req = new uv_write_t;
-    req->data = new WriteCtx{c, payload, keepAlive, finish};
-    uv_buf_t buf = uv_buf_init((char*)payload->data(), (unsigned)payload->size());
-    uv_write(req, (uv_stream_t*)&c->handle, &buf, 1, &UvReactor::onWrite);
-    return;
-  }
+    payload = new std::string(tlsDrain(c));
+  } else
 #endif
-  auto* payload = new std::string(std::move(bytes));
+  {
+    payload = new std::string(std::move(bytes));
+  }
+  if (c->writePending == 0) c->writeStartedAt = Clock::now();
+  c->writePending += (int64_t)payload->size();
   auto* req = new uv_write_t;
   req->data = new WriteCtx{c, payload, keepAlive, finish};
   uv_buf_t buf = uv_buf_init((char*)payload->data(), (unsigned)payload->size());
   uv_write(req, (uv_stream_t*)&c->handle, &buf, 1, &UvReactor::onWrite);
+  // A WebSocket session that outruns its reader past the buffer cap is closed
+  // with 1009 (message too big / backpressure).
+  if (c->ws && !c->wsClosing && cfg_.wsMaxBufferBytes > 0 &&
+      c->writePending > cfg_.wsMaxBufferBytes) {
+    wsCloseConn(c, 1009);
+  }
 }
 
 // Loop thread: write bytes without changing request state (finish=false).
@@ -881,6 +961,8 @@ void UvReactor::writeRaw(Conn* c, std::string bytes) {
 #endif
   if (bytes.empty()) return;
   auto* payload = new std::string(std::move(bytes));
+  if (c->writePending == 0) c->writeStartedAt = Clock::now();
+  c->writePending += (int64_t)payload->size();
   auto* req = new uv_write_t;
   req->data = new WriteCtx{c, payload, true, /*finish=*/false};
   uv_buf_t buf = uv_buf_init((char*)payload->data(), (unsigned)payload->size());
@@ -892,6 +974,8 @@ void UvReactor::onWrite(uv_write_t* req, int status) {
   Conn* c = ctx->c;
   const bool keepAlive = ctx->keepAlive;
   const bool finish = ctx->finish;
+  c->writePending -= (int64_t)ctx->payload->size();
+  if (c->writePending < 0) c->writePending = 0;
   delete ctx->payload;
   delete ctx;
   delete req;
@@ -1051,9 +1135,21 @@ void UvReactor::onSweep(uv_timer_t* timer) {
   const auto now = Clock::now();
   std::vector<Conn*> idle;
   std::vector<int64_t> timedOut;  // reqIds whose handler missed its deadline
+  const int64_t writeMs =
+      self->cfg_.writeTimeoutMs > 0 ? self->cfg_.writeTimeoutMs : 30000;
   for (auto& kv : lp->conns) {
     Conn* c = kv.second;
     if (c->closing) continue;
+    // A peer that stopped reading: its write has been pending too long.
+    if (c->writePending > 0 &&
+        now - c->writeStartedAt >= std::chrono::milliseconds(writeMs)) {
+      c->closing = true;
+      self->broadcastEvent(ServerEventKind::ClientError, c->id,
+                           "write timed out");
+      if (!uv_is_closing((uv_handle_t*)&c->handle))
+        uv_close((uv_handle_t*)&c->handle, &UvReactor::onCloseConn);
+      continue;
+    }
     if (c->busy) {
       if (c->hasDeadline && now >= c->reqDeadline && c->reqIdInFlight >= 0)
         timedOut.push_back(c->id);
@@ -1109,7 +1205,11 @@ void UvReactor::wsCloseConn(Conn* c, int code) {
     std::lock_guard<std::mutex> lk(reqMutex_);
     wsConnLoop_.erase(c->id);
   }
-  uint8_t cc[2] = {(uint8_t)((code >> 8) & 0xff), (uint8_t)(code & 0xff)};
+  // Tell the runner the session closed with [code] so session.closeCode
+  // resolves (a server-initiated 1002/1009 as well as a client close echo).
+  if (c->wsEmitter) c->wsEmitter->emitWsMessage(c->id, nullptr, 0, ws::kClose, code);
+  const int wire = code == 1005 ? 1000 : code;  // 1005 is not a wire code
+  uint8_t cc[2] = {(uint8_t)((wire >> 8) & 0xff), (uint8_t)(wire & 0xff)};
   std::vector<uint8_t> frame;
   ws::encodeFrame(ws::kClose, cc, 2, true, frame);
   writeAnswer(c, std::string(frame.begin(), frame.end()), /*keepAlive=*/false,
@@ -1154,10 +1254,18 @@ void UvReactor::wsHandshake(Conn* c, const ParsedHead& head,
       return;
     }
   }
+  // permessage-deflate (no context takeover): the Dart runner does the actual
+  // deflate/inflate; the engine only negotiates it and moves the RSV1 bit.
+  const Header* ext = uvFindHeader(head.headers, "sec-websocket-extensions");
+  c->deflate = cfg_.wsCompression && ext &&
+               ext->value.find("permessage-deflate") != std::string::npos;
   const std::string accept = ws::acceptKey(key->value);
   std::string shake =
       "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
       "Connection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n";
+  if (c->deflate)
+    shake += "Sec-WebSocket-Extensions: permessage-deflate; "
+             "server_no_context_takeover; client_no_context_takeover\r\n";
   if (!protocol.empty())
     shake += "Sec-WebSocket-Protocol: " + protocol + "\r\n";
   shake += "\r\n";
@@ -1187,7 +1295,8 @@ void UvReactor::wsProcess(Conn* c) {
     if (c->buf.size() < 2) return;  // header incomplete
     const uint8_t b0 = (uint8_t)c->buf[0];
     const int opcode = b0 & 0x0f;
-    const bool badRsv = (b0 & 0x70) != 0;  // no extensions negotiated
+    // RSV1 is a valid data-frame bit when permessage-deflate is negotiated.
+    const bool badRsv = c->deflate ? ((b0 & 0x30) != 0) : ((b0 & 0x70) != 0);
     const bool badOp = opcode != 0 && opcode != 1 && opcode != 2 &&
                        opcode != 8 && opcode != 9 && opcode != 0xA;
     const bool masked = (c->buf[1] & 0x80) != 0;
@@ -1196,7 +1305,8 @@ void UvReactor::wsProcess(Conn* c) {
       return;
     }
     ws::FrameHeader h;
-    if (!ws::parseHeader((const uint8_t*)c->buf.data(), c->buf.size(), h))
+    if (!ws::parseHeader((const uint8_t*)c->buf.data(), c->buf.size(), h,
+                         /*allowRsv1=*/c->deflate))
       return;  // header not fully buffered yet
     if (c->buf.size() < h.headerSize + h.length) return;  // payload incomplete
     // Unmask the payload in place into a local buffer.
@@ -1217,13 +1327,13 @@ void UvReactor::wsProcess(Conn* c) {
       int code = 1005;
       if (payload.size() >= 2)
         code = ((uint8_t)payload[0] << 8) | (uint8_t)payload[1];
-      if (c->wsEmitter) c->wsEmitter->emitWsMessage(c->id, nullptr, 0, ws::kClose, code);
-      wsCloseConn(c, code == 1005 ? 1000 : code);
+      wsCloseConn(c, code);  // emits the close to the runner + echoes the frame
       return;
     }
     // Data frame: reassemble across fragments.
     if (h.opcode == ws::kText || h.opcode == ws::kBinary) {
       c->wsMsgOpcode = h.opcode;
+      c->wsMsgCompressed = h.rsv1;  // deflate marker rides on the first frame
       c->wsMsg = std::move(payload);
     } else {  // continuation
       c->wsMsg.append(payload);
@@ -1233,7 +1343,9 @@ void UvReactor::wsProcess(Conn* c) {
       if (buf) {
         if (!c->wsMsg.empty()) std::memcpy(buf, c->wsMsg.data(), c->wsMsg.size());
         pending_.trackPayload(c->id, buf);
-        if (c->wsEmitter)          c->wsEmitter->emitWsMessage(c->id, buf, c->wsMsg.size(), c->wsMsgOpcode, 0);
+        if (c->wsEmitter)
+          c->wsEmitter->emitWsMessage(c->id, buf, c->wsMsg.size(),
+                                      c->wsMsgOpcode, c->wsMsgCompressed ? 1 : 0);
       }
       c->wsMsg.clear();
     }
@@ -1242,7 +1354,6 @@ void UvReactor::wsProcess(Conn* c) {
 
 int64_t UvReactor::wsSend(int64_t connId, const uint8_t* payload, size_t n,
                           bool binary, bool compressed) {
-  (void)compressed;  // permessage-deflate not negotiated yet
   int loopIdx;
   {
     std::lock_guard<std::mutex> lk(reqMutex_);
@@ -1252,6 +1363,7 @@ int64_t UvReactor::wsSend(int64_t connId, const uint8_t* payload, size_t n,
   }
   std::vector<uint8_t> frame;
   ws::encodeFrame(binary ? ws::kBinary : ws::kText, payload, n, true, frame);
+  if (compressed) frame[0] |= 0x40;  // RSV1: the runner already deflated
   Loop* lp = loops_[(size_t)loopIdx].get();
   {
     std::lock_guard<std::mutex> lk(lp->qMutex);
@@ -1412,7 +1524,7 @@ void UvReactor::tlsOnRead(Conn* c, const char* data, size_t n) {
     c->buf.append(plain, (size_t)r);
   tlsRawWrite(c, tlsDrain(c));  // anything SSL_read produced
   if (c->streamingBody) {
-    emitStreamBytes(c);
+    if (c->streamChunked) emitStreamChunked(c); else emitStreamBytes(c);
   } else if (c->ws) {
     wsProcess(c);
   } else {

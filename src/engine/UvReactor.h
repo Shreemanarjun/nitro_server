@@ -155,7 +155,8 @@ class UvReactor {
   static void onCloseConn(uv_handle_t* h);
   void runLoop(Loop* lp);
   void processConn(Conn* c);            // parse + dispatch complete requests
-  void emitStreamBytes(Conn* c);        // stream a streamBody upload chunk-wise
+  void emitStreamBytes(Conn* c);        // stream a Content-Length streamBody
+  void emitStreamChunked(Conn* c);      // stream a chunked streamBody
   void wsProcess(Conn* c);              // decode WebSocket frames (loop thread)
   void wsCloseConn(Conn* c, int code);  // send a close frame + close (loop thread)
 #ifdef NITRO_SERVER_TLS

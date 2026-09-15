@@ -203,17 +203,32 @@ live connection count, so a low-load server is unaffected:
 | 256 | ~94k  | ~115k | ~135k |
 | 512 | ~94k  | ~106k | ~137k |
 
-Raising the cap recovered ~90% of Go at 256 connections, up from ~70%. The
-residual gap and the dip past a few hundred connections are the I/O model:
-nitro pins a worker per active connection (it cooperatively yields *idle*
-keep-alive fds, but a queued one is only watched once a worker picks it up and
-blocks in `poll` on that one fd), whereas Go's netpoller watches every
-connection with one `epoll`/`kqueue` and dispatches only ready ones to a small
-thread set. Fully closing it needs a central readiness poller in the engine
-(replacing the blind ready-queue) — the C10k lever. Profiling confirmed the
+Raising the cap recovered ~90% of Go at 256 connections, up from ~70%. But
+past a few hundred connections nitro still dips — it pins a worker per active
+connection (it cooperatively yields *idle* keep-alive fds, but a queued one is
+only watched once a worker picks it up and blocks in `poll` on that one fd),
+whereas Go's netpoller watches every connection with one `epoll`/`kqueue` and
+dispatches only ready ones to a small thread set. Profiling confirmed the
 locus: at load the worker threads sit in `poll` inside `recvWait`, not in
-parsing, routing or the write path. Real-work routes (`/file`, large JSON,
-WebSocket) are unaffected — the engine's I/O dominates there, which is where
+parsing, routing or the write path.
+
+Fully closing it needs a central readiness poller — a reactor. A **libuv
+spike** (`benchmark/experiments/uv_reactor_spike.c`: N event loops over
+`SO_REUSEPORT`, the fixed-response shape a libuv-backed engine would take)
+measured the ceiling on the same box and loadgen:
+
+| connections | nitro `/static` (cap 512) | Go net/http | libuv reactor (spike) |
+|-------------|--------------------------:|------------:|----------------------:|
+| 64   | ~119k | ~129k | ~147k |
+| 256  | ~115k | ~135k | ~145k |
+| 512  | ~106k | ~137k | ~145k |
+| 1024 | ~70k  | ~133k | ~143k |
+
+The reactor holds **flat above Go** where thread-per-connection collapses
+(nitro ~70k at 1024 vs libuv ~143k) — validation for building the engine's I/O
+core on libuv (keeping the Dart dispatch layer, parser, WebSocket and TLS),
+`io_uring` on Linux included. Real-work routes (`/file`, large JSON, WebSocket)
+are unaffected by the model — the engine's I/O dominates there, which is where
 nitro already leads.
 
 WebSocket echo (keep-alive, one message per round trip; shelf has no

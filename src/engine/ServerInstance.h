@@ -54,8 +54,10 @@ struct ServerConfig {
   int64_t keepAliveTimeoutMs = 5000;
   int64_t maxRequestsPerConn = 100;
   /// Cap on the worker pool. The pool starts at min(cores, cap) threads
-  /// and grows on demand up to the cap; idle workers above the floor retire
-  /// after 10 s. `<= 0` means max(64, 4 × CPU cores).
+  /// and grows on demand up to the cap (self-limiting to the live connection
+  /// count); idle workers above the floor retire after 10 s. The cap is what
+  /// bounds concurrency: with more live keep-alive connections than the cap,
+  /// the surplus queue and throughput dips. `<= 0` means max(512, 32 × cores).
   int64_t workerThreads = 0;
   int64_t maxConnections = 0;      // <= 0: unlimited.
   int64_t maxConnectionsPerIp = 0;  // <= 0: unlimited.

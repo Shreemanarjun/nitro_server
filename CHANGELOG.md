@@ -19,6 +19,13 @@ Initial release.
   cached bodies. `getStatic` is the GET shorthand; `staticRoute` takes any
   method (custom included). See `benchmark/README.md`.
 * Per-route `timeout`, `maxBodyBytes`, `middleware`, `streamBody`.
+* Worker-pool cap default raised to `max(512, 32 × cores)` (was
+  `max(64, 4 × cores)`). The pool grows on demand and self-limits to the live
+  connection count, so low-load servers are unaffected, but high-concurrency
+  servers no longer queue behind a too-small cap: on an 8-core box, `/static`
+  held ~115k req/s at 256 connections (was ~94k) and ~106k at 512 — ~90% of Go
+  `net/http`, up from ~70%. A central readiness poller (reactor) remains the
+  C10k upgrade path. See `benchmark/README.md`.
 * `ServerConfig`: `maxBodyBytes`, `keepAliveTimeout`,
   `maxRequestsPerConnection`, `headerTimeout`, `writeTimeout`,
   `maxConnections`, `maxConnectionsPerIp`, `workerThreads`, `isolates`,

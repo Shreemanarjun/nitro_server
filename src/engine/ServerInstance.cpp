@@ -1051,12 +1051,19 @@ StatusResult ServerInstance::start() {
   // connections on 16 workers). The pool therefore auto-scales: it starts
   // at one thread per core and grows on demand up to the cap, retiring
   // idle threads above the floor so a quiet server holds few threads.
-  // ponytail: thread-per-connection caps out around a few hundred live
-  // connections; a poller-driven reactor is the upgrade path.
+  //
+  // The cap is what caps concurrency: growth stops there, so with more live
+  // keep-alive connections than the cap the surplus wait in the queue and
+  // throughput dips (measured on an 8-core box, /static: cap 64 held 118k at
+  // 64 connections but fell to 94k at 256; a cap of 512 held 121k at 256 and
+  // 110k at 512 — ~90% of Go net/http, up from ~70%). Growth is on demand and
+  // self-limits to the live connection count, so a high cap costs a low-load
+  // server nothing. ponytail: thread-per-connection still caps out at a few
+  // hundred live connections; a poller-driven reactor is the C10k upgrade path.
   const unsigned cores = std::thread::hardware_concurrency();
   const unsigned effectiveCores = cores == 0 ? 8u : cores;
   const unsigned cap = cfg.workerThreads > 0 ? (unsigned)cfg.workerThreads
-                                             : std::max(64u, effectiveCores * 4);
+                                             : std::max(512u, effectiveCores * 32);
   {
     auto self = shared_from_this();
     std::lock_guard<std::mutex> lk(acceptMutex_);

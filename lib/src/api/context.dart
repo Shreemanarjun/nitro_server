@@ -83,8 +83,11 @@ class ServerConfig {
   final int maxRequestsPerConnection;
 
   /// Cap on the native worker pool. The pool starts at one thread per CPU
-  /// core and grows on demand up to this cap (idle threads above the floor
-  /// retire after 10 s). `0` means `max(64, 4 × cores)`.
+  /// core and grows on demand up to this cap — self-limiting to the live
+  /// connection count — while idle threads above the floor retire after 10 s.
+  /// The cap bounds concurrency: with more live keep-alive connections than
+  /// the cap, the surplus queue and throughput dips, so raise it for
+  /// high-concurrency servers. `0` means `max(512, 32 × cores)`.
   final int workerThreads;
 
   /// Dart isolates running handlers behind this server. `1` (default) runs

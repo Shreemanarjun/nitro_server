@@ -13,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -94,9 +95,16 @@ class PumpEmitter final : public Emitter {
             ids_.pop_front();
           }
         }
+        std::string reply;
+        if (id >= 0) {
+          std::lock_guard<std::mutex> lk(m_);
+          auto it = bodies_.find(id);
+          reply = it != bodies_.end() && !it->second.empty() ? it->second : body_;
+          bodies_.erase(id);
+        }
         if (id >= 0) {
           reactor_->respond(id, 200, {{"Content-Type", "text/plain"}},
-                            (const uint8_t*)body_.data(), body_.size());
+                            (const uint8_t*)reply.data(), reply.size());
         } else {
           std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
@@ -114,7 +122,11 @@ class PumpEmitter final : public Emitter {
     ids_.push_back(id);
     lastPath_ = path;
   }
-  void emitBodyData(int64_t, uint8_t*, size_t) override {}
+  // Copy the body for echo; the engine owns the payload (freed on ack/stop).
+  void emitBodyData(int64_t id, uint8_t* payload, size_t n) override {
+    std::lock_guard<std::mutex> lk(m_);
+    bodies_[id].append((const char*)payload, n);
+  }
   void emitBodyEnd(int64_t) override {}
   void emitBodyError(int64_t, uint8_t*, size_t, ErrorKind) override {}
   void emitWsMessage(int64_t, uint8_t*, size_t, int, int) override {}
@@ -127,6 +139,7 @@ class PumpEmitter final : public Emitter {
   std::atomic<bool> running_{true};
   std::mutex m_;
   std::deque<int64_t> ids_;
+  std::map<int64_t, std::string> bodies_;
   std::string lastPath_;
 };
 
@@ -210,6 +223,47 @@ TEST(UvReactorTest, HandlerRouteRoundTripsThroughRespond) {
   close(fd);
   EXPECT_EQ(statusOf(r), 200);
   EXPECT_EQ(bodyOf(r), "handled");
+}
+
+TEST(UvReactorTest, PostBodyReachesTheHandlerAndEchoesBack) {
+  Fixture f;
+  ASSERT_EQ((int64_t)f.reactor.registerRoute(httpRoute(Method::Post, "/echo")).kind,
+            (int64_t)ErrorKind::None);
+  f.start();
+
+  const std::string payload = "the quick brown fox";
+  const int fd = connectTo(f.port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "POST /echo HTTP/1.1\r\nHost: x\r\nConnection: close\r\n"
+              "Content-Length: " + std::to_string(payload.size()) + "\r\n\r\n" +
+              payload);
+  std::string r;
+  char buf[512];
+  ssize_t n;
+  while ((n = recv(fd, buf, sizeof(buf), 0)) > 0) r.append(buf, (size_t)n);
+  close(fd);
+  EXPECT_EQ(statusOf(r), 200);
+  EXPECT_EQ(bodyOf(r), payload);  // the handler echoed the request body
+}
+
+TEST(UvReactorTest, OversizeBodyIs413) {
+  Fixture f;
+  ServerConfig cfg;
+  cfg.port = 0;
+  cfg.keepAliveTimeoutMs = 5000;
+  cfg.maxBodyBytes = 8;
+  f.reactor.configure(cfg);
+  ASSERT_EQ((int64_t)f.reactor.registerRoute(httpRoute(Method::Post, "/up")).kind,
+            (int64_t)ErrorKind::None);
+  // start() is called by Fixture normally, but we reconfigured — start directly.
+  ASSERT_EQ((int64_t)f.reactor.start(2).kind, (int64_t)ErrorKind::None);
+  f.port = (int)f.reactor.boundPort();
+  ASSERT_GT(f.port, 0);
+  const int fd = connectTo(f.port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n");
+  EXPECT_EQ(statusOf(readHead(fd)), 413);
+  close(fd);
 }
 
 TEST(UvReactorTest, UnroutedPathIs404) {

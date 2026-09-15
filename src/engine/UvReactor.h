@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "Common.h"
+#include "PendingTable.h"    // payload lifecycle (trackPayload / ack)
 #include "Router.h"
 #include "ServerInstance.h"  // Emitter, ServerConfig, StatusResult
 
@@ -58,6 +59,10 @@ class UvReactor {
   /// Answers request [id] from any thread. No-op if the connection is gone.
   void respond(int64_t id, int64_t status, const std::vector<Header>& headers,
                const uint8_t* body, size_t bodyLen);
+
+  /// Releases body-chunk payloads with sequence < [ackedChunks] (the runner's
+  /// cumulative ack). Frees native memory; safe from any thread.
+  void ackBody(int64_t id, int64_t ackedChunks) { pending_.ack(id, ackedChunks); }
 
  private:
   struct Conn;
@@ -117,6 +122,7 @@ class UvReactor {
   std::atomic<int64_t> nextConnId_{1};
   std::atomic<bool> running_{false};
   std::vector<std::unique_ptr<Loop>> loops_;
+  PendingTable pending_;  // body-chunk payload logs (freed on ack / stop)
 
   // reqId -> where to send the answer. Guarded (respond is cross-thread).
   std::mutex reqMutex_;

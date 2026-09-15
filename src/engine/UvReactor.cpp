@@ -235,12 +235,22 @@ void UvReactor::processConn(Conn* c) {
       writeAnswer(c, uvBuildHead(400, {}, 0, false, 0), false);
       return;
     }
-    // Body (Content-Length only for now): wait until fully buffered, then skip
-    // it. Streaming bodies to Dart migrate in the next stage.
+    // Body: Content-Length is read whole into the connection buffer, then
+    // emitted as one inline chunk (the common POST). Chunked and true streaming
+    // uploads migrate in a later stage.
     int64_t clen = 0;
     if (const Header* cl = uvFindHeader(head.headers, "content-length"))
       clen = std::strtoll(cl->value.c_str(), nullptr, 10);
-    const size_t reqEnd = headEnd + 4 + (clen > 0 ? (size_t)clen : 0);
+    if (clen < 0) {  // malformed Content-Length
+      writeAnswer(c, uvBuildHead(400, {}, 0, false, 0), false);
+      return;
+    }
+    const int64_t maxBody = cfg_.maxBodyBytes > 0 ? cfg_.maxBodyBytes : (10 << 20);
+    if (clen > maxBody) {  // over the cap: refuse before buffering the rest
+      writeAnswer(c, uvBuildHead(413, {}, 0, false, 0), false);
+      return;
+    }
+    const size_t reqEnd = headEnd + 4 + (size_t)clen;
     if (c->buf.size() < reqEnd) return;  // await the rest of the body
 
     std::string path = head.target;
@@ -252,6 +262,9 @@ void UvReactor::processConn(Conn* c) {
     const bool keepAlive = uvClientWantsKeepAlive(head) && cfg_.keepAliveTimeoutMs > 0;
     const int64_t kaSecs = (cfg_.keepAliveTimeoutMs + 999) / 1000;
     MatchResult m = match(head.method, head.customMethod, path);
+    // Capture the body before consuming the request from the buffer.
+    std::string bodyBytes = clen > 0 ? c->buf.substr(headEnd + 4, (size_t)clen)
+                                     : std::string();
     c->buf.erase(0, reqEnd);  // consume this request
 
     if (!m.matched) {
@@ -277,8 +290,19 @@ void UvReactor::processConn(Conn* c) {
     }
     c->busy = true;
     if (emitter_) {
+      const bool hasBody = !bodyBytes.empty();
+      if (hasBody) {
+        // Inline body: the chunk is tracked and emitted first, then the
+        // complete head — the runner assembles them (chunks may precede heads).
+        auto* payload = (uint8_t*)std::malloc(bodyBytes.size());
+        if (payload) {
+          std::memcpy(payload, bodyBytes.data(), bodyBytes.size());
+          pending_.trackPayload(reqId, payload);
+          emitter_->emitBodyData(reqId, payload, bodyBytes.size());
+        }
+      }
       emitter_->emitHead(reqId, head.method, head.customMethod, path, query,
-                         head.headers, 0, false, true, m.route.pattern,
+                         head.headers, clen, hasBody, true, m.route.pattern,
                          m.params);
     }
     return;  // wait for respond()
@@ -388,6 +412,9 @@ void UvReactor::stop() {
     uv_loop_close(&lp->loop);
   }
   loops_.clear();
+  // Loop threads are gone; free any body-chunk payloads the runner never
+  // acked (frees leak-free in production, where ackBody would have).
+  pending_.abortAll();
 }
 
 }  // namespace nitroserver

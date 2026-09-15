@@ -4,3 +4,4 @@
 #include "Router.cpp"
 #include "ServerInstance.cpp"
 #include "EngineRegistry.cpp"
+#include "UvReactor.cpp"  // compiles to nothing unless NITRO_SERVER_LIBUV

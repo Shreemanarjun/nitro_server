@@ -79,6 +79,7 @@ set(NITRO_SERVER_ENGINE_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/engine/Router.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/engine/ServerInstance.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/engine/EngineRegistry.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/engine/UvReactor.cpp"
 )
 
 function(nitro_server_attach_engine target)

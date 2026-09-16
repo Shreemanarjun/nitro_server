@@ -2430,7 +2430,15 @@ struct TlsClient {
       memcpy(p + 1, alpn, strlen(alpn));
       SSL_set_alpn_protos(ssl, p, (unsigned)strlen(alpn) + 1);
     }
-    return SSL_connect(ssl) == 1;
+    const int rc = SSL_connect(ssl);
+    if (rc != 1) {
+      const int se = SSL_get_error(ssl, rc);
+      char eb[256] = {0};
+      ERR_error_string_n(ERR_get_error(), eb, sizeof(eb));
+      fprintf(stderr, "[TLSDBG] client SSL_connect rc=%d ssl_err=%d %s\n", rc,
+              se, eb);
+    }
+    return rc == 1;
   }
   bool write(const std::string& s) {
     return SSL_write(ssl, s.data(), (int)s.size()) == (int)s.size();

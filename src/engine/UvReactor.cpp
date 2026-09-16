@@ -1657,6 +1657,10 @@ void UvReactor::tlsOnRead(Conn* c, const char* data, size_t n) {
     if (r != 1) {
       const int e = SSL_get_error(c->ssl, r);
       if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE) {
+        char eb[256] = {0};
+        ERR_error_string_n(ERR_get_error(), eb, sizeof(eb));
+        fprintf(stderr, "[TLSDBG] server SSL_accept r=%d ssl_err=%d %s\n", r, e,
+                eb);
         c->closing = true;
         if (!uv_is_closing((uv_handle_t*)&c->handle))
           uv_close((uv_handle_t*)&c->handle, &UvReactor::onCloseConn);

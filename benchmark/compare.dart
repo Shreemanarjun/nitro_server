@@ -531,6 +531,52 @@ Future<({Process proc, int port})?> _startGoServer(
   return (proc: proc, port: port);
 }
 
+/// Starts the Node.js http side (compare_node_server.js) as a child process,
+/// returning its process + bound port. Returns null when Node is not installed
+/// or the source is missing, so the run proceeds without it. Node is excluded
+/// from the WebSocket cases (no stdlib WS), exactly as shelf and Go are.
+///
+/// [procs] pins Node's cluster-worker count to the Dart sides' isolate/core
+/// budget, mirroring Go's GOMAXPROCS, so a CPU case like `/work` is a
+/// same-budget comparison instead of a single event loop against a core pool.
+Future<({Process proc, int port})?> _startNodeServer(
+  bool batchEvents,
+  int procs,
+) async {
+  const src = 'benchmark/compare_node_server.js';
+  if (!File(src).existsSync()) return null;
+  final Process proc;
+  try {
+    proc = await Process.start(
+      'node',
+      [src, if (batchEvents) '--batch-events'],
+      environment: {'NODE_PROCS': '$procs'},
+    );
+  } on ProcessException {
+    return null; // Node not on PATH: skip the side rather than fail the run.
+  }
+  final portCompleter = Completer<int>();
+  final sub = const LineSplitter().bind(utf8.decoder.bind(proc.stdout)).listen((
+    line,
+  ) {
+    final m = RegExp(r'LISTENING (\d+)').firstMatch(line);
+    if (m != null && !portCompleter.isCompleted) {
+      portCompleter.complete(int.parse(m.group(1)!));
+    }
+  });
+  unawaited(proc.stderr.drain<void>());
+  final port = await portCompleter.future.timeout(
+    const Duration(seconds: 10),
+    onTimeout: () => -1,
+  );
+  await sub.cancel();
+  if (port < 0) {
+    proc.kill();
+    return null;
+  }
+  return (proc: proc, port: port);
+}
+
 Future<NitroServer> _startNitroServer() async {
   // Without `--keep-alive` every response carries `Connection: close`,
   // matching the dart:io and shelf servers below. (The engine default
@@ -1264,12 +1310,17 @@ Future<void> main(List<String> args) async {
   // an equal CPU budget (e.g. matching nitro's isolate count on `/work`).
   final goProcs = _flagInt(args, '--go-procs', Platform.numberOfProcessors);
   final goServer = await _startGoServer(_batchEvents, goProcs);
+  // Node forks NODE_PROCS cluster workers, pinned like Go's GOMAXPROCS so the
+  // /work CPU case is an equal-budget comparison. `--node-procs N` overrides.
+  final nodeProcs = _flagInt(args, '--node-procs', Platform.numberOfProcessors);
+  final nodeServer = await _startNodeServer(_batchEvents, nodeProcs);
 
   final sides = <(String, int)>[
     ('dart:io', dartServer.port),
     ('shelf  ', shelfServer.port),
     ('nitro  ', nitroServer.port),
     if (goServer != null) ('go     ', goServer.port),
+    if (nodeServer != null) ('node   ', nodeServer.port),
   ];
   final cases = <(String, String, int)>[
     for (final opKey in _ops.keys)
@@ -1278,8 +1329,10 @@ Future<void> main(List<String> args) async {
     for (final opKey in _wsCases.keys)
       if (only == null || opKey == only)
         for (final (side, port) in sides)
-          // shelf and Go have no WebSocket side here.
-          if (!side.startsWith('shelf') && !side.startsWith('go'))
+          // shelf, Go and Node have no WebSocket side here.
+          if (!side.startsWith('shelf') &&
+              !side.startsWith('go') &&
+              !side.startsWith('node'))
             ('$side $opKey', opKey, port),
   ];
 
@@ -1334,6 +1387,7 @@ Future<void> main(List<String> args) async {
   await shelfServer.close(force: true);
   await nitroServer.close();
   goServer?.proc.kill();
+  nodeServer?.proc.kill();
   print(
     'Load: $connections connections / $clients client isolates, '
     '${millis ~/ 1000} s per case. Sequential: harness ~2 s per case, '

@@ -37,6 +37,16 @@ void main() {
       expect(utf8.decode(gzip.decode(res.body)), big);
     });
 
+    test('honours a custom compression level (round-trips)', () async {
+      // Repetitive-but-varied body so a higher level can compress tighter.
+      final body = List.generate(400, (i) => 'row $i: item-$i\n').join();
+      await client.server.use(compress(level: 9));
+      await client.server.get('/t', (_) => ResponseContext.text(body));
+      final res = await client.get('/t', headers: {'accept-encoding': 'gzip'});
+      expect(res.headers['content-encoding'], 'gzip');
+      expect(utf8.decode(gzip.decode(res.body)), body);
+    });
+
     test(
       'leaves small, opaque, pre-encoded and unaccepting answers alone',
       () async {

@@ -2491,6 +2491,25 @@ inline int sslReadRetry(SSL* ssl, void* buf, int len) {
   }
 }
 
+// SSL_connect that retries a transient WANT_READ/WANT_WRITE the same way. On
+// GHA-x86 a blocking SSL_connect can hand back WANT_READ before the server's
+// handshake flight has arrived; the naive `== 1` check treated that as a
+// failed handshake and the client FIN'd mid-handshake. Loop until the
+// handshake completes or a 5s deadline. Returns 1 on success, else <= 0.
+inline int sslConnectRetry(SSL* ssl) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  for (;;) {
+    const int rc = SSL_connect(ssl);
+    if (rc == 1) return 1;
+    const int e = SSL_get_error(ssl, rc);
+    if ((e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) &&
+        std::chrono::steady_clock::now() < deadline)
+      continue;  // handshake needs more bytes — keep driving it
+    return rc;    // real handshake failure
+  }
+}
+
 // A blocking OpenSSL client for the tests: connect, handshake, then plain
 // SSL_read/SSL_write with a receive timeout so a hung server fails the test
 // instead of wedging it.
@@ -2513,7 +2532,7 @@ struct TlsClient {
       memcpy(p + 1, alpn, strlen(alpn));
       SSL_set_alpn_protos(ssl, p, (unsigned)strlen(alpn) + 1);
     }
-    return SSL_connect(ssl) == 1;
+    return sslConnectRetry(ssl) == 1;
   }
   bool write(const std::string& s) {
     return SSL_write(ssl, s.data(), (int)s.size()) == (int)s.size();
@@ -2596,7 +2615,7 @@ TEST(TlsTest, ForcedTls13KeepAliveExchange) {
   SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
   SSL* ssl = SSL_new(ctx);
   SSL_set_fd(ssl, fd);
-  ASSERT_EQ(SSL_connect(ssl), 1);
+  ASSERT_EQ(sslConnectRetry(ssl), 1);
   EXPECT_STREQ(SSL_get_version(ssl), "TLSv1.3");
   for (int i = 0; i < 3; i++) {
     const std::string req = "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n";

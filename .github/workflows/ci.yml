@@ -85,3 +85,20 @@ jobs:
       - run: cmake --build build/lib --parallel
       - run: mkdir -p build/benchmark && dart compile exe benchmark/compare.dart -o build/benchmark/compare
       - run: ./build/benchmark/compare --quick --keep-alive
+
+  # Windows uses a single libuv listener (no SO_REUSEPORT). This job proves the
+  # engine compiles and links on Windows/MSVC; the gtest suite is a POSIX-socket
+  # harness and does not run here.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libuv + OpenSSL (vcpkg)
+        run: vcpkg install libuv openssl --triplet x64-windows
+      - name: Configure
+        run: >
+          cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          -DVCPKG_TARGET_TRIPLET=x64-windows
+      - name: Build
+        run: cmake --build build/lib --config Release

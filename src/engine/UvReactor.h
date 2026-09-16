@@ -153,6 +153,11 @@ class UvReactor {
   static void readCb(uv_stream_t* s, ssize_t nread, const uv_buf_t* b);
   static void onWrite(uv_write_t* req, int status);
   static void onCloseConn(uv_handle_t* h);
+  static void onShutdown(uv_shutdown_t* req, int status);
+  // Flush the send buffer and send FIN before closing, so a peer with unread
+  // bytes doesn't make the OS reset the connection and discard the response
+  // (TCP RST on close with unread data — strict on Linux, lenient on macOS).
+  void closeGracefully(Conn* c);
   void runLoop(Loop* lp);
   void processConn(Conn* c);            // parse + dispatch complete requests
   void emitStreamBytes(Conn* c);        // stream a Content-Length streamBody

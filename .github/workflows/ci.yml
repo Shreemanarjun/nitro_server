@@ -27,7 +27,7 @@ jobs:
       - run: dart format --output=none --set-exit-if-changed lib test benchmark tool
       - run: cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release -DNITRO_SERVER_BUILD_TESTS=ON
       - run: cmake --build build/lib --parallel
-      - run: ./build/lib/nitro_server_tests/nitro_server_engine_tests
+      - run: ./build/lib/nitro_server_tests/nitro_server_engine_tests --gtest_filter='TlsTest.ServesARequestOverTls' --gtest_repeat=6
       - run: bash tool/coverage.sh
         env:
           NITRO_TLS_DEBUG: '1'

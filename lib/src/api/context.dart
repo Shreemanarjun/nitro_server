@@ -468,8 +468,9 @@ class ResponseContext {
     int status = 200,
     Map<String, String> headers = const {},
   }) {
-    final encoded = JsonUtf8Encoder().convert(data);
-    final bytes = encoded is Uint8List ? encoded : Uint8List.fromList(encoded);
+    // JsonUtf8Encoder.convert always returns a Uint8List (a byte view over its
+    // encoded output); the cast keeps it zero-copy and avoids a dead branch.
+    final bytes = JsonUtf8Encoder().convert(data) as Uint8List;
     return ResponseContext(
       status: status,
       headers: {'content-type': 'application/json; charset=utf-8', ...headers},

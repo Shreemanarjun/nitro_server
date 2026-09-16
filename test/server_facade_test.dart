@@ -475,6 +475,46 @@ void main() {
       expect(fake.acked.where((a) => a.$1 == 41), [(41, 1)]);
     });
 
+    test('a body error after a buffered head drops without dispatch', () async {
+      var calls = 0;
+      final runner = ServerRunner(fake);
+      addTearDown(runner.close);
+      runner.addRoute(HttpMethod.post, '', '/perr', null, (_) async {
+        calls++;
+        return const ResponseContext();
+      });
+      await pump();
+      // Head first, non-stream, body still incoming: the request parks
+      // (pending, not complete, not a stream) awaiting its body.
+      fake.heads.add(
+        fakeHead(
+          requestId: 42,
+          method: RawServerMethod.post,
+          path: '/perr',
+          hasBody: true,
+          contentLength: 5,
+          routePattern: '/perr',
+        ),
+      );
+      await pump();
+      expect(runner.pendingIdsForTesting, {42});
+      // A terminal body error lands before the end marker (the engine already
+      // answered directly, e.g. 413): the parked handler is dropped, never run.
+      fake.chunks.add(
+        RawBodyChunk(
+          bytes: Uint8List.fromList('too large'.codeUnits),
+          requestId: 42,
+          kind: RawBodyKind.error.index,
+          aux: 0,
+        ),
+      );
+      fake.chunks.add(fakeEnd(42));
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(calls, 0);
+      expect(fake.responded.where((r) => r.requestId == 42), isEmpty);
+      expect(runner.pendingIdsForTesting, isEmpty);
+    });
+
     test('orphan chunks are bounded', () async {
       final runner = ServerRunner(fake);
       addTearDown(runner.close);

@@ -15,7 +15,11 @@ Future<void> main(List<String> args) async {
     ServerConfig(maxRequestsPerConnection: 0, isolates: n),
     (s) async {
       await s.get('/hello', (_) => ResponseContext.text('hello'));
-      await s.getStatic('/static', 'hello'.codeUnits, contentType: 'text/plain');
+      await s.getStatic(
+        '/static',
+        'hello'.codeUnits,
+        contentType: 'text/plain',
+      );
     },
   );
   print('LISTENING ${server.port}');

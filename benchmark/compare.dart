@@ -480,17 +480,19 @@ Future<({Process proc, int port})?> _startGoServer(
     environment: {'GOMAXPROCS': '$gomaxprocs'},
   );
   final portCompleter = Completer<int>();
-  final sub = const LineSplitter()
-      .bind(utf8.decoder.bind(proc.stdout))
-      .listen((line) {
-        final m = RegExp(r'LISTENING (\d+)').firstMatch(line);
-        if (m != null && !portCompleter.isCompleted) {
-          portCompleter.complete(int.parse(m.group(1)!));
-        }
-      });
+  final sub = const LineSplitter().bind(utf8.decoder.bind(proc.stdout)).listen((
+    line,
+  ) {
+    final m = RegExp(r'LISTENING (\d+)').firstMatch(line);
+    if (m != null && !portCompleter.isCompleted) {
+      portCompleter.complete(int.parse(m.group(1)!));
+    }
+  });
   unawaited(proc.stderr.drain<void>());
-  final port = await portCompleter.future
-      .timeout(const Duration(seconds: 10), onTimeout: () => -1);
+  final port = await portCompleter.future.timeout(
+    const Duration(seconds: 10),
+    onTimeout: () => -1,
+  );
   await sub.cancel();
   if (port < 0) {
     proc.kill();

@@ -639,11 +639,7 @@ void UvReactor::onCloseConn(uv_handle_t* h) {
     }
   }
 #ifdef NITRO_SERVER_TLS
-  if (c->ssl) {
-    fprintf(stderr, "[TLSDBG] close served=%lld busy=%d writePending=%lld\n",
-            (long long)c->served, c->busy ? 1 : 0, (long long)c->writePending);
-    SSL_free(c->ssl);  // frees the attached rbio + wbio too
-  }
+  if (c->ssl) SSL_free(c->ssl);  // frees the attached rbio + wbio too
 #endif
   delete c;
 }
@@ -680,10 +676,6 @@ void UvReactor::readCb(uv_stream_t* s, ssize_t nread, const uv_buf_t* b) {
     bool tls = false;
 #ifdef NITRO_SERVER_TLS
     tls = c->ssl != nullptr;
-    if (tls)
-      fprintf(stderr, "[TLSDBG] readCb nread=%zd (%s) busy=%d served=%lld\n",
-              nread, uv_err_name((int)nread), c->busy ? 1 : 0,
-              (long long)c->served);
 #endif
     if (!c->busy && !c->ws && !c->closing && !tls &&
         c->buf.find("\r\n\r\n") != std::string::npos) {
@@ -1033,20 +1025,12 @@ void UvReactor::writeAnswer(Conn* c, std::string bytes, bool keepAlive,
     // return after a single record (~16 KiB), so loop until it is all in; the
     // memory write-BIO is unbounded, so the ciphertext then drains in full.
     size_t off = 0;
-    int lastw = 0, lasterr = 0;
     while (off < bytes.size()) {
       const int w = SSL_write(c->ssl, bytes.data() + off, (int)(bytes.size() - off));
-      lastw = w;
-      if (w <= 0) { lasterr = SSL_get_error(c->ssl, w); break; }
+      if (w <= 0) break;
       off += (size_t)w;
     }
-    std::string drained = tlsDrain(c);
-    fprintf(stderr,
-            "[TLSDBG] writeAnswer plain=%zu off=%zu lastw=%d sslerr=%d "
-            "cipher=%zu hs=%d finish=%d ka=%d\n",
-            bytes.size(), off, lastw, lasterr, drained.size(),
-            c->tlsHandshakeDone ? 1 : 0, finish ? 1 : 0, keepAlive ? 1 : 0);
-    payload = new std::string(std::move(drained));
+    payload = new std::string(tlsDrain(c));
   } else
 #endif
   {
@@ -1666,21 +1650,13 @@ void UvReactor::tlsRawWrite(Conn* c, std::string cipher) {
 // Loop thread: feed ciphertext into the SSL engine, drive the handshake, then
 // decrypt application data into the plaintext buffer and process it.
 void UvReactor::tlsOnRead(Conn* c, const char* data, size_t n) {
-  const int bw = BIO_write(c->rbio, data, (int)n);
+  BIO_write(c->rbio, data, (int)n);
   if (!c->tlsHandshakeDone) {
     const int r = SSL_accept(c->ssl);
     const int e = (r == 1) ? 0 : SSL_get_error(c->ssl, r);
-    std::string flight = tlsDrain(c);
-    fprintf(stderr,
-            "[TLSDBG] tlsOnRead in=%zu bw=%d SSL_accept r=%d ssl_err=%d "
-            "flight=%zu\n",
-            n, bw, r, e, flight.size());
-    tlsRawWrite(c, std::move(flight));  // ServerHello / handshake flight
+    tlsRawWrite(c, tlsDrain(c));  // ServerHello / handshake flight
     if (r != 1) {
       if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE) {
-        char eb[256] = {0};
-        ERR_error_string_n(ERR_get_error(), eb, sizeof(eb));
-        fprintf(stderr, "[TLSDBG] SSL_accept fatal ssl_err=%d %s\n", e, eb);
         c->closing = true;
         if (!uv_is_closing((uv_handle_t*)&c->handle))
           uv_close((uv_handle_t*)&c->handle, &UvReactor::onCloseConn);

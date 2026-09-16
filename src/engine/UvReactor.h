@@ -158,6 +158,8 @@ class UvReactor {
   // bytes doesn't make the OS reset the connection and discard the response
   // (TCP RST on close with unread data — strict on Linux, lenient on macOS).
   void closeGracefully(Conn* c);
+  // Release a connection's admission accounting (liveConns_ + per-IP). Idempotent.
+  void releaseAdmission(Conn* c);
   void runLoop(Loop* lp);
   void processConn(Conn* c);            // parse + dispatch complete requests
   void emitStreamBytes(Conn* c);        // stream a Content-Length streamBody

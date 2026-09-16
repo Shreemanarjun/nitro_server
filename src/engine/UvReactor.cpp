@@ -279,6 +279,7 @@ struct UvReactor::Conn {
   bool busy = false;  // a request is awaiting its answer (ordered per conn)
   bool closing = false;
   bool shuttingDown = false;  // a graceful uv_shutdown is already in flight
+  bool peerHalfClosed = false;  // read EOF (peer FIN) while a request was busy
   bool counted = false;    // admitted: liveConns_ (+ per-IP) incremented for it
   std::string peerIp;      // remote IP, for the per-IP cap (empty = not counted)
   int64_t served = 0;  // completed requests (header vs keep-alive timeout)
@@ -618,18 +619,28 @@ void UvReactor::allocCb(uv_handle_t* h, size_t suggested, uv_buf_t* b) {
   *b = uv_buf_init(scratch.data(), (unsigned)scratch.size());
 }
 
+// Release a connection's admission accounting (global + per-IP). Idempotent:
+// clears the markers so a later onCloseConn won't double-release. Called early
+// when a peer half-closes, and again at teardown.
+void UvReactor::releaseAdmission(Conn* c) {
+  if (c->counted) {
+    liveConns_.fetch_sub(1);
+    c->counted = false;
+  }
+  if (!c->peerIp.empty()) {
+    std::lock_guard<std::mutex> lk(ipMutex_);
+    auto it = ipCounts_.find(c->peerIp);
+    if (it != ipCounts_.end() && --it->second <= 0) ipCounts_.erase(it);
+    c->peerIp.clear();
+  }
+}
+
 void UvReactor::onCloseConn(uv_handle_t* h) {
   Conn* c = (Conn*)h;
   if (c->lp) {
     UvReactor* self = c->lp->owner;
     c->lp->conns.erase(c->id);
-    if (c->counted) self->liveConns_.fetch_sub(1);  // only if admitted
-    if (!c->peerIp.empty()) {                        // release the per-IP slot
-      std::lock_guard<std::mutex> lk(self->ipMutex_);
-      auto it = self->ipCounts_.find(c->peerIp);
-      if (it != self->ipCounts_.end() && --it->second <= 0)
-        self->ipCounts_.erase(it);
-    }
+    self->releaseAdmission(c);  // global + per-IP (no-op if already released)
     if (c->ws) {
       {
         std::lock_guard<std::mutex> lk(self->reqMutex_);
@@ -680,6 +691,21 @@ void UvReactor::readCb(uv_stream_t* s, ssize_t nread, const uv_buf_t* b) {
     if (!c->busy && !c->ws && !c->closing && !tls &&
         c->buf.find("\r\n\r\n") != std::string::npos) {
       c->lp->owner->writeAnswer(c, uvBuildHead(400, {}, 0, false, 0), false, true);
+      return;
+    }
+    // Peer half-closed (FIN) while a request is dispatched and awaiting its
+    // answer. TCP half-close leaves our write side open, so the pending
+    // response must still be delivered — closing now would drop it (the
+    // reported Linux flake). Stop reading and let onWrite close once the
+    // answer lands (or the request deadline / write timeout reaps it).
+    if (c->busy && !c->streamingBody && !c->ws && !c->closing &&
+        !c->peerHalfClosed && !uv_is_closing((uv_handle_t*)s)) {
+      c->peerHalfClosed = true;
+      uv_read_stop(s);
+      // The peer is done sending: release its admission slot now so an
+      // abandoned request can't pin a connection / per-IP slot until its
+      // deadline. The handle stays open so the in-flight response still goes.
+      c->lp->owner->releaseAdmission(c);
       return;
     }
     c->closing = true;
@@ -1096,9 +1122,11 @@ void UvReactor::onWrite(uv_write_t* req, int status) {
   c->reqIdInFlight = -1;
   c->continueSent = false;
   c->lastActive = Clock::now();
-  if (!keepAlive || c->closing) {
+  if (!keepAlive || c->closing || c->peerHalfClosed) {
     // The response is written; close the write side gracefully so the peer's
-    // unread bytes can't turn this into a reset that drops the response.
+    // unread bytes can't turn this into a reset that drops the response. A peer
+    // that already half-closed (FIN) will send no further requests, so a
+    // keep-alive answer to it is also the last.
     c->lp->owner->closeGracefully(c);
     return;
   }

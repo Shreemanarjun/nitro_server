@@ -2470,6 +2470,27 @@ TEST(UvReactorTest, StreamEndsWithAnEmptyLastChunk) {
 #ifdef NITRO_SERVER_TLS
 // ── TLS ───────────────────────────────────────────────────────────────────
 
+// SSL_read that retries a transient WANT_READ/WANT_WRITE instead of treating
+// it as failure. A non-application TLS record — or an application record split
+// across TCP segments, which happens on Linux loopback but rarely on macOS —
+// makes a blocking SSL_read hand back WANT_READ; a real client loops on it.
+// Bounded by a 5s wall-clock deadline so a genuinely hung server still fails
+// the test instead of wedging it. Returns like SSL_read (>0 data, <=0 the
+// real EOF/close/error once retries are exhausted).
+inline int sslReadRetry(SSL* ssl, void* buf, int len) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  for (;;) {
+    const int n = SSL_read(ssl, buf, len);
+    if (n > 0) return n;
+    const int e = SSL_get_error(ssl, n);
+    if ((e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) &&
+        std::chrono::steady_clock::now() < deadline)
+      continue;  // the record hasn't fully arrived yet — read again
+    return n;     // real close/EOF/error
+  }
+}
+
 // A blocking OpenSSL client for the tests: connect, handshake, then plain
 // SSL_read/SSL_write with a receive timeout so a hung server fails the test
 // instead of wedging it.
@@ -2503,14 +2524,14 @@ struct TlsClient {
     char buf[4096];
     // Head.
     while (out.find("\r\n\r\n") == std::string::npos) {
-      const int n = SSL_read(ssl, buf, sizeof(buf));
+      const int n = sslReadRetry(ssl, buf, sizeof(buf));
       if (n <= 0) return out;
       out.append(buf, (size_t)n);
     }
     const size_t end = out.find("\r\n\r\n");
     const size_t need = end + 4 + (size_t)atol(headerOf(out, "content-length").c_str());
     while (out.size() < need) {
-      const int n = SSL_read(ssl, buf, sizeof(buf));
+      const int n = sslReadRetry(ssl, buf, sizeof(buf));
       if (n <= 0) break;
       out.append(buf, (size_t)n);
     }
@@ -2583,7 +2604,7 @@ TEST(TlsTest, ForcedTls13KeepAliveExchange) {
     std::string res;
     char b[2048];
     while (res.find("\r\n\r\n") == std::string::npos) {
-      const int n = SSL_read(ssl, b, sizeof(b));
+      const int n = sslReadRetry(ssl, b, sizeof(b));
       if (n <= 0) break;
       res.append(b, (size_t)n);
     }
@@ -2688,7 +2709,7 @@ TEST(TlsTest, WebSocketBothDirectionsOverTls) {
   std::string head;
   char b[1024];
   while (head.find("\r\n\r\n") == std::string::npos) {
-    const int n = SSL_read(c.ssl, b, sizeof(b));
+    const int n = sslReadRetry(c.ssl, b, sizeof(b));
     if (n <= 0) break;
     head.append(b, (size_t)n);
   }
@@ -2715,7 +2736,7 @@ TEST(TlsTest, WebSocketBothDirectionsOverTls) {
   unsigned char rin[8];
   int got = 0;
   while (got < 4) {
-    const int n = SSL_read(c.ssl, rin + got, (int)sizeof(rin) - got);
+    const int n = sslReadRetry(c.ssl, rin + got, (int)sizeof(rin) - got);
     if (n <= 0) break;
     got += n;
   }

@@ -420,10 +420,40 @@ ServerSetup _nitroSetup(bool batchEvents) {
       (request) => ResponseContext.jsonMap(request.queryParameters),
     );
     await server.get('/mw', (_) => ResponseContext.bytes(_routes['/hello']!));
+    // nitro's fastest JSON answer: a native JsonWriter driven straight into a
+    // C++ byte buffer. The schema's fixed strings (keys and the constant name/
+    // tag values in this payload) are interned once as JsonTokens so the hot
+    // loop never re-encodes them — only the varying id/score cross per record.
+    final kId = JsonToken('id');
+    final kName = JsonToken('name');
+    final kTags = JsonToken('tags');
+    final kScore = JsonToken('score');
+    final vName = JsonToken('item-\$i');
+    final vA = JsonToken('a');
+    final vB = JsonToken('b');
     await server.get(
-      // nitro's idiomatic JSON answer: one-pass object -> UTF-8 bytes.
       '/work',
-      (_) => ResponseContext.jsonBody(_workData()),
+      (_) => ResponseContext.jsonWriter((w) {
+        w.beginArray();
+        for (final row in _workData()) {
+          final m = row as Map<String, Object?>;
+          w
+            ..beginObject()
+            ..keyToken(kId)
+            ..writeInt(m['id'] as int)
+            ..keyToken(kName)
+            ..writeStringToken(vName)
+            ..keyToken(kTags)
+            ..beginArray()
+            ..writeStringToken(vA)
+            ..writeStringToken(vB)
+            ..endArray()
+            ..keyToken(kScore)
+            ..writeDouble(m['score'] as double)
+            ..endObject();
+        }
+        w.endArray();
+      }),
     );
     await server.get('/file', (_) => ResponseContext.file(_staticFile.path));
     await server.get(

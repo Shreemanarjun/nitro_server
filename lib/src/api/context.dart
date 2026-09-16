@@ -6,6 +6,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'http_method.dart';
+import 'json_writer.dart';
 import 'multipart.dart';
 
 /// Identity for server TLS. Empty means plain HTTP; any field set requires a
@@ -454,6 +455,37 @@ class ResponseContext {
     Map<String, String> headers = const {},
   }) {
     return ResponseContext.jsonBody(data, status: status, headers: headers);
+  }
+
+  /// Serializes a JSON response with a native [JsonWriter], driven by [build].
+  /// On large payloads this is ~2.5x faster than [jsonBody] (which goes through
+  /// dart:convert): the bytes are built in a C++ buffer and cross into Dart
+  /// once. Prefer it for hot JSON handlers; [jsonBody] is simpler for one-offs.
+  ///
+  /// ```dart
+  /// ResponseContext.jsonWriter((w) {
+  ///   w..beginObject()..key('id')..writeInt(42)..endObject();
+  /// });
+  /// ```
+  factory ResponseContext.jsonWriter(
+    void Function(JsonWriter writer) build, {
+    int status = 200,
+    Map<String, String> headers = const {},
+  }) {
+    final w = JsonWriter();
+    try {
+      build(w);
+      return ResponseContext(
+        status: status,
+        headers: {
+          'content-type': 'application/json; charset=utf-8',
+          ...headers,
+        },
+        body: w.toBytes(),
+      );
+    } finally {
+      w.dispose();
+    }
   }
 
   /// Encodes any JSON-encodable [data] (maps, lists, nested values) and

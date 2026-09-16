@@ -78,6 +78,7 @@ endfunction()
 set(NITRO_SERVER_ENGINE_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/engine/Router.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/engine/HttpParse.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/engine/JsonWriter.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/engine/EngineRegistry.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/engine/UvReactor.cpp"
 )

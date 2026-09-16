@@ -21,8 +21,10 @@ add_executable(nitro_server_engine_tests
   engine_units_test.cpp
   wire_test.cpp
   uv_reactor_test.cpp
+  json_writer_test.cpp
   "${CMAKE_CURRENT_SOURCE_DIR}/../../src/engine/Router.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../src/engine/HttpParse.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../src/engine/JsonWriter.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../src/engine/EngineRegistry.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../src/engine/UvReactor.cpp"
 )

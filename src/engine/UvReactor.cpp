@@ -639,7 +639,11 @@ void UvReactor::onCloseConn(uv_handle_t* h) {
     }
   }
 #ifdef NITRO_SERVER_TLS
-  if (c->ssl) SSL_free(c->ssl);  // frees the attached rbio + wbio too
+  if (c->ssl) {
+    fprintf(stderr, "[TLSDBG] close served=%lld busy=%d writePending=%lld\n",
+            (long long)c->served, c->busy ? 1 : 0, (long long)c->writePending);
+    SSL_free(c->ssl);  // frees the attached rbio + wbio too
+  }
 #endif
   delete c;
 }
@@ -1025,12 +1029,20 @@ void UvReactor::writeAnswer(Conn* c, std::string bytes, bool keepAlive,
     // return after a single record (~16 KiB), so loop until it is all in; the
     // memory write-BIO is unbounded, so the ciphertext then drains in full.
     size_t off = 0;
+    int lastw = 0, lasterr = 0;
     while (off < bytes.size()) {
       const int w = SSL_write(c->ssl, bytes.data() + off, (int)(bytes.size() - off));
-      if (w <= 0) break;
+      lastw = w;
+      if (w <= 0) { lasterr = SSL_get_error(c->ssl, w); break; }
       off += (size_t)w;
     }
-    payload = new std::string(tlsDrain(c));
+    std::string drained = tlsDrain(c);
+    fprintf(stderr,
+            "[TLSDBG] writeAnswer plain=%zu off=%zu lastw=%d sslerr=%d "
+            "cipher=%zu hs=%d finish=%d ka=%d\n",
+            bytes.size(), off, lastw, lasterr, drained.size(),
+            c->tlsHandshakeDone ? 1 : 0, finish ? 1 : 0, keepAlive ? 1 : 0);
+    payload = new std::string(std::move(drained));
   } else
 #endif
   {

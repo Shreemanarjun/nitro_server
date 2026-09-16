@@ -5,7 +5,8 @@ export 'src/api/context.dart';
 export 'src/api/event.dart';
 export 'src/api/exceptions.dart';
 export 'src/api/http_method.dart';
-export 'src/api/json_writer.dart' show JsonToken, JsonWriter;
+export 'src/api/json_writer.dart'
+    show DoubleColumn, IntColumn, JsonColumn, JsonToken, JsonWriter;
 export 'src/api/metrics.dart' show LatencyStats, RouteMetrics, ServerMetrics;
 export 'src/api/middleware.dart';
 export 'src/api/multipart.dart';

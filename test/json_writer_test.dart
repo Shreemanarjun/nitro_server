@@ -183,6 +183,82 @@ void main() {
       expect(got, equals(utf8.encode(jsonEncode(data))));
     });
 
+    test('writeTemplatedArray is byte-identical to jsonEncode', () {
+      final segments = [
+        JsonToken('{"id":'),
+        JsonToken(',"score":'),
+        JsonToken('}'),
+      ];
+      // First call allocates the scratch; the second (smaller) reuses it.
+      for (final rows in [
+        [1, 2, 3],
+        [7],
+      ]) {
+        final ids = Int64List.fromList(rows);
+        final scores = Float64List.fromList([for (final r in rows) r * 1.5]);
+        final got = enc(
+          (w) => w.writeTemplatedArray(segments, [
+            IntColumn(ids),
+            DoubleColumn(scores),
+          ]),
+        );
+        final expected = [
+          for (var i = 0; i < rows.length; i++)
+            {'id': rows[i], 'score': rows[i] * 1.5},
+        ];
+        expect(got, equals(utf8.encode(jsonEncode(expected))));
+      }
+    });
+
+    test('writeTemplatedArray matches the /work shape', () {
+      final segments = [
+        JsonToken('{"id":'),
+        JsonToken(',"name":"item-\$i","tags":["a","b"],"score":'),
+        JsonToken('}'),
+      ];
+      final ids = Int64List.fromList([for (var i = 0; i < 200; i++) i]);
+      final scores = Float64List.fromList([
+        for (var i = 0; i < 200; i++) i * 1.5,
+      ]);
+      final got = enc(
+        (w) => w.writeTemplatedArray(segments, [
+          IntColumn(ids),
+          DoubleColumn(scores),
+        ]),
+      );
+      final expected = [
+        for (var i = 0; i < 200; i++)
+          {
+            'id': i,
+            'name': 'item-\$i',
+            'tags': ['a', 'b'],
+            'score': i * 1.5,
+          },
+      ];
+      expect(got, equals(utf8.encode(jsonEncode(expected))));
+    });
+
+    test('writeTemplatedArray validates segment count and column lengths', () {
+      final w = JsonWriter();
+      // Two columns need three segments.
+      expect(
+        () => w.writeTemplatedArray(
+          [JsonToken('['), JsonToken(']')],
+          [IntColumn(Int64List(1)), DoubleColumn(Float64List(1))],
+        ),
+        throwsArgumentError,
+      );
+      // Columns must be the same length.
+      expect(
+        () => w.writeTemplatedArray(
+          [JsonToken('{"a":'), JsonToken(',"b":'), JsonToken('}')],
+          [IntColumn(Int64List(3)), DoubleColumn(Float64List(2))],
+        ),
+        throwsArgumentError,
+      );
+      w.dispose();
+    });
+
     test('writeRaw injects a pre-encoded fragment verbatim', () {
       expect(enc((w) => w.writeRaw('[1,2,3]')), utf8.encode('[1,2,3]'));
     });

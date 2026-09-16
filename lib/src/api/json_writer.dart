@@ -104,6 +104,27 @@ final class _JwNative {
             Void Function(_Vp, Pointer<Uint8>, Int32),
             void Function(_Vp, Pointer<Uint8>, int)
           >('nitro_server_jw_raw', isLeaf: true),
+      emitTemplate = lib
+          .lookupFunction<
+            Void Function(
+              _Vp,
+              Int32,
+              Int32,
+              Pointer<Pointer<Uint8>>,
+              Pointer<Int32>,
+              Pointer<Uint8>,
+              Pointer<Pointer<Void>>,
+            ),
+            void Function(
+              _Vp,
+              int,
+              int,
+              Pointer<Pointer<Uint8>>,
+              Pointer<Int32>,
+              Pointer<Uint8>,
+              Pointer<Pointer<Void>>,
+            )
+          >('nitro_server_jw_emit_template', isLeaf: true),
       bytes = lib
           .lookupFunction<
             Pointer<Uint8> Function(_Vp),
@@ -135,6 +156,16 @@ final class _JwNative {
   final void Function(_Vp, int) boolFn;
   final void Function(_Vp) nullFn;
   final void Function(_Vp, Pointer<Uint8>, int) rawFn;
+  final void Function(
+    _Vp,
+    int,
+    int,
+    Pointer<Pointer<Uint8>>,
+    Pointer<Int32>,
+    Pointer<Uint8>,
+    Pointer<Pointer<Void>>,
+  )
+  emitTemplate;
   final Pointer<Uint8> Function(_Vp) bytes;
   final int Function(_Vp) len;
   final Pointer<NativeFinalizerFunction> freeFinalizer;
@@ -179,6 +210,39 @@ final class JsonToken implements Finalizable {
   static final _finalizer = NativeFinalizer(
     _JwNative.instance.freeBufFinalizer,
   );
+}
+
+/// A varying numeric column for [JsonWriter.writeTemplatedArray]. Each row's
+/// value is rendered exactly as [JsonWriter.writeInt] / [JsonWriter.writeDouble]
+/// would, so the array is byte-identical to building it token by token.
+sealed class JsonColumn {
+  const JsonColumn();
+
+  /// Number of records in the column.
+  int get length;
+}
+
+/// An integer column (rendered like [JsonWriter.writeInt]).
+final class IntColumn extends JsonColumn {
+  const IntColumn(this.values);
+
+  /// The per-record values.
+  final Int64List values;
+
+  @override
+  int get length => values.length;
+}
+
+/// A double column (rendered like [JsonWriter.writeDouble]). Values must be
+/// finite, as with `jsonEncode`.
+final class DoubleColumn extends JsonColumn {
+  const DoubleColumn(this.values);
+
+  /// The per-record values.
+  final Float64List values;
+
+  @override
+  int get length => values.length;
 }
 
 /// Builds a JSON document straight into a native byte buffer. Create one per
@@ -253,6 +317,93 @@ final class JsonWriter implements Finalizable {
     _n.rawFn(_w, ptr, n);
   }
 
+  // Reused scratch for writeTemplatedArray's native argument arrays: the k+1
+  // segment (pointer, length) pairs, the k column type tags and data pointers,
+  // and one buffer holding every column's values back to back.
+  Pointer<Pointer<Uint8>> _segPtrs = nullptr;
+  Pointer<Int32> _segLens = nullptr;
+  int _segCap = 0;
+  Pointer<Uint8> _colTypes = nullptr;
+  Pointer<Pointer<Void>> _colData = nullptr;
+  int _colCap = 0;
+  Pointer<Uint8> _colBuf = nullptr;
+  int _colBufCap = 0;
+
+  /// Writes a JSON array of records built from a fixed template, in one native
+  /// call — the engine runs the whole loop, so a hot handler pays no per-token
+  /// method call or FFI crossing. For a fixed-schema array whose only varying
+  /// fields are numeric (the common `[{id, ...metrics}, …]` response), this is
+  /// the fast path; the token-by-token methods stay for irregular shapes.
+  ///
+  /// [segments] are the constant bytes around and between the varying values —
+  /// interned [JsonToken]s built once. [columns] are the varying numeric
+  /// fields ([IntColumn]/[DoubleColumn]); the array holds `columns.first.length`
+  /// records, and each record is
+  /// `segments[0] col[0][i] segments[1] col[1][i] … columns.last[i] segments[last]`.
+  /// There must be exactly one more segment than columns, and every column the
+  /// same length. Example — `[{"id":0,"score":0.0},…]`:
+  ///
+  /// ```dart
+  /// w.writeTemplatedArray(
+  ///   [JsonToken('{"id":'), JsonToken(',"score":'), JsonToken('}')],
+  ///   [IntColumn(ids), DoubleColumn(scores)],
+  /// );
+  /// ```
+  void writeTemplatedArray(List<JsonToken> segments, List<JsonColumn> columns) {
+    final k = columns.length;
+    if (segments.length != k + 1) {
+      throw ArgumentError(
+        'writeTemplatedArray needs one more segment than '
+        'columns (${segments.length} segments, $k columns)',
+      );
+    }
+    final n = k == 0 ? 0 : columns.first.length;
+    if (k + 1 > _segCap) {
+      if (_segPtrs != nullptr) _n.freeBuf(_segPtrs.cast());
+      if (_segLens != nullptr) _n.freeBuf(_segLens.cast());
+      _segPtrs = _n.alloc((k + 1) * sizeOf<Pointer<Uint8>>()).cast();
+      _segLens = _n.alloc((k + 1) * sizeOf<Int32>()).cast();
+      _segCap = k + 1;
+    }
+    if (k > _colCap) {
+      if (_colTypes != nullptr) _n.freeBuf(_colTypes.cast());
+      if (_colData != nullptr) _n.freeBuf(_colData.cast());
+      _colTypes = _n.alloc(k);
+      _colData = _n.alloc(k * sizeOf<Pointer<Void>>()).cast();
+      _colCap = k;
+    }
+    final need = k * n * 8;
+    if (need > _colBufCap) {
+      if (_colBuf != nullptr) _n.freeBuf(_colBuf.cast());
+      _colBuf = _n.alloc(need);
+      _colBufCap = need;
+    }
+    for (var c = 0; c < k; c++) {
+      _segPtrs[c] = segments[c].pointer;
+      _segLens[c] = segments[c].length;
+      final col = columns[c];
+      if (col.length != n) {
+        throw ArgumentError(
+          'every column must be the same length '
+          '(column $c has ${col.length}, expected $n)',
+        );
+      }
+      final slice = Pointer<Uint8>.fromAddress(_colBuf.address + c * n * 8);
+      _colData[c] = slice.cast();
+      switch (col) {
+        case IntColumn():
+          _colTypes[c] = 0;
+          slice.cast<Int64>().asTypedList(n).setAll(0, col.values);
+        case DoubleColumn():
+          _colTypes[c] = 1;
+          slice.cast<Double>().asTypedList(n).setAll(0, col.values);
+      }
+    }
+    _segPtrs[k] = segments[k].pointer;
+    _segLens[k] = segments[k].length;
+    _n.emitTemplate(_w, n, k, _segPtrs, _segLens, _colTypes, _colData);
+  }
+
   /// The bytes written so far, copied into a Dart-owned list.
   Uint8List toBytes() {
     final n = _n.len(_w);
@@ -265,6 +416,11 @@ final class JsonWriter implements Finalizable {
     _disposed = true;
     _finalizer.detach(this);
     if (_scratch != nullptr) _n.freeBuf(_scratch.cast());
+    if (_segPtrs != nullptr) _n.freeBuf(_segPtrs.cast());
+    if (_segLens != nullptr) _n.freeBuf(_segLens.cast());
+    if (_colTypes != nullptr) _n.freeBuf(_colTypes.cast());
+    if (_colData != nullptr) _n.freeBuf(_colData.cast());
+    if (_colBuf != nullptr) _n.freeBuf(_colBuf.cast());
     _n.freeBuf(_w);
   }
 

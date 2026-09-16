@@ -237,6 +237,36 @@ NITRO_EXPORT void nitro_server_jw_raw(void* p, const uint8_t* r, int32_t n) {
   auto* w = cast(p); sep(w); putN(w, reinterpret_cast<const char*>(r), n);
   w->needComma = true;
 }
+// Emit a JSON array of `n` records built from a fixed template, in one FFI
+// call — the engine runs the whole loop, so a hot handler pays no per-token
+// Dart method call or FFI crossing (the residual cost once the JSON is the
+// only work left). Each record interleaves `k` constant segments with `k`
+// numeric columns: seg[0] col[0][row] seg[1] col[1][row] ... seg[k-1]
+// col[k-1][row] seg[k]. So `segPtrs`/`segLens` have k+1 entries and there are
+// k columns; `colTypes[c]` is 0 for an int64 column, 1 for a double column,
+// and `colData[c]` points at that column's n-element array. Framed like any
+// other value (leading comma if needed).
+NITRO_EXPORT void nitro_server_jw_emit_template(
+    void* p, int32_t n, int32_t k,
+    const uint8_t* const* segPtrs, const int32_t* segLens,
+    const uint8_t* colTypes, const void* const* colData) {
+  auto* w = cast(p);
+  sep(w);
+  put(w, '[');
+  for (int32_t row = 0; row < n; row++) {
+    if (row) put(w, ',');
+    for (int32_t c = 0; c < k; c++) {
+      putN(w, reinterpret_cast<const char*>(segPtrs[c]), segLens[c]);
+      if (colTypes[c] == 0)
+        writeInt(w, static_cast<const int64_t*>(colData[c])[row]);
+      else
+        writeDouble(w, static_cast<const double*>(colData[c])[row]);
+    }
+    putN(w, reinterpret_cast<const char*>(segPtrs[k]), segLens[k]);
+  }
+  put(w, ']');
+  w->needComma = true;
+}
 NITRO_EXPORT const uint8_t* nitro_server_jw_bytes(void* p) {
   return cast(p)->data;
 }

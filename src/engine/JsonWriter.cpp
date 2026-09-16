@@ -16,9 +16,9 @@
 // comma. This one flag frames both objects and arrays correctly.
 // ─────────────────────────────────────────────────────────────────────────────
 #include <charconv>
-#include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 #include "../nitro.h"  // NITRO_EXPORT
@@ -81,12 +81,18 @@ inline void writeEscaped(NitroJsonWriter* w, const uint8_t* s, int n) {
 // exactly Dart's configuration. NaN/Inf never reach here (the Dart wrapper
 // guards them, matching jsonEncode which throws).
 inline void writeDouble(NitroJsonWriter* w, double v) {
+  // Read the raw sign bit, not std::signbit / v < 0: the engine builds with
+  // -ffast-math (implies -fno-signed-zeros), so GCC folds signbit(zero) to
+  // false and loses -0.0's "-". Inspecting the bits is immune — it is the
+  // stored pattern, not an FP operation.
+  uint64_t bits;
+  std::memcpy(&bits, &v, sizeof(bits));
+  const bool neg = (bits >> 63) != 0;
   if (v == 0.0) {  // 0.0 -> "0.0", -0.0 -> "-0.0"
-    if (std::signbit(v)) put(w, '-');
+    if (neg) put(w, '-');
     putN(w, "0.0", 3);
     return;
   }
-  const bool neg = v < 0;
   const double av = neg ? -v : v;
   char sci[40];
   const auto res =

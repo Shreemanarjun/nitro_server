@@ -17,6 +17,7 @@ void nitro_server_jw_begin_array(void*);
 void nitro_server_jw_end_array(void*);
 void nitro_server_jw_key(void*, const uint8_t*, int32_t);
 void nitro_server_jw_int(void*, int64_t);
+void nitro_server_jw_double(void*, double);
 void nitro_server_jw_string(void*, const uint8_t*, int32_t);
 void nitro_server_jw_bool(void*, int32_t);
 void nitro_server_jw_null(void*);
@@ -100,6 +101,27 @@ TEST(JsonWriter, IntEdgeCasesAndReset) {
   nitro_server_jw_begin_array(w);
   nitro_server_jw_end_array(w);
   EXPECT_EQ(out(w), "[]");
+  nitro_server_jw_free(w);
+}
+
+TEST(JsonWriter, DoubleFormatsLikeDart) {
+  // Byte-identical to Dart's double.toString() across every rendering branch:
+  // whole numbers get ".0", fixed vs exponential switches at the -6/21 decimal
+  // exponent, negatives and signed zero carry the sign. (Dart's exact fuzz
+  // check lives in test/json_writer_test.dart.)
+  struct Case { double v; const char* want; };
+  const Case cases[] = {
+    {0.0, "0.0"}, {-0.0, "-0.0"}, {1.5, "1.5"}, {3.0, "3.0"},
+    {298.5, "298.5"}, {100.0, "100.0"}, {-2.25, "-2.25"}, {0.0001, "0.0001"},
+    {1e-6, "0.000001"}, {1e-7, "1e-7"}, {1e20, "100000000000000000000.0"},
+    {1e21, "1e+21"}, {1234.5, "1234.5"}, {-1e21, "-1e+21"},
+  };
+  void* w = nitro_server_jw_new();
+  for (const auto& c : cases) {
+    nitro_server_jw_reset(w);
+    nitro_server_jw_double(w, c.v);
+    EXPECT_EQ(out(w), c.want) << "value " << c.v;
+  }
   nitro_server_jw_free(w);
 }
 

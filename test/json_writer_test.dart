@@ -3,6 +3,7 @@
 // server_e2e_test.
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:nitro_server/nitro_server.dart';
@@ -50,6 +51,41 @@ void main() {
     test('doubles match jsonEncode', () {
       for (final d in [0.0, 1.5, 3.0, -2.25, 0.1, 1e21, 1e-7, 1e100, 100.0]) {
         matches((w) => w.writeDouble(d), d);
+      }
+    });
+
+    test('writeDouble is byte-identical to jsonEncode across many doubles', () {
+      // The native formatter (std::to_chars shortest + Dart's ECMAScript-style
+      // rendering) must match double.toString() exactly. Edge cases + a fuzz.
+      final edges = <double>[
+        0.0, -0.0, 1.0, -1.0, 0.5, 0.25, 1.5, 3.0, 298.5, 100.0, 1234.5,
+        0.1, 0.2, 0.3, 0.0001, 1e-6, 1e-7, 1e20, 1e21, 1e22, 1e-20, 1e-21,
+        1e100, 1e-100, 1e308, 1e-308, double.minPositive,
+        1.7976931348623157e308, 3.141592653589793, 2.718281828459045,
+        123456789.123456789, 9007199254740992.0, 9007199254740993.0,
+        -0.0001, -1e21, -3.5, 5e-324, 4.9e-324,
+        for (var i = 0; i < 200; i++) i * 1.5, // the /work payload's scores
+      ];
+      final rng = math.Random(0xC0FFEE);
+      final fuzz = <double>[
+        for (var i = 0; i < 20000; i++)
+          (rng.nextDouble() - 0.5) *
+              math.pow(10, rng.nextInt(60) - 30).toDouble(),
+      ];
+      final w = JsonWriter();
+      try {
+        for (final d in [...edges, ...fuzz]) {
+          if (!d.isFinite) continue;
+          w.reset();
+          w.writeDouble(d);
+          expect(
+            utf8.decode(w.toBytes()),
+            jsonEncode(d),
+            reason: 'writeDouble($d) != jsonEncode($d)',
+          );
+        }
+      } finally {
+        w.dispose();
       }
     });
 

@@ -5,9 +5,9 @@
 // jsonEncode. The engine only appends bytes; correctness (schema, ordering)
 // is the caller's, exactly like hand-writing JSON.
 //
-// Numbers: integers are formatted here (unambiguous, matches Dart). Doubles are
-// formatted on the Dart side — `double.toString()` already matches jsonEncode
-// for finite values — and handed over via jw_raw, so the writer needs no dtoa.
+// Numbers: integers and finite doubles are both formatted here (see writeInt
+// and writeDouble), byte-identical to Dart — so a hot handler pays no Dart-side
+// toString() + utf8.encode per number. jw_raw stays for pre-encoded fragments.
 // Strings and keys are JSON-escaped here (", \\, and control chars < 0x20),
 // matching jsonEncode's default (non-ASCII bytes pass through as UTF-8).
 //
@@ -15,6 +15,8 @@
 // cleared after `{` `[` or a key, so a following value never adds a leading
 // comma. This one flag frames both objects and arrays correctly.
 // ─────────────────────────────────────────────────────────────────────────────
+#include <charconv>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <vector>
@@ -70,6 +72,68 @@ inline void writeEscaped(NitroJsonWriter* w, const uint8_t* s, int n) {
   put(w, '"');
 }
 
+// Formats a finite double byte-identically to Dart's double.toString(): the
+// shortest decimal that round-trips (via std::to_chars, the same shortest
+// algorithm Dart's dtoa uses), reformatted with Dart's rules — fixed notation
+// for a decimal exponent in [-6, 21), else `e±exp`; a trailing `.0` on any
+// whole number that isn't in exponent form. This is what the double-conversion
+// EcmaScript converter with EMIT_TRAILING_*_DECIMAL_* flags produces, which is
+// exactly Dart's configuration. NaN/Inf never reach here (the Dart wrapper
+// guards them, matching jsonEncode which throws).
+inline void writeDouble(NitroJsonWriter* w, double v) {
+  if (v == 0.0) {  // 0.0 -> "0.0", -0.0 -> "-0.0"
+    if (std::signbit(v)) put(w, '-');
+    putN(w, "0.0", 3);
+    return;
+  }
+  const bool neg = v < 0;
+  const double av = neg ? -v : v;
+  char sci[40];
+  const auto res =
+      std::to_chars(sci, sci + sizeof(sci), av, std::chars_format::scientific);
+  const int slen = static_cast<int>(res.ptr - sci);
+  // Parse "d[.ddd]e±xx" into significant digits and the scientific exponent E.
+  char digits[24];
+  int k = 0, i = 0;
+  digits[k++] = sci[i++];
+  if (i < slen && sci[i] == '.') {
+    i++;
+    while (i < slen && sci[i] != 'e') digits[k++] = sci[i++];
+  }
+  i++;  // skip 'e'
+  int esign = 1;
+  if (sci[i] == '+') { i++; } else if (sci[i] == '-') { esign = -1; i++; }
+  int e = 0;
+  while (i < slen) e = e * 10 + (sci[i++] - '0');
+  e *= esign;
+  const int n = e + 1;  // position of the decimal point among the digits
+
+  if (neg) put(w, '-');
+  if (k <= n && n <= 21) {  // whole number in fixed range: digits, zeros, ".0"
+    for (int j = 0; j < k; j++) put(w, digits[j]);
+    for (int j = 0; j < n - k; j++) put(w, '0');
+    putN(w, ".0", 2);
+  } else if (0 < n && n <= 21) {  // decimal point inside the digits
+    for (int j = 0; j < n; j++) put(w, digits[j]);
+    put(w, '.');
+    for (int j = n; j < k; j++) put(w, digits[j]);
+  } else if (-6 < n && n <= 0) {  // 0.00…digits
+    putN(w, "0.", 2);
+    for (int j = 0; j < -n; j++) put(w, '0');
+    for (int j = 0; j < k; j++) put(w, digits[j]);
+  } else {  // exponential: d[.ddd]e±exp
+    put(w, digits[0]);
+    if (k > 1) {
+      put(w, '.');
+      for (int j = 1; j < k; j++) put(w, digits[j]);
+    }
+    put(w, 'e');
+    int exp = n - 1;
+    if (exp >= 0) { put(w, '+'); } else { put(w, '-'); exp = -exp; }
+    writeInt(w, exp);
+  }
+}
+
 inline NitroJsonWriter* cast(void* p) {
   return static_cast<NitroJsonWriter*>(p);
 }
@@ -113,6 +177,11 @@ NITRO_EXPORT void nitro_server_jw_key(void* p, const uint8_t* k, int32_t kl) {
 }
 NITRO_EXPORT void nitro_server_jw_int(void* p, int64_t v) {
   auto* w = cast(p); sep(w); writeInt(w, v); w->needComma = true;
+}
+// Formats and appends a finite double natively (see writeDouble above), so a
+// hot handler skips the Dart-side toString() + utf8.encode allocation.
+NITRO_EXPORT void nitro_server_jw_double(void* p, double v) {
+  auto* w = cast(p); sep(w); writeDouble(w, v); w->needComma = true;
 }
 NITRO_EXPORT void nitro_server_jw_string(void* p, const uint8_t* s, int32_t n) {
   auto* w = cast(p); sep(w); writeEscaped(w, s, n); w->needComma = true;

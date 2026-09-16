@@ -22,9 +22,9 @@
 ///
 /// Correctness of the shape (matched `begin`/`end`, a key before each object
 /// value) is the caller's, exactly like hand-writing JSON. Numbers: [writeInt]
-/// formats integers natively; [writeDouble] renders with `toString` (which
-/// matches `jsonEncode` for finite doubles) — so `5` and `5.0` are the caller's
-/// choice, as with `jsonEncode`.
+/// and [writeDouble] both format natively, byte-identical to `jsonEncode` for
+/// finite values — so `5` and `5.0` are the caller's choice, as with
+/// `jsonEncode`.
 library;
 
 import 'dart:convert';
@@ -80,6 +80,11 @@ final class _JwNative {
             'nitro_server_jw_int',
             isLeaf: true,
           ),
+      doubleFn = lib
+          .lookupFunction<
+            Void Function(_Vp, Double),
+            void Function(_Vp, double)
+          >('nitro_server_jw_double', isLeaf: true),
       stringFn = lib
           .lookupFunction<
             Void Function(_Vp, Pointer<Uint8>, Int32),
@@ -125,6 +130,7 @@ final class _JwNative {
   final void Function(_Vp) endArray;
   final void Function(_Vp, Pointer<Uint8>, int) keyFn;
   final void Function(_Vp, int) intFn;
+  final void Function(_Vp, double) doubleFn;
   final void Function(_Vp, Pointer<Uint8>, int) stringFn;
   final void Function(_Vp, int) boolFn;
   final void Function(_Vp) nullFn;
@@ -217,14 +223,14 @@ final class JsonWriter implements Finalizable {
   /// Writes an integer value.
   void writeInt(int value) => _n.intFn(_w, value);
 
-  /// Writes a double value, rendered like `jsonEncode` (via `toString`).
-  /// Throws for non-finite values, as `jsonEncode` does.
+  /// Writes a double value, rendered natively byte-identically to `jsonEncode`
+  /// (Dart's `double.toString()` shape). Throws for non-finite values, as
+  /// `jsonEncode` does.
   void writeDouble(double value) {
     if (!value.isFinite) {
       throw ArgumentError.value(value, 'value', 'not a finite JSON number');
     }
-    final (ptr, n) = _marshal(value.toString());
-    _n.rawFn(_w, ptr, n);
+    _n.doubleFn(_w, value);
   }
 
   /// Writes a `num` as an integer or a double, matching its runtime type.

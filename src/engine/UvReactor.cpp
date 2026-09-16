@@ -287,7 +287,6 @@ struct UvReactor::Conn {
   std::string buf;   // accumulated request bytes
   bool busy = false;  // a request is awaiting its answer (ordered per conn)
   bool closing = false;
-  bool shuttingDown = false;  // a graceful uv_shutdown is already in flight
   bool counted = false;    // admitted: liveConns_ (+ per-IP) incremented for it
   std::string peerIp;      // remote IP, for the per-IP cap (empty = not counted)
   int64_t served = 0;  // completed requests (header vs keep-alive timeout)
@@ -719,30 +718,6 @@ void UvReactor::onCloseConn(uv_handle_t* h) {
   delete c;
 }
 
-void UvReactor::closeGracefully(Conn* c) {
-  c->closing = true;
-  if (c->shuttingDown || uv_is_closing((uv_handle_t*)&c->handle)) return;
-  c->shuttingDown = true;
-  // shutdown(SHUT_WR) flushes queued writes and sends FIN. Unlike close() it
-  // never resets the connection when the peer still has unread bytes, so the
-  // response is delivered before teardown. Fall back to a hard close if it
-  // can't be queued.
-  auto* req = new uv_shutdown_t;
-  req->data = c;
-  if (uv_shutdown(req, (uv_stream_t*)&c->handle, &UvReactor::onShutdown) != 0) {
-    delete req;
-    uv_close((uv_handle_t*)&c->handle, &UvReactor::onCloseConn);
-  }
-}
-
-void UvReactor::onShutdown(uv_shutdown_t* req, int status) {
-  Conn* c = (Conn*)req->data;
-  delete req;
-  (void)status;  // FIN sent (or the peer already went away); close either way.
-  if (!uv_is_closing((uv_handle_t*)&c->handle))
-    uv_close((uv_handle_t*)&c->handle, &UvReactor::onCloseConn);
-}
-
 void UvReactor::readCb(uv_stream_t* s, ssize_t nread, const uv_buf_t* b) {
   Conn* c = (Conn*)s;
   if (nread < 0) {
@@ -1172,9 +1147,9 @@ void UvReactor::onWrite(uv_write_t* req, int status) {
   c->continueSent = false;
   c->lastActive = Clock::now();
   if (!keepAlive || c->closing) {
-    // The response is written; close the write side gracefully so the peer's
-    // unread bytes can't turn this into a reset that drops the response.
-    c->lp->owner->closeGracefully(c);
+    c->closing = true;
+    if (!uv_is_closing((uv_handle_t*)&c->handle))
+      uv_close((uv_handle_t*)&c->handle, &UvReactor::onCloseConn);
     return;
   }
   c->busy = false;

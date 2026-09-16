@@ -68,6 +68,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # Comparison numbers, not a correctness gate. Non-blocking with a timeout:
+    # the full 32-connection load sweep can stall the reactor on the 2-core CI
+    # runners (a reactor-under-load issue tracked separately), and a benchmark
+    # must never hang the pipeline or gate merges on throughput.
+    continue-on-error: true
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2

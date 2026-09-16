@@ -19,20 +19,41 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <vector>
 
 #include "../nitro.h"  // NITRO_EXPORT
 
 namespace {
 
+// A growable byte buffer with an ensure-once fast path: the hot token writers
+// (writeEscaped, writeInt) reserve their worst-case size in one bounds check,
+// then fill through a raw cursor — no per-byte capacity check. malloc/realloc
+// (not std::vector) so growth never value-initializes the new bytes.
 struct NitroJsonWriter {
-  std::vector<uint8_t> buf;
+  uint8_t* data = nullptr;
+  size_t len = 0;
+  size_t cap = 0;
   bool needComma = false;
+  ~NitroJsonWriter() { std::free(data); }
+
+  void grow(size_t need) {  // out-of-line: the cold path
+    size_t nc = cap ? cap * 2 : 256;
+    while (nc < need) nc *= 2;
+    data = static_cast<uint8_t*>(std::realloc(data, nc));
+    cap = nc;
+  }
+  inline void ensure(size_t extra) {
+    if (len + extra > cap) grow(len + extra);
+  }
 };
 
-inline void put(NitroJsonWriter* w, uint8_t b) { w->buf.push_back(b); }
+inline void put(NitroJsonWriter* w, uint8_t b) {
+  w->ensure(1);
+  w->data[w->len++] = b;
+}
 inline void putN(NitroJsonWriter* w, const char* s, int n) {
-  w->buf.insert(w->buf.end(), s, s + n);
+  w->ensure(static_cast<size_t>(n));
+  std::memcpy(w->data + w->len, s, static_cast<size_t>(n));
+  w->len += static_cast<size_t>(n);
 }
 inline void sep(NitroJsonWriter* w) { if (w->needComma) put(w, ','); }
 
@@ -43,33 +64,39 @@ inline void writeInt(NitroJsonWriter* w, int64_t v) {
   const bool neg = v < 0;
   uint64_t x = neg ? ~static_cast<uint64_t>(v) + 1 : static_cast<uint64_t>(v);
   while (x) { tmp[n++] = static_cast<uint8_t>('0' + x % 10); x /= 10; }
-  if (neg) put(w, '-');
-  while (n) put(w, tmp[--n]);
+  w->ensure(static_cast<size_t>(n) + 1);  // digits + optional '-'
+  uint8_t* d = w->data + w->len;
+  if (neg) *d++ = '-';
+  while (n) *d++ = tmp[--n];
+  w->len = static_cast<size_t>(d - w->data);
 }
 
 inline void writeEscaped(NitroJsonWriter* w, const uint8_t* s, int n) {
   static const char kHex[] = "0123456789abcdef";
-  put(w, '"');
+  w->ensure(static_cast<size_t>(n) * 6 + 2);  // worst case: every byte -> \u00XX
+  uint8_t* d = w->data + w->len;
+  *d++ = '"';
   for (int i = 0; i < n; i++) {
     const uint8_t c = s[i];
     switch (c) {
-      case '"': put(w, '\\'); put(w, '"'); break;
-      case '\\': put(w, '\\'); put(w, '\\'); break;
-      case '\b': put(w, '\\'); put(w, 'b'); break;
-      case '\f': put(w, '\\'); put(w, 'f'); break;
-      case '\n': put(w, '\\'); put(w, 'n'); break;
-      case '\r': put(w, '\\'); put(w, 'r'); break;
-      case '\t': put(w, '\\'); put(w, 't'); break;
+      case '"': *d++ = '\\'; *d++ = '"'; break;
+      case '\\': *d++ = '\\'; *d++ = '\\'; break;
+      case '\b': *d++ = '\\'; *d++ = 'b'; break;
+      case '\f': *d++ = '\\'; *d++ = 'f'; break;
+      case '\n': *d++ = '\\'; *d++ = 'n'; break;
+      case '\r': *d++ = '\\'; *d++ = 'r'; break;
+      case '\t': *d++ = '\\'; *d++ = 't'; break;
       default:
         if (c < 0x20) {
-          put(w, '\\'); put(w, 'u'); put(w, '0'); put(w, '0');
-          put(w, kHex[c >> 4]); put(w, kHex[c & 0xf]);
+          *d++ = '\\'; *d++ = 'u'; *d++ = '0'; *d++ = '0';
+          *d++ = kHex[c >> 4]; *d++ = kHex[c & 0xf];
         } else {
-          put(w, c);
+          *d++ = c;
         }
     }
   }
-  put(w, '"');
+  *d++ = '"';
+  w->len = static_cast<size_t>(d - w->data);
 }
 
 // Formats a finite double byte-identically to Dart's double.toString(): the
@@ -114,6 +141,10 @@ inline void writeDouble(NitroJsonWriter* w, double v) {
   e *= esign;
   const int n = e + 1;  // position of the decimal point among the digits
 
+  // Widest output is the fixed whole-number branch: sign + up to 21 digits +
+  // ".0". Reserve once so the per-char puts below never re-grow. (The
+  // exponential branch's writeInt reserves its own tail.)
+  w->ensure(40);
   if (neg) put(w, '-');
   if (k <= n && n <= 21) {  // whole number in fixed range: digits, zeros, ".0"
     for (int j = 0; j < k; j++) put(w, digits[j]);
@@ -150,13 +181,13 @@ extern "C" {
 
 NITRO_EXPORT void* nitro_server_jw_new() {
   auto* w = new NitroJsonWriter();
-  w->buf.reserve(256);
+  w->grow(256);  // allocate up front so data is never null
   return w;
 }
 NITRO_EXPORT void nitro_server_jw_free(void* p) { delete cast(p); }
 NITRO_EXPORT void nitro_server_jw_reset(void* p) {
   auto* w = cast(p);
-  w->buf.clear();
+  w->len = 0;  // keep the allocation; reuse across requests
   w->needComma = false;
 }
 // Scratch native memory the Dart wrapper copies key/string bytes into.
@@ -203,14 +234,14 @@ NITRO_EXPORT void nitro_server_jw_null(void* p) {
 // Pre-formatted value bytes (a double already rendered by Dart, or a nested
 // pre-encoded fragment). Written verbatim, framed like any other value.
 NITRO_EXPORT void nitro_server_jw_raw(void* p, const uint8_t* r, int32_t n) {
-  auto* w = cast(p); sep(w); w->buf.insert(w->buf.end(), r, r + n);
+  auto* w = cast(p); sep(w); putN(w, reinterpret_cast<const char*>(r), n);
   w->needComma = true;
 }
 NITRO_EXPORT const uint8_t* nitro_server_jw_bytes(void* p) {
-  return cast(p)->buf.data();
+  return cast(p)->data;
 }
 NITRO_EXPORT int32_t nitro_server_jw_len(void* p) {
-  return static_cast<int32_t>(cast(p)->buf.size());
+  return static_cast<int32_t>(cast(p)->len);
 }
 
 }  // extern "C"

@@ -69,17 +69,20 @@ final Map<String, Uint8List> _routes = {
 /// the shape of an API endpoint rather than a byte echo. Deterministic, so
 /// the exact bytes are asserted like every other case. This is where
 /// isolates matter: a single Dart isolate is the ceiling for handler work.
-Uint8List _workBody() => Uint8List.fromList(
-  jsonEncode([
-    for (var i = 0; i < 200; i++)
-      {
-        'id': i,
-        'name': 'item-\$i',
-        'tags': ['a', 'b'],
-        'score': i * 1.5,
-      },
-  ]).codeUnits,
-);
+///
+/// The raw records, encoded per request by each side. nitro answers with
+/// `ResponseContext.jsonBody` (one-pass JsonUtf8Encoder); dart:io and shelf
+/// use `jsonEncode` + byte conversion, their idiomatic path.
+List<Object> _workData() => [
+  for (var i = 0; i < 200; i++)
+    {
+      'id': i,
+      'name': 'item-\$i',
+      'tags': ['a', 'b'],
+      'score': i * 1.5,
+    },
+];
+Uint8List _workBody() => Uint8List.fromList(jsonEncode(_workData()).codeUnits);
 final Uint8List _workExpected = _workBody();
 
 /// `/file`: a 64 KiB static file. dart:io and shelf stream it through the
@@ -418,9 +421,9 @@ ServerSetup _nitroSetup(bool batchEvents) {
     );
     await server.get('/mw', (_) => ResponseContext.bytes(_routes['/hello']!));
     await server.get(
+      // nitro's idiomatic JSON answer: one-pass object -> UTF-8 bytes.
       '/work',
-      (_) =>
-          ResponseContext.bytes(_workBody(), contentType: 'application/json'),
+      (_) => ResponseContext.jsonBody(_workData()),
     );
     await server.get('/file', (_) => ResponseContext.file(_staticFile.path));
     await server.get(
@@ -1224,12 +1227,11 @@ Future<void> main(List<String> args) async {
         );
   final shelfServer = await _startShelfServer();
   final nitroServer = await _startNitroServer();
-  // Effective handler parallelism the Dart sides use, so Go's core budget can
-  // match it (a fair `/work` CPU comparison instead of Go's default all-cores).
-  final effectiveWorkers = _isolates == 0
-      ? Platform.numberOfProcessors ~/ 2
-      : _isolates;
-  final goServer = await _startGoServer(_batchEvents, effectiveWorkers);
+  // Go runs at its natural default — all cores (GOMAXPROCS = CPU count) — so
+  // it stays a strong competitor. `--go-procs N` pins it lower to compare on
+  // an equal CPU budget (e.g. matching nitro's isolate count on `/work`).
+  final goProcs = _flagInt(args, '--go-procs', Platform.numberOfProcessors);
+  final goServer = await _startGoServer(_batchEvents, goProcs);
 
   final sides = <(String, int)>[
     ('dart:io', dartServer.port),

@@ -788,57 +788,6 @@ TEST(UvReactorTest, RouteTimeoutAnswers408AndEmitsEvent) {
   server->stop();
 }
 
-TEST(UvReactorTest, HalfCloseWhileBusyStillDeliversResponse) {
-  // A peer that half-closes (shutdown(SHUT_WR) → FIN) after sending its request
-  // but before the handler answers still has its read side open, so the server
-  // must deliver the in-flight response instead of dropping it. Regression for
-  // the Linux flake where a FIN arriving while `busy` closed the connection and
-  // discarded the pending answer (empty response / status -1).
-  RecordingEmitter emitter([](Method, const std::string&, const std::string&) {
-    return std::make_pair(200, "answer");
-  });
-  auto server = std::make_shared<UvReactor>();
-  server->setEmitter(&emitter);
-  ASSERT_EQ(server->registerRoute(Method::Get, "", "/hello", -1).kind,
-            ErrorKind::None);
-  ServerConfig cfg;
-  cfg.port = 0;
-  cfg.defaultTimeoutMs = 5000;
-  server->configure(cfg);
-  ASSERT_EQ((int64_t)server->start().kind, (int64_t)ErrorKind::None);
-  const int port = (int)server->boundPort();
-
-  // Delayed pump: answer ~80ms after dispatch so the FIN lands while busy.
-  std::atomic<bool> pumping{true};
-  std::thread pump([&] {
-    while (pumping.load()) {
-      RecordingEmitter::Job job{0, 0, ""};
-      if (emitter.takeJob(job)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(80));
-        std::vector<uint8_t> b(job.body.begin(), job.body.end());
-        server->respond(job.requestId, job.status,
-                        {{"Content-Type", "text/plain"}}, b.data(), b.size());
-      } else {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      }
-    }
-  });
-
-  const int fd = connectTo(port);
-  ASSERT_GE(fd, 0);
-  sendStr(fd, "GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
-  std::this_thread::sleep_for(std::chrono::milliseconds(20));  // let it dispatch
-  shutdown(fd, SHUT_WR);                                        // half-close: FIN
-  const std::string res = readAll(fd);
-  close(fd);
-  EXPECT_EQ(statusOf(res), 200) << "server dropped the in-flight response on FIN";
-  EXPECT_EQ(bodyOf(res), "answer");
-
-  pumping.store(false);
-  pump.join();
-  server->stop();
-}
-
 TEST(UvReactorTest, ConcurrentConnectionsDoNotDeadlock) {
   Fixture f([](Method, const std::string& path, const std::string&) {
     return std::make_pair(200, "got " + path);

@@ -2,11 +2,20 @@
 
 #ifdef NITRO_SERVER_LIBUV
 
+#ifdef _WIN32
+// Winsock has no SO_REUSEPORT, so the multi-listener model doesn't apply here;
+// on Windows the reactor binds a single libuv listener (see start()). These
+// headers cover the address helpers (inet_pton / htons / sockaddr_*), which
+// Winsock provides the same way.
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -476,6 +485,7 @@ StatusResult UvReactor::start(int loops) {
     reservedPort_ = (int)cfg_.port;
   }
 
+#ifndef _WIN32
   auto releaseAndFail = [&](std::vector<int>& fds,
                             const char* msg) -> StatusResult {
     for (int fd : fds) close(fd);
@@ -487,7 +497,61 @@ StatusResult UvReactor::start(int loops) {
     running_.store(false);
     return {ErrorKind::BindFailed, msg, 0};
   };
+#endif
 
+#ifdef _WIN32
+  // Windows has no SO_REUSEPORT, so the "N listeners sharing one port" model
+  // doesn't apply: bind a single libuv listener on one loop. libuv (IOCP)
+  // initializes Winsock and owns the accept socket, so there is no raw socket
+  // to open. Loses the per-core listener fan-out, but is correct and keeps the
+  // rest of the reactor (per-conn handling, TLS, WebSocket) unchanged.
+  (void)n;
+  {
+    auto lp = std::make_unique<Loop>();
+    lp->owner = this;
+    uv_loop_init(&lp->loop);
+    lp->async.data = lp.get();
+    uv_async_init(&lp->loop, &lp->async, &UvReactor::onAsync);
+    lp->sweep.data = lp.get();
+    uv_timer_init(&lp->loop, &lp->sweep);
+    uv_timer_start(&lp->sweep, &UvReactor::onSweep, 100, 100);
+    lp->server.data = lp.get();
+    uv_tcp_init(&lp->loop, &lp->server);
+    auto winFail = [&](const char* msg) -> StatusResult {
+      uv_close((uv_handle_t*)&lp->server, nullptr);
+      uv_close((uv_handle_t*)&lp->async, nullptr);
+      uv_close((uv_handle_t*)&lp->sweep, nullptr);
+      uv_run(&lp->loop, UV_RUN_DEFAULT);
+      uv_loop_close(&lp->loop);
+      if (reservedPort_ != 0) {
+        std::lock_guard<std::mutex> lk(boundPortsMutex());
+        boundPorts().erase(reservedPort_);
+        reservedPort_ = 0;
+      }
+      running_.store(false);
+      return {ErrorKind::BindFailed, msg, 0};
+    };
+    sockaddr_storage ss;
+    socklen_t sslen;
+    if (uvBuildAddr(cfg_.host, (int)cfg_.port, ss, sslen) < 0)
+      return winFail("invalid host");
+    if (uv_tcp_bind(&lp->server, (const sockaddr*)&ss, 0) != 0)
+      return winFail("bind failed");
+    sockaddr_storage bound{};
+    int bl = (int)sizeof(bound);
+    uv_tcp_getsockname(&lp->server, (sockaddr*)&bound, &bl);
+    boundPort_.store(uvPortOf(bound));
+    cfg_.port = boundPort_.load();
+    if (reservedPort_ == 0) {
+      std::lock_guard<std::mutex> lk(boundPortsMutex());
+      boundPorts().insert((int)boundPort_.load());
+      reservedPort_ = (int)boundPort_.load();
+    }
+    if (uv_listen((uv_stream_t*)&lp->server, backlog, &UvReactor::onConnection) != 0)
+      return winFail("listen failed");
+    loops_.push_back(std::move(lp));
+  }
+#else
   // Phase one: bind every listener socket. A failure here cleans up with no
   // libuv resources yet created.
   std::vector<int> fds;
@@ -538,6 +602,7 @@ StatusResult UvReactor::start(int loops) {
     uv_listen((uv_stream_t*)&lp->server, backlog, &UvReactor::onConnection);
     loops_.push_back(std::move(lp));
   }
+#endif  // _WIN32
   for (auto& lp : loops_) {
     Loop* raw = lp.get();
     raw->thread = std::thread([this, raw] { runLoop(raw); });

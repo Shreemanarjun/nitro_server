@@ -58,3 +58,30 @@ jobs:
           -DNITRO_SERVER_BUILD_TESTS=ON -DNITRO_SERVER_SANITIZE=${{ matrix.sanitizer }}
       - run: cmake --build build/san --parallel --target nitro_server_engine_tests
       - run: ./build/san/nitro_server_tests/nitro_server_engine_tests
+
+  # Runs the cross-framework comparison (nitro vs dart:io vs shelf vs Go) and
+  # prints the table to the job log. Not a pass/fail gate on the numbers — it
+  # fails only if a server crashes or a client can't complete a request.
+  benchmark:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang libssl-dev libuv1-dev
+      - if: runner.os == 'macOS'
+        run: brew install openssl@3 libuv
+      - run: flutter pub get
+      - run: cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build/lib --parallel
+      - run: mkdir -p build/benchmark && dart compile exe benchmark/compare.dart -o build/benchmark/compare
+      - run: ./build/benchmark/compare --quick --keep-alive

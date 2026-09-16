@@ -680,6 +680,10 @@ void UvReactor::readCb(uv_stream_t* s, ssize_t nread, const uv_buf_t* b) {
     bool tls = false;
 #ifdef NITRO_SERVER_TLS
     tls = c->ssl != nullptr;
+    if (tls)
+      fprintf(stderr, "[TLSDBG] readCb nread=%zd (%s) busy=%d served=%lld\n",
+              nread, uv_err_name((int)nread), c->busy ? 1 : 0,
+              (long long)c->served);
 #endif
     if (!c->busy && !c->ws && !c->closing && !tls &&
         c->buf.find("\r\n\r\n") != std::string::npos) {

@@ -31,6 +31,7 @@
 #include <utility>
 #include <vector>
 
+#include "engine/Brotli.h"
 #include "engine/Combiner.h"
 #include "engine/Common.h"
 #include "engine/EngineRegistry.h"
@@ -179,6 +180,24 @@ class HybridNitroServerImpl final : public HybridNitroServerNative {
   }
 
   void resetNative() override { EngineRegistry::resetAll(); }
+
+  bool supportsBrotli() override { return nitro_brotli::available(); }
+
+  // brotliEncode/Decode return a @zeroCopy Uint8List: the bridge takes the
+  // malloc'd buffer and frees it after copying to Dart (see
+  // nitro_server_release_typed_data_return). {nullptr, 0} -> an empty result.
+  NitroCppBuffer brotliEncode(const uint8_t* data, size_t data_length,
+                              int64_t quality) override {
+    const nitro_brotli::Bytes out = nitro_brotli::encode(
+        data, data_length, static_cast<int>(quality));
+    return NitroCppBuffer{out.data, out.size};
+  }
+
+  NitroCppBuffer brotliDecode(const uint8_t* data,
+                              size_t data_length) override {
+    const nitro_brotli::Bytes out = nitro_brotli::decode(data, data_length);
+    return NitroCppBuffer{out.data, out.size};
+  }
 
   // ── Server role ────────────────────────────────────────────────────────────
 

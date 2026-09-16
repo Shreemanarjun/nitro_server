@@ -22,11 +22,13 @@ add_executable(nitro_server_engine_tests
   wire_test.cpp
   uv_reactor_test.cpp
   json_writer_test.cpp
+  brotli_test.cpp
   "${CMAKE_CURRENT_SOURCE_DIR}/../../src/engine/Router.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../src/engine/HttpParse.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../src/engine/JsonWriter.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../src/engine/EngineRegistry.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../src/engine/UvReactor.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../src/engine/Brotli.cpp"
 )
 
 target_include_directories(nitro_server_engine_tests PRIVATE
@@ -88,6 +90,7 @@ if(NOT COMMAND nitro_server_attach_libuv)
   include("${CMAKE_CURRENT_SOURCE_DIR}/../../src/engine.cmake")
 endif()
 nitro_server_attach_libuv(nitro_server_engine_tests)
+nitro_server_attach_brotli(nitro_server_engine_tests)
 
 include(GoogleTest)
 gtest_discover_tests(nitro_server_engine_tests)

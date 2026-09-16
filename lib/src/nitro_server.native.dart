@@ -409,6 +409,21 @@ abstract class NitroServerNative extends HybridObject {
   /// pending request. The Dart layer calls this once at startup.
   void resetNative();
 
+  /// Whether the engine was built with libbrotli, for the `compress()`
+  /// middleware's `br` path. When false the middleware falls back to gzip.
+  bool supportsBrotli();
+
+  /// Brotli-encodes [data] at [quality] (0–11) in text mode. Returns the
+  /// compressed bytes, or empty on failure (or when brotli is not built in).
+  @zeroCopy
+  Uint8List brotliEncode(@zeroCopy Uint8List data, int quality);
+
+  /// Brotli-decodes [data], the inverse of [brotliEncode]. Exposed so the
+  /// `compress()` round-trip tests can verify output — Dart's `dart:io` has no
+  /// brotli decoder. Returns empty on failure.
+  @zeroCopy
+  Uint8List brotliDecode(@zeroCopy Uint8List data);
+
   // ── Server role: 's:<serverId>' ────────────────────────────────────────────
 
   /// Synchronous by design — there is no reason to make users `await` a server

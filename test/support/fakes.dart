@@ -79,6 +79,17 @@ class FakeNitroServerNative extends NitroServerNative {
   bool supportsTls() => false;
 
   @override
+  bool supportsBrotli() => false;
+
+  @override
+  Uint8List brotliEncode(Uint8List data, int quality) =>
+      throw UnsupportedError('brotli unavailable in the fake engine');
+
+  @override
+  Uint8List brotliDecode(Uint8List data) =>
+      throw UnsupportedError('brotli unavailable in the fake engine');
+
+  @override
   void resetNative() => resetCalls++;
 
   @override

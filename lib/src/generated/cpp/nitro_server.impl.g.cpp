@@ -55,6 +55,24 @@ public:
         throw std::runtime_error("Not implemented: resetNative");
     }
 
+    bool supportsBrotli() override {
+        // TODO: implement supportsBrotli
+        throw std::runtime_error("Not implemented: supportsBrotli");
+        // return false;
+    }
+
+    NitroCppBuffer brotliEncode(const uint8_t* data, size_t data_length, int64_t quality) override {
+        // TODO: implement brotliEncode
+        throw std::runtime_error("Not implemented: brotliEncode");
+        // return { nullptr, 0 };
+    }
+
+    NitroCppBuffer brotliDecode(const uint8_t* data, size_t data_length) override {
+        // TODO: implement brotliDecode
+        throw std::runtime_error("Not implemented: brotliDecode");
+        // return { nullptr, 0 };
+    }
+
     void configureServer(NitroCppBuffer config) override {
         // TODO: implement configureServer
         throw std::runtime_error("Not implemented: configureServer");

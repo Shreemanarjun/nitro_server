@@ -19,9 +19,9 @@ jobs:
         with:
           channel: stable
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y lcov clang llvm libssl-dev libuv1-dev
+        run: sudo apt-get update && sudo apt-get install -y lcov clang llvm libssl-dev libuv1-dev libbrotli-dev
       - if: runner.os == 'macOS'
-        run: brew install lcov openssl@3 libuv
+        run: brew install lcov openssl@3 libuv brotli
       - run: flutter pub get
       - run: dart analyze
       - run: dart format --output=none --set-exit-if-changed lib test benchmark tool
@@ -50,9 +50,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev libuv1-dev
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev libuv1-dev libbrotli-dev
       - if: runner.os == 'macOS'
-        run: brew install openssl@3 libuv
+        run: brew install openssl@3 libuv brotli
       - run: >
           cmake -S src -B build/san -DCMAKE_BUILD_TYPE=Debug
           -DNITRO_SERVER_BUILD_TESTS=ON -DNITRO_SERVER_SANITIZE=${{ matrix.sanitizer }}
@@ -83,9 +83,9 @@ jobs:
         with:
           go-version: stable
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y clang libssl-dev libuv1-dev
+        run: sudo apt-get update && sudo apt-get install -y clang libssl-dev libuv1-dev libbrotli-dev
       - if: runner.os == 'macOS'
-        run: brew install openssl@3 libuv
+        run: brew install openssl@3 libuv brotli
       - run: flutter pub get
       - run: cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release
       - run: cmake --build build/lib --parallel
@@ -99,8 +99,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install libuv + OpenSSL (vcpkg)
-        run: vcpkg install libuv openssl --triplet x64-windows
+      - name: Install libuv + OpenSSL + Brotli (vcpkg)
+        run: vcpkg install libuv openssl brotli --triplet x64-windows
       - name: Configure
         run: >
           cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release

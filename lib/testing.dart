@@ -419,6 +419,19 @@ class _InMemoryNative extends NitroServerNative {
   bool supportsTls() => false;
 
   @override
+  bool supportsBrotli() => false;
+
+  // The in-memory engine has no native brotli; supportsBrotli() gates callers
+  // off this path, so these are never reached.
+  @override
+  Uint8List brotliEncode(Uint8List data, int quality) =>
+      throw UnsupportedError('brotli unavailable in the in-memory test engine');
+
+  @override
+  Uint8List brotliDecode(Uint8List data) =>
+      throw UnsupportedError('brotli unavailable in the in-memory test engine');
+
+  @override
   void resetNative() {}
 
   @override

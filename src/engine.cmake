@@ -70,6 +70,43 @@ function(nitro_server_attach_libuv target)
     "(brew install libuv / apt install libuv1-dev)")
 endfunction()
 
+# ── Brotli (response compression, optional) ──────────────────────────────────
+# Links libbrotli and defines NITRO_SERVER_BROTLI when found; otherwise the
+# engine builds without it and nitro_server_brotli_available() reports 0, so the
+# compress() middleware falls back to gzip. Found via pkg-config (Ubuntu's
+# libbrotli-dev, Homebrew's brotli.pc) with a Homebrew-prefix fallback. Needs
+# all three components: encoder, decoder (round-trip tests) and common.
+function(nitro_server_attach_brotli target)
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(BROTLI QUIET libbrotlienc libbrotlidec libbrotlicommon)
+    if(BROTLI_FOUND)
+      target_include_directories(${target} PRIVATE ${BROTLI_INCLUDE_DIRS})
+      target_link_libraries(${target} PRIVATE ${BROTLI_LIBRARIES})
+      target_link_directories(${target} PRIVATE ${BROTLI_LIBRARY_DIRS})
+      target_compile_definitions(${target} PRIVATE NITRO_SERVER_BROTLI=1)
+      message(STATUS "nitro_server: Brotli enabled (pkg-config ${BROTLI_libbrotlienc_VERSION})")
+      return()
+    endif()
+  endif()
+  foreach(cand /opt/homebrew/opt/brotli /usr/local/opt/brotli /opt/homebrew /usr/local)
+    if(EXISTS "${cand}/include/brotli/encode.h")
+      find_library(NITRO_BROTLI_ENC NAMES brotlienc HINTS "${cand}/lib")
+      find_library(NITRO_BROTLI_DEC NAMES brotlidec HINTS "${cand}/lib")
+      find_library(NITRO_BROTLI_COM NAMES brotlicommon HINTS "${cand}/lib")
+      if(NITRO_BROTLI_ENC AND NITRO_BROTLI_DEC AND NITRO_BROTLI_COM)
+        target_include_directories(${target} PRIVATE "${cand}/include")
+        target_link_libraries(${target} PRIVATE
+          "${NITRO_BROTLI_ENC}" "${NITRO_BROTLI_DEC}" "${NITRO_BROTLI_COM}")
+        target_compile_definitions(${target} PRIVATE NITRO_SERVER_BROTLI=1)
+        message(STATUS "nitro_server: Brotli enabled at ${cand}")
+        return()
+      endif()
+    endif()
+  endforeach()
+  message(STATUS "nitro_server: Brotli not found; building without it (gzip only)")
+endfunction()
+
 # ── nitro_server engine ────────────────────────────────────────────────────
 # Compiles src/engine/*.cpp and links the result into the plugin library.
 # Mirrors nitro_http's engine.cmake: Apple platforms compile the unity TU
@@ -81,6 +118,7 @@ set(NITRO_SERVER_ENGINE_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/engine/JsonWriter.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/engine/EngineRegistry.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/engine/UvReactor.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/engine/Brotli.cpp"
 )
 
 function(nitro_server_attach_engine target)
@@ -97,6 +135,7 @@ function(nitro_server_attach_engine target)
   )
   nitro_server_attach_tls(${target})
   nitro_server_attach_libuv(${target})
+  nitro_server_attach_brotli(${target})
   if(WIN32)
     target_compile_definitions(${target} PRIVATE
       WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)

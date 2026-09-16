@@ -1337,15 +1337,17 @@ TEST(UvReactorTest, WsSendQueuesAndOverflowCloses1009) {
   std::string payload;
   EXPECT_EQ(readWsFrame(fd, payload), 0x1);
   EXPECT_EQ(payload, "hi");
-  // The peer stops reading: sends fill the socket, then the reactor queue,
-  // then the cap trips and the session closes with 1009. The volume must
-  // exceed the OS send buffer so the writes back up into writePending — a
-  // capped client RCVBUF keeps that within a few MB even where loopback
-  // autotunes generously.
+  // The peer stops reading: queued sends fill the socket, then the reactor's
+  // writePending crosses the 64 KB cap and the session closes with 1009.
+  // wsSend only reports -1 once that teardown has happened, and it happens on
+  // the loop thread — so yield to it periodically. Otherwise this thread can
+  // enqueue the entire flood before the loop runs once (it then coalesces and
+  // trips, but every wsSend already returned 0), and `last` never sees -1.
   std::vector<uint8_t> block(16 * 1024, 'q');
   int64_t last = 0;
-  for (int i = 0; i < 1024 && last >= 0; i++) {
+  for (int i = 0; i < 4000 && last >= 0; i++) {
     last = f.server->wsSend(id, block.data(), block.size(), true, false);
+    if ((i & 31) == 31) std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   EXPECT_EQ(last, -1);
   ASSERT_TRUE(f.waitForWsSeen(1));

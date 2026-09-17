@@ -310,6 +310,48 @@ final class JsonWriter implements Finalizable {
   void writeBool(bool value) => _n.boolFn(_w, value ? 1 : 0);
   void writeNull() => _n.nullFn(_w);
 
+  /// Serializes an arbitrary JSON [value] (`Map`, `List`, `String`, `int`,
+  /// `double`, `bool`, `null`) by walking it and driving the writer directly —
+  /// no intermediate `String` like `jsonEncode` + `utf8.encode`, so it is the
+  /// fast path behind [ResponseContext.jsonBody]. A non-JSON object is asked
+  /// for `.toJson()` (as `jsonEncode` does); if it has none, a
+  /// [JsonUnsupportedObjectError] is thrown naming the type.
+  void writeValue(Object? value) {
+    switch (value) {
+      case null:
+        writeNull();
+      case final bool b:
+        writeBool(b);
+      case final int i:
+        writeInt(i);
+      case final double d:
+        writeDouble(d);
+      case final String s:
+        writeString(s);
+      case final Map<dynamic, dynamic> m:
+        beginObject();
+        for (final e in m.entries) {
+          key(e.key.toString());
+          writeValue(e.value);
+        }
+        endObject();
+      case final List<dynamic> l:
+        beginArray();
+        for (final v in l) {
+          writeValue(v);
+        }
+        endArray();
+      default:
+        final Object? converted;
+        try {
+          converted = (value as dynamic).toJson();
+        } catch (_) {
+          throw JsonUnsupportedObjectError(value);
+        }
+        writeValue(converted);
+    }
+  }
+
   /// Writes already-encoded JSON [fragment] verbatim as one value (e.g. a
   /// cached sub-document). The caller guarantees it is valid JSON.
   void writeRaw(String fragment) {

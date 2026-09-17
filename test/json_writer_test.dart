@@ -297,6 +297,36 @@ void main() {
       w.dispose();
     });
 
+    test('writeValue serializes any JSON value byte-identically to jsonEncode', () {
+      final w = JsonWriter();
+      for (final v in <Object?>[
+        null,
+        true,
+        42,
+        -3.5,
+        'a "quoted"\n\tvalue',
+        [1, 'two', false, null],
+        {'id': 1, 'tags': ['x', 'y'], 'meta': {'v': 2, 'ok': true}},
+        <String, Object?>{},
+        <Object?>[],
+      ]) {
+        w.reset();
+        w.writeValue(v);
+        expect(w.toBytes(), utf8.encode(jsonEncode(v)), reason: '$v');
+      }
+      w.dispose();
+    });
+
+    test('writeValue uses toJson() and rejects an unencodable object', () {
+      final w = JsonWriter();
+      w.writeValue(_Money(5));  // has toJson
+      expect(w.toBytes(), utf8.encode('{"cents":5}'));
+      w.reset();
+      expect(() => w.writeValue(_NoJson()),
+          throwsA(isA<JsonUnsupportedObjectError>()));
+      w.dispose();
+    });
+
     test('dispose is idempotent', () {
       final w = JsonWriter()..writeInt(1);
       w.dispose();
@@ -328,3 +358,14 @@ void main() {
     });
   }, skip: libPath == null ? 'native library not built' : null);
 }
+
+/// A value object with a `toJson()`, like a real domain type — writeValue must
+/// call it, mirroring jsonEncode.
+class _Money {
+  final int cents;
+  _Money(this.cents);
+  Map<String, Object?> toJson() => {'cents': cents};
+}
+
+/// No `toJson()` — writeValue must reject it with JsonUnsupportedObjectError.
+class _NoJson {}

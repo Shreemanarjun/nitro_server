@@ -67,10 +67,14 @@ env-gated engine timer to split head-decode vs the two crossings.
 
 ## Phase 2 — Structural (target: further under load)
 
-5. **Response batching.** Mirror the head-side Backpressure.batch: queue
-   `respond()` calls on the Dart isolate and flush once per event-loop turn as
-   one FFI crossing carrying N answers. The engine already coalesces consecutive
-   same-conn writes in `onAsync`; this cuts the *crossing* count under load.
+5. ~~**Response batching.**~~ **Measured, rejected.** Queue `respond()` on the
+   isolate, flush N answers as one FFI crossing. Ceiling is tiny and the trade is
+   wrong: the `FastCalls` leaf crossing is **0.16 µs** (`tool/perf/respond_bench`),
+   so batching it away reclaims ~1.3% of one core at 81k req/s (below noise), and
+   libuv's `uv_async_send` already coalesces the loop-thread wake. The handler is
+   bound by round-trip **latency** (736 µs p50), which a batch flush-hop only
+   *increases* — hurting throughput at fixed concurrency and the p99 tail lead.
+   See `docs/benchmark-results.md` §2b.
 6. **Engine-side response templates.** Generalize `writeTemplatedArray`: a
    handler describes a fixed template + the few dynamic values, the engine
    assembles the bytes natively — no full Dart serialization, one lean crossing.
@@ -92,7 +96,7 @@ env-gated engine timer to split head-decode vs the two crossings.
 | P1.2 lazy head decode | med | low | low |
 | P1.3 object reuse | med | low | med |
 | P1.4 leaner respond | med | low | low |
-| P2.5 response batching | high (under load) | med | med |
+| ~~P2.5 response batching~~ | ~1.3% (measured, < noise) | med | med — **rejected** |
 | P2.6 engine templates | high (fixed shapes) | med | high |
 
 Do P1 first (cheap, likely ~100k), re-measure against the 8.1 µs ceiling, then

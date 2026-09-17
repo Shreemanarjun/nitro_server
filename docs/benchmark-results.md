@@ -61,6 +61,55 @@ handler path (79k); nitro's **`getStatic` (engine-served) hits 122k** — ~0.9×
 — and nitro owns **tail latency** on every path (p99 ~5ms handler / ~2.3ms
 getStatic vs Go 11–16ms, Node 52–56ms).
 
+### 2a. Differentiating run — `wrk -t2 -c64` (servers get their own cores)
+
+`-c256` on an 8-core laptop puts `wrk -t8` and an 8-isolate server on the same
+cores; under that contention every framework ties at the *machine* ceiling
+(~80k, identical p50/p99) — it measures the box, not the server. Giving `wrk`
+2 threads and the server the rest separates them. `/json`, avg of 4×6 s runs:
+
+| framework | req/s | p50 | **p99** |
+|---|--:|--:|--:|
+| node | 141301 | 294µs | 1.57ms |
+| **nitro** (`getStatic`) | **139970** | 411µs | **1.00ms** |
+| go | 137712 | 310µs | 1.16ms |
+| dart:io | 83124¹ | 511µs | 2.39ms |
+| **nitro** (handler) | 81312 | 736µs | **1.14ms** |
+| shelf | 39784¹ | 0.93ms | 6.41ms |
+
+¹ dart:io and shelf ran last in a ~15-min sweep; the laptop thermally throttled
+by then (both measured ~100k / ~84k earlier in the same session). nitro, go and
+node ran first — clean, and consistent across every run today.
+
+**What this run says:**
+- **`getStatic` (140k) ties the throughput leaders** (node/go 138–141k) — the
+  engine-served path is Go/Node-class, and takes the **best tail in the field**
+  (p99 1.00ms).
+- **The handler path is latency-bound, not CPU-bound:** 736µs p50 × 64 conns ≈
+  81k. Throughput is mid-pack (the Dart round-trip sets the floor), but its p99
+  **1.14ms is the 2nd-best tail here** — the two best tails are both nitro.
+
+### 2b. Why not response batching (measured)
+
+The obvious next lever looked like batching the per-request `respond` FFI
+crossings (heads already arrive batched via `Backpressure.batch`). Measured, it
+does not pay:
+
+| quantity | measured | implication |
+|---|--:|---|
+| `respond` leaf crossing (`FastCalls`) | **0.16 µs/call** | the whole crossing is already sub-µs |
+| batchable CPU at 81k req/s | 0.16µs × 81k ≈ **1.3%** of one core | below the ±3–5% run-to-run noise |
+| handler p50 (the real limiter) | **736 µs** | 4600× the crossing — batching can't touch it |
+
+The handler is bound by round-trip **latency**, not crossing CPU. A Dart-side
+batch buffer must *defer* answers to coalesce them (a flush hop), which **adds**
+latency — lowering the concurrency-bound throughput and threatening the p99
+1.14ms lead that is nitro's actual differentiator. So the crossing count is not
+worth cutting; the only lever that moves the handler number is removing the
+round-trip itself (engine-served templates / native micro-handlers, P2.6/P3.7 in
+[dynamic-route-perf-plan.md](dynamic-route-perf-plan.md)) — or using `getStatic`
+for anything cacheable.
+
 ---
 
 ## Reconciliation

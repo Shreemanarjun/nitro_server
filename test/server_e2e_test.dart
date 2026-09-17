@@ -613,22 +613,20 @@ void main() {
       skip: skipReason,
     );
 
-    test('template routes assemble the body from path params, engine-side', () async {
+    test('template routes assemble the body from path + query, engine-side', () async {
       server = await NitroServer.bind();
       await server!.getTemplated(
         '/tmpl/:id',
-        const [
-          TemplateSegment.literal('{"id":'),
-          TemplateSegment.param('id'),
-          TemplateSegment.literal(',"ok":true}'),
-        ],
+        '{"id":{id},"ok":true}',
         contentType: 'application/json',
       );
-      await server!.getTemplated('/pair/:a/:b', const [
-        TemplateSegment.param('a'),
-        TemplateSegment.literal('-'),
-        TemplateSegment.param('b', escape: SlotEscape.raw),
-      ]);
+      await server!.getTemplated('/pair/:a/:b', '{a}-{b!}');
+      // A query slot, form-decoded, plus a raw numeric query field.
+      await server!.getTemplated(
+        '/search',
+        '{"q":{?q},"page":{?page!}}',
+        contentType: 'application/json',
+      );
 
       final res = await _get(server!.port, '/tmpl/42');
       expect(res.status, 200);
@@ -649,6 +647,10 @@ void main() {
       // Two slots, one raw (no quotes).
       final pair = await _get(server!.port, '/pair/x/y');
       expect(pair.body, '"x"-y');
+
+      // Query slots: q form-decoded to "a b", page raw.
+      final search = await _get(server!.port, '/search?q=a%20b&page=2');
+      expect(search.body, '{"q":"a b","page":2}');
     });
 
     test('several cookies ride as separate set-cookie headers', () async {

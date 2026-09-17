@@ -124,11 +124,21 @@ body, `wrk -t2 -c64`, same thermal instant):
 
 **2.57× the handler's throughput, 3× lower p50**, and the template p50 (0.85ms)
 matches `getStatic` (~0.81ms in §2a) — i.e. it runs at engine-served speed
-because it never crosses into Dart. Slots land only in the body (no
-header-splitting surface); `SlotEscape.jsonString` escapes the value so a
-`"`/`\`/control byte cannot break out of its JSON string (unit + libFuzzer
-covered: `template_test.cpp`, `template_fuzz.cpp` — 262k execs clean). Scope:
-literal + `:param` slots; query slots are v2.
+because it never crosses into Dart.
+
+The API is a template **string**: `{id}` = path param, `{?q}` = query value
+(form-decoded engine-side), trailing `!` = raw, `{{`/`}}` = literal braces; any
+other brace (a JSON `{`/`}`) is literal, so a JSON body needs no escaping:
+
+```dart
+server.getTemplated('/users/:id', '{"userId":{id},"q":{?q}}',
+    contentType: 'application/json');
+```
+
+Slots land only in the body (no header-splitting surface); `jsonString` (the
+default) escapes the value so a `"`/`\`/control byte cannot break out of its
+JSON string. Unit + libFuzzer covered (`template_test.cpp`, `template_fuzz.cpp`
+— decode + escape + query form-decode, 1.85M execs clean).
 
 ---
 

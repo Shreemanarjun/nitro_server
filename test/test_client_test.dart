@@ -92,59 +92,58 @@ void main() {
     expect(res.text(), 'gone');
   });
 
-  test('getTemplated assembles the body from path params, no handler', () async {
+  test('getTemplated fills path + query slots from a template string', () async {
     await client.server.getTemplated(
       '/u/:id',
-      const [
-        TemplateSegment.literal('{"id":'),
-        TemplateSegment.param('id'),
-        TemplateSegment.literal('}'),
-      ],
+      '{"id":{id},"q":{?q},"n":{?n!}}',
       contentType: 'application/json',
     );
-    final res = await client.get('/u/42');
+    final res = await client.get('/u/42?q=a%20b&n=5');
     expect(res.status, 200);
-    expect(res.text(), '{"id":"42"}');
+    expect(res.text(), '{"id":"42","q":"a b","n":5}');  // q form-decoded, n raw
     expect(res.headers['content-type'], 'application/json');
     // HEAD carries no body.
-    expect((await client.head('/u/42')).text(), isEmpty);
-    // A tricky value stays inside its JSON string (still parses).
-    final tricky = await client.get('/u/a%22b');
-    expect(() => jsonDecode(tricky.text()), returnsNormally);
+    expect((await client.head('/u/42?q=x&n=1')).text(), isEmpty);
+    // A missing jsonString query slot is "" (valid JSON), raw slot empty.
+    final missing = await client.get('/u/7?n=0');
+    expect(missing.text(), '{"id":"7","q":"","n":0}');
   });
 
-  test('getTemplated raw slot passes the value through unquoted', () async {
-    await client.server.getTemplated('/p/:a/:b', const [
-      TemplateSegment.param('a', escape: SlotEscape.raw),
-      TemplateSegment.literal('/'),
-      TemplateSegment.param('b'),
-    ]);
-    expect((await client.get('/p/7/9')).text(), '7/"9"');
+  test('getTemplated raw escape and a plain-text default', () async {
+    await client.server.getTemplated(
+      '/greet/:name',
+      'Hello {name}!',  // raw default: no quotes around the value
+      escape: SlotEscape.raw,
+      contentType: 'text/plain',
+    );
+    expect((await client.get('/greet/bob')).text(), 'Hello bob!');
+    // Literal braces via {{ }}.
+    await client.server.getTemplated('/b/:x', '{{{x!}}}');
+    expect((await client.get('/b/9')).text(), '{9}');
   });
 
-  test('getTemplated rejects a slot with no matching :param', () async {
+  test('getTemplated rejects a path slot with no matching :param', () async {
     expect(
-      () => client.server.getTemplated('/u/:id', const [
-        TemplateSegment.param('wrong'),
-      ]),
+      () => client.server.getTemplated('/u/:id', '{wrong}'),
       throwsA(isA<ArgumentError>()),
     );
+    // An unrecognised `{…}` is literal text, not an error: this registers and
+    // echoes the braces back verbatim.
+    await client.server.getTemplated('/lit', 'a {not a slot} b',
+        contentType: 'text/plain');
+    expect((await client.get('/lit')).text(), 'a {not a slot} b');
   });
 
   test('templateRoute needs a token for HttpMethod.custom', () async {
     expect(
-      () => client.server.templateRoute(
-        HttpMethod.custom,
-        '/x',
-        const [TemplateSegment.literal('x')],
-      ),
+      () => client.server.templateRoute(HttpMethod.custom, '/x', 'x'),
       throwsA(isA<ArgumentError>()),
     );
     // A custom template route with a token registers and serves.
     await client.server.templateRoute(
       HttpMethod.custom,
       '/x/:v',
-      const [TemplateSegment.param('v', escape: SlotEscape.raw)],
+      '{v!}',
       customMethod: 'REPORT',
     );
     final res = await client.request(HttpMethod.custom, '/x/9',
@@ -152,23 +151,39 @@ void main() {
     expect(res.text(), '9');
   });
 
-  test('template blob round-trips and rejects malformed input', () {
+  test('parseTemplate compiles the placeholder grammar', () {
+    final segs = parseTemplate('{"id":{id},"q":{?q},"n":{n!}} {{x}}');
+    expect(segs.whereType<TemplateParam>().map((s) => s.name), ['id', 'n']);
+    expect(segs.whereType<TemplateQuery>().single.name, 'q');
+    expect(
+      segs.firstWhere((s) => s is TemplateParam && s.name == 'n'),
+      isA<TemplateParam>().having((s) => s.escape, 'escape', SlotEscape.raw),
+    );
+    // {{ }} collapse to literal braces somewhere in the output.
+    expect(segs.whereType<TemplateLiteral>().map((s) => s.text).join(),
+        contains('{x}'));
+    // A JSON brace that is not a placeholder stays literal (no escaping).
+    expect(parseTemplate('{"a":{a}}').whereType<TemplateLiteral>().first.text,
+        '{"a":');
+    expect((parseTemplate('{}').single as TemplateLiteral).text, '{}');
+  });
+
+  test('template blob round-trips and the assembler mirrors the engine', () {
     const segs = [
       TemplateSegment.literal('a"b'),
       TemplateSegment.param('id'),
-      TemplateSegment.param('n', escape: SlotEscape.raw),
+      TemplateSegment.query('q', escape: SlotEscape.raw),
     ];
     final decoded = decodeTemplateBlob(encodeTemplateBlob(segs));
     expect(decoded, hasLength(3));
-    expect((decoded[0] as TemplateLiteral).text, 'a"b');
     expect((decoded[1] as TemplateParam).escape, SlotEscape.jsonString);
-    expect((decoded[2] as TemplateParam).escape, SlotEscape.raw);
-    // Assembler: escaping, raw passthrough, missing -> empty ("" when json).
+    expect((decoded[2] as TemplateQuery).escape, SlotEscape.raw);
+    // Assembler: escaping, query raw passthrough, missing -> empty.
     expect(
-      assembleTemplateBody(decoded, {'id': 'x"y', 'n': '5'}),
+      assembleTemplateBody(decoded, {'id': 'x"y'}, {'q': '5'}),
       'a"b"x\\"y"5',
     );
-    expect(assembleTemplateBody(decoded, const {}), 'a"b""');  // both missing
+    expect(assembleTemplateBody(decoded, const {}, const {}), 'a"b""');
     // Truncated blob throws.
     final blob = encodeTemplateBlob(segs);
     expect(

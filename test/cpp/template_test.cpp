@@ -50,7 +50,29 @@ TEST(TemplateTest, AssemblesLiteralsAndParams) {
       {TemplateSegment::Kind::Literal, TemplateSegment::Escape::Raw, "}"},
   };
   std::vector<RouteParam> params = {{"id", "42"}};
-  EXPECT_EQ(assembleTemplateBody(segs, params), "{\"id\":\"42\"}");
+  EXPECT_EQ(assembleTemplateBody(segs, params, ""), "{\"id\":\"42\"}");
+}
+
+TEST(TemplateTest, QuerySlotsFormDecode) {
+  std::vector<TemplateSegment> segs = {
+      {TemplateSegment::Kind::Query, TemplateSegment::Escape::JsonString, "q"},
+      {TemplateSegment::Kind::Literal, TemplateSegment::Escape::Raw, "|"},
+      {TemplateSegment::Kind::Query, TemplateSegment::Escape::Raw, "n"},
+  };
+  // q = "a b" (form-decoded from a+b), n missing -> empty raw.
+  EXPECT_EQ(assembleTemplateBody(segs, {}, "q=a+b&x=1"), "\"a b\"|");
+  EXPECT_EQ(assembleTemplateBody(segs, {}, "n=5"), "\"\"|5");
+}
+
+TEST(TemplateTest, QueryGetDecodesValueAndHandlesEdges) {
+  EXPECT_EQ(queryGet("a=1&b=two", "b"), "two");
+  EXPECT_EQ(queryGet("q=hello%20world", "q"), "hello world");
+  EXPECT_EQ(queryGet("q=a+b", "q"), "a b");
+  EXPECT_EQ(queryGet("a=1", "missing"), "");
+  EXPECT_EQ(queryGet("", "x"), "");
+  EXPECT_EQ(queryGet("flag&a=1", "flag"), "");   // bare key
+  EXPECT_EQ(queryGet("q=%zz", "q"), "%zz");       // bad %-escape kept verbatim
+  EXPECT_EQ(queryGet("q=%f", "q"), "%f");          // truncated %-escape kept
 }
 
 TEST(TemplateTest, EscapesParamValuesSoInjectionCannotBreakOut) {
@@ -59,7 +81,7 @@ TEST(TemplateTest, EscapesParamValuesSoInjectionCannotBreakOut) {
   };
   // A value with a quote + brace must stay inside its JSON string.
   std::vector<RouteParam> params = {{"q", "\",\"admin\":true}"}};
-  EXPECT_EQ(assembleTemplateBody(segs, params),
+  EXPECT_EQ(assembleTemplateBody(segs, params, ""),
             "\"\\\",\\\"admin\\\":true}\"");
 }
 
@@ -70,7 +92,7 @@ TEST(TemplateTest, RawEscapeEmitsVerbatimAndMissingParamIsEmpty) {
       {TemplateSegment::Kind::Param, TemplateSegment::Escape::JsonString, "gone"},
   };
   std::vector<RouteParam> params = {{"n", "7"}};  // "gone" not captured
-  EXPECT_EQ(assembleTemplateBody(segs, params), "7|\"\"");
+  EXPECT_EQ(assembleTemplateBody(segs, params, ""), "7|\"\"");
 }
 
 TEST(TemplateTest, BlobRoundTrips) {

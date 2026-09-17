@@ -391,23 +391,47 @@ class NitroServer {
   );
 
   /// Registers a route whose body the engine assembles per request from
-  /// [template] — literal chunks interleaved with `:param` slots from the
-  /// matched path — and serves entirely on its own thread, never crossing into
-  /// Dart. This is the middle ground between [getStatic] (fully fixed) and a
-  /// handler: for a response fully derivable from the URL (echo, canned lookups
-  /// keyed by a param, redirects-as-body) it runs at static-route throughput.
+  /// [template] and serves entirely on its own thread, never crossing into
+  /// Dart. The middle ground between [getStatic] (fully fixed) and a handler:
+  /// for a response derivable from the URL (echo, canned lookups keyed by a
+  /// param, search-style query reflection) it runs at static-route throughput.
   ///
-  /// Every [TemplateParam] must name a `:param` in [pattern]. A [TemplateParam]
-  /// defaults to [SlotEscape.jsonString] so values with `"`/`\`/control bytes
-  /// stay inside their JSON string — pass [SlotEscape.raw] only for values you
-  /// know are safe unescaped. Like [staticRoute]: no handler, so [middleware],
-  /// timeouts and fallbacks never apply, and a request carrying a body closes
-  /// the connection after the answer. Registering replaces any route at
-  /// (method, pattern). Returns `this`.
+  /// [template] is a string with placeholders — `{id}` = the `:id` path param,
+  /// `{?q}` = the `?q=` query value, a trailing `!` (`{n!}`) forces raw, and
+  /// `{{`/`}}` are literal braces. Slots are escaped per [escape]
+  /// ([SlotEscape.jsonString] by default, so a value with `"`/`\`/control bytes
+  /// stays inside its JSON string — use [SlotEscape.raw] for a plain-text body).
+  /// Every `{name}` path slot must name a `:param` in [pattern].
+  ///
+  /// Like [staticRoute]: no handler, so [middleware], timeouts and fallbacks
+  /// never apply, and a request carrying a body closes the connection after the
+  /// answer. Registering replaces any route at (method, pattern). Returns
+  /// `this`. Build a template programmatically with [parseTemplate] +
+  /// [templateRouteSegments] instead when the string form does not fit.
   Future<NitroServer> templateRoute(
     HttpMethod method,
     String pattern,
-    List<TemplateSegment> template, {
+    String template, {
+    SlotEscape escape = SlotEscape.jsonString,
+    int status = 200,
+    String? contentType,
+    Map<String, String> headers = const {},
+    String customMethod = '',
+  }) => templateRouteSegments(
+        method,
+        pattern,
+        parseTemplate(template, defaultEscape: escape),
+        status: status,
+        contentType: contentType,
+        headers: headers,
+        customMethod: customMethod,
+      );
+
+  /// [templateRoute] from pre-built [segments] (see [parseTemplate]).
+  Future<NitroServer> templateRouteSegments(
+    HttpMethod method,
+    String pattern,
+    List<TemplateSegment> segments, {
     int status = 200,
     String? contentType,
     Map<String, String> headers = const {},
@@ -422,7 +446,7 @@ class NitroServer {
       );
     }
     final params = _patternParams(pattern);
-    for (final seg in template) {
+    for (final seg in segments) {
       if (seg is TemplateParam && !params.contains(seg.name)) {
         throw ArgumentError.value(
           seg.name,
@@ -437,15 +461,17 @@ class NitroServer {
       pattern,
       status,
       {'content-type': ?contentType, ...headers},
-      encodeTemplateBlob(template),
+      encodeTemplateBlob(segments),
     );
     return this;
   }
 
-  /// GET shorthand for [templateRoute].
+  /// GET shorthand for [templateRoute]:
+  /// `server.getTemplated('/users/:id', '{"userId":{id}}')`.
   Future<NitroServer> getTemplated(
     String pattern,
-    List<TemplateSegment> template, {
+    String template, {
+    SlotEscape escape = SlotEscape.jsonString,
     int status = 200,
     String? contentType,
     Map<String, String> headers = const {},
@@ -453,6 +479,7 @@ class NitroServer {
     HttpMethod.get,
     pattern,
     template,
+    escape: escape,
     status: status,
     contentType: contentType,
     headers: headers,

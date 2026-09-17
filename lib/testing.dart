@@ -139,7 +139,7 @@ class NitroTestClient {
 
     // Template routes are engine-assembled too — matched and served before any
     // dispatch, HEAD shipping the length but no bytes.
-    final templateHit = _native.matchTemplate(token, path);
+    final templateHit = _native.matchTemplate(token, path, query);
     if (templateHit != null) {
       return token == 'HEAD'
           ? NitroTestResponse(
@@ -722,11 +722,19 @@ class _InMemoryNative extends NitroServerNative with NitroServerNativeDefaults {
     return best;
   }
 
-  /// The assembled answer a template route serves for [methodToken] + [path],
-  /// or null when none matches. Same precedence and HEAD→GET fallback as
-  /// [matchStatic]; the body is assembled from the matched path's params.
-  NitroTestResponse? matchTemplate(String methodToken, String path) {
+  /// The assembled answer a template route serves for [methodToken] + [path]
+  /// (with [query] the raw query string), or null when none matches. Same
+  /// precedence and HEAD→GET fallback as [matchStatic]; the body is assembled
+  /// from the matched path's params and the (form-decoded) query.
+  NitroTestResponse? matchTemplate(
+    String methodToken,
+    String path,
+    String query,
+  ) {
     final pathSegs = _split(path);
+    final queryMap = query.isEmpty
+        ? const <String, String>{}
+        : Uri.splitQueryString(query);
     NitroTestResponse? best;
     var bestSpec = -1;
     for (final route in templateRoutes) {
@@ -741,7 +749,9 @@ class _InMemoryNative extends NitroServerNative with NitroServerNativeDefaults {
           status: route.status,
           headers: route.headers,
           body: Uint8List.fromList(
-            utf8.encode(assembleTemplateBody(route.segments, scored.$2)),
+            utf8.encode(
+              assembleTemplateBody(route.segments, scored.$2, queryMap),
+            ),
           ),
         );
         bestSpec = scored.$1;

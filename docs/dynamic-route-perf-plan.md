@@ -86,8 +86,10 @@ env-gated engine timer to split head-decode vs the two crossings.
    ms), i.e. it runs at engine-served speed. Slots land only in the body (no
    header-splitting surface); `JsonString` slots are escaped so a `"`/`\`/
    control value cannot break out (unit + fuzz covered — `Template.h`,
-   `template_test.cpp`, `template_fuzz.cpp`). Scope: literal + `:param` slots;
-   query slots are v2. See `docs/benchmark-results.md` §2c.
+   `template_test.cpp`, `template_fuzz.cpp`). Ergonomic API is a template
+   **string** (`'{"id":{id},"q":{?q}}'`) parsed to segments; slots are `{id}`
+   (path param), `{?q}` (query value, engine form-decoded), `!` = raw. See
+   `docs/benchmark-results.md` §2c.
 
 ## Phase 3 — Architectural bets (only if Phase 1–2 fall short)
 

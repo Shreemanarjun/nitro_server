@@ -5,11 +5,8 @@ import 'dart:io';
 import 'package:nitro_server/nitro_server.dart';
 
 Future<void> _setup(NitroServer server) async {
-  await server.getTemplated('/t/:id', const [
-    TemplateSegment.literal('{"message":"Hello, World!","id":'),
-    TemplateSegment.param('id'),
-    TemplateSegment.literal('}'),
-  ], contentType: 'application/json');
+  await server.getTemplated('/t/:id', '{"message":"Hello, World!","id":{id}}',
+      contentType: 'application/json');
   await server.get('/h/:id', (ctx) => ResponseContext.jsonBody(
       {'message': 'Hello, World!', 'id': ctx.param('id') ?? ''}));
 }

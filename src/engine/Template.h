@@ -58,33 +58,85 @@ inline void jsonEscapeQuoted(std::string& out, const std::string& v) {
   out.push_back('"');
 }
 
-/// Builds the response body from `segments`: literals verbatim, params looked
-/// up in `params` (linear — a route captures a handful) and escaped per slot.
-/// A param with no captured value contributes an empty string (`""` when
+/// Form-decodes one URL-encoded token: `+` → space, `%XX` → byte, everything
+/// else verbatim. A stray `%` with no two hex digits behind it is kept as-is
+/// (lenient, never over-reads).
+inline std::string formDecode(const char* s, size_t n) {
+  auto hex = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+  };
+  std::string out;
+  out.reserve(n);
+  for (size_t i = 0; i < n; i++) {
+    if (s[i] == '+') {
+      out.push_back(' ');
+    } else if (s[i] == '%' && i + 2 < n) {
+      const int hi = hex(s[i + 1]), lo = hex(s[i + 2]);
+      if (hi >= 0 && lo >= 0) {
+        out.push_back((char)((hi << 4) | lo));
+        i += 2;
+      } else {
+        out.push_back('%');
+      }
+    } else {
+      out.push_back(s[i]);
+    }
+  }
+  return out;
+}
+
+/// The form-decoded value of the first `key=value` in `query` (a `k=v&k2=v2`
+/// string), or empty if `key` is absent. Keys are compared raw (rarely
+/// encoded); only the value is decoded.
+inline std::string queryGet(const std::string& query, const std::string& key) {
+  size_t i = 0;
+  while (i < query.size()) {
+    size_t amp = query.find('&', i);
+    if (amp == std::string::npos) amp = query.size();
+    size_t eq = query.find('=', i);
+    if (eq != std::string::npos && eq < amp) {
+      if (query.compare(i, eq - i, key) == 0) {
+        return formDecode(query.data() + eq + 1, amp - eq - 1);
+      }
+    } else if (amp - i == key.size() && query.compare(i, amp - i, key) == 0) {
+      return "";  // bare `key` with no `=`
+    }
+    i = amp + 1;
+  }
+  return "";
+}
+
+/// Builds the response body from `segments`: literals verbatim, Param slots
+/// from `params` (the captured `:name`s) and Query slots from `query`, each
+/// escaped per slot. A missing value contributes an empty string (`""` when
 /// JsonString), never a partial or dangling token.
 inline std::string assembleTemplateBody(
     const std::vector<TemplateSegment>& segments,
-    const std::vector<RouteParam>& params) {
+    const std::vector<RouteParam>& params, const std::string& query) {
   std::string out;
   for (const auto& seg : segments) {
     if (seg.kind == TemplateSegment::Kind::Literal) {
       out += seg.text;
       continue;
     }
-    // Param: find the captured value by name.
-    const std::string* val = nullptr;
-    for (const auto& p : params) {
-      if (p.name == seg.text) {
-        val = &p.value;
-        break;
+    std::string value;  // owns query results; empty for a missing field
+    if (seg.kind == TemplateSegment::Kind::Query) {
+      value = queryGet(query, seg.text);
+    } else {  // Param
+      for (const auto& p : params) {
+        if (p.name == seg.text) {
+          value = p.value;
+          break;
+        }
       }
     }
-    static const std::string kEmpty;
-    const std::string& v = val ? *val : kEmpty;
     if (seg.escape == TemplateSegment::Escape::JsonString) {
-      jsonEscapeQuoted(out, v);
+      jsonEscapeQuoted(out, value);
     } else {
-      out += v;
+      out += value;
     }
   }
   return out;
@@ -119,7 +171,9 @@ inline std::vector<TemplateSegment> decodeTemplateBlob(const uint8_t* buf,
     off += 4;
     need(off, textLen);
     TemplateSegment seg;
-    seg.kind = kind == 1 ? TemplateSegment::Kind::Param : TemplateSegment::Kind::Literal;
+    seg.kind = kind == 1   ? TemplateSegment::Kind::Param
+               : kind == 2 ? TemplateSegment::Kind::Query
+                           : TemplateSegment::Kind::Literal;
     seg.escape = escape == 1 ? TemplateSegment::Escape::JsonString : TemplateSegment::Escape::Raw;
     seg.text.assign((const char*)buf + off, textLen);
     off += textLen;

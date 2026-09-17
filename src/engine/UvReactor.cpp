@@ -1050,7 +1050,7 @@ void UvReactor::processConn(Conn* c) {
       // Assembled on this thread from the captured path params — no Dart hop.
       // Same body-carrying-request rule as a static route (answer then close).
       const bool ka = keepAlive && bodyBytes.empty();
-      std::string body = assembleTemplateBody(tr.segments, m.params);
+      std::string body = assembleTemplateBody(tr.segments, m.params, query);
       std::string out =
           uvBuildHead(tr.status, tr.headers, (int64_t)body.size(), ka, kaSecs);
       if (head.method != Method::Head) out.append(body);

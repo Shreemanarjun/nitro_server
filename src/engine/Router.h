@@ -28,13 +28,14 @@ struct StaticResponse {
 };
 
 /// One piece of a templated body. A Literal contributes its bytes verbatim; a
-/// Param substitutes the captured `:name` path parameter, escaped per `escape`.
+/// Param substitutes the captured `:name` path parameter and a Query the
+/// `?name=` query value (form-decoded), each escaped per `escape`.
 struct TemplateSegment {
-  enum class Kind : uint8_t { Literal = 0, Param = 1 };
+  enum class Kind : uint8_t { Literal = 0, Param = 1, Query = 2 };
   enum class Escape : uint8_t { Raw = 0, JsonString = 1 };
   Kind kind = Kind::Literal;
   Escape escape = Escape::Raw;  // ignored for Literal
-  std::string text;             // Literal: the bytes; Param: the parameter name
+  std::string text;  // Literal: the bytes; Param/Query: the field name
 };
 
 /// A body the engine assembles per request from `segments` + the request's

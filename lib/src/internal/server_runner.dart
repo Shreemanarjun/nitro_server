@@ -1081,10 +1081,10 @@ class _WsSessionImpl implements WsSession {
     if (!_done) _messages.add(message);
   }
 
-  /// Peer-initiated close: echo the code (a no-op on the reaped engine
-  /// side, but it completes observers like the test client deterministically)
-  /// and finish without further answers.
-  void _remoteClose(int code) {
+  /// The shared close path: mark done, complete the closing handshake natively
+  /// (a no-op on the reaped engine side, but it settles observers like the test
+  /// client deterministically), and finish without further answers.
+  void _finish(int code) {
     if (_done) return;
     _done = true;
     _closeCode = code;
@@ -1095,18 +1095,12 @@ class _WsSessionImpl implements WsSession {
     _onDone();
   }
 
-  /// Local close (handler return/throw, explicit close, runner shutdown):
-  /// complete the closing handshake unless already done.
-  void _closeLocal(int code) {
-    if (_done) return;
-    _done = true;
-    _closeCode = code;
-    try {
-      _native.wsClose(_id, code);
-    } catch (_) {}
-    _messages.close();
-    _onDone();
-  }
+  /// Peer-initiated close (a close frame arrived): echoes the code and finishes.
+  void _remoteClose(int code) => _finish(code);
+
+  /// Local close (handler return/throw, explicit close): completes the closing
+  /// handshake unless already done.
+  void _closeLocal(int code) => _finish(code);
 
   /// Runner shutdown: same as a local close but without touching native
   /// (stop() already landed).

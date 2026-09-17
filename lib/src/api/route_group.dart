@@ -4,6 +4,7 @@ library;
 import 'context.dart';
 import 'http_method.dart';
 import 'server.dart';
+import 'route_registrar.dart';
 import 'ws.dart';
 
 /// A path-prefixed view of a [NitroServer].
@@ -18,7 +19,7 @@ import 'ws.dart';
 /// Groups prefix patterns and scope middleware: [RouteGroup.use] wraps the
 /// routes registered through this group (inside the server-global chain,
 /// see [NitroServer.use]); per-route `middleware:` sits innermost.
-class RouteGroup {
+class RouteGroup with RouteRegistrar<RouteGroup> {
   /// Creates a group over [server] with [prefix]. Prefer [NitroServer.group]
   /// (and [group] for nesting) over calling this directly.
   RouteGroup({required this.server, required String prefix})
@@ -51,6 +52,7 @@ class RouteGroup {
 
   /// Registers [handler] for [method] + the prefixed [pattern]. Returns
   /// `this`, so registrations chain.
+  @override
   Future<RouteGroup> route(
     HttpMethod method,
     String pattern,
@@ -87,123 +89,6 @@ class RouteGroup {
     );
     return this;
   }
-
-  Future<RouteGroup> get(
-    String pattern,
-    RequestHandler handler, {
-    Duration? timeout,
-    List<Middleware>? middleware,
-  }) => route(
-    HttpMethod.get,
-    pattern,
-    handler,
-    timeout: timeout,
-    middleware: middleware,
-  );
-
-  Future<RouteGroup> head(
-    String pattern,
-    RequestHandler handler, {
-    Duration? timeout,
-    List<Middleware>? middleware,
-  }) => route(
-    HttpMethod.head,
-    pattern,
-    handler,
-    timeout: timeout,
-    middleware: middleware,
-  );
-
-  Future<RouteGroup> post(
-    String pattern,
-    RequestHandler handler, {
-    Duration? timeout,
-    List<Middleware>? middleware,
-    bool streamBody = false,
-    int? maxBodyBytes,
-  }) => route(
-    HttpMethod.post,
-    pattern,
-    handler,
-    timeout: timeout,
-    middleware: middleware,
-    streamBody: streamBody,
-    maxBodyBytes: maxBodyBytes,
-  );
-
-  Future<RouteGroup> put(
-    String pattern,
-    RequestHandler handler, {
-    Duration? timeout,
-    List<Middleware>? middleware,
-    bool streamBody = false,
-    int? maxBodyBytes,
-  }) => route(
-    HttpMethod.put,
-    pattern,
-    handler,
-    timeout: timeout,
-    middleware: middleware,
-    streamBody: streamBody,
-    maxBodyBytes: maxBodyBytes,
-  );
-
-  Future<RouteGroup> delete(
-    String pattern,
-    RequestHandler handler, {
-    Duration? timeout,
-    List<Middleware>? middleware,
-  }) => route(
-    HttpMethod.delete,
-    pattern,
-    handler,
-    timeout: timeout,
-    middleware: middleware,
-  );
-
-  Future<RouteGroup> patch(
-    String pattern,
-    RequestHandler handler, {
-    Duration? timeout,
-    List<Middleware>? middleware,
-    bool streamBody = false,
-    int? maxBodyBytes,
-  }) => route(
-    HttpMethod.patch,
-    pattern,
-    handler,
-    timeout: timeout,
-    middleware: middleware,
-    streamBody: streamBody,
-    maxBodyBytes: maxBodyBytes,
-  );
-
-  Future<RouteGroup> options(
-    String pattern,
-    RequestHandler handler, {
-    Duration? timeout,
-    List<Middleware>? middleware,
-  }) => route(
-    HttpMethod.options,
-    pattern,
-    handler,
-    timeout: timeout,
-    middleware: middleware,
-  );
-
-  /// Matches every method under the prefixed [pattern].
-  Future<RouteGroup> all(
-    String pattern,
-    RequestHandler handler, {
-    Duration? timeout,
-    List<Middleware>? middleware,
-  }) => route(
-    HttpMethod.all,
-    pattern,
-    handler,
-    timeout: timeout,
-    middleware: middleware,
-  );
 
   /// Registers a WebSocket route under the prefixed [pattern].
   /// See [NitroServer.ws]. Returns `this`, so registrations chain.

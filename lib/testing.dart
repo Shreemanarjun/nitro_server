@@ -164,10 +164,7 @@ class NitroTestClient {
         hasBody: bodyBytes.isNotEmpty,
         bodyComplete: bodyBytes.isEmpty,
         routePattern: match.pattern,
-        params: [
-          for (final entry in match.params.entries)
-            RawRouteParam(name: entry.key, value: entry.value),
-        ],
+        params: _rawParams(match),
       ),
     );
     if (bodyBytes.isNotEmpty) {
@@ -298,10 +295,7 @@ class NitroTestClient {
         query: query,
         packedHeaders: packHeaders((headers ?? const {}).entries),
         routePattern: match.pattern,
-        params: [
-          for (final entry in match.params.entries)
-            RawRouteParam(name: entry.key, value: entry.value),
-        ],
+        params: _rawParams(match),
       ),
     );
     // The session opens on dispatch (a microtask away); wait for it so
@@ -379,6 +373,13 @@ class _RouteMatch {
   final String pattern;
   final Map<String, String> params;
 }
+
+/// The captured `:param`s of [match] as the wire `RawRouteParam` list a head
+/// carries — shared by the request and WS-handshake head builders.
+List<RawRouteParam> _rawParams(_RouteMatch match) => [
+  for (final entry in match.params.entries)
+    RawRouteParam(name: entry.key, value: entry.value),
+];
 
 /// The in-memory half of the FFI boundary: records registrations, matches
 /// requests with engine precedence (static > `:param` > trailing `*`,

@@ -19,13 +19,6 @@ Initial release.
   cached bodies. `getStatic` is the GET shorthand; `staticRoute` takes any
   method (custom included). See `benchmark/README.md`.
 * Per-route `timeout`, `maxBodyBytes`, `middleware`, `streamBody`.
-* Worker-pool cap default raised to `max(512, 32 × cores)` (was
-  `max(64, 4 × cores)`). The pool grows on demand and self-limits to the live
-  connection count, so low-load servers are unaffected, but high-concurrency
-  servers no longer queue behind a too-small cap: on an 8-core box, `/static`
-  held ~115k req/s at 256 connections (was ~94k) and ~106k at 512 — ~90% of Go
-  `net/http`, up from ~70%. A central readiness poller (reactor) remains the
-  C10k upgrade path. See `benchmark/README.md`.
 * `ServerConfig`: `maxBodyBytes`, `keepAliveTimeout`,
   `maxRequestsPerConnection`, `headerTimeout`, `writeTimeout`,
   `maxConnections`, `maxConnectionsPerIp`, `workerThreads`, `isolates`,
@@ -78,8 +71,8 @@ Initial release.
   over reusable native buffers (0.18 µs per call vs 0.7 µs generated, AOT).
 * Request headers cross the bridge as one packed string (`packedHeaders`)
   and unpack on first access; `queryParameters` parses on first access.
-* Heads combine per isolate (`RawIncomingBatch`): heads that arrive while
-  the previous bridge post is in flight cross as one message.
+* Heads coalesce per isolate under load: heads that arrive while the previous
+  bridge post is in flight cross as one message.
 * `sendfile` for file answers (read + `SSL_write` fallback under TLS).
 * TLS via OpenSSL when built with it (`ServerConfig.tls`): HTTP/1.1 and
   `wss://` over TLS 1.2+, ALPN `http/1.1`, PEM strings or files, cert/key

@@ -16,6 +16,7 @@ import 'http_method.dart';
 import 'metrics.dart';
 import 'native_loader.dart';
 import 'route_group.dart';
+import 'route_registrar.dart';
 import 'ws.dart';
 
 /// Registers routes and middleware on a freshly bound server. With
@@ -37,7 +38,7 @@ typedef ServerSetup = FutureOr<void> Function(NitroServer server);
 /// * Android: call from a foreground service; the engine cannot keep the
 ///   process alive by itself.
 /// * Desktop: no constraints.
-class NitroServer {
+class NitroServer with RouteRegistrar<NitroServer> {
   NitroServer._(this._runner);
 
   /// Test seam: builds a facade over an injected runner (fakes) without
@@ -157,6 +158,7 @@ class NitroServer {
   /// [RequestContext.bodyStream] — for uploads too large to assemble.
   /// [maxBodyBytes] caps this route's request body; null inherits
   /// [ServerConfig.maxBodyBytes].
+  @override
   Future<NitroServer> route(
     HttpMethod method,
     String pattern,
@@ -204,128 +206,6 @@ class NitroServer {
     _runner.removeRoute(method, customMethod.toUpperCase(), pattern);
     return this;
   }
-
-  /// Shorthands so the common case stays one line:
-  ///
-  /// ```dart
-  /// await server.get('/hello', (_) async => ResponseContext.text('hi'));
-  /// ```
-  Future<NitroServer> get(
-    String pattern,
-    RequestHandler handler, {
-    Duration? timeout,
-    List<Middleware>? middleware,
-  }) => route(
-    HttpMethod.get,
-    pattern,
-    handler,
-    timeout: timeout,
-    middleware: middleware,
-  );
-
-  Future<NitroServer> head(
-    String pattern,
-    RequestHandler handler, {
-    Duration? timeout,
-    List<Middleware>? middleware,
-  }) => route(
-    HttpMethod.head,
-    pattern,
-    handler,
-    timeout: timeout,
-    middleware: middleware,
-  );
-
-  Future<NitroServer> post(
-    String pattern,
-    RequestHandler handler, {
-    Duration? timeout,
-    List<Middleware>? middleware,
-    bool streamBody = false,
-    int? maxBodyBytes,
-  }) => route(
-    HttpMethod.post,
-    pattern,
-    handler,
-    timeout: timeout,
-    middleware: middleware,
-    streamBody: streamBody,
-    maxBodyBytes: maxBodyBytes,
-  );
-
-  Future<NitroServer> put(
-    String pattern,
-    RequestHandler handler, {
-    Duration? timeout,
-    List<Middleware>? middleware,
-    bool streamBody = false,
-    int? maxBodyBytes,
-  }) => route(
-    HttpMethod.put,
-    pattern,
-    handler,
-    timeout: timeout,
-    middleware: middleware,
-    streamBody: streamBody,
-    maxBodyBytes: maxBodyBytes,
-  );
-
-  Future<NitroServer> delete(
-    String pattern,
-    RequestHandler handler, {
-    Duration? timeout,
-    List<Middleware>? middleware,
-  }) => route(
-    HttpMethod.delete,
-    pattern,
-    handler,
-    timeout: timeout,
-    middleware: middleware,
-  );
-
-  Future<NitroServer> patch(
-    String pattern,
-    RequestHandler handler, {
-    Duration? timeout,
-    List<Middleware>? middleware,
-    bool streamBody = false,
-    int? maxBodyBytes,
-  }) => route(
-    HttpMethod.patch,
-    pattern,
-    handler,
-    timeout: timeout,
-    middleware: middleware,
-    streamBody: streamBody,
-    maxBodyBytes: maxBodyBytes,
-  );
-
-  Future<NitroServer> options(
-    String pattern,
-    RequestHandler handler, {
-    Duration? timeout,
-    List<Middleware>? middleware,
-  }) => route(
-    HttpMethod.options,
-    pattern,
-    handler,
-    timeout: timeout,
-    middleware: middleware,
-  );
-
-  /// Matches every method — handy for echo, proxy and fallback routes.
-  Future<NitroServer> all(
-    String pattern,
-    RequestHandler handler, {
-    Duration? timeout,
-    List<Middleware>? middleware,
-  }) => route(
-    HttpMethod.all,
-    pattern,
-    handler,
-    timeout: timeout,
-    middleware: middleware,
-  );
 
   /// Registers a route whose response is fixed and served entirely by the
   /// engine: the request never crosses into Dart, so it answers at raw engine

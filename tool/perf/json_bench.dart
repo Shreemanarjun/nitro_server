@@ -3,7 +3,6 @@
 //   dart compile exe tool/perf/json_bench.dart -o build/json_bench && ./build/json_bench
 // ignore_for_file: avoid_print
 import 'dart:convert';
-import 'dart:typed_data';
 
 import 'package:nitro_server/nitro_server.dart';
 
@@ -96,7 +95,7 @@ void main() {
     w.endArray();
   }
 
-  for (final (label, obj, build) in [
+  for (final (label, obj, _) in [
     ('small  (1 field)', small, smallW),
     ('medium (9 fields)', medium, mediumW),
     ('array  (100 rows)', rows, rowsW),

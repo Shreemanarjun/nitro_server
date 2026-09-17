@@ -162,74 +162,10 @@ Additional measurements (`--quick --raw`, 32 connections):
 | `/work`, 4 isolates | 10,929 | 11,298 | 3,058 |
 | `/file` | 24,627 | 11,827 | 10,865 |
 
-### Static fast path (`getStatic`)
-
-A `getStatic` route is answered entirely inside the C++ engine — the request
-never crosses the FFI boundary into a Dart handler. On a trivial fixed
-response that boundary is the whole cost, so removing it is where nitro pulls
-ahead of dart:io outright.
-
-The `--raw` Dart client above tops out around 70k req/s and hides this — it
-caps the server, not the reverse. Measured instead with a saturating C++
-keep-alive load generator (64 connections, 4 server isolates, same request on
-every side, two runs each):
-
-| route (4 isolates, C++ loadgen) | server | req/s |
-|---------------------------------|--------|------:|
-| `/static` (engine-served) | nitro | 120,704 / 124,118 |
-| `/hello` (Dart handler) | dart:io | 88,397 / 95,637 |
-| `/hello` (Dart handler) | nitro | 75,682 / 76,317 |
-
-The fixed-response fast path serves ~122k req/s — ~28% over dart:io's ~96k and
-~60% over nitro's own handler path — because it pays neither the per-request
-FFI round-trip nor a Dart event-loop turn. A route backed by a Dart handler
-still pays that round-trip (76k): dart:io runs its handler in the isolate that
-owns the socket, so on a zero-work handler it stays ahead of nitro's handler
-path. Use `getStatic` for health checks, static assets, and pre-rendered or
-cached bodies to serve them at engine speed.
-
-### Connection scaling (vs Go net/http)
-
-Same C++ loadgen, `/static` (nitro) and `/hello` (Go `net/http`), as the
-connection count rises on an 8-core box. The worker pool grows to serve
-concurrent keep-alive connections but stops at its cap; with the old default
-(`max(64, 4×cores)` = 64 here) the surplus queued and throughput dipped. The
-cap is now `max(512, 32×cores)` — growth is on demand and self-limits to the
-live connection count, so a low-load server is unaffected:
-
-| connections | nitro, old cap 64 | nitro, cap 512 (default) | Go net/http |
-|-------------|------------------:|-------------------------:|------------:|
-| 64  | ~118k | ~119k | ~129k |
-| 256 | ~94k  | ~115k | ~135k |
-| 512 | ~94k  | ~106k | ~137k |
-
-Raising the cap recovered ~90% of Go at 256 connections, up from ~70%. But
-past a few hundred connections nitro still dips — it pins a worker per active
-connection (it cooperatively yields *idle* keep-alive fds, but a queued one is
-only watched once a worker picks it up and blocks in `poll` on that one fd),
-whereas Go's netpoller watches every connection with one `epoll`/`kqueue` and
-dispatches only ready ones to a small thread set. Profiling confirmed the
-locus: at load the worker threads sit in `poll` inside `recvWait`, not in
-parsing, routing or the write path.
-
-Fully closing it needs a central readiness poller — a reactor. A **libuv
-spike** (`benchmark/experiments/uv_reactor_spike.c`: N event loops over
-`SO_REUSEPORT`, the fixed-response shape a libuv-backed engine would take)
-measured the ceiling on the same box and loadgen:
-
-| connections | nitro `/static` (cap 512) | Go net/http | libuv reactor (spike) |
-|-------------|--------------------------:|------------:|----------------------:|
-| 64   | ~119k | ~129k | ~147k |
-| 256  | ~115k | ~135k | ~145k |
-| 512  | ~106k | ~137k | ~145k |
-| 1024 | ~70k  | ~133k | ~143k |
-
-The reactor holds **flat above Go** where thread-per-connection collapses
-(nitro ~70k at 1024 vs libuv ~143k) — validation for building the engine's I/O
-core on libuv (keeping the Dart dispatch layer, parser, WebSocket and TLS),
-`io_uring` on Linux included. Real-work routes (`/file`, large JSON, WebSocket)
-are unaffected by the model — the engine's I/O dominates there, which is where
-nitro already leads.
+**Engine-served fast path (`getStatic`) and the Go/Node comparison** (a fast C
+client via `wrk`, TechEmpower-style) live in
+[`../docs/benchmark-results.md`](../docs/benchmark-results.md) — the single home
+for the cross-framework results and the engine-path throughput analysis.
 
 WebSocket echo (keep-alive, one message per round trip; shelf has no
 WebSocket):

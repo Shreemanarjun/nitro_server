@@ -170,10 +170,12 @@ cacheable responses.
 
 ## Improving dynamic routes
 
-The `getStatic` (122k) vs handler (79k) delta is the **~4.5µs native↔Dart
-round-trip**. The roadmap to close it — sync handler fast-path, lazy head
-decode, object reuse, response batching, engine-side templates — is in
-[dynamic-route-perf-plan.md](dynamic-route-perf-plan.md).
+The `getStatic` (≈140k) vs handler (≈82k) delta is the
+**~4.5 µs native↔Dart round-trip** — the standalone Dart VM's isolate-message
+floor. Why that is the ceiling, which Dart-level levers were tried (and why
+shared-memory polling lost to the already-batched port), and where raw
+throughput is still winnable (the engine-served `uv_try_write` fast path):
+[perf-research-dart-ffi.md](perf-research-dart-ffi.md).
 
 ## Reproduce
 

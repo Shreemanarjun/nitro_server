@@ -66,28 +66,36 @@ getStatic vs Go 11–16ms, Node 52–56ms).
 `-c256` on an 8-core laptop puts `wrk -t8` and an 8-isolate server on the same
 cores; under that contention every framework ties at the *machine* ceiling
 (~80k, identical p50/p99) — it measures the box, not the server. Giving `wrk`
-2 threads and the server the rest separates them. `/json`, avg of 4×6 s runs:
+2 threads and the server the rest separates them. `/json` (`/t/:id` for the
+template tier), avg of 3×6 s runs, **leaders run first** so nitro's rows are
+warmer — a conservative comparison, not a flattering one:
 
 | framework | req/s | p50 | **p99** |
 |---|--:|--:|--:|
-| node | 141301 | 294µs | 1.57ms |
-| **nitro** (`getStatic`) | **139970** | 411µs | **1.00ms** |
-| go | 137712 | 310µs | 1.16ms |
-| dart:io | 83124¹ | 511µs | 2.39ms |
-| **nitro** (handler) | 81312 | 736µs | **1.14ms** |
-| shelf | 39784¹ | 0.93ms | 6.41ms |
-
-¹ dart:io and shelf ran last in a ~15-min sweep; the laptop thermally throttled
-by then (both measured ~100k / ~84k earlier in the same session). nitro, go and
-node ran first — clean, and consistent across every run today.
+| node | 150273 | 281µs | 1.29ms |
+| go | 143093 | 299µs | 1.16ms |
+| **nitro** (`getStatic`) | 136367 | 477µs | **1.02ms** |
+| **nitro** (`getTemplated`) | **135515** | 389µs | **1.01ms** |
+| dart:io | 103539 | 452µs | 2.32ms |
+| shelf | 86416 | 588µs | 4.83ms |
+| **nitro** (handler) | 81677 | 734µs | **1.11ms** |
 
 **What this run says:**
-- **`getStatic` (140k) ties the throughput leaders** (node/go 138–141k) — the
-  engine-served path is Go/Node-class, and takes the **best tail in the field**
-  (p99 1.00ms).
-- **The handler path is latency-bound, not CPU-bound:** 736µs p50 × 64 conns ≈
-  81k. Throughput is mid-pack (the Dart round-trip sets the floor), but its p99
-  **1.14ms is the 2nd-best tail here** — the two best tails are both nitro.
+- **`getTemplated` (135.5k) ≈ `getStatic` (136.4k)** — engine-side assembly
+  from `:param`/`?query` slots runs at engine-served speed (both ~0.9× the
+  node/go leaders), **1.66× the handler**, and takes the **best tail in the
+  whole field** (p99 1.01ms).
+- **nitro owns the tail:** the three tightest p99s are all nitro — template
+  1.01ms, getStatic 1.02ms, handler 1.11ms — vs go 1.16, node 1.29, dart:io
+  2.32, shelf 4.83.
+- **The handler path is latency-bound, not CPU-bound:** 734µs p50 × 64 conns ≈
+  82k. Throughput is mid-pack (the Dart round-trip sets the floor) — which is
+  exactly why `getTemplated`/`getStatic`, which skip that round-trip, leap to
+  135k+.
+
+(Absolute numbers drift with laptop thermals across a long sweep; the reliable
+signals are the **nitro-tier ordering** — template ≈ getStatic ≫ handler — and
+the **tail-latency lead**, both stable across every run this session.)
 
 ### 2b. Why not response batching (measured)
 
@@ -112,19 +120,14 @@ round-trip itself — which is what §2c's engine templates do — or using
 ### 2c. Engine-side templates — `getTemplated` (shipped)
 
 A **template route** serves a body the engine assembles on its own thread from
-the matched path's `:param` slots — no Dart handler runs, so it answers at
-static-route speed while still varying per request. The lever P2.6 predicted.
-Measured in **one process** (both routes live, identical `{"…","id":<id>}`
-body, `wrk -t2 -c64`, same thermal instant):
-
-| route (same body) | req/s | p50 | p99 |
-|---|--:|--:|--:|
-| **`getTemplated` /t/:id** | **54296** | **0.85ms** | 4.74ms |
-| handler /h/:id | 21106 | 2.58ms | 8.80ms |
-
-**2.57× the handler's throughput, 3× lower p50**, and the template p50 (0.85ms)
-matches `getStatic` (~0.81ms in §2a) — i.e. it runs at engine-served speed
-because it never crosses into Dart.
+the matched path's `:param` slots and `?query` values — no Dart handler runs,
+so it answers at static-route speed while still varying per request. The lever
+P2.6 predicted. In §2a's full table it lands at **135.5k req/s ≈ `getStatic`
+(136.4k), 1.66× the handler (81.7k), and the field's best p99 (1.01ms)** — it
+never crosses into Dart, so it runs at engine-served speed. (A same-process
+`/t` vs `/h` run under heavier contention showed the wider **2.57×** ratio; the
+gap over the handler grows as the box saturates, since only the handler pays the
+round-trip.)
 
 The API is a template **string**: `{id}` = path param, `{?q}` = query value
 (form-decoded engine-side), trailing `!` = raw, `{{`/`}}` = literal braces; any

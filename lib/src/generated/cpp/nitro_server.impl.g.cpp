@@ -100,6 +100,12 @@ public:
         // return { nullptr, 0 };
     }
 
+    NitroCppBuffer registerTemplateRoute(const std::string& method, const std::string& pattern, int64_t status, NitroCppBuffer headers, const uint8_t* templateBlob, size_t templateBlob_length) override {
+        // TODO: implement registerTemplateRoute
+        throw std::runtime_error("Not implemented: registerTemplateRoute");
+        // return { nullptr, 0 };
+    }
+
     NitroCppBuffer start() override {
         // TODO: implement start
         throw std::runtime_error("Not implemented: start");

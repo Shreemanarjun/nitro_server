@@ -92,6 +92,91 @@ void main() {
     expect(res.text(), 'gone');
   });
 
+  test('getTemplated assembles the body from path params, no handler', () async {
+    await client.server.getTemplated(
+      '/u/:id',
+      const [
+        TemplateSegment.literal('{"id":'),
+        TemplateSegment.param('id'),
+        TemplateSegment.literal('}'),
+      ],
+      contentType: 'application/json',
+    );
+    final res = await client.get('/u/42');
+    expect(res.status, 200);
+    expect(res.text(), '{"id":"42"}');
+    expect(res.headers['content-type'], 'application/json');
+    // HEAD carries no body.
+    expect((await client.head('/u/42')).text(), isEmpty);
+    // A tricky value stays inside its JSON string (still parses).
+    final tricky = await client.get('/u/a%22b');
+    expect(() => jsonDecode(tricky.text()), returnsNormally);
+  });
+
+  test('getTemplated raw slot passes the value through unquoted', () async {
+    await client.server.getTemplated('/p/:a/:b', const [
+      TemplateSegment.param('a', escape: SlotEscape.raw),
+      TemplateSegment.literal('/'),
+      TemplateSegment.param('b'),
+    ]);
+    expect((await client.get('/p/7/9')).text(), '7/"9"');
+  });
+
+  test('getTemplated rejects a slot with no matching :param', () async {
+    expect(
+      () => client.server.getTemplated('/u/:id', const [
+        TemplateSegment.param('wrong'),
+      ]),
+      throwsA(isA<ArgumentError>()),
+    );
+  });
+
+  test('templateRoute needs a token for HttpMethod.custom', () async {
+    expect(
+      () => client.server.templateRoute(
+        HttpMethod.custom,
+        '/x',
+        const [TemplateSegment.literal('x')],
+      ),
+      throwsA(isA<ArgumentError>()),
+    );
+    // A custom template route with a token registers and serves.
+    await client.server.templateRoute(
+      HttpMethod.custom,
+      '/x/:v',
+      const [TemplateSegment.param('v', escape: SlotEscape.raw)],
+      customMethod: 'REPORT',
+    );
+    final res = await client.request(HttpMethod.custom, '/x/9',
+        customMethod: 'REPORT');
+    expect(res.text(), '9');
+  });
+
+  test('template blob round-trips and rejects malformed input', () {
+    const segs = [
+      TemplateSegment.literal('a"b'),
+      TemplateSegment.param('id'),
+      TemplateSegment.param('n', escape: SlotEscape.raw),
+    ];
+    final decoded = decodeTemplateBlob(encodeTemplateBlob(segs));
+    expect(decoded, hasLength(3));
+    expect((decoded[0] as TemplateLiteral).text, 'a"b');
+    expect((decoded[1] as TemplateParam).escape, SlotEscape.jsonString);
+    expect((decoded[2] as TemplateParam).escape, SlotEscape.raw);
+    // Assembler: escaping, raw passthrough, missing -> empty ("" when json).
+    expect(
+      assembleTemplateBody(decoded, {'id': 'x"y', 'n': '5'}),
+      'a"b"x\\"y"5',
+    );
+    expect(assembleTemplateBody(decoded, const {}), 'a"b""');  // both missing
+    // Truncated blob throws.
+    final blob = encodeTemplateBlob(segs);
+    expect(
+      () => decodeTemplateBlob(blob.sublist(0, blob.length - 3)),
+      throwsFormatException,
+    );
+  });
+
   test('staticRoute serves a non-GET method and needs a custom token', () async {
     await client.server.staticRoute(HttpMethod.post, '/hook', 'ack'.codeUnits);
     expect((await client.post('/hook', body: 'x')).text(), 'ack');

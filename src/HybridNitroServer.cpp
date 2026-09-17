@@ -35,6 +35,7 @@
 #include "engine/Common.h"
 #include "engine/EngineRegistry.h"
 #include "engine/EngineTypes.h"
+#include "engine/Template.h"
 #include "engine/Wire.h"
 
 namespace {
@@ -254,6 +255,27 @@ class HybridNitroServerImpl final : public HybridNitroServerNative {
     }
     return toStatus(server_->registerStaticRoute(m, custom, pattern, status, hs,
                                                  body, body_length))
+        .toNativeBuffer();
+  }
+
+  NitroCppBuffer registerTemplateRoute(const std::string& method,
+                                       const std::string& pattern,
+                                       int64_t status, NitroCppBuffer headers,
+                                       const uint8_t* templ,
+                                       size_t templ_length) override {
+    std::string custom;
+    const Method m = parseUnregisterMethod(method, custom);
+    std::vector<Header> hs;
+    std::vector<TemplateSegment> segs;
+    try {
+      hs = decodeHeaderList(headers);
+      segs = decodeTemplateBlob(templ, templ_length);
+    } catch (...) {
+      return toStatus({ErrorKind::BadRequest, "malformed template route", 0})
+          .toNativeBuffer();
+    }
+    return toStatus(server_->registerTemplateRoute(m, custom, pattern, status,
+                                                   hs, std::move(segs)))
         .toNativeBuffer();
   }
 

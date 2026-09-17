@@ -24,6 +24,7 @@
 #include <mutex>
 #include <set>
 
+#include "Template.h"
 #include "WsCodec.h"
 
 #ifdef NITRO_SERVER_TLS
@@ -373,6 +374,24 @@ StatusResult UvReactor::registerStaticRoute(
   if (body && bodyLen) sr->body.assign((const char*)body, bodyLen);
   e.staticResponse = std::move(sr);
   return registerStaticRoute(e);
+}
+
+StatusResult UvReactor::registerTemplateRoute(
+    Method method, const std::string& customMethod, const std::string& pattern,
+    int64_t status, const std::vector<Header>& headers,
+    std::vector<TemplateSegment> segments) {
+  RouteEntry e;
+  e.method = method;
+  e.customMethod = customMethod;
+  e.pattern = pattern;
+  auto tr = std::make_shared<TemplateResponse>();
+  tr->status = status;
+  tr->headers = headers;
+  tr->segments = std::move(segments);
+  e.templateResponse = std::move(tr);
+  // A template route registers through the same trie path as a static one.
+  if (!router_.add(e)) return {ErrorKind::BadRequest, "invalid route", 0};
+  return {};
 }
 
 StatusResult UvReactor::unregisterRoute(Method method,
@@ -1023,6 +1042,18 @@ void UvReactor::processConn(Conn* c) {
       std::string out = uvBuildHead(sr.status, sr.headers,
                                   (int64_t)sr.body.size(), ka, kaSecs);
       if (head.method != Method::Head) out.append(sr.body);
+      writeAnswer(c, std::move(out), ka, true);
+      continue;
+    }
+    if (m.route.templateResponse) {
+      const TemplateResponse& tr = *m.route.templateResponse;
+      // Assembled on this thread from the captured path params — no Dart hop.
+      // Same body-carrying-request rule as a static route (answer then close).
+      const bool ka = keepAlive && bodyBytes.empty();
+      std::string body = assembleTemplateBody(tr.segments, m.params);
+      std::string out =
+          uvBuildHead(tr.status, tr.headers, (int64_t)body.size(), ka, kaSecs);
+      if (head.method != Method::Head) out.append(body);
       writeAnswer(c, std::move(out), ka, true);
       continue;
     }

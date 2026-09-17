@@ -442,6 +442,22 @@ abstract class NitroServerNative extends HybridObject {
     @zeroCopy Uint8List body,
   );
 
+  /// Registers a route whose body the engine assembles per request from
+  /// [template] — literal bytes interleaved with `:param` slots pulled from the
+  /// matched path — and serves entirely on its own thread, never crossing into
+  /// Dart. Same framing and precedence rules as [registerStaticRoute]; [method]
+  /// is the uppercase token or `*`. [template] is the packed segment blob (see
+  /// `TemplateSegment` encoding in the runner): `[u32 count]` then per segment
+  /// `[u8 kind][u8 escape][u32 len][utf8 text]`. A malformed blob is a
+  /// registration error, not a crash.
+  RawServerStatus registerTemplateRoute(
+    String method,
+    String pattern,
+    int status,
+    List<RawHeader> headers,
+    @zeroCopy Uint8List templateBlob,
+  );
+
   /// Binds and starts the accept loop. `boundPort` in the returned status is
   /// the actual port (== config port unless the config asked for 0).
   RawServerStatus start();

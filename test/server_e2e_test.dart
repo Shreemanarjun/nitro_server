@@ -613,6 +613,44 @@ void main() {
       skip: skipReason,
     );
 
+    test('template routes assemble the body from path params, engine-side', () async {
+      server = await NitroServer.bind();
+      await server!.getTemplated(
+        '/tmpl/:id',
+        const [
+          TemplateSegment.literal('{"id":'),
+          TemplateSegment.param('id'),
+          TemplateSegment.literal(',"ok":true}'),
+        ],
+        contentType: 'application/json',
+      );
+      await server!.getTemplated('/pair/:a/:b', const [
+        TemplateSegment.param('a'),
+        TemplateSegment.literal('-'),
+        TemplateSegment.param('b', escape: SlotEscape.raw),
+      ]);
+
+      final res = await _get(server!.port, '/tmpl/42');
+      expect(res.status, 200);
+      expect(res.body, '{"id":"42","ok":true}');
+      expect(res.headers.contentType?.mimeType, 'application/json');
+
+      // HEAD: length framed, no body.
+      final head = await _get(server!.port, '/tmpl/42', method: 'HEAD');
+      expect(head.headers.contentLength, '{"id":"42","ok":true}'.length);
+      expect(head.body, isEmpty);
+
+      // jsonString escaping keeps a tricky value inside its JSON string: the
+      // response must still parse, whatever the router does with %-encoding.
+      final tricky = await _get(server!.port, '/tmpl/a%22b%5Cc');
+      expect(tricky.status, 200);
+      expect(() => jsonDecode(tricky.body), returnsNormally);
+
+      // Two slots, one raw (no quotes).
+      final pair = await _get(server!.port, '/pair/x/y');
+      expect(pair.body, '"x"-y');
+    });
+
     test('several cookies ride as separate set-cookie headers', () async {
       server = await NitroServer.bind();
       await server!.get(

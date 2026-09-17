@@ -106,9 +106,29 @@ batch buffer must *defer* answers to coalesce them (a flush hop), which **adds**
 latency — lowering the concurrency-bound throughput and threatening the p99
 1.14ms lead that is nitro's actual differentiator. So the crossing count is not
 worth cutting; the only lever that moves the handler number is removing the
-round-trip itself (engine-served templates / native micro-handlers, P2.6/P3.7 in
-[dynamic-route-perf-plan.md](dynamic-route-perf-plan.md)) — or using `getStatic`
-for anything cacheable.
+round-trip itself — which is what §2c's engine templates do — or using
+`getStatic` for anything cacheable.
+
+### 2c. Engine-side templates — `getTemplated` (shipped)
+
+A **template route** serves a body the engine assembles on its own thread from
+the matched path's `:param` slots — no Dart handler runs, so it answers at
+static-route speed while still varying per request. The lever P2.6 predicted.
+Measured in **one process** (both routes live, identical `{"…","id":<id>}`
+body, `wrk -t2 -c64`, same thermal instant):
+
+| route (same body) | req/s | p50 | p99 |
+|---|--:|--:|--:|
+| **`getTemplated` /t/:id** | **54296** | **0.85ms** | 4.74ms |
+| handler /h/:id | 21106 | 2.58ms | 8.80ms |
+
+**2.57× the handler's throughput, 3× lower p50**, and the template p50 (0.85ms)
+matches `getStatic` (~0.81ms in §2a) — i.e. it runs at engine-served speed
+because it never crosses into Dart. Slots land only in the body (no
+header-splitting surface); `SlotEscape.jsonString` escapes the value so a
+`"`/`\`/control byte cannot break out of its JSON string (unit + libFuzzer
+covered: `template_test.cpp`, `template_fuzz.cpp` — 262k execs clean). Scope:
+literal + `:param` slots; query slots are v2.
 
 ---
 

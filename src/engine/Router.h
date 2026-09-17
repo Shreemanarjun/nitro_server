@@ -27,6 +27,26 @@ struct StaticResponse {
   std::string body;             // raw bytes (HEAD strips them, keeps the length)
 };
 
+/// One piece of a templated body. A Literal contributes its bytes verbatim; a
+/// Param substitutes the captured `:name` path parameter, escaped per `escape`.
+struct TemplateSegment {
+  enum class Kind : uint8_t { Literal = 0, Param = 1 };
+  enum class Escape : uint8_t { Raw = 0, JsonString = 1 };
+  Kind kind = Kind::Literal;
+  Escape escape = Escape::Raw;  // ignored for Literal
+  std::string text;             // Literal: the bytes; Param: the parameter name
+};
+
+/// A body the engine assembles per request from `segments` + the request's
+/// captured path params, then serves entirely on its own thread — no Dart hop.
+/// Like StaticResponse but with request-derived slots. Behind a shared_ptr so a
+/// MatchResult copy is a refcount bump, not a segment-vector copy.
+struct TemplateResponse {
+  int64_t status = 200;
+  std::vector<Header> headers;  // Content-Length/Connection are engine-framed.
+  std::vector<TemplateSegment> segments;
+};
+
 struct RouteEntry {
   Method method = Method::Get;
   std::string customMethod;
@@ -39,6 +59,9 @@ struct RouteEntry {
   // Non-null marks a static route: the engine answers it directly and never
   // dispatches. Copying a RouteEntry copies the pointer, never the bytes.
   std::shared_ptr<const StaticResponse> staticResponse;
+  // Non-null marks a template route: the engine assembles the body from the
+  // request's params and answers directly, still never dispatching to Dart.
+  std::shared_ptr<const TemplateResponse> templateResponse;
 };
 
 struct MatchResult {

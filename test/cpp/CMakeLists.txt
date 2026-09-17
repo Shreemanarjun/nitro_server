@@ -19,6 +19,7 @@ add_executable(nitro_server_engine_tests
   pending_table_test.cpp
   engine_units_test.cpp
   wire_test.cpp
+  template_test.cpp
   uv_reactor_test.cpp
   json_writer_test.cpp
   brotli_test.cpp

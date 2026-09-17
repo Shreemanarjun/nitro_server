@@ -16,6 +16,7 @@ import 'http_method.dart';
 import 'metrics.dart';
 import 'native_loader.dart';
 import 'route_group.dart';
+import 'template.dart';
 import 'ws.dart';
 
 /// Registers routes and middleware on a freshly bound server. With
@@ -389,6 +390,74 @@ class NitroServer {
     headers: headers,
   );
 
+  /// Registers a route whose body the engine assembles per request from
+  /// [template] — literal chunks interleaved with `:param` slots from the
+  /// matched path — and serves entirely on its own thread, never crossing into
+  /// Dart. This is the middle ground between [getStatic] (fully fixed) and a
+  /// handler: for a response fully derivable from the URL (echo, canned lookups
+  /// keyed by a param, redirects-as-body) it runs at static-route throughput.
+  ///
+  /// Every [TemplateParam] must name a `:param` in [pattern]. A [TemplateParam]
+  /// defaults to [SlotEscape.jsonString] so values with `"`/`\`/control bytes
+  /// stay inside their JSON string — pass [SlotEscape.raw] only for values you
+  /// know are safe unescaped. Like [staticRoute]: no handler, so [middleware],
+  /// timeouts and fallbacks never apply, and a request carrying a body closes
+  /// the connection after the answer. Registering replaces any route at
+  /// (method, pattern). Returns `this`.
+  Future<NitroServer> templateRoute(
+    HttpMethod method,
+    String pattern,
+    List<TemplateSegment> template, {
+    int status = 200,
+    String? contentType,
+    Map<String, String> headers = const {},
+    String customMethod = '',
+  }) async {
+    _requirePattern(pattern);
+    if (method == HttpMethod.custom && customMethod.isEmpty) {
+      throw ArgumentError.value(
+        customMethod,
+        'customMethod',
+        'HttpMethod.custom needs an explicit token',
+      );
+    }
+    final params = _patternParams(pattern);
+    for (final seg in template) {
+      if (seg is TemplateParam && !params.contains(seg.name)) {
+        throw ArgumentError.value(
+          seg.name,
+          'template',
+          'no :${seg.name} segment in "$pattern" (params: ${params.join(', ')})',
+        );
+      }
+    }
+    _runner.addTemplateRoute(
+      method,
+      customMethod.toUpperCase(),
+      pattern,
+      status,
+      {'content-type': ?contentType, ...headers},
+      encodeTemplateBlob(template),
+    );
+    return this;
+  }
+
+  /// GET shorthand for [templateRoute].
+  Future<NitroServer> getTemplated(
+    String pattern,
+    List<TemplateSegment> template, {
+    int status = 200,
+    String? contentType,
+    Map<String, String> headers = const {},
+  }) => templateRoute(
+    HttpMethod.get,
+    pattern,
+    template,
+    status: status,
+    contentType: contentType,
+    headers: headers,
+  );
+
   /// Registers a WebSocket route (RFC 6455). Matching handshakes upgrade
   /// in-engine and [handler] receives the live session; anything else on
   /// the pattern (plain requests, bad handshakes) is answered 426/400 and
@@ -541,3 +610,10 @@ void _requirePattern(String pattern) {
     );
   }
 }
+
+/// The `:param` names in [pattern] (without the colon), for validating that a
+/// template only references slots the route actually captures.
+Set<String> _patternParams(String pattern) => {
+  for (final seg in pattern.split('/'))
+    if (seg.startsWith(':') && seg.length > 1) seg.substring(1),
+};

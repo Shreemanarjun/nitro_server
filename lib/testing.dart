@@ -137,6 +137,19 @@ class NitroTestClient {
           : staticHit;
     }
 
+    // Template routes are engine-assembled too — matched and served before any
+    // dispatch, HEAD shipping the length but no bytes.
+    final templateHit = _native.matchTemplate(token, path);
+    if (templateHit != null) {
+      return token == 'HEAD'
+          ? NitroTestResponse(
+              status: templateHit.status,
+              headers: templateHit.headers,
+              body: Uint8List(0),
+            )
+          : templateHit;
+    }
+
     final match = _native.matchRoute(token, path);
     if (match == null) {
       // Engine-consistent: unrouted paths never reach dispatch. The engine
@@ -399,6 +412,17 @@ class _InMemoryNative extends NitroServerNative with NitroServerNativeDefaults {
   final staticRoutes =
       <({String token, String pattern, NitroTestResponse response})>[];
 
+  /// Template routes as (method token, pattern, segments, status, headers). The
+  /// engine assembles these from the matched path's params on its own thread;
+  /// the tester mirrors that, matching then assembling the body — no dispatch.
+  final templateRoutes = <({
+    String token,
+    String pattern,
+    List<TemplateSegment> segments,
+    int status,
+    Map<String, String> headers,
+  })>[];
+
   @override
   Stream<RawIncomingRequest> get incomingRequests => heads.stream;
 
@@ -454,6 +478,26 @@ class _InMemoryNative extends NitroServerNative with NitroServerNativeDefaults {
         headers: {for (final h in headers) h.name: h.value},
         body: Uint8List.fromList(body),
       ),
+    ));
+    return const RawServerStatus(errorKind: RawServerErrorKind.none);
+  }
+
+  @override
+  RawServerStatus registerTemplateRoute(
+    String method,
+    String pattern,
+    int status,
+    List<RawHeader> headers,
+    Uint8List templateBlob,
+  ) {
+    final token = method.toUpperCase();
+    templateRoutes.removeWhere((r) => r.token == token && r.pattern == pattern);
+    templateRoutes.add((
+      token: token,
+      pattern: pattern,
+      segments: decodeTemplateBlob(templateBlob),
+      status: status,
+      headers: {for (final h in headers) h.name: h.value},
     ));
     return const RawServerStatus(errorKind: RawServerErrorKind.none);
   }
@@ -672,6 +716,34 @@ class _InMemoryNative extends NitroServerNative with NitroServerNativeDefaults {
       if (scored == null) continue;
       if (scored.$1 > bestSpec) {
         best = route.response;
+        bestSpec = scored.$1;
+      }
+    }
+    return best;
+  }
+
+  /// The assembled answer a template route serves for [methodToken] + [path],
+  /// or null when none matches. Same precedence and HEAD→GET fallback as
+  /// [matchStatic]; the body is assembled from the matched path's params.
+  NitroTestResponse? matchTemplate(String methodToken, String path) {
+    final pathSegs = _split(path);
+    NitroTestResponse? best;
+    var bestSpec = -1;
+    for (final route in templateRoutes) {
+      if (route.token != methodToken &&
+          !(methodToken == 'HEAD' && route.token == 'GET')) {
+        continue;
+      }
+      final scored = _matchPath(route.pattern, pathSegs);
+      if (scored == null) continue;
+      if (scored.$1 > bestSpec) {
+        best = NitroTestResponse(
+          status: route.status,
+          headers: route.headers,
+          body: Uint8List.fromList(
+            utf8.encode(assembleTemplateBody(route.segments, scored.$2)),
+          ),
+        );
         bestSpec = scored.$1;
       }
     }

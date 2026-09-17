@@ -218,7 +218,7 @@ void main() {
       expect(selectWsProtocol('c', ['a']), isNull);
     });
 
-    test('a batch dispatches every head it carries', () async {
+    test('every head dispatches (coalesced or not)', () async {
       var calls = 0;
       runner.addRoute(HttpMethod.get, '', '/b', null, (_) async {
         calls++;
@@ -226,14 +226,10 @@ void main() {
       });
       await Future<void>.delayed(Duration.zero);
 
-      fake.batches.add(
-        RawIncomingBatch(
-          requests: [
-            fakeHead(requestId: 11, path: '/b', routePattern: '/b'),
-            fakeHead(requestId: 12, path: '/b', routePattern: '/b'),
-          ],
-        ),
-      );
+      // Under load the bridge coalesces heads into one delivery; to the runner
+      // they arrive as individual RawIncomingRequest events either way.
+      fake.heads.add(fakeHead(requestId: 11, path: '/b', routePattern: '/b'));
+      fake.heads.add(fakeHead(requestId: 12, path: '/b', routePattern: '/b'));
       await waitFor(11);
       await waitFor(12);
       expect(calls, 2);

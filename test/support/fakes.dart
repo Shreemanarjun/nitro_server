@@ -12,7 +12,8 @@ import 'package:nitro_server/src/nitro_server.native.dart';
 /// A scriptable [NitroServerNative]. Routes registered here are dispatched by
 /// feeding [RawIncomingRequest]s into [heads] — the fake performs no matching
 /// itself, so tests control the exact wire values the runner sees.
-class FakeNitroServerNative extends NitroServerNative {
+class FakeNitroServerNative extends NitroServerNative
+    with NitroServerNativeDefaults {
   final heads = StreamController<RawIncomingRequest>.broadcast();
   final chunks = StreamController<RawBodyChunk>.broadcast();
   final events = StreamController<RawServerEvent>.broadcast();
@@ -53,18 +54,8 @@ class FakeNitroServerNative extends NitroServerNative {
   final streamChunks = <int, List<Uint8List>>{};
   final streamsEnded = <int>{};
 
-  /// Multi-head batches, as the engine posts them under load.
-  final batches = StreamController<RawIncomingBatch>();
-
   @override
-  Stream<RawIncomingBatch> get incomingRequests {
-    final out = StreamController<RawIncomingBatch>();
-    heads.stream
-        .map((h) => RawIncomingBatch(requests: [h]))
-        .listen(out.add, onError: out.addError);
-    batches.stream.listen(out.add, onError: out.addError);
-    return out.stream;
-  }
+  Stream<RawIncomingRequest> get incomingRequests => heads.stream;
 
   @override
   Stream<RawBodyChunk> get bodyChunks => chunks.stream;
@@ -81,14 +72,7 @@ class FakeNitroServerNative extends NitroServerNative {
   @override
   bool supportsBrotli() => false;
 
-  @override
-  Uint8List brotliEncode(Uint8List data, int quality) =>
-      throw UnsupportedError('brotli unavailable in the fake engine');
-
-  @override
-  Uint8List brotliDecode(Uint8List data) =>
-      throw UnsupportedError('brotli unavailable in the fake engine');
-
+  // brotliEncode/Decode fall to the NitroServerNativeDefaults mixin.
   @override
   void resetNative() => resetCalls++;
 

@@ -111,16 +111,6 @@ class RawHeader {
   const RawHeader({required this.name, required this.value});
 }
 
-/// Heads posted in one message. One per head when the isolate keeps up;
-/// under load the engine combines the heads that arrived while the previous
-/// post was in flight.
-@HybridRecord()
-class RawIncomingBatch {
-  final List<RawIncomingRequest> requests;
-
-  const RawIncomingBatch({this.requests = const []});
-}
-
 /// A route parameter captured from a `:param` segment, e.g. `:id` → `42`.
 @HybridRecord()
 class RawRouteParam {
@@ -465,11 +455,13 @@ abstract class NitroServerNative extends HybridObject {
   void beginDrain();
 
   /// Requests dispatched but not yet fully answered on the wire.
+  @nitroFast
   int inFlightRequests();
 
   /// Connections accepted and not yet closed (queued, idle or serving).
   /// During a drain the engine closes idle ones itself, so this converges
   /// on the in-flight count.
+  @nitroFast
   int liveConnections();
 
   /// Answers a pending request with [length] bytes of the file at [path]
@@ -508,6 +500,7 @@ abstract class NitroServerNative extends HybridObject {
   /// what makes the zero-copy path leak-free *and* use-after-free-free.
   /// Passing a value the runner has not actually copied is memory corruption.
   /// (Same protocol as `nitro_http`'s `grantCredit` ack half.)
+  @nitroFast
   void ackBody(int requestId, int ackedChunks);
 
   // ── Chunked response streams ─────────────────────────────────────────────
@@ -553,6 +546,7 @@ abstract class NitroServerNative extends HybridObject {
   );
 
   /// Completes the closing handshake with [code] and reaps the session.
+  @nitroFast
   void wsClose(int connectionId, int code);
 
   // ── Module-global streams — EXACTLY ONE internal subscriber each ───────────
@@ -565,8 +559,13 @@ abstract class NitroServerNative extends HybridObject {
   // the TCP window instead, since a connection thread that cannot emit simply
   // stops reading.
 
-  @NitroStream(backpressure: Backpressure.bufferDrop)
-  Stream<RawIncomingBatch> get incomingRequests;
+  // Heads stream per request. `Backpressure.batch` (nitro 0.7.6) coalesces
+  // natively: the connection thread posts one head, and every head emitted
+  // while the Dart isolate is still handling the previous delivery arrives as
+  // one `[head, head, …]` message — the same "one post per pass under load"
+  // the hand-rolled `Combiner` used to give, now on the maintained bridge path.
+  @NitroStream(backpressure: Backpressure.batch)
+  Stream<RawIncomingRequest> get incomingRequests;
 
   @NitroStream(backpressure: Backpressure.bufferDrop)
   Stream<RawBodyChunk> get bodyChunks;

@@ -212,7 +212,7 @@ class ServerRunner {
     _errorHandler = handler;
   }
 
-  StreamSubscription<RawIncomingBatch>? _heads;
+  StreamSubscription<RawIncomingRequest>? _heads;
   StreamSubscription<RawBodyChunk>? _chunks;
   StreamSubscription<RawServerEvent>? _serverEvents;
   StreamSubscription<RawWsMessage>? _wsMessages;
@@ -260,10 +260,7 @@ class ServerRunner {
   void _ensureListening() {
     if (_listening) return;
     _listening = true;
-    _heads = _native.incomingRequests.listen(
-      (batch) => batch.requests.forEach(_onHead),
-      onError: (_) {},
-    );
+    _heads = _native.incomingRequests.listen(_onHead, onError: (_) {});
     _chunks = _native.bodyChunks.listen(_onChunk, onError: (_) {});
     _serverEvents = _native.serverEvents.listen(_onEvent, onError: (_) {});
     _wsMessages = _native.wsMessages.listen(_onWsMessage, onError: (_) {});

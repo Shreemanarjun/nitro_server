@@ -32,7 +32,6 @@
 #include <vector>
 
 #include "engine/Brotli.h"
-#include "engine/Combiner.h"
 #include "engine/Common.h"
 #include "engine/EngineRegistry.h"
 #include "engine/EngineTypes.h"
@@ -86,13 +85,10 @@ class BridgeEmitter final : public Emitter {
       rp.value = p.value;
       req.params.push_back(std::move(rp));
     }
-    // Heads combine per isolate: one VM post per pass instead of one
-    // contended post per worker thread.
-    heads_.submit(std::move(req), [this](std::vector<RawIncomingRequest>& b) {
-      RawIncomingBatch batch;
-      batch.requests = std::move(b);
-      bridge_->emit_incomingRequests(batch.toNativeBuffer());
-    });
+    // Backpressure.batch (nitro 0.7.6) coalesces on the bridge's completion
+    // batcher: one post per head, heads arriving while Dart is busy delivered
+    // as one message — replacing the hand-rolled per-isolate Combiner.
+    bridge_->emit_incomingRequests(req.toNativeBuffer());
   }
 
   void emitBodyData(int64_t requestId, uint8_t* payload, size_t n) override {
@@ -152,7 +148,6 @@ class BridgeEmitter final : public Emitter {
 
  private:
   HybridNitroServerNative* bridge_;
-  Combiner<RawIncomingRequest> heads_;
 };
 
 class HybridNitroServerImpl final : public HybridNitroServerNative {

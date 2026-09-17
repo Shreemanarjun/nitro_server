@@ -17,7 +17,6 @@ FetchContent_MakeAvailable(googletest)
 add_executable(nitro_server_engine_tests
   router_test.cpp
   pending_table_test.cpp
-  combiner_test.cpp
   engine_units_test.cpp
   wire_test.cpp
   uv_reactor_test.cpp

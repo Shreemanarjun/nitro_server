@@ -384,7 +384,7 @@ class _RouteMatch {
 /// requests with engine precedence (static > `:param` > trailing `*`,
 /// method-specific > `all`), and serves as the runner's stream source and
 /// `respond` sink.
-class _InMemoryNative extends NitroServerNative {
+class _InMemoryNative extends NitroServerNative with NitroServerNativeDefaults {
   final heads = StreamController<RawIncomingRequest>.broadcast();
   final chunks = StreamController<RawBodyChunk>.broadcast();
   final events = StreamController<RawServerEvent>.broadcast();
@@ -400,8 +400,7 @@ class _InMemoryNative extends NitroServerNative {
       <({String token, String pattern, NitroTestResponse response})>[];
 
   @override
-  Stream<RawIncomingBatch> get incomingRequests =>
-      heads.stream.map((h) => RawIncomingBatch(requests: [h]));
+  Stream<RawIncomingRequest> get incomingRequests => heads.stream;
 
   @override
   Stream<RawBodyChunk> get bodyChunks => chunks.stream;
@@ -418,18 +417,10 @@ class _InMemoryNative extends NitroServerNative {
   @override
   bool supportsTls() => false;
 
+  // brotliEncode/Decode (and any future capability method) fall to the
+  // generated NitroServerNativeDefaults mixin — no per-method stub needed.
   @override
   bool supportsBrotli() => false;
-
-  // The in-memory engine has no native brotli; supportsBrotli() gates callers
-  // off this path, so these are never reached.
-  @override
-  Uint8List brotliEncode(Uint8List data, int quality) =>
-      throw UnsupportedError('brotli unavailable in the in-memory test engine');
-
-  @override
-  Uint8List brotliDecode(Uint8List data) =>
-      throw UnsupportedError('brotli unavailable in the in-memory test engine');
 
   @override
   void resetNative() {}

@@ -579,7 +579,10 @@ StatusResult UvReactor::start(int loops) {
         reservedPort_ = (int)boundPort_.load();
       }
     }
-    listen(fd, backlog);
+    if (listen(fd, backlog) != 0) {
+      close(fd);
+      return releaseAndFail(fds, "listen failed");
+    }
     fds.push_back(fd);
   }
 

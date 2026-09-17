@@ -25,27 +25,40 @@ Steps 2–5 are the delta. Suspects, biggest-first (to be confirmed in Phase 0):
 head-record decode + allocation, per-request async scheduling, `ResponseContext`
 + serialization, respond marshaling (headers list).
 
-## Phase 0 — Measure before touching anything (mandatory)
+## Phase 0 — Measure (done; findings below)
 
-- Env-gated engine timing (`NITRO_PERF`) stamping monotonic ns at parse-done,
-  emit, respond-entry, write-submit; diff to attribute native vs bridge time.
-- Dart microbench: dispatch-only (empty handler) vs full `/json` — isolates the
-  scheduling + serialization cost from the FFI cost.
-- Anchor: the `getStatic` 8.1 µs is the crossing-free ceiling; every phase is
-  scored against closing the 4.5 µs to it.
+Two things are already settled, which reshapes the plan:
 
-## Phase 1 — Low-risk Dart-side wins (target: 79k → ~100k)
+- **The synchronous handler fast-path already exists.** `RequestHandler`,
+  `Middleware`, `NotFoundHandler`, `ErrorHandler` and `ServerSetup` are all
+  `FutureOr`; `ServerRunner._dispatch` answers a synchronous handler **inline**
+  (`if (result is ResponseContext) _deliver(...)`, no Future/microtask), and a
+  no-middleware route allocates zero closures (`_identity`). The 79k already
+  benefits — there is **no further `FutureOr` win in the request path.**
+- **Serialization is free.** `/json` (75.2k, `jsonEncode` per request) measured
+  identical to `/raw` (75.3k, precomputed bytes) at `-t4 -c64`. So `jsonEncode`
+  of a tiny object costs nothing; the whole ~4.5 µs gap to `getStatic` is the
+  **native↔Dart dispatch round-trip**, not response building.
 
-1. **Synchronous handler fast-path.** A handler returning a `ResponseContext`
-   (not a `Future`) is invoked and answered inline — no per-request `Future`/
-   microtask. Most handlers are sync; this removes one event-loop turn each.
-2. **Lazy head decode.** `packedHeaders` is already lazy; make `path`/`query`
-   decode-on-first-access too, so routes that ignore them pay no utf8+alloc.
-3. **Reuse hot objects.** Pool/reuse `ResponseContext` and the `RawHeader` list
-   on the dispatch path; skip the headers-list allocation for the common
-   no-custom-header answer.
-4. **Leaner respond.** For a handler that sets no custom headers, a respond
-   variant that skips the `List<RawHeader>` marshaling entirely.
+So the budget is: head-record wire decode → `RequestContext` build → the head
+stream delivery (FFI) + the `respond` FFI (2 crossings) → native head build +
+write. That is what the remaining phases must cut. Still TODO in Phase 0: an
+env-gated engine timer to split head-decode vs the two crossings.
+
+## Phase 1 — Trim the per-request Dart work (target: 79k → ~90k)
+
+1. ~~Synchronous handler fast-path~~ — **already done** (see Phase 0).
+2. **Lazy head decode.** The head arrives as `RawIncomingRequest` with `path`,
+   `query`, `packedHeaders` strings; `/json` ignores all three yet pays their
+   utf8+alloc. `packedHeaders` is already lazy — extend to `path`/`query` so a
+   route that doesn't read them skips the decode. (Touches the generated record
+   or a hand-rolled head reader.)
+3. **Reuse hot objects.** Pool/reuse `RequestContext` and the `RawHeader` list
+   on the dispatch path; share one empty list for the common no-custom-header
+   answer.
+4. **Leaner respond.** A `respond` variant that skips `List<RawHeader>`
+   marshaling entirely when the handler set no custom headers (the `/json`,
+   `/plaintext` case).
 
 ## Phase 2 — Structural (target: further under load)
 

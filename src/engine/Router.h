@@ -67,7 +67,11 @@ struct RouteEntry {
 
 struct MatchResult {
   bool matched = false;
-  RouteEntry route;
+  // Points into the router trie (stable while serving — routes register at
+  // setup, never mid-request), so a match is a pointer store, not a per-request
+  // copy of the RouteEntry's strings, vectors and shared_ptr refcounts. Only
+  // dereference when `matched`.
+  const RouteEntry* route = nullptr;
   std::vector<RouteParam> params;
 };
 
@@ -106,6 +110,10 @@ class Router {
   /// Splits on '/' dropping empties. Views into [path] — the caller keeps
   /// it alive for the whole match/add/remove.
   static std::vector<std::string_view> split(std::string_view path);
+  /// [split] into a caller-owned buffer (cleared first), so the hot path can
+  /// reuse a thread_local vector instead of allocating one per match.
+  static void splitInto(std::string_view path,
+                        std::vector<std::string_view>& segs);
   static bool validPattern(const std::string& pattern);
 
   const Node* findNode(const std::vector<std::string_view>& segs) const;

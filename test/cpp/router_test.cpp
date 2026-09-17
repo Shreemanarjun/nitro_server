@@ -21,12 +21,12 @@ TEST(RouterTest, HeadFallsBackToGetThenAll) {
   // A HEAD on a GET-only pattern matches the GET route.
   auto m = r.match(Method::Head, "", "/g");
   EXPECT_TRUE(m.matched);
-  EXPECT_EQ(m.route.method, Method::Get);
+  EXPECT_EQ(m.route->method, Method::Get);
   // An explicit HEAD route wins over the GET one.
   m = r.match(Method::Head, "", "/both");
   EXPECT_TRUE(m.matched);
-  EXPECT_EQ(m.route.method, Method::Head);
-  EXPECT_EQ(m.route.timeoutMs, 7);
+  EXPECT_EQ(m.route->method, Method::Head);
+  EXPECT_EQ(m.route->timeoutMs, 7);
   // The All fallback still applies when neither exists.
   EXPECT_TRUE(r.match(Method::Head, "", "/a").matched);
   // Other methods never fall back to GET.
@@ -48,7 +48,7 @@ TEST(RouterTest, MatchesLiteral) {
   EXPECT_TRUE(r.add(route(Method::Get, "/hello")));
   const MatchResult m = r.match(Method::Get, "", "/hello");
   EXPECT_TRUE(m.matched);
-  EXPECT_EQ(m.route.pattern, "/hello");
+  EXPECT_EQ(m.route->pattern, "/hello");
   EXPECT_TRUE(m.params.empty());
 }
 
@@ -87,10 +87,10 @@ TEST(RouterTest, StaticBeatsParam) {
   EXPECT_TRUE(r.add(route(Method::Get, "/files/readme")));
   const MatchResult m = r.match(Method::Get, "", "/files/readme");
   EXPECT_TRUE(m.matched);
-  EXPECT_EQ(m.route.pattern, "/files/readme");
+  EXPECT_EQ(m.route->pattern, "/files/readme");
   const MatchResult p = r.match(Method::Get, "", "/files/other");
   EXPECT_TRUE(p.matched);
-  EXPECT_EQ(p.route.pattern, "/files/:name");
+  EXPECT_EQ(p.route->pattern, "/files/:name");
 }
 
 TEST(RouterTest, ParamBeatsWildcard) {
@@ -99,10 +99,10 @@ TEST(RouterTest, ParamBeatsWildcard) {
   EXPECT_TRUE(r.add(route(Method::Get, "/files/:name")));
   const MatchResult m = r.match(Method::Get, "", "/files/x");
   EXPECT_TRUE(m.matched);
-  EXPECT_EQ(m.route.pattern, "/files/:name");
+  EXPECT_EQ(m.route->pattern, "/files/:name");
   const MatchResult w = r.match(Method::Get, "", "/files/a/b");
   EXPECT_TRUE(w.matched);
-  EXPECT_EQ(w.route.pattern, "/files/*");
+  EXPECT_EQ(w.route->pattern, "/files/*");
 }
 
 TEST(RouterTest, WildcardMatchesEmptyRemainder) {
@@ -125,10 +125,10 @@ TEST(RouterTest, SpecificBeatsAll) {
   EXPECT_TRUE(r.add(route(Method::Post, "/any", 100)));
   const MatchResult m = r.match(Method::Post, "", "/any");
   EXPECT_TRUE(m.matched);
-  EXPECT_EQ(m.route.timeoutMs, 100);
+  EXPECT_EQ(m.route->timeoutMs, 100);
   const MatchResult g = r.match(Method::Get, "", "/any");
   EXPECT_TRUE(g.matched);
-  EXPECT_EQ(g.route.timeoutMs, -1);
+  EXPECT_EQ(g.route->timeoutMs, -1);
 }
 
 TEST(RouterTest, CustomTokensMatchByToken) {
@@ -145,7 +145,7 @@ TEST(RouterTest, ReregisterReplacesTimeout) {
   EXPECT_TRUE(r.add(route(Method::Get, "/t", 100)));
   EXPECT_TRUE(r.add(route(Method::Get, "/t", 200)));
   EXPECT_EQ(r.size(), 1u);
-  EXPECT_EQ(r.match(Method::Get, "", "/t").route.timeoutMs, 200);
+  EXPECT_EQ(r.match(Method::Get, "", "/t").route->timeoutMs, 200);
 }
 
 TEST(RouterTest, RemoveDropsOnlyTheNamedMethod) {

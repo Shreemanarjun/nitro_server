@@ -10,8 +10,9 @@ std::string Router::methodKey(Method m, const std::string& custom) {
   return "M:" + std::to_string(static_cast<int64_t>(m));
 }
 
-std::vector<std::string_view> Router::split(std::string_view path) {
-  std::vector<std::string_view> segs;
+void Router::splitInto(std::string_view path,
+                       std::vector<std::string_view>& segs) {
+  segs.clear();
   size_t i = 0;
   while (i < path.size()) {
     while (i < path.size() && path[i] == '/') i++;
@@ -19,6 +20,11 @@ std::vector<std::string_view> Router::split(std::string_view path) {
     while (i < path.size() && path[i] != '/') i++;
     if (i > start) segs.push_back(path.substr(start, i - start));
   }
+}
+
+std::vector<std::string_view> Router::split(std::string_view path) {
+  std::vector<std::string_view> segs;
+  splitInto(path, segs);
   return segs;
 }
 
@@ -107,7 +113,11 @@ Router::Node* Router::findNodeMut(const std::vector<std::string_view>& segs) {
 MatchResult Router::match(Method method, const std::string& customMethod,
                           const std::string& path) const {
   MatchResult out;
-  const auto segs = split(path);
+  // Reused per thread: the segment list is rebuilt every match but never
+  // reallocates after warmup (string_views into `path`, which outlives it).
+  thread_local std::vector<std::string_view> segsTls;
+  splitInto(path, segsTls);
+  const std::vector<std::string_view>& segs = segsTls;
 
   const std::string mkey = methodKey(method, customMethod);
   const std::string akey = methodKey(Method::All, "");
@@ -216,7 +226,7 @@ MatchResult Router::match(Method method, const std::string& customMethod,
 
   if (best) {
     out.matched = true;
-    out.route = *best;
+    out.route = best;
     std::vector<RouteParam> ps;
     for (int id = bestFrame; id > 0; id = arena[(size_t)id].parent) {
       const Frame& fr = arena[(size_t)id];

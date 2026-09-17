@@ -907,8 +907,8 @@ void UvReactor::processConn(Conn* c) {
     }
     const MatchResult m = match(head.method, head.customMethod, path);
     const int64_t serverMax = cfg_.maxBodyBytes > 0 ? cfg_.maxBodyBytes : (10 << 20);
-    const int64_t maxBody = (m.matched && m.route.maxBodyBytes >= 0)
-                                ? m.route.maxBodyBytes
+    const int64_t maxBody = (m.matched && m.route->maxBodyBytes >= 0)
+                                ? m.route->maxBodyBytes
                                 : serverMax;
     if (!chunked && clen > maxBody) {  // over the cap: refuse before buffering
       writeAnswer(c, uvBuildHead(413, {}, 0, false, 0), false, true);
@@ -928,8 +928,8 @@ void UvReactor::processConn(Conn* c) {
     // streamBody route: dispatch the head now and stream the body (Content-
     // Length or chunked) to the handler as it arrives.
     if (clen > 0 || chunked) {
-      if (m.matched && m.route.streamBody &&
-          !(m.route.maxBodyBytes >= 0 && clen > m.route.maxBodyBytes)) {
+      if (m.matched && m.route->streamBody &&
+          !(m.route->maxBodyBytes >= 0 && clen > m.route->maxBodyBytes)) {
         const int64_t reqId = nextReqId_.fetch_add(1);
         int loopIdx = 0;
         for (size_t i = 0; i < loops_.size(); i++)
@@ -945,7 +945,7 @@ void UvReactor::processConn(Conn* c) {
         c->busy = true;
         c->reqIdInFlight = reqId;
         const int64_t timeoutMs =
-            m.route.timeoutMs >= 0 ? m.route.timeoutMs : cfg_.defaultTimeoutMs;
+            m.route->timeoutMs >= 0 ? m.route->timeoutMs : cfg_.defaultTimeoutMs;
         if (timeoutMs > 0) {
           c->reqDeadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
           c->hasDeadline = true;
@@ -954,7 +954,7 @@ void UvReactor::processConn(Conn* c) {
         if (em)
           em->emitHead(reqId, head.method, head.customMethod, path, query,
                        head.headers, clen, /*hasBody=*/true,
-                       /*bodyComplete=*/false, m.route.pattern, m.params);
+                       /*bodyComplete=*/false, m.route->pattern, m.params);
         c->streamingBody = true;
         c->streamChunked = chunked;
         c->streamReqId = reqId;
@@ -1009,7 +1009,7 @@ void UvReactor::processConn(Conn* c) {
       }
       continue;
     }
-    if (m.route.isWebSocket) {
+    if (m.route->isWebSocket) {
       // A non-upgrade request on a WS route is 426, not dispatched to the
       // handshake (which would misreport a missing key as 400).
       if (!wsUpgrade) {
@@ -1034,8 +1034,8 @@ void UvReactor::processConn(Conn* c) {
                   false, true);
       continue;
     }
-    if (m.route.staticResponse) {
-      const StaticResponse& sr = *m.route.staticResponse;
+    if (m.route->staticResponse) {
+      const StaticResponse& sr = *m.route->staticResponse;
       // A fixed route has no reader for a request body: if one came with the
       // request, answer then close so the read bytes can't confuse framing.
       const bool ka = keepAlive && bodyBytes.empty();
@@ -1045,8 +1045,8 @@ void UvReactor::processConn(Conn* c) {
       writeAnswer(c, std::move(out), ka, true);
       continue;
     }
-    if (m.route.templateResponse) {
-      const TemplateResponse& tr = *m.route.templateResponse;
+    if (m.route->templateResponse) {
+      const TemplateResponse& tr = *m.route->templateResponse;
       // Assembled on this thread from the captured path params — no Dart hop.
       // Same body-carrying-request rule as a static route (answer then close).
       const bool ka = keepAlive && bodyBytes.empty();
@@ -1070,7 +1070,7 @@ void UvReactor::processConn(Conn* c) {
     c->reqIdInFlight = reqId;
     {
       const int64_t timeoutMs =
-          m.route.timeoutMs >= 0 ? m.route.timeoutMs : cfg_.defaultTimeoutMs;
+          m.route->timeoutMs >= 0 ? m.route->timeoutMs : cfg_.defaultTimeoutMs;
       if (timeoutMs > 0) {
         c->reqDeadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
         c->hasDeadline = true;
@@ -1084,7 +1084,7 @@ void UvReactor::processConn(Conn* c) {
       // head" form: it races the two streams and can dispatch an empty body.)
       em->emitHead(reqId, head.method, head.customMethod, path, query,
                    head.headers, clen, hasBody, /*bodyComplete=*/!hasBody,
-                   m.route.pattern, m.params);
+                   m.route->pattern, m.params);
       if (hasBody) {
         auto* payload = (uint8_t*)std::malloc(bodyBytes.size());
         if (payload) {
@@ -1445,10 +1445,10 @@ void UvReactor::wsHandshake(Conn* c, const ParsedHead& head,
   // offered. A client that offers protocols none of which overlap is refused
   // with 400; a client that offers none upgrades unselected (no header back).
   std::string protocol;
-  if (!m.route.wsProtocols.empty()) {
+  if (!m.route->wsProtocols.empty()) {
     const Header* offer = uvFindHeader(head.headers, "sec-websocket-protocol");
     if (offer && !uvTrim(offer->value).empty()) {
-      for (const std::string& want : m.route.wsProtocols) {
+      for (const std::string& want : m.route->wsProtocols) {
         // The offer is comma-separated; match on a trimmed token.
         size_t b = 0;
         while (b <= offer->value.size() && protocol.empty()) {
@@ -1495,7 +1495,7 @@ void UvReactor::wsHandshake(Conn* c, const ParsedHead& head,
   c->wsEmitter = nextEmitter();
   if (c->wsEmitter) {
     c->wsEmitter->emitHead(c->id, head.method, head.customMethod, path, query,
-                           head.headers, 0, false, true, m.route.pattern,
+                           head.headers, 0, false, true, m.route->pattern,
                            m.params);
   }
   wsProcess(c);  // handle any frames already buffered

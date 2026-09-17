@@ -143,6 +143,42 @@ default) escapes the value so a `"`/`\`/control byte cannot break out of its
 JSON string. Unit + libFuzzer covered (`template_test.cpp`, `template_fuzz.cpp`
 — decode + escape + query form-decode, 1.85M execs clean).
 
+### 2d. How go/node reach their ceiling, and closing the engine-path gap
+
+The comparison is honest about what the others do: **go** is `net/http`
+(stdlib, not fasthttp) with GOMAXPROCS across all cores; **node** is `http` +
+`cluster` (one worker per core), llhttp (C parser) and V8. Both win by (a) never
+crossing a language boundary and (b) allocating almost nothing per request —
+Go's escape analysis + `sync.Pool`, V8's hidden classes and llhttp's zero-copy
+parse. nitro's engine-served path (`getStatic`/`getTemplated`) has the same
+shape — pure C++ on libuv, no Dart hop — so the only thing between it and
+net/http was **its own per-request allocations**.
+
+Found and cut two in `Router::match` (every route runs it):
+- **`MatchResult` held a `RouteEntry` by value** — a per-request copy of the
+  entry's strings, vectors and *two `shared_ptr` refcount atomics*. Now it holds
+  a `const RouteEntry*` into the trie (stable while serving), so a match is a
+  pointer store.
+- **`split(path)` heap-allocated a vector** per match — now a reused
+  `thread_local`.
+
+Measured A/B (getStatic `/json`, `-t2 -c64`, baseline built first so the
+optimized build ran *warmer* — conservative):
+
+| build | req/s | p50 | p99 |
+|---|--:|--:|--:|
+| baseline (RouteEntry copy) | 139730 | 424µs | 1.00ms |
+| **pointer + thread_local** | **142274** | **402µs** | 1.00ms |
+
+**+1.8% throughput, −5% p50** — `getStatic`/`getTemplated` now sit at ~142k,
+**level with go's net/http (143k)**; node's 150k edge is its cluster+V8+llhttp
+stack. The win lands on the engine-served paths, where `match` is a real slice
+of the budget; it does **not** move the Dart *handler* (82k), which is bound by
+the FFI round-trip, not the match. Further engine-path headroom (a reusable
+response buffer instead of a per-request `std::string`, a faster head builder)
+is real but small — the honest ceiling for "C++ engine over libuv" is right here
+at net/http, and nitro already holds the tail-latency lead over all of them.
+
 ---
 
 ## Reconciliation

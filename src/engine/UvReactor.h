@@ -65,11 +65,6 @@ class UvReactor {
                                    const std::string& pattern, int64_t status,
                                    const std::vector<Header>& headers,
                                    const uint8_t* body, size_t bodyLen);
-  StatusResult registerTemplateRoute(Method method,
-                                     const std::string& customMethod,
-                                     const std::string& pattern, int64_t status,
-                                     const std::vector<Header>& headers,
-                                     std::vector<TemplateSegment> segments);
   StatusResult unregisterRoute(Method method, const std::string& customMethod,
                                const std::string& pattern);
   /// Answers [id] with [length] bytes of the file at [path] from [offset]

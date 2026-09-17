@@ -364,27 +364,6 @@ class ServerRunner {
     if (method == HttpMethod.get) _wsHandlers.remove(pattern);
   }
 
-  /// Registers a template route: the engine assembles [templateBlob] from the
-  /// request's path params and answers on its own thread — no head reaches this
-  /// isolate. Evicts any handler/WS route at the pattern, like [addStaticRoute].
-  void addTemplateRoute(
-    HttpMethod method,
-    String customToken,
-    String pattern,
-    int status,
-    Map<String, String> headers,
-    Uint8List templateBlob,
-  ) {
-    _ensureListening();
-    final token = _tokenOf(method, customToken);
-    final result = _native.registerTemplateRoute(token, pattern, status, [
-      for (final e in headers.entries) RawHeader(name: e.key, value: e.value),
-    ], templateBlob);
-    throwIfFailed(result, operation: 'registerTemplateRoute($pattern)');
-    _routes[token]?.remove(pattern);
-    if (method == HttpMethod.get) _wsHandlers.remove(pattern);
-  }
-
   /// Registers a WebSocket route: matching handshakes upgrade in-engine and
   /// [handler] receives the live session. Evicts a GET HTTP route on the
   /// same pattern (and vice versa in [addRoute]) — the engine holds a

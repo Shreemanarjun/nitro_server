@@ -613,57 +613,6 @@ void main() {
       skip: skipReason,
     );
 
-    test('template routes assemble the body from path + query, engine-side', () async {
-      server = await NitroServer.bind();
-      await server!.getTemplated(
-        '/tmpl/:id',
-        '{"id":{id},"ok":true}',
-        contentType: 'application/json',
-      );
-      await server!.getTemplated('/pair/:a/:b', '{a}-{b!}');
-      // A query slot, form-decoded, plus a raw numeric query field.
-      await server!.getTemplated(
-        '/search',
-        '{"q":{?q},"page":{?page!}}',
-        contentType: 'application/json',
-      );
-
-      final res = await _get(server!.port, '/tmpl/42');
-      expect(res.status, 200);
-      expect(res.body, '{"id":"42","ok":true}');
-      expect(res.headers.contentType?.mimeType, 'application/json');
-
-      // HEAD: length framed, no body.
-      final head = await _get(server!.port, '/tmpl/42', method: 'HEAD');
-      expect(head.headers.contentLength, '{"id":"42","ok":true}'.length);
-      expect(head.body, isEmpty);
-
-      // jsonString escaping keeps a tricky value inside its JSON string: the
-      // response must still parse, whatever the router does with %-encoding.
-      final tricky = await _get(server!.port, '/tmpl/a%22b%5Cc');
-      expect(tricky.status, 200);
-      expect(() => jsonDecode(tricky.body), returnsNormally);
-
-      // Two slots, one raw (no quotes).
-      final pair = await _get(server!.port, '/pair/x/y');
-      expect(pair.body, '"x"-y');
-
-      // Query slots: q form-decoded to "a b", page raw.
-      final search = await _get(server!.port, '/search?q=a%20b&page=2');
-      expect(search.body, '{"q":"a b","page":2}');
-
-      // The typed JSON builder over the real engine.
-      await server!.getTemplatedJson('/j/:id', {
-        'userId': Slot.param('id'),
-        'n': Slot.paramRaw('id'),
-        'q': Slot.query('q'),
-        'ok': true,
-      });
-      final j = await _get(server!.port, '/j/9?q=x');
-      expect(j.headers.contentType?.mimeType, 'application/json');
-      expect(jsonDecode(j.body), {'userId': '9', 'n': 9, 'q': 'x', 'ok': true});
-    });
-
     test('several cookies ride as separate set-cookie headers', () async {
       server = await NitroServer.bind();
       await server!.get(

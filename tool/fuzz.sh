@@ -11,7 +11,7 @@ CXX=${CXX:-$([ -x /opt/homebrew/opt/llvm/bin/clang++ ] && echo /opt/homebrew/opt
 cmake -S test/fuzz -B build/fuzz -DCMAKE_BUILD_TYPE=Debug \
   -DCMAKE_CXX_COMPILER="$CXX" >/dev/null
 cmake --build build/fuzz --parallel >/dev/null
-for t in head_fuzz ws_frame_fuzz template_fuzz server_fuzz; do
+for t in head_fuzz ws_frame_fuzz server_fuzz; do
   mkdir -p "build/fuzz/corpus/$t"
   echo "== $t ($SECS s)"
   "./build/fuzz/$t" -max_total_time="$SECS" -max_len=4096 -print_final_stats=1 \

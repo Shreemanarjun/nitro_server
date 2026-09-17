@@ -75,26 +75,15 @@ env-gated engine timer to split head-decode vs the two crossings.
    bound by round-trip **latency** (736 µs p50), which a batch flush-hop only
    *increases* — hurting throughput at fixed concurrency and the p99 tail lead.
    See `docs/benchmark-results.md` §2b.
-6. **Engine-side response templates.** ✅ **SHIPPED** (`getTemplated` /
-   `templateRoute`). A route registers a template — literal chunks interleaved
-   with `:param` slots — and the engine assembles the body from the matched
-   path's params **on the reactor thread, no Dart hop**, framing the response
-   like `getStatic`. This *is* the P3.7 native-micro-handler idea in its safe,
-   general form. Measured (same process, `wrk -t2 -c64`, identical `{id}` body):
-   template **54.3k req/s @ p50 0.85 ms**, handler **21.1k @ 2.58 ms** — **2.57×
-   throughput, 3× lower p50**, and the template p50 matches `getStatic` (~0.81
-   ms), i.e. it runs at engine-served speed. Slots land only in the body (no
-   header-splitting surface); `JsonString` slots are escaped so a `"`/`\`/
-   control value cannot break out (unit + fuzz covered — `Template.h`,
-   `template_test.cpp`, `template_fuzz.cpp`). Ergonomic API is a template
-   **string** (`'{"id":{id},"q":{?q}}'`) parsed to segments; slots are `{id}`
-   (path param), `{?q}` (query value, engine form-decoded), `!` = raw. See
-   `docs/benchmark-results.md` §2c.
+6. ~~**Engine-side response templates.**~~ Built (`getTemplated` at getStatic
+   speed, ~135k) then **REMOVED**: too niche for end users (reflect-only, no
+   logic), and `getStatic` already gives the engine-served speed. The handler
+   stays the tool for anything with real logic.
 
 ## Phase 3 — Architectural bets (only if Phase 1–2 fall short)
 
-7. ~~**Native micro-handlers**~~ — **subsumed by P2.6** (`getTemplated` is the
-   general, safe form: engine-assembled body from request params, no Dart).
+7. **Native micro-handlers** for the hottest fixed shapes — the same idea as the
+   removed templates; parked unless a concrete demand appears.
 8. **Refreshable getStatic cache** as a documented pattern: re-register a
    `getStatic` route every N seconds for slowly-changing "dynamic" data —
    engine-served throughput for data that isn't per-request.
@@ -108,7 +97,7 @@ env-gated engine timer to split head-decode vs the two crossings.
 | P1.3 object reuse | med | low | med |
 | P1.4 leaner respond | med | low | low |
 | ~~P2.5 response batching~~ | ~1.3% (measured, < noise) | med | med — **rejected** |
-| P2.6 engine templates | **2.57× vs handler (measured)** | med | high — **shipped** |
+| ~~P2.6 engine templates~~ | getStatic-speed (measured) | med | **built then removed (niche)** |
 
 Do P1 first (cheap, likely ~100k), re-measure against the 8.1 µs ceiling, then
 decide whether P2 is worth it. Never trade away the p99 tail-latency win.

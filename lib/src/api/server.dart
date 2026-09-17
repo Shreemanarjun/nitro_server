@@ -16,7 +16,6 @@ import 'http_method.dart';
 import 'metrics.dart';
 import 'native_loader.dart';
 import 'route_group.dart';
-import 'template.dart';
 import 'ws.dart';
 
 /// Registers routes and middleware on a freshly bound server. With
@@ -390,131 +389,6 @@ class NitroServer {
     headers: headers,
   );
 
-  /// Registers a route whose body the engine assembles per request from
-  /// [template] and serves entirely on its own thread, never crossing into
-  /// Dart. The middle ground between [getStatic] (fully fixed) and a handler:
-  /// for a response derivable from the URL (echo, canned lookups keyed by a
-  /// param, search-style query reflection) it runs at static-route throughput.
-  ///
-  /// [template] is a string with placeholders — `{id}` = the `:id` path param,
-  /// `{?q}` = the `?q=` query value, a trailing `!` (`{n!}`) forces raw, and
-  /// `{{`/`}}` are literal braces. Slots are escaped per [escape]
-  /// ([SlotEscape.jsonString] by default, so a value with `"`/`\`/control bytes
-  /// stays inside its JSON string — use [SlotEscape.raw] for a plain-text body).
-  /// Every `{name}` path slot must name a `:param` in [pattern].
-  ///
-  /// Like [staticRoute]: no handler, so [middleware], timeouts and fallbacks
-  /// never apply, and a request carrying a body closes the connection after the
-  /// answer. Registering replaces any route at (method, pattern). Returns
-  /// `this`. Build a template programmatically with [parseTemplate] +
-  /// [templateRouteSegments] instead when the string form does not fit.
-  Future<NitroServer> templateRoute(
-    HttpMethod method,
-    String pattern,
-    String template, {
-    SlotEscape escape = SlotEscape.jsonString,
-    int status = 200,
-    String? contentType,
-    Map<String, String> headers = const {},
-    String customMethod = '',
-  }) => templateRouteSegments(
-        method,
-        pattern,
-        parseTemplate(template, defaultEscape: escape),
-        status: status,
-        contentType: contentType,
-        headers: headers,
-        customMethod: customMethod,
-      );
-
-  /// [templateRoute] from pre-built [segments] (see [parseTemplate]).
-  Future<NitroServer> templateRouteSegments(
-    HttpMethod method,
-    String pattern,
-    List<TemplateSegment> segments, {
-    int status = 200,
-    String? contentType,
-    Map<String, String> headers = const {},
-    String customMethod = '',
-  }) async {
-    _requirePattern(pattern);
-    if (method == HttpMethod.custom && customMethod.isEmpty) {
-      throw ArgumentError.value(
-        customMethod,
-        'customMethod',
-        'HttpMethod.custom needs an explicit token',
-      );
-    }
-    final params = _patternParams(pattern);
-    for (final seg in segments) {
-      if (seg is TemplateParam && !params.contains(seg.name)) {
-        throw ArgumentError.value(
-          seg.name,
-          'template',
-          'no :${seg.name} segment in "$pattern" (params: ${params.join(', ')})',
-        );
-      }
-    }
-    _runner.addTemplateRoute(
-      method,
-      customMethod.toUpperCase(),
-      pattern,
-      status,
-      {'content-type': ?contentType, ...headers},
-      encodeTemplateBlob(segments),
-    );
-    return this;
-  }
-
-  /// The ergonomic JSON form of [getTemplated]: describe the body as a Dart
-  /// structure instead of a template string — no hand-written JSON, no quoting.
-  /// [Slot] values ([Slot.param], [Slot.query], …) are filled engine-side per
-  /// request; every other value is a JSON literal. `Content-Type` defaults to
-  /// `application/json`. Every path [Slot.param]/[Slot.paramRaw] must name a
-  /// `:param` in [pattern].
-  ///
-  /// ```dart
-  /// server.getTemplatedJson('/users/:id', {
-  ///   'userId': Slot.param('id'),   // -> "42"
-  ///   'search': Slot.query('q'),    // -> "hello" (or "" if absent)
-  ///   'active': true,               // literal
-  ///   'roles': ['user', 'admin'],   // literal array
-  /// });
-  /// ```
-  Future<NitroServer> getTemplatedJson(
-    String pattern,
-    Object? structure, {
-    int status = 200,
-    String contentType = 'application/json',
-    Map<String, String> headers = const {},
-  }) => templateRouteSegments(
-        HttpMethod.get,
-        pattern,
-        jsonTemplate(structure),
-        status: status,
-        contentType: contentType,
-        headers: headers,
-      );
-
-  /// GET shorthand for [templateRoute]:
-  /// `server.getTemplated('/users/:id', '{"userId":{id}}')`.
-  Future<NitroServer> getTemplated(
-    String pattern,
-    String template, {
-    SlotEscape escape = SlotEscape.jsonString,
-    int status = 200,
-    String? contentType,
-    Map<String, String> headers = const {},
-  }) => templateRoute(
-    HttpMethod.get,
-    pattern,
-    template,
-    escape: escape,
-    status: status,
-    contentType: contentType,
-    headers: headers,
-  );
-
   /// Registers a WebSocket route (RFC 6455). Matching handshakes upgrade
   /// in-engine and [handler] receives the live session; anything else on
   /// the pattern (plain requests, bad handshakes) is answered 426/400 and
@@ -667,10 +541,3 @@ void _requirePattern(String pattern) {
     );
   }
 }
-
-/// The `:param` names in [pattern] (without the colon), for validating that a
-/// template only references slots the route actually captures.
-Set<String> _patternParams(String pattern) => {
-  for (final seg in pattern.split('/'))
-    if (seg.startsWith(':') && seg.length > 1) seg.substring(1),
-};

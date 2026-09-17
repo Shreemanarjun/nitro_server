@@ -66,36 +66,31 @@ getStatic vs Go 11–16ms, Node 52–56ms).
 `-c256` on an 8-core laptop puts `wrk -t8` and an 8-isolate server on the same
 cores; under that contention every framework ties at the *machine* ceiling
 (~80k, identical p50/p99) — it measures the box, not the server. Giving `wrk`
-2 threads and the server the rest separates them. `/json` (`/t/:id` for the
-template tier), avg of 3×6 s runs, **leaders run first** so nitro's rows are
-warmer — a conservative comparison, not a flattering one:
+2 threads and the server the rest separates them. `/json`, avg of 3×6 s runs,
+**leaders run first** so nitro's rows are warmer — a conservative comparison,
+not a flattering one:
 
 | framework | req/s | p50 | **p99** |
 |---|--:|--:|--:|
 | node | 150273 | 281µs | 1.29ms |
 | go | 143093 | 299µs | 1.16ms |
 | **nitro** (`getStatic`) | 136367 | 477µs | **1.02ms** |
-| **nitro** (`getTemplated`) | **135515** | 389µs | **1.01ms** |
 | dart:io | 103539 | 452µs | 2.32ms |
 | shelf | 86416 | 588µs | 4.83ms |
 | **nitro** (handler) | 81677 | 734µs | **1.11ms** |
 
 **What this run says:**
-- **`getTemplated` (135.5k) ≈ `getStatic` (136.4k)** — engine-side assembly
-  from `:param`/`?query` slots runs at engine-served speed (both ~0.9× the
-  node/go leaders), **1.66× the handler**, and takes the **best tail in the
-  whole field** (p99 1.01ms).
-- **nitro owns the tail:** the three tightest p99s are all nitro — template
-  1.01ms, getStatic 1.02ms, handler 1.11ms — vs go 1.16, node 1.29, dart:io
-  2.32, shelf 4.83.
+- **`getStatic` (136.4k) is engine-served** — ~0.9× the node/go leaders, and it
+  takes the **best tail in the whole field** (p99 1.02ms).
+- **nitro owns the tail:** getStatic 1.02ms and handler 1.11ms are the two
+  tightest p99s here — vs go 1.16, node 1.29, dart:io 2.32, shelf 4.83.
 - **The handler path is latency-bound, not CPU-bound:** 734µs p50 × 64 conns ≈
   82k. Throughput is mid-pack (the Dart round-trip sets the floor) — which is
-  exactly why `getTemplated`/`getStatic`, which skip that round-trip, leap to
-  135k+.
+  exactly why `getStatic`, which skips that round-trip, leaps to 136k.
 
 (Absolute numbers drift with laptop thermals across a long sweep; the reliable
-signals are the **nitro-tier ordering** — template ≈ getStatic ≫ handler — and
-the **tail-latency lead**, both stable across every run this session.)
+signals are the **getStatic ≫ handler ordering** and the **tail-latency lead**,
+both stable across every run this session.)
 
 ### 2b. Why not response batching (measured)
 
@@ -114,49 +109,14 @@ batch buffer must *defer* answers to coalesce them (a flush hop), which **adds**
 latency — lowering the concurrency-bound throughput and threatening the p99
 1.14ms lead that is nitro's actual differentiator. So the crossing count is not
 worth cutting; the only lever that moves the handler number is removing the
-round-trip itself — which is what §2c's engine templates do — or using
-`getStatic` for anything cacheable.
+round-trip itself (engine-side serving) — or using `getStatic` for anything
+cacheable.
 
-### 2c. Engine-side templates — `getTemplated` (shipped)
-
-A **template route** serves a body the engine assembles on its own thread from
-the matched path's `:param` slots and `?query` values — no Dart handler runs,
-so it answers at static-route speed while still varying per request. The lever
-P2.6 predicted. In §2a's full table it lands at **135.5k req/s ≈ `getStatic`
-(136.4k), 1.66× the handler (81.7k), and the field's best p99 (1.01ms)** — it
-never crosses into Dart, so it runs at engine-served speed. (A same-process
-`/t` vs `/h` run under heavier contention showed the wider **2.57×** ratio; the
-gap over the handler grows as the box saturates, since only the handler pays the
-round-trip.)
-
-Two ways to write the body. A template **string** — `{id}` = path param,
-`{?q}` = query value (form-decoded engine-side), trailing `!` = raw, `{{`/`}}` =
-literal braces; any other brace (a JSON `{`/`}`) is literal, so a JSON body
-needs no escaping:
-
-```dart
-server.getTemplated('/users/:id', '{"userId":{id},"q":{?q}}',
-    contentType: 'application/json');
-```
-
-…or, for JSON, a **typed builder** (`getTemplatedJson`) — describe the body as a
-Dart structure, no hand-written string or manual quoting, literals stay typed:
-
-```dart
-server.getTemplatedJson('/users/:id', {
-  'userId': Slot.param('id'),   // -> "42"
-  'search': Slot.query('q'),    // -> "hi" (or "" if absent)
-  'active': true,               // literal
-  'roles': ['user', 'admin'],   // literal array
-});
-```
-
-Both compile to the same engine segments — same 135k, same escaping guarantees.
-
-Slots land only in the body (no header-splitting surface); `jsonString` (the
-default) escapes the value so a `"`/`\`/control byte cannot break out of its
-JSON string. Unit + libFuzzer covered (`template_test.cpp`, `template_fuzz.cpp`
-— decode + escape + query form-decode, 1.85M execs clean).
+> An engine-side **template route** (`getTemplated`, which assembled a body from
+> `:param`/`?query` slots on the reactor thread) was built and measured at
+> getStatic speed (~135k), then **removed** — it was too niche for end users
+> (reflect-only, no logic), and the same engine-served speed is available via
+> `getStatic`. The handler remains the tool for anything with real logic.
 
 ### 2d. How go/node reach their ceiling, and closing the engine-path gap
 
@@ -165,7 +125,7 @@ The comparison is honest about what the others do: **go** is `net/http`
 `cluster` (one worker per core), llhttp (C parser) and V8. Both win by (a) never
 crossing a language boundary and (b) allocating almost nothing per request —
 Go's escape analysis + `sync.Pool`, V8's hidden classes and llhttp's zero-copy
-parse. nitro's engine-served path (`getStatic`/`getTemplated`) has the same
+parse. nitro's engine-served path (`getStatic`) has the same
 shape — pure C++ on libuv, no Dart hop — so the only thing between it and
 net/http was **its own per-request allocations**.
 
@@ -185,7 +145,7 @@ optimized build ran *warmer* — conservative):
 | baseline (RouteEntry copy) | 139730 | 424µs | 1.00ms |
 | **pointer + thread_local** | **142274** | **402µs** | 1.00ms |
 
-**+1.8% throughput, −5% p50** — `getStatic`/`getTemplated` now sit at ~142k,
+**+1.8% throughput, −5% p50** — `getStatic` now sits at ~142k,
 **level with go's net/http (143k)**; node's 150k edge is its cluster+V8+llhttp
 stack. The win lands on the engine-served paths, where `match` is a real slice
 of the budget; it does **not** move the Dart *handler* (82k), which is bound by

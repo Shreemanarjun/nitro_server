@@ -14,7 +14,6 @@ export 'src/api/middleware.dart';
 export 'src/api/multipart.dart';
 export 'src/api/route_group.dart';
 export 'src/api/static_files.dart';
-export 'src/api/template.dart';
 export 'src/api/ws.dart';
 export 'src/api/native_loader.dart'
     show

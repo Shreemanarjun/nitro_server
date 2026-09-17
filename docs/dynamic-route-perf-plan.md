@@ -55,7 +55,12 @@ env-gated engine timer to split head-decode vs the two crossings.
    or a hand-rolled head reader.)
 3. **Reuse hot objects.** Pool/reuse `RequestContext` and the `RawHeader` list
    on the dispatch path; share one empty list for the common no-custom-header
-   answer.
+   answer. **Partly done:** `httpMethodOf` now returns `const`-canonicalized
+   records (no per-request method-record alloc on dispatch), the empty
+   `RawHeader` list and empty param map/body are shared. Verified flat on
+   throughput (~80.6k `/json`, `-t4 -c64`) — as expected: this is GC/tail
+   relief, not a crossing cut. `RequestContext` pooling is still open (risky:
+   async handlers outlive the dispatch frame).
 4. **Leaner respond.** A `respond` variant that skips `List<RawHeader>`
    marshaling entirely when the handler set no custom headers (the `/json`,
    `/plaintext` case).

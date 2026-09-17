@@ -425,6 +425,7 @@ void UvReactor::respondFile(int64_t id, int64_t status,
                             const std::vector<Header>& headers,
                             const std::string& path, int64_t offset,
                             int64_t length) {
+  if (!running_.load()) return;  // no-op after stop() (see respond)
   FILE* f = std::fopen(path.c_str(), "rb");
   if (!f) {
     static const char msg[] = "not found";
@@ -1181,6 +1182,11 @@ void UvReactor::pushWrite(const ReqLoc& loc, std::string bytes, bool finish) {
 void UvReactor::respond(int64_t id, int64_t status,
                         const std::vector<Header>& headers, const uint8_t* body,
                         size_t bodyLen) {
+  // After stop() the loops are torn down, so a late answer from Dart must be a
+  // no-op. The higher layer stops dispatching before shutdown; this guard
+  // hardens the narrow stop()-vs-respond() window (a late uv_async_send on a
+  // closing async handle) rather than relying on that contract alone.
+  if (!running_.load()) return;
   ReqLoc loc;
   if (!lookupReq(id, loc, /*erase=*/true)) return;  // unknown/already answered
   const int64_t kaSecs = (cfg_.keepAliveTimeoutMs + 999) / 1000;
@@ -1194,6 +1200,7 @@ void UvReactor::respond(int64_t id, int64_t status,
 // stays until the terminal chunk (see sendStreamChunk).
 void UvReactor::startStream(int64_t id, int64_t status,
                             const std::vector<Header>& headers) {
+  if (!running_.load()) return;  // no-op after stop() (see respond)
   ReqLoc loc;
   if (!lookupReq(id, loc, /*erase=*/false)) return;
   std::string out;
@@ -1229,6 +1236,7 @@ void UvReactor::startStream(int64_t id, int64_t status,
 // Any thread: one chunk frame; `last` appends the terminal chunk and finishes.
 void UvReactor::sendStreamChunk(int64_t id, const uint8_t* chunk, size_t n,
                                 bool last) {
+  if (!running_.load()) return;  // no-op after stop() (see respond)
   if (chunk == nullptr) n = 0;
   if (n == 0 && !last) return;  // empty non-terminal chunk: nothing to send
   ReqLoc loc;
@@ -1554,6 +1562,7 @@ void UvReactor::wsProcess(Conn* c) {
 
 int64_t UvReactor::wsSend(int64_t connId, const uint8_t* payload, size_t n,
                           bool binary, bool compressed) {
+  if (!running_.load()) return -1;  // no-op after stop() (see respond)
   int loopIdx;
   {
     std::lock_guard<std::mutex> lk(reqMutex_);
@@ -1575,6 +1584,7 @@ int64_t UvReactor::wsSend(int64_t connId, const uint8_t* payload, size_t n,
 }
 
 void UvReactor::wsClose(int64_t connId, int code) {
+  if (!running_.load()) return;  // no-op after stop() (see respond)
   int loopIdx;
   {
     std::lock_guard<std::mutex> lk(reqMutex_);

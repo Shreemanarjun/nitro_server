@@ -54,6 +54,18 @@ void main() {
         expect(httpMethodOf(raw, ''), (method, ''));
       }
     });
+
+    test('non-custom results are canonical (no per-request allocation)', () {
+      // The dispatch hot path calls httpMethodOf once per request; the
+      // non-custom branches are `const` records, so repeated calls hand back
+      // the same canonical instance instead of allocating. `identical` holds
+      // only if that canonicalization is in place.
+      for (final raw in RawServerMethod.values) {
+        if (raw == RawServerMethod.custom) continue;
+        expect(identical(httpMethodOf(raw, ''), httpMethodOf(raw, '')), isTrue);
+        expect(identical(rawMethodOf(HttpMethod.get, ''), rawMethodOf(HttpMethod.get, '')), isTrue);
+      }
+    });
   });
 
   group('throwIfFailed', () {

@@ -47,33 +47,40 @@ int throwIfFailed(RawServerStatus status, {required String operation}) {
 }
 
 /// Maps a public method to its wire value plus custom token.
+///
+/// Every non-custom result is a `const` record, so it is canonicalized to a
+/// single shared instance instead of allocating one per call.
 (RawServerMethod, String) rawMethodOf(HttpMethod method, String customToken) {
   return switch (method) {
-    HttpMethod.get => (RawServerMethod.get, ''),
-    HttpMethod.head => (RawServerMethod.head, ''),
-    HttpMethod.post => (RawServerMethod.post, ''),
-    HttpMethod.put => (RawServerMethod.put, ''),
-    HttpMethod.delete => (RawServerMethod.delete, ''),
-    HttpMethod.patch => (RawServerMethod.patch, ''),
-    HttpMethod.options => (RawServerMethod.options, ''),
-    HttpMethod.trace => (RawServerMethod.trace, ''),
-    HttpMethod.all => (RawServerMethod.all, ''),
+    HttpMethod.get => const (RawServerMethod.get, ''),
+    HttpMethod.head => const (RawServerMethod.head, ''),
+    HttpMethod.post => const (RawServerMethod.post, ''),
+    HttpMethod.put => const (RawServerMethod.put, ''),
+    HttpMethod.delete => const (RawServerMethod.delete, ''),
+    HttpMethod.patch => const (RawServerMethod.patch, ''),
+    HttpMethod.options => const (RawServerMethod.options, ''),
+    HttpMethod.trace => const (RawServerMethod.trace, ''),
+    HttpMethod.all => const (RawServerMethod.all, ''),
     HttpMethod.custom => (RawServerMethod.custom, customToken),
   };
 }
 
 /// Maps a wire method back to the public enum plus custom token.
+///
+/// On the request hot path (once per dispatch): the non-custom branches are
+/// `const` records, canonicalized to shared instances — no per-request record
+/// allocation for a standard HTTP method.
 (HttpMethod, String) httpMethodOf(RawServerMethod method, String custom) {
   return switch (method) {
-    RawServerMethod.get => (HttpMethod.get, ''),
-    RawServerMethod.head => (HttpMethod.head, ''),
-    RawServerMethod.post => (HttpMethod.post, ''),
-    RawServerMethod.put => (HttpMethod.put, ''),
-    RawServerMethod.delete => (HttpMethod.delete, ''),
-    RawServerMethod.patch => (HttpMethod.patch, ''),
-    RawServerMethod.options => (HttpMethod.options, ''),
-    RawServerMethod.trace => (HttpMethod.trace, ''),
-    RawServerMethod.all => (HttpMethod.all, ''),
+    RawServerMethod.get => const (HttpMethod.get, ''),
+    RawServerMethod.head => const (HttpMethod.head, ''),
+    RawServerMethod.post => const (HttpMethod.post, ''),
+    RawServerMethod.put => const (HttpMethod.put, ''),
+    RawServerMethod.delete => const (HttpMethod.delete, ''),
+    RawServerMethod.patch => const (HttpMethod.patch, ''),
+    RawServerMethod.options => const (HttpMethod.options, ''),
+    RawServerMethod.trace => const (HttpMethod.trace, ''),
+    RawServerMethod.all => const (HttpMethod.all, ''),
     RawServerMethod.custom => (HttpMethod.custom, custom),
   };
 }

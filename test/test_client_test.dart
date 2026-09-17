@@ -192,6 +192,62 @@ void main() {
     );
   });
 
+  test('getTemplatedJson builds a JSON body from a typed structure', () async {
+    await client.server.getTemplatedJson('/u/:id', {
+      'userId': Slot.param('id'),        // -> "42"
+      'search': Slot.query('q'),         // -> "hi" (or "" if absent)
+      'active': true,                    // literal
+      'roles': ['user', 'admin'],        // literal array
+      'meta': {'v': 1},                  // nested literal
+    });
+    final res = await client.get('/u/42?q=hi');
+    expect(res.status, 200);
+    expect(res.headers['content-type'], 'application/json');
+    expect(jsonDecode(res.text()), {
+      'userId': '42',
+      'search': 'hi',
+      'active': true,
+      'roles': ['user', 'admin'],
+      'meta': {'v': 1},
+    });
+    // Missing query slot -> "" keeps the JSON valid.
+    expect((jsonDecode((await client.get('/u/7')).text()) as Map)['search'], '');
+  });
+
+  test('getTemplatedJson: paramRaw numeric field + slot validation', () async {
+    await client.server.getTemplatedJson('/n/:count', {
+      'count': Slot.paramRaw('count'),  // unquoted -> a JSON number
+    });
+    expect(jsonDecode((await client.get('/n/5')).text()), {'count': 5});
+    // A path slot naming no :param is rejected.
+    expect(
+      () => client.server.getTemplatedJson('/n/:count', {'x': Slot.param('nope')}),
+      throwsA(isA<ArgumentError>()),
+    );
+  });
+
+  test('jsonTemplate compiles slots + literals to segments', () {
+    final segs = jsonTemplate({'id': Slot.param('id'), 'ok': true});
+    // Literal "{"id":" , param(id) , literal ","ok":true}"
+    expect(segs.whereType<TemplateParam>().single.name, 'id');
+    expect(
+      assembleTemplateBody(segs, {'id': 'x"y'}, const {}),
+      '{"id":"x\\"y","ok":true}',
+    );
+    // All four slot kinds + nested list/map assemble to valid JSON.
+    final all = jsonTemplate({
+      's': Slot.param('id'),
+      'r': Slot.paramRaw('id'),
+      'q': Slot.query('q'),
+      'qr': Slot.queryRaw('n'),
+      'list': [1, 'two'],
+    });
+    expect(
+      assembleTemplateBody(all, {'id': '3'}, {'q': 'hi', 'n': '7'}),
+      '{"s":"3","r":3,"q":"hi","qr":7,"list":[1,"two"]}',
+    );
+  });
+
   test('staticRoute serves a non-GET method and needs a custom token', () async {
     await client.server.staticRoute(HttpMethod.post, '/hook', 'ack'.codeUnits);
     expect((await client.post('/hook', body: 'x')).text(), 'ack');

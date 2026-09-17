@@ -466,6 +466,36 @@ class NitroServer {
     return this;
   }
 
+  /// The ergonomic JSON form of [getTemplated]: describe the body as a Dart
+  /// structure instead of a template string — no hand-written JSON, no quoting.
+  /// [Slot] values ([Slot.param], [Slot.query], …) are filled engine-side per
+  /// request; every other value is a JSON literal. `Content-Type` defaults to
+  /// `application/json`. Every path [Slot.param]/[Slot.paramRaw] must name a
+  /// `:param` in [pattern].
+  ///
+  /// ```dart
+  /// server.getTemplatedJson('/users/:id', {
+  ///   'userId': Slot.param('id'),   // -> "42"
+  ///   'search': Slot.query('q'),    // -> "hello" (or "" if absent)
+  ///   'active': true,               // literal
+  ///   'roles': ['user', 'admin'],   // literal array
+  /// });
+  /// ```
+  Future<NitroServer> getTemplatedJson(
+    String pattern,
+    Object? structure, {
+    int status = 200,
+    String contentType = 'application/json',
+    Map<String, String> headers = const {},
+  }) => templateRouteSegments(
+        HttpMethod.get,
+        pattern,
+        jsonTemplate(structure),
+        status: status,
+        contentType: contentType,
+        headers: headers,
+      );
+
   /// GET shorthand for [templateRoute]:
   /// `server.getTemplated('/users/:id', '{"userId":{id}}')`.
   Future<NitroServer> getTemplated(

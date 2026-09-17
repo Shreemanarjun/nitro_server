@@ -194,6 +194,89 @@ List<TemplateSegment> decodeTemplateBlob(Uint8List blob) {
   return out;
 }
 
+/// A dynamic value in a [jsonTemplate] structure: a path param or query value
+/// the engine fills per request. Anything else in the structure (strings,
+/// numbers, bools, null, lists, maps) is a literal, JSON-encoded at build time.
+final class Slot {
+  final TemplateSegment segment;
+  const Slot._(this.segment);
+
+  /// The `:name` path param as a JSON **string** (quoted, escaped): `"42"`.
+  factory Slot.param(String name) => Slot._(TemplateParam(name));
+
+  /// The `:name` path param **verbatim** — for a field that is already a JSON
+  /// literal, e.g. a numeric segment: `/count/:n` → `42` (no quotes). The value
+  /// must be valid JSON in that position; a path param is always present.
+  factory Slot.paramRaw(String name) =>
+      Slot._(TemplateParam(name, escape: SlotEscape.raw));
+
+  /// The `?name=` query value as a JSON **string** (quoted, escaped); a missing
+  /// query param yields `""`, so the JSON stays valid.
+  factory Slot.query(String name) => Slot._(TemplateQuery(name));
+
+  /// The `?name=` query value **verbatim** (numeric query fields). Caller-beware:
+  /// a missing or non-numeric value breaks the JSON — use [Slot.query] unless
+  /// you control the input.
+  factory Slot.queryRaw(String name) =>
+      Slot._(TemplateQuery(name, escape: SlotEscape.raw));
+}
+
+/// Builds template segments from a JSON-shaped Dart [structure] — the ergonomic
+/// way to describe a JSON template body without hand-writing the encoded string
+/// or worrying about quoting. [Slot] values become engine-filled slots; every
+/// other value (String/num/bool/null/List/Map, nested freely) is JSON-encoded
+/// as a literal. See [NitroServer.getTemplatedJson].
+///
+/// ```dart
+/// jsonTemplate({
+///   'userId': Slot.param('id'),   // -> "42"
+///   'active': true,               // literal
+///   'tags': ['a', 'b'],           // literal array
+/// });
+/// ```
+List<TemplateSegment> jsonTemplate(Object? structure) {
+  final segments = <TemplateSegment>[];
+  final literal = StringBuffer();
+  void flush() {
+    if (literal.isNotEmpty) {
+      segments.add(TemplateLiteral(literal.toString()));
+      literal.clear();
+    }
+  }
+
+  void walk(Object? v) {
+    if (v is Slot) {
+      flush();
+      segments.add(v.segment);
+    } else if (v is Map) {
+      literal.write('{');
+      var first = true;
+      v.forEach((k, value) {
+        if (!first) literal.write(',');
+        first = false;
+        literal
+          ..write(jsonEncode(k.toString()))
+          ..write(':');
+        walk(value);
+      });
+      literal.write('}');
+    } else if (v is List) {
+      literal.write('[');
+      for (var i = 0; i < v.length; i++) {
+        if (i > 0) literal.write(',');
+        walk(v[i]);
+      }
+      literal.write(']');
+    } else {
+      literal.write(jsonEncode(v));  // String/num/bool/null
+    }
+  }
+
+  walk(structure);
+  flush();
+  return segments;
+}
+
 /// Assembles a template body from [segments], captured path [params] and the
 /// (form-decoded) [query] map — literals verbatim, slots escaped per mode
 /// (`jsonString` → a quoted JSON string via [jsonEncode]). Mirrors

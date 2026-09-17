@@ -651,6 +651,17 @@ void main() {
       // Query slots: q form-decoded to "a b", page raw.
       final search = await _get(server!.port, '/search?q=a%20b&page=2');
       expect(search.body, '{"q":"a b","page":2}');
+
+      // The typed JSON builder over the real engine.
+      await server!.getTemplatedJson('/j/:id', {
+        'userId': Slot.param('id'),
+        'n': Slot.paramRaw('id'),
+        'q': Slot.query('q'),
+        'ok': true,
+      });
+      final j = await _get(server!.port, '/j/9?q=x');
+      expect(j.headers.contentType?.mimeType, 'application/json');
+      expect(jsonDecode(j.body), {'userId': '9', 'n': 9, 'q': 'x', 'ok': true});
     });
 
     test('several cookies ride as separate set-cookie headers', () async {

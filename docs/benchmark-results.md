@@ -129,14 +129,29 @@ never crosses into Dart, so it runs at engine-served speed. (A same-process
 gap over the handler grows as the box saturates, since only the handler pays the
 round-trip.)
 
-The API is a template **string**: `{id}` = path param, `{?q}` = query value
-(form-decoded engine-side), trailing `!` = raw, `{{`/`}}` = literal braces; any
-other brace (a JSON `{`/`}`) is literal, so a JSON body needs no escaping:
+Two ways to write the body. A template **string** — `{id}` = path param,
+`{?q}` = query value (form-decoded engine-side), trailing `!` = raw, `{{`/`}}` =
+literal braces; any other brace (a JSON `{`/`}`) is literal, so a JSON body
+needs no escaping:
 
 ```dart
 server.getTemplated('/users/:id', '{"userId":{id},"q":{?q}}',
     contentType: 'application/json');
 ```
+
+…or, for JSON, a **typed builder** (`getTemplatedJson`) — describe the body as a
+Dart structure, no hand-written string or manual quoting, literals stay typed:
+
+```dart
+server.getTemplatedJson('/users/:id', {
+  'userId': Slot.param('id'),   // -> "42"
+  'search': Slot.query('q'),    // -> "hi" (or "" if absent)
+  'active': true,               // literal
+  'roles': ['user', 'admin'],   // literal array
+});
+```
+
+Both compile to the same engine segments — same 135k, same escaping guarantees.
 
 Slots land only in the body (no header-splitting surface); `jsonString` (the
 default) escapes the value so a `"`/`\`/control byte cannot break out of its

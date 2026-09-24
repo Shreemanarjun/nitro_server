@@ -39,14 +39,21 @@ typedef ServerSetup = FutureOr<void> Function(NitroServer server);
 ///   process alive by itself.
 /// * Desktop: no constraints.
 class NitroServer with RouteRegistrar<NitroServer> {
-  NitroServer._(this._runner);
+  NitroServer._(this._runner, this._config);
 
   /// Test seam: builds a facade over an injected runner (fakes) without
   /// touching native code. Never used in production.
   @visibleForTesting
-  NitroServer.forRunnerForTesting(this._runner);
+  NitroServer.forRunnerForTesting(this._runner)
+    : _config = const ServerConfig();
 
   final ServerRunner _runner;
+
+  /// The config the server started with, resolved (see [config]).
+  ServerConfig _config;
+
+  /// The setup that built this server's routes, kept so [reload] can re-run it.
+  ServerSetup? _setup;
 
   /// Helper isolates dealt a share of this server's requests (empty for a
   /// single-isolate server). Closed with the server.
@@ -62,7 +69,7 @@ class NitroServer with RouteRegistrar<NitroServer> {
     ServerConfig config = const ServerConfig(),
     ServerSetup? setup,
   ]) async {
-    ensureNativeAttached();
+    _ensureNativeLoaded();
     final isolates = config.isolates == 0 ? _autoIsolates() : config.isolates;
     if (isolates > 1 && setup == null) {
       throw ArgumentError.value(
@@ -74,7 +81,7 @@ class NitroServer with RouteRegistrar<NitroServer> {
     }
     final key = serverKey(Ids.nextServer());
     final runner = ServerRunner(attachedNative(key));
-    final server = NitroServer._(runner);
+    final server = NitroServer._(runner, config).._setup = setup;
     if (setup != null) await setup(server);
     if (isolates > 1) {
       server._helpers = await _Helper.spawnAll(
@@ -85,7 +92,32 @@ class NitroServer with RouteRegistrar<NitroServer> {
       );
     }
     server._port = runner.start(config);
+    server._config = config.copyWith(port: server._port, isolates: isolates);
     return server;
+  }
+
+  /// Opens the cmake-built native library so [bind] works in a Dart CLI
+  /// program without a manual [loadNitroServerNative] call. On Flutter the
+  /// library is bundled and no cmake output exists, so a not-found is ignored
+  /// and the already-loaded symbols are used; if attaching then fails the
+  /// actionable "build it first" error from the load is raised.
+  static void _ensureNativeLoaded() {
+    StateError? loadError;
+    try {
+      loadNitroServerNative();
+      // coverage:ignore-start
+    } on StateError catch (e) {
+      loadError = e; // cmake output absent: Flutter/bundled, or not built yet
+    }
+    // coverage:ignore-end
+    try {
+      ensureNativeAttached();
+    } catch (_) {
+      // coverage:ignore-start
+      if (loadError != null) throw loadError;
+      rethrow;
+      // coverage:ignore-end
+    }
   }
 
   /// Auto size for [ServerConfig.isolates] == 0: half the cores, so the
@@ -137,6 +169,21 @@ class NitroServer with RouteRegistrar<NitroServer> {
 
   /// The actual bound port (== config port unless the config asked for 0).
   int get port => _port;
+
+  /// The effective configuration this server started with: the [ServerConfig]
+  /// passed to [bind], with [ServerConfig.port] and [ServerConfig.isolates]
+  /// resolved to the values actually in force (the bound port, and the auto
+  /// isolate count when the config asked for 0).
+  ServerConfig get config => _config;
+
+  /// The base URL this server answers on: `http`/`https` per
+  /// [ServerConfig.tls], the configured [ServerConfig.host] and the bound
+  /// [port] (e.g. `http://127.0.0.1:8080`).
+  Uri get uri => Uri(
+    scheme: _config.tls.enabled ? 'https' : 'http',
+    host: _config.host,
+    port: _port,
+  );
 
   /// Engine health and lifecycle observations. Broadcast.
   Stream<ServerEvent> get events => _runner.events;
@@ -310,6 +357,35 @@ class NitroServer with RouteRegistrar<NitroServer> {
     _runner.errorHandler = handler;
   }
 
+  /// Rebuilds the whole routing surface on the live socket: unregisters every
+  /// route, clears middleware and resets the 404/500 fallbacks, then re-runs
+  /// [setup] (or the [ServerSetup] this server was bound with). Added, removed,
+  /// changed and re-mapped routes all take effect without dropping the port or
+  /// open connections — the primitive behind hot reload (see
+  /// `package:nitro_server/hot_reload.dart`).
+  ///
+  /// On a multi-isolate server every helper isolate rebuilds too, re-running
+  /// the [ServerSetup] it was bound with (a [setup] passed here applies to the
+  /// calling isolate only — hot reload passes none, so all isolates stay in
+  /// step). Throws [StateError] when the server was bound without a
+  /// [ServerSetup] and none is passed here — there is nothing to rebuild from.
+  Future<NitroServer> reload([ServerSetup? setup]) async {
+    final rebuild = setup ?? _setup;
+    if (rebuild == null) {
+      throw StateError(
+        'reload() needs a ServerSetup: bind the server with one, or pass one '
+        'to reload().',
+      );
+    }
+    _setup = rebuild;
+    _runner.clearAll();
+    await rebuild(this);
+    for (final helper in _helpers) {
+      await helper.reload();
+    }
+    return this;
+  }
+
   /// Stops the server. Without [drain] it stops now: parked requests get
   /// a 503. With [drain] it first closes the listener, answers everything
   /// already accepted (each answer says `Connection: close`) and waits up
@@ -374,6 +450,14 @@ class _Helper {
 
   late final StreamIterator<Object?> _queue;
 
+  /// Tells the helper to rebuild its routes from the setup it was bound with
+  /// (which VM hot reload has already patched), matching the main isolate's
+  /// [NitroServer.reload].
+  Future<void> reload() async {
+    _control.send(_HelperBoot.reloadSignal);
+    await _queue.moveNext(); // 'reloaded'
+  }
+
   Future<void> close() async {
     _control.send(_HelperBoot.closeSignal);
     await _queue.moveNext(); // 'closed' — the helper's runner is shut.
@@ -385,6 +469,7 @@ class _HelperBoot {
   const _HelperBoot(this.key, this.dylibPath, this.setup, this.reply);
 
   static const closeSignal = 'close';
+  static const reloadSignal = 'reload';
 
   final String key;
   final String? dylibPath;
@@ -399,13 +484,21 @@ class _HelperBoot {
 Future<void> _helperMain(_HelperBoot boot) async {
   if (boot.dylibPath != null) loadNitroServerNative(path: boot.dylibPath);
   final runner = ServerRunner(attachedNative(boot.key));
-  final server = NitroServer._(runner);
+  // The helper's facade only runs setup on the shared engine; its config is
+  // never read (the main isolate owns lifecycle and holds the real config).
+  final server = NitroServer._(runner, const ServerConfig());
   await boot.setup(server);
   runner.prepareHelper();
   final control = ReceivePort();
   boot.reply.send(control.sendPort);
   await for (final message in control) {
     if (message == _HelperBoot.closeSignal) break;
+    if (message == _HelperBoot.reloadSignal) {
+      // The isolate's code is already hot-reloaded; rebuild the routes from it.
+      runner.clearAll();
+      await boot.setup(server);
+      boot.reply.send('reloaded');
+    }
   }
   control.close();
   await runner.close();

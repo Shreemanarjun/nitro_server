@@ -373,6 +373,53 @@ void main() {
       expect(statuses, {200, 404});
     }, skip: skipReason);
 
+    test('config and uri expose the resolved port and host', () async {
+      server = await NitroServer.bind(const ServerConfig(), _whoSetup);
+      expect(server!.port, isNot(0));
+      expect(server!.config.port, server!.port); // 0 resolved to the real port
+      expect(server!.config.host, '127.0.0.1');
+      expect(server!.config.isolates, 1);
+      expect(server!.uri, Uri.parse('http://127.0.0.1:${server!.port}'));
+    }, skip: skipReason);
+
+    test('reload swaps routes on the live socket, same port', () async {
+      server = await NitroServer.bind(
+        const ServerConfig(),
+        (s) async => s.get('/a', (_) async => ResponseContext.text('A')),
+      );
+      final port = server!.port;
+      expect((await _get(port, '/a')).status, 200);
+      expect((await _get(port, '/b')).status, 404);
+
+      await server!.reload(
+        (s) async => s.get('/b', (_) async => ResponseContext.text('B')),
+      );
+      expect(server!.port, port); // never re-bound
+      expect((await _get(port, '/a')).status, 404); // old route torn down
+      final res = await _get(port, '/b');
+      expect(res.status, 200);
+      expect(res.body, 'B');
+    }, skip: skipReason);
+
+    test('reload rebuilds every isolate on the live socket', () async {
+      server = await NitroServer.bind(
+        const ServerConfig(isolates: 2),
+        _whoSetup,
+      );
+      final port = server!.port;
+      expect((await _get(port, '/who')).status, 200);
+      // No-arg reload re-runs the bound setup on the main isolate AND every
+      // helper; if a helper cleared but failed to re-register, its share of
+      // round-robin requests would 404.
+      await server!.reload();
+      expect(server!.port, port);
+      final statuses = <int>{};
+      for (var i = 0; i < 8; i++) {
+        statuses.add((await _get(port, '/who')).status);
+      }
+      expect(statuses, {200});
+    }, skip: skipReason);
+
     test('isolates: 0 picks a size from the CPU count', () async {
       server = await NitroServer.bind(
         const ServerConfig(isolates: 0),

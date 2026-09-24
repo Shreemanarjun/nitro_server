@@ -51,6 +51,8 @@ await server.close();
 | `server.ws(pattern, handler, {protocols})` | WebSocket route (RFC 6455); the handler gets a `WsSession`; `protocols` selects a subprotocol |
 | `server.notFoundHandler`, `server.errorHandler` | custom 404 and 500 answers |
 | `server.unroute(method, pattern)` | removes a route; `RouteNotFoundException` if absent |
+| `server.port`, `server.config`, `server.uri` | the bound port, the resolved `ServerConfig` it started with (port and isolates filled in), and the base URL (`http(s)://host:port`) |
+| `server.reload([setup])` | rebuilds every route on the live socket — re-runs `setup` (or the one `bind` was given), so added, removed and changed routes take effect without dropping the port; single-isolate. Turnkey hot reload: `package:nitro_server/hot_reload.dart` |
 | `server.events` | lifecycle stream: started, stopped, handler timeout, client error |
 | `server.metrics` | per-route request and 5xx counts, latency p50/p90/p99 |
 | `server.close({drain})` | stops; with `drain:` stops accepting, closes idle connections and waits up to `drain` for in-flight requests |
@@ -114,20 +116,49 @@ final server = await NitroServer.bind(const ServerConfig(isolates: 0), setup);
 
 ## Dart-only use
 
-No Flutter SDK dependency. Build the library with cmake and open it once:
+No Flutter SDK dependency. Build the library with cmake; `bind` opens it
+automatically — Flutter bundles the native library, a Dart CLI builds it, and
+either way you never call the loader by hand:
 
 ```dart
 import 'package:nitro_server/nitro_server.dart';
 
 void main() async {
-  loadNitroServerNative(); // build/lib/libnitro_server.{dylib,so,dll}
-  final server = await NitroServer.bind();
+  final server = await NitroServer.bind(); // finds build/lib/libnitro_server.*
   await server.get('/hello', (_) => ResponseContext.text('hi 👋'));
 }
 ```
 
-Search order: `path:` argument, `NITRO_SERVER_DYLIB`, `build/lib/<name>`,
-`build/<name>`.
+`bind` searches `NITRO_SERVER_DYLIB`, then `build/lib/<name>`, then
+`build/<name>`. To load from a custom path, call
+`loadNitroServerNative(path: ...)` before `bind` (idempotent).
+
+## Hot reload
+
+`server.reload()` rebuilds the whole routing surface on the live socket, so a
+`setup` edit takes effect without a restart. Wire it to VM hot reload with the
+opt-in helper (add `hotreloader` to your `dev_dependencies`):
+
+```dart
+import 'package:nitro_server/nitro_server.dart';
+import 'package:nitro_server/hot_reload.dart';
+
+void main() async {
+  final server = await NitroServer.bind(const ServerConfig(port: 8080), setup);
+  await enableHotReload(server); // re-runs `setup` after every hot reload
+}
+```
+
+Pass `enableHotReload(server, log: print)` to trace reloads (watched dirs, each
+change, the VM result, the route rebuild); it is silent otherwise. `watch:`
+overrides which directories are watched.
+
+Run it with `dart run --enable-vm-service bin/server.dart`, then edit a handler
+and save. `setup` must be a **top-level or static function** (not an inline
+`bind(config, (s) async { … })` closure) — Dart hot reload doesn't re-patch a
+stored anonymous closure. Handlers written inline inside `setup` are fine.
+`enableHotReload` also watches the entry script's own directory, so a server
+run from anywhere (not just `bin`/`lib`) reloads.
 
 ## Benchmark
 

@@ -317,6 +317,59 @@ void main() {
     });
   });
 
+  group('config & reload', () {
+    test('config and uri reflect the config the server was built with', () {
+      // forRunnerForTesting builds over a default ServerConfig (port 0).
+      expect(server.config.host, '127.0.0.1');
+      expect(server.config.port, 0);
+      expect(server.config.tls.enabled, isFalse);
+      expect(server.uri, Uri.parse('http://127.0.0.1:0'));
+    });
+
+    test('reload without a setup throws', () async {
+      await expectLater(server.reload(), throwsStateError);
+    });
+
+    test(
+      'reload tears down every route kind before re-running setup',
+      () async {
+        Future<ResponseContext> ok(RequestContext _) async =>
+            const ResponseContext();
+        // A handler, a WebSocket route, a static route, middleware and a 404.
+        await server.reload((s) async {
+          await s.get('/old', ok);
+          await s.ws('/sock', (_) async {});
+          await s.getStatic('/static', const [1, 2, 3]);
+          s.use((request, next) => next(request));
+          s.notFoundHandler = (_) => const ResponseContext(status: 418);
+        });
+        expect(
+          fake.registered.map((r) => r.pattern),
+          containsAll(['/old', '/sock']),
+        );
+        expect(fake.staticRegistered.single.pattern, '/static');
+
+        fake.unregistered.clear();
+        await server.reload((s) => s.get('/new', ok));
+        expect(
+          fake.unregistered,
+          containsAll([('GET', '/old'), ('GET', '/sock'), ('GET', '/static')]),
+        );
+        expect(fake.registered.last.pattern, '/new');
+      },
+    );
+
+    test(
+      'reload with no argument re-runs the setup given the first time',
+      () async {
+        var runs = 0;
+        await server.reload((_) async => runs++);
+        await server.reload();
+        expect(runs, 2);
+      },
+    );
+  });
+
   group('value types', () {
     test('ResponseContext.isStream tells the two body kinds apart', () {
       expect(const ResponseContext().isStream, isFalse);

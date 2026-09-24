@@ -1,6 +1,6 @@
 name: nitro_server
 description: Fast HTTP/1.1 and WebSocket server for Dart and Flutter, backed by a native multithreaded C++ engine over Nitro FFI, with trie routing and per-route timeouts.
-version: 0.0.1
+version: 0.0.2
 homepage: https://github.com/Shreemanarjun/nitro_server
 repository: https://github.com/Shreemanarjun/nitro_server
 issue_tracker: https://github.com/Shreemanarjun/nitro_server/issues
@@ -28,6 +28,9 @@ dev_dependencies:
   shelf: ^1.4.2
   test: ^1.25.0
   benchmark_harness: ^2.4.0
+  # Only to type-check the opt-in `lib/hot_reload.dart`; consumers who use that
+  # helper add `hotreloader` to their own dev_dependencies. Not shipped.
+  hotreloader: ^4.2.0
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec

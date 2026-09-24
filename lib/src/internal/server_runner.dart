@@ -195,12 +195,25 @@ class ServerRunner {
   /// is dropped. Bounded like [_boundEarly].
   final _wsEarly = <int, List<({int kind, int aux, Uint8List bytes})>>{};
 
+  /// The 404 answer before any override: an empty 404.
+  static ResponseContext _defaultNotFound(RequestContext _) =>
+      const ResponseContext(status: 404);
+
+  /// The 500 answer before any override: a text body naming the error.
+  static ResponseContext _defaultError(Object error, RequestContext _) =>
+      ResponseContext.text('handler error: $error', status: 500);
+
   /// Answers unmatched requests. Defaults to an empty 404.
-  NotFoundHandler _notFoundHandler = (_) => const ResponseContext(status: 404);
+  NotFoundHandler _notFoundHandler = _defaultNotFound;
 
   /// Answers requests whose handler threw. Defaults to a 500 text body.
-  ErrorHandler _errorHandler = (error, _) =>
-      ResponseContext.text('handler error: $error', status: 500);
+  ErrorHandler _errorHandler = _defaultError;
+
+  /// Every (method-token, pattern) pair currently registered in the engine —
+  /// handler, WebSocket AND static routes alike, since the engine holds one
+  /// entry per (method, pattern) regardless of kind. The single source of
+  /// truth for [clearAll]; static routes have no other Dart-side record.
+  final _registered = <String, Set<String>>{};
 
   /// Overrides the 404 answer. A throwing handler falls back to empty 404.
   ///
@@ -316,6 +329,7 @@ class ServerRunner {
     );
     final token = _tokenOf(method, customToken);
     (_routes[token] ??= {})[pattern] = entry;
+    (_registered[token] ??= <String>{}).add(pattern);
     // Single-entry mirror of the engine table (see addWsRoute).
     if (token == 'GET') _wsHandlers.remove(pattern);
   }
@@ -349,10 +363,33 @@ class ServerRunner {
       pattern,
     );
     throwIfFailed(status, operation: 'unregisterRoute($pattern)');
-    _routes[_tokenOf(method, customToken)]?.remove(pattern);
+    final token = _tokenOf(method, customToken);
+    _routes[token]?.remove(pattern);
+    _registered[token]?.remove(pattern);
     // The engine holds one entry per (method, pattern) whatever its kind:
     // removing a GET route removes a WS route on the same pattern too.
     if (method == HttpMethod.get) _wsHandlers.remove(pattern);
+  }
+
+  /// Empties the whole routing surface without touching the engine's accept
+  /// loop: unregisters every route (handler, WebSocket, static), drops all
+  /// middleware and resets the 404/500 fallbacks to their defaults. The server
+  /// keeps listening on the same socket. Backs [NitroServer.reload]; a fresh
+  /// [ServerSetup] then rebuilds the routes.
+  void clearAll() {
+    for (final entry in _registered.entries) {
+      for (final pattern in entry.value) {
+        final status = _native.unregisterRoute(entry.key, pattern);
+        throwIfFailed(status, operation: 'unregisterRoute($pattern)');
+      }
+    }
+    _registered.clear();
+    _routes.clear();
+    _wsHandlers.clear();
+    _middlewares.clear();
+    _compose = _identity;
+    _notFoundHandler = _defaultNotFound;
+    _errorHandler = _defaultError;
   }
 
   /// Registers a static route: the engine answers [status]/[headers]/[body]
@@ -374,6 +411,7 @@ class ServerRunner {
     ], body is Uint8List ? body : Uint8List.fromList(body));
     throwIfFailed(result, operation: 'registerStaticRoute($pattern)');
     _routes[token]?.remove(pattern);
+    (_registered[token] ??= <String>{}).add(pattern);
     if (method == HttpMethod.get) _wsHandlers.remove(pattern);
   }
 
@@ -399,6 +437,7 @@ class ServerRunner {
     );
     throwIfFailed(status, operation: 'registerRoute($pattern)');
     _routes['GET']?.remove(pattern);
+    (_registered['GET'] ??= <String>{}).add(pattern);
     _wsHandlers[pattern] = (handler: handler, protocols: protocols);
   }
 

@@ -1,3 +1,28 @@
+## 0.0.2
+
+### Server
+
+* `NitroServer.bind` opens the native library itself — a Dart CLI no longer
+  calls `loadNitroServerNative` first (Flutter still bundles it); the manual
+  loader remains for a non-default path.
+* `server.config` (the resolved `ServerConfig`, with the bound port and isolate
+  count) and `server.uri` (the base `http(s)://host:port` URL).
+* `server.reload([setup])`: rebuilds the whole routing surface on the live
+  socket — unregisters every route, clears middleware, resets the 404/500
+  fallbacks, then re-runs `setup` — so added, removed and changed routes take
+  effect without dropping the port or open connections. Every isolate rebuilds
+  on a multi-isolate server.
+
+### Hot reload
+
+* Opt-in `package:nitro_server/hot_reload.dart` (`enableHotReload(server)`)
+  wires `reload()` to VM hot reload via `hotreloader` — a dev-dependency you
+  add, so the core package ships no runtime dependency. It also watches the
+  running script's own directory (hotreloader watches only `bin`/`lib`/`test`),
+  so a server run from anywhere reloads. `setup` must be a top-level or static
+  function for a reload to pick up changes. Pass `log:` (e.g. `print`) to trace
+  reload activity; silent otherwise.
+
 ## 0.0.1
 
 Initial release.

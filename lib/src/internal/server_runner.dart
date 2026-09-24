@@ -186,6 +186,15 @@ class ServerRunner {
   /// Every WebSocket connection id ever opened (test seam backing).
   final _wsOpened = <int>{};
 
+  /// Frames that reached [_onWsMessage] before their session opened. The open
+  /// event ([_dispatchWs]) and message events ([_onWsMessage]) ride separate
+  /// bridge streams with no cross-ordering — the same property that lets HTTP
+  /// body chunks precede their head (see [_early]) — so a client's first frame
+  /// can beat its open. Parked here (already copied and acked) and replayed on
+  /// open; a frame for an id in [_wsOpened] is instead a post-close stale and
+  /// is dropped. Bounded like [_boundEarly].
+  final _wsEarly = <int, List<({int kind, int aux, Uint8List bytes})>>{};
+
   /// Answers unmatched requests. Defaults to an empty 404.
   NotFoundHandler _notFoundHandler = (_) => const ResponseContext(status: 404);
 
@@ -231,6 +240,10 @@ class ServerRunner {
   /// Test seam: every WebSocket connection id ever opened (sessions remove
   /// themselves on close, so liveness alone cannot prove an open happened).
   Set<int> get wsOpenedIdsForTesting => {..._wsOpened};
+
+  /// Test seam: total frames parked awaiting their session's open.
+  int get wsEarlyFrameCountForTesting =>
+      _wsEarly.values.fold(0, (sum, list) => sum + list.length);
 
   /// Test seam: subscribes the engine streams without touching native state,
   /// mirroring what `addRoute`/`start` do in production. Needed by tests that
@@ -485,6 +498,7 @@ class ServerRunner {
       session._shutdown();
     }
     _wsSessions.clear();
+    _wsEarly.clear();
     await _heads?.cancel();
     await _chunks?.cancel();
     await _serverEvents?.cancel();
@@ -965,6 +979,15 @@ class ServerRunner {
     );
     _wsSessions[connectionId] = session;
     _wsOpened.add(connectionId);
+    // Replay any frames that beat the open (buffered in the stream controller
+    // until the handler subscribes), in arrival order, before live frames.
+    final parked = _wsEarly.remove(connectionId);
+    if (parked != null) {
+      for (final m in parked) {
+        if (session._done) break; // a replayed close already finished it
+        _deliverWs(session, m.kind, m.aux, m.bytes);
+      }
+    }
     Future<void>.sync(() => handler(session)).then(
       (_) => session._closeLocal(1000),
       onError: (_) => session._closeLocal(1011),
@@ -977,16 +1000,34 @@ class ServerRunner {
     // so deferred acks would leak native memory.
     final copy = Uint8List.fromList(message.payload);
     _native.ackBody(message.connectionId, 1);
-    final session = _wsSessions[message.connectionId];
-    if (session == null) return; // Stale: already acked above, bytes dropped.
-    if (message.kind == 8) {
-      session._remoteClose(message.aux);
+    final id = message.connectionId;
+    final session = _wsSessions[id];
+    if (session == null) {
+      // No session yet. Either the frame beat its open across the bridge —
+      // park it for [_dispatchWs] to replay — or the id already opened and
+      // closed, which makes this a stale post-close frame we drop.
+      if (!_wsOpened.contains(id)) {
+        (_wsEarly[id] ??= [])
+            .add((kind: message.kind, aux: message.aux, bytes: copy));
+        _boundWsEarly();
+      }
+      return;
+    }
+    _deliverWs(session, message.kind, message.aux, copy);
+  }
+
+  /// Decodes one WS frame ([copy] already lifted out of native memory) and
+  /// hands it to [session]. Shared by the live path ([_onWsMessage]) and the
+  /// pre-open replay ([_dispatchWs]).
+  void _deliverWs(_WsSessionImpl session, int kind, int aux, Uint8List copy) {
+    if (kind == 8) {
+      session._remoteClose(aux);
       return;
     }
     // aux == 1: a permessage-deflate payload (no context takeover), one
     // independent raw-deflate stream per message.
     final Uint8List bytes;
-    if (message.aux == 1) {
+    if (aux == 1) {
       try {
         bytes = wsInflate(copy);
       } on Object {
@@ -996,9 +1037,9 @@ class ServerRunner {
     } else {
       bytes = copy;
     }
-    if (message.kind == 1) {
-      // Re-decode from the copy: the view died with the ack above. The
-      // engine validated UTF-8 for plain text; inflated text is checked here.
+    if (kind == 1) {
+      // The engine validated UTF-8 for plain text; inflated text is checked
+      // here.
       try {
         session._add(WsMessage.text(utf8.decode(bytes)));
       } on FormatException {
@@ -1006,6 +1047,18 @@ class ServerRunner {
       }
     } else {
       session._add(WsMessage.binary(bytes));
+    }
+  }
+
+  /// Caps total parked pre-open frames, evicting the oldest connection's
+  /// frames first — the same 1024 bound as [_boundEarly].
+  void _boundWsEarly() {
+    var total = 0;
+    for (final list in _wsEarly.values) {
+      total += list.length;
+    }
+    while (total > 1024 && _wsEarly.isNotEmpty) {
+      total -= _wsEarly.remove(_wsEarly.keys.first)!.length;
     }
   }
 }

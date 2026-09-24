@@ -391,8 +391,10 @@ abstract class NitroServerNative extends HybridObject {
   // ── Capabilities (valid on any instance) ───────────────────────────────────
 
   /// e.g. `nitro_server/0.0.1 http/1.1 threads`.
+  @nitroFast
   String engineVersion();
 
+  @nitroFast
   bool supportsTls();
 
   /// Hot-restart recovery: stop every server, join every thread, drop every
@@ -401,6 +403,7 @@ abstract class NitroServerNative extends HybridObject {
 
   /// Whether the engine was built with libbrotli, for the `compress()`
   /// middleware's `br` path. When false the middleware falls back to gzip.
+  @nitroFast
   bool supportsBrotli();
 
   /// Brotli-encodes [data] at [quality] (0–11) in text mode. Returns the
@@ -453,6 +456,7 @@ abstract class NitroServerNative extends HybridObject {
   /// every following answer `Connection: close`, while requests already
   /// accepted keep being served. Poll [inFlightRequests] until it reaches
   /// zero (or a deadline passes), then call [stop].
+  @nitroFast
   void beginDrain();
 
   /// Requests dispatched but not yet fully answered on the wire.
@@ -484,6 +488,7 @@ abstract class NitroServerNative extends HybridObject {
   /// parked on its own condition variable and wakes when this lands. Answering
   /// an unknown or already-answered `requestId` is a no-op, never an error —
   /// the timeout path may have answered first.
+  @nitroFast
   void respond(
     int requestId,
     int status,
@@ -517,9 +522,11 @@ abstract class NitroServerNative extends HybridObject {
   // body); the terminal call always completes, even with an empty payload.
 
   /// Starts a chunked response. Fire-and-forget, same terms as `respond`.
+  @nitroFast
   void startStream(int requestId, int status, List<RawHeader> headers);
 
   /// Sends one stream chunk. Fire-and-forget; `last` completes the stream.
+  @nitroFast
   void sendStreamChunk(int requestId, @zeroCopy Uint8List chunk, bool last);
 
   // ── WebSocket sessions ───────────────────────────────────────────────────
@@ -539,6 +546,7 @@ abstract class NitroServerNative extends HybridObject {
   /// or `-1` for an unknown or closing session. Server frames are never
   /// masked (RFC 6455 §5.3). A queue past `wsMaxBufferBytes` closes the
   /// session with 1009.
+  @nitroFast
   int wsSend(
     int connectionId,
     @zeroCopy Uint8List payload,

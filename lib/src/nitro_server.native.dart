@@ -445,7 +445,6 @@ abstract class NitroServerNative extends HybridObject {
     @zeroCopy Uint8List body,
   );
 
-
   /// Binds and starts the accept loop. `boundPort` in the returned status is
   /// the actual port (== config port unless the config asked for 0).
   RawServerStatus start();

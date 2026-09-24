@@ -1007,8 +1007,11 @@ class ServerRunner {
       // park it for [_dispatchWs] to replay — or the id already opened and
       // closed, which makes this a stale post-close frame we drop.
       if (!_wsOpened.contains(id)) {
-        (_wsEarly[id] ??= [])
-            .add((kind: message.kind, aux: message.aux, bytes: copy));
+        (_wsEarly[id] ??= []).add((
+          kind: message.kind,
+          aux: message.aux,
+          bytes: copy,
+        ));
         _boundWsEarly();
       }
       return;

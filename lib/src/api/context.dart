@@ -318,8 +318,9 @@ class RequestContext {
 /// UTF-8 bytes → JSON in a single pass, skipping the intermediate `String` that
 /// `jsonDecode(utf8.decode(bytes))` allocates and re-scans. Built once (the
 /// fused converter is stateless) and shared by every [RequestContext].
-final Converter<List<int>, dynamic> _jsonFromUtf8 =
-    const Utf8Decoder().fuse(const JsonDecoder());
+final Converter<List<int>, dynamic> _jsonFromUtf8 = const Utf8Decoder().fuse(
+  const JsonDecoder(),
+);
 
 /// The answer a [RequestHandler] returns. One value or a byte stream: the
 /// handler resolves one [ResponseContext] and the runner answers exactly

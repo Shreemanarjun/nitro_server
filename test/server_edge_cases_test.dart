@@ -1354,31 +1354,34 @@ void main() {
       expect(fake.wsClosed.single, (601, 1000));
     });
 
-    test('frames that beat the open are parked and replayed in order', () async {
-      // The open head and the message stream have no cross-ordering, so a
-      // client's first frames can reach the runner before the session opens.
-      final received = <WsMessage>[];
-      final gotBoth = Completer<void>();
-      runner.addWsRoute('/chat', (session) async {
-        await for (final message in session.messages) {
-          received.add(message);
-          if (received.length == 2) gotBoth.complete();
-        }
-      });
-      await Future<void>.delayed(Duration.zero);
-      inject(700, 1, Uint8List.fromList('first'.codeUnits));
-      inject(700, 2, Uint8List.fromList([7, 8, 9]));
-      await Future<void>.delayed(Duration.zero);
-      expect(runner.wsEarlyFrameCountForTesting, 2);
-      // The open lands: parked frames replay before any live frame.
-      fake.heads.add(
-        fakeHead(requestId: 700, path: '/chat', routePattern: '/chat'),
-      );
-      await gotBoth.future.timeout(const Duration(seconds: 5));
-      expect(runner.wsEarlyFrameCountForTesting, 0);
-      expect(received[0].text, 'first');
-      expect(received[1].bytes, orderedEquals([7, 8, 9]));
-    });
+    test(
+      'frames that beat the open are parked and replayed in order',
+      () async {
+        // The open head and the message stream have no cross-ordering, so a
+        // client's first frames can reach the runner before the session opens.
+        final received = <WsMessage>[];
+        final gotBoth = Completer<void>();
+        runner.addWsRoute('/chat', (session) async {
+          await for (final message in session.messages) {
+            received.add(message);
+            if (received.length == 2) gotBoth.complete();
+          }
+        });
+        await Future<void>.delayed(Duration.zero);
+        inject(700, 1, Uint8List.fromList('first'.codeUnits));
+        inject(700, 2, Uint8List.fromList([7, 8, 9]));
+        await Future<void>.delayed(Duration.zero);
+        expect(runner.wsEarlyFrameCountForTesting, 2);
+        // The open lands: parked frames replay before any live frame.
+        fake.heads.add(
+          fakeHead(requestId: 700, path: '/chat', routePattern: '/chat'),
+        );
+        await gotBoth.future.timeout(const Duration(seconds: 5));
+        expect(runner.wsEarlyFrameCountForTesting, 0);
+        expect(received[0].text, 'first');
+        expect(received[1].bytes, orderedEquals([7, 8, 9]));
+      },
+    );
 
     test('a parked close finishes the session and halts replay', () async {
       final received = <WsMessage>[];

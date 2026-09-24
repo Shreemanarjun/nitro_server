@@ -34,8 +34,13 @@ mixin RouteRegistrar<T> {
     RequestHandler handler, {
     Duration? timeout,
     List<Middleware>? middleware,
-  }) => route(HttpMethod.get, pattern, handler,
-      timeout: timeout, middleware: middleware);
+  }) => route(
+    HttpMethod.get,
+    pattern,
+    handler,
+    timeout: timeout,
+    middleware: middleware,
+  );
 
   /// Shorthand for `route(HttpMethod.head, …)`.
   Future<T> head(
@@ -43,8 +48,13 @@ mixin RouteRegistrar<T> {
     RequestHandler handler, {
     Duration? timeout,
     List<Middleware>? middleware,
-  }) => route(HttpMethod.head, pattern, handler,
-      timeout: timeout, middleware: middleware);
+  }) => route(
+    HttpMethod.head,
+    pattern,
+    handler,
+    timeout: timeout,
+    middleware: middleware,
+  );
 
   /// Shorthand for `route(HttpMethod.post, …)`; supports [streamBody] uploads.
   Future<T> post(
@@ -54,11 +64,15 @@ mixin RouteRegistrar<T> {
     List<Middleware>? middleware,
     bool streamBody = false,
     int? maxBodyBytes,
-  }) => route(HttpMethod.post, pattern, handler,
-      timeout: timeout,
-      middleware: middleware,
-      streamBody: streamBody,
-      maxBodyBytes: maxBodyBytes);
+  }) => route(
+    HttpMethod.post,
+    pattern,
+    handler,
+    timeout: timeout,
+    middleware: middleware,
+    streamBody: streamBody,
+    maxBodyBytes: maxBodyBytes,
+  );
 
   /// Shorthand for `route(HttpMethod.put, …)`; supports [streamBody] uploads.
   Future<T> put(
@@ -68,11 +82,15 @@ mixin RouteRegistrar<T> {
     List<Middleware>? middleware,
     bool streamBody = false,
     int? maxBodyBytes,
-  }) => route(HttpMethod.put, pattern, handler,
-      timeout: timeout,
-      middleware: middleware,
-      streamBody: streamBody,
-      maxBodyBytes: maxBodyBytes);
+  }) => route(
+    HttpMethod.put,
+    pattern,
+    handler,
+    timeout: timeout,
+    middleware: middleware,
+    streamBody: streamBody,
+    maxBodyBytes: maxBodyBytes,
+  );
 
   /// Shorthand for `route(HttpMethod.delete, …)`.
   Future<T> delete(
@@ -80,8 +98,13 @@ mixin RouteRegistrar<T> {
     RequestHandler handler, {
     Duration? timeout,
     List<Middleware>? middleware,
-  }) => route(HttpMethod.delete, pattern, handler,
-      timeout: timeout, middleware: middleware);
+  }) => route(
+    HttpMethod.delete,
+    pattern,
+    handler,
+    timeout: timeout,
+    middleware: middleware,
+  );
 
   /// Shorthand for `route(HttpMethod.patch, …)`; supports [streamBody] uploads.
   Future<T> patch(
@@ -91,11 +114,15 @@ mixin RouteRegistrar<T> {
     List<Middleware>? middleware,
     bool streamBody = false,
     int? maxBodyBytes,
-  }) => route(HttpMethod.patch, pattern, handler,
-      timeout: timeout,
-      middleware: middleware,
-      streamBody: streamBody,
-      maxBodyBytes: maxBodyBytes);
+  }) => route(
+    HttpMethod.patch,
+    pattern,
+    handler,
+    timeout: timeout,
+    middleware: middleware,
+    streamBody: streamBody,
+    maxBodyBytes: maxBodyBytes,
+  );
 
   /// Shorthand for `route(HttpMethod.options, …)`.
   Future<T> options(
@@ -103,8 +130,13 @@ mixin RouteRegistrar<T> {
     RequestHandler handler, {
     Duration? timeout,
     List<Middleware>? middleware,
-  }) => route(HttpMethod.options, pattern, handler,
-      timeout: timeout, middleware: middleware);
+  }) => route(
+    HttpMethod.options,
+    pattern,
+    handler,
+    timeout: timeout,
+    middleware: middleware,
+  );
 
   /// Matches every method — handy for echo, proxy and fallback routes.
   Future<T> all(
@@ -112,6 +144,11 @@ mixin RouteRegistrar<T> {
     RequestHandler handler, {
     Duration? timeout,
     List<Middleware>? middleware,
-  }) => route(HttpMethod.all, pattern, handler,
-      timeout: timeout, middleware: middleware);
+  }) => route(
+    HttpMethod.all,
+    pattern,
+    handler,
+    timeout: timeout,
+    middleware: middleware,
+  );
 }

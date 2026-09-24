@@ -63,7 +63,13 @@ void main() {
       for (final raw in RawServerMethod.values) {
         if (raw == RawServerMethod.custom) continue;
         expect(identical(httpMethodOf(raw, ''), httpMethodOf(raw, '')), isTrue);
-        expect(identical(rawMethodOf(HttpMethod.get, ''), rawMethodOf(HttpMethod.get, '')), isTrue);
+        expect(
+          identical(
+            rawMethodOf(HttpMethod.get, ''),
+            rawMethodOf(HttpMethod.get, ''),
+          ),
+          isTrue,
+        );
       }
     });
   });

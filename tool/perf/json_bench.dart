@@ -67,14 +67,31 @@ void main() {
   void mediumW(JsonWriter w) {
     w
       ..beginObject()
-      ..key('id')..writeInt(12345)
-      ..key('name')..writeString('Ada Lovelace')
-      ..key('email')..writeString('ada@example.com')
-      ..key('age')..writeInt(36)
-      ..key('active')..writeBool(true)
-      ..key('score')..writeDouble(98.6)
-      ..key('tags')..beginArray()..writeString('admin')..writeString('beta')..writeString('vip')..endArray()
-      ..key('address')..beginObject()..key('city')..writeString('London')..key('zip')..writeString('SW1')..endObject()
+      ..key('id')
+      ..writeInt(12345)
+      ..key('name')
+      ..writeString('Ada Lovelace')
+      ..key('email')
+      ..writeString('ada@example.com')
+      ..key('age')
+      ..writeInt(36)
+      ..key('active')
+      ..writeBool(true)
+      ..key('score')
+      ..writeDouble(98.6)
+      ..key('tags')
+      ..beginArray()
+      ..writeString('admin')
+      ..writeString('beta')
+      ..writeString('vip')
+      ..endArray()
+      ..key('address')
+      ..beginObject()
+      ..key('city')
+      ..writeString('London')
+      ..key('zip')
+      ..writeString('SW1')
+      ..endObject()
       ..endObject();
   }
 
@@ -88,8 +105,10 @@ void main() {
     for (var i = 0; i < 100; i++) {
       w
         ..beginObject()
-        ..key('id')..writeInt(i)
-        ..key('message')..writeString('fortune number $i is a pretty long-ish string')
+        ..key('id')
+        ..writeInt(i)
+        ..key('message')
+        ..writeString('fortune number $i is a pretty long-ish string')
         ..endObject();
     }
     w.endArray();
@@ -107,11 +126,13 @@ void main() {
     final naive = _timeNaive(obj, n);
     final u8 = _timeUtf8Encoder(obj, n);
     final gv = _timeWriter((w) => w.writeValue(obj), n); // native generic walk
-    print('${label.padRight(18)} ${bytes.toString().padLeft(5)}B | '
-        'naive ${naive.toStringAsFixed(2).padLeft(6)} | '
-        'JsonUtf8Encoder ${u8.toStringAsFixed(2).padLeft(6)}us (jsonBody today) | '
-        'writeValue ${gv.toStringAsFixed(2).padLeft(6)}us | '
-        'vs jsonBody ${(u8 / gv).toStringAsFixed(2)}x');
+    print(
+      '${label.padRight(18)} ${bytes.toString().padLeft(5)}B | '
+      'naive ${naive.toStringAsFixed(2).padLeft(6)} | '
+      'JsonUtf8Encoder ${u8.toStringAsFixed(2).padLeft(6)}us (jsonBody today) | '
+      'writeValue ${gv.toStringAsFixed(2).padLeft(6)}us | '
+      'vs jsonBody ${(u8 / gv).toStringAsFixed(2)}x',
+    );
   }
   if (_sink == 0x7fffffff) print('');
 }

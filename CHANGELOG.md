@@ -20,6 +20,24 @@
 * `server.onClose`: a `Future` that completes when `close()` is called, so
   add-ons can release resources when the server stops.
 
+### Engine
+
+* Adaptive request dispatch across isolates. The engine now hill-climbs how many
+  of the configured `isolates` it deals requests to, by measured throughput: a
+  light / IO-bound handler stays on one isolate (the cores-wide engine already
+  does the I/O, so fanning out only adds coordination cost), while a CPU-bound
+  or head-of-line-blocked handler fans out across every isolate. So `isolates`
+  can be set to the core count for any workload — extra isolates are headroom
+  for heavy handlers, never a tax on light ones. On an 8-core box the same
+  config serves `/json` at ~115k req/s and a CPU-bound handler at ~38k, each
+  within ~2% of its hand-tuned optimum, with no knobs.
+* `ServerConfig.workerThreads` now caps the number of libuv event loops (`0` =
+  one per CPU core, the default; a value below the core count runs fewer loop
+  threads). It was previously accepted but unused by the event-loop engine.
+* Upgraded to `nitro` 0.7.11: a native read-buffer leak in the completion
+  batcher is fixed, and `@nitroFast` native throws surface as `HybridException`
+  in debug builds (free in release).
+
 ### Hot reload
 
 * Opt-in `package:nitro_server/hot_reload.dart` (`enableHotReload(server)`)

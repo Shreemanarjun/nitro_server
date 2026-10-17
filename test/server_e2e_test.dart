@@ -355,7 +355,8 @@ void main() {
       skip: skipReason,
     );
 
-    test('isolates: 2 deals requests across both runners', () async {
+    test('isolates: 2 spawns a helper; adaptive dispatch concentrates light load',
+        () async {
       server = await NitroServer.bind(
         const ServerConfig(isolates: 2),
         _whoSetup,
@@ -367,16 +368,11 @@ void main() {
         expect(res.status, 200);
         seen.add(res.body);
       }
-      // Round-robin: every other request lands on the helper isolate.
-      expect(seen, hasLength(2));
-      // A route only the main isolate knows is a 404 on the helper's turn:
-      // registration outside `setup` does not reach helpers.
-      await server!.get('/main-only', (_) async => ResponseContext.text('m'));
-      final statuses = <int>{};
-      for (var i = 0; i < 4; i++) {
-        statuses.add((await _get(server!.port, '/main-only')).status);
-      }
-      expect(statuses, {200, 404});
+      // Light, sequential requests never back up, so adaptive dispatch keeps
+      // them on one isolate (fanning out would only add coordination cost). The
+      // helper is spawned and has run `setup`; it stays parked until a workload
+      // the engine measures as worth parallelizing arrives.
+      expect(seen, hasLength(1));
     }, skip: skipReason);
 
     test('config and uri expose the resolved port and host', () async {

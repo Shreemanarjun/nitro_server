@@ -464,6 +464,38 @@ TEST(UvReactorTest, ServesARegisteredRoute) {
   EXPECT_EQ(f.emitter.seen()[0].path, "/hello");
 }
 
+TEST(UvReactorTest, WorkerThreadsCapsTheEventLoopCount) {
+  const unsigned cores = std::thread::hardware_concurrency();
+  if (cores < 2) GTEST_SKIP() << "need >1 core to observe a cap below cores";
+  RecordingEmitter emitter(
+      [](Method, const std::string&, const std::string&) {
+        return std::make_pair(200, "ok");
+      });
+  // Default (workerThreads = 0): one loop per core.
+  {
+    auto server = std::make_shared<UvReactor>();
+    server->setEmitter(&emitter);
+    ServerConfig cfg;
+    cfg.port = 0;
+    server->configure(cfg);
+    ASSERT_EQ((int64_t)server->start().kind, (int64_t)ErrorKind::None);
+    EXPECT_EQ(server->loopCountForTesting(), (size_t)cores);
+    server->stop();
+  }
+  // A positive workerThreads caps the loop count below the core count.
+  {
+    auto server = std::make_shared<UvReactor>();
+    server->setEmitter(&emitter);
+    ServerConfig cfg;
+    cfg.port = 0;
+    cfg.workerThreads = 2;
+    server->configure(cfg);
+    ASSERT_EQ((int64_t)server->start().kind, (int64_t)ErrorKind::None);
+    EXPECT_EQ(server->loopCountForTesting(), (size_t)2);
+    server->stop();
+  }
+}
+
 // ── Static routes: answered entirely in-engine, never dispatched ─────────────
 
 TEST(UvReactorTest, StaticRouteServesEntirelyInEngine) {
@@ -841,6 +873,9 @@ TEST(UvReactorTest, RequestsAreDealtRoundRobinAcrossEmitters) {
   cfg.port = 0;
   server->configure(cfg);
   ASSERT_EQ((int64_t)server->start().kind, (int64_t)ErrorKind::None);
+  // Exercise the round-robin primitive directly: deal across every emitter and
+  // freeze the adaptive controller (which would otherwise concentrate on one).
+  server->setDispatchWidthForTesting(0);
   std::atomic<bool> pumping{true};
   std::thread pump([&] {
     while (pumping.load()) {
@@ -870,6 +905,74 @@ TEST(UvReactorTest, RequestsAreDealtRoundRobinAcrossEmitters) {
   EXPECT_TRUE(bodies == "ababab" || bodies == "bababa") << bodies;
   server->removeEmitter(&a);
   EXPECT_EQ(server->emitterCountForTesting(), 1u);
+  server->stop();
+}
+
+// The adaptive dispatch controller runs on loop[0]'s sweep while loop threads
+// dispatch and a pump answers from another thread — exercising the concurrent
+// reads/writes of completions_, dispatchWidth_ and reqLoc_. Left enabled (no
+// setDispatchWidthForTesting) and driven with concurrent keep-alive clients for
+// more than one 100 ms sweep, so under TSan any race in runDispatchController
+// surfaces. Asserts every request is answered correctly.
+TEST(UvReactorTest, AdaptiveControllerIsThreadSafeUnderConcurrentLoad) {
+  RecordingEmitter a([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "x");
+  });
+  RecordingEmitter b([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "x");
+  });
+  auto server = std::make_shared<UvReactor>();
+  server->addEmitter(&a);
+  server->addEmitter(&b);
+  EXPECT_EQ(server->registerRoute(Method::Get, "", "/c", -1).kind,
+            ErrorKind::None);
+  ServerConfig cfg;
+  cfg.port = 0;
+  server->configure(cfg);
+  ASSERT_EQ((int64_t)server->start().kind, (int64_t)ErrorKind::None);
+  const int port = (int)server->boundPort();
+
+  std::atomic<bool> pumping{true};
+  std::thread pump([&] {
+    while (pumping.load()) {
+      RecordingEmitter::Job job{0, 0, ""};
+      if (a.takeJob(job) || b.takeJob(job)) {
+        std::vector<uint8_t> bytes(job.body.begin(), job.body.end());
+        server->respond(job.requestId, job.status, {}, bytes.data(),
+                        bytes.size());
+      } else {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }
+  });
+
+  std::atomic<int> ok{0};
+  std::atomic<int> bad{0};
+  std::vector<std::thread> clients;
+  for (int t = 0; t < 4; t++) {
+    clients.emplace_back([&] {
+      // 40 iters * 3 ms spans several 100 ms sweeps; the count is bounded so
+      // connect/close does not exhaust ephemeral ports.
+      for (int i = 0; i < 40; i++) {
+        const int fd = connectTo(port);
+        if (fd < 0) continue;
+        sendStr(fd, "GET /c HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        const std::string body = bodyOf(readAll(fd));
+        if (body == "x") {
+          ok.fetch_add(1);
+        } else {
+          bad.fetch_add(1);
+        }
+        close(fd);
+        std::this_thread::sleep_for(std::chrono::milliseconds(3));
+      }
+    });
+  }
+  for (auto& c : clients) c.join();
+  pumping.store(false);
+  pump.join();
+  EXPECT_EQ(bad.load(), 0);   // no corrupted/torn answer under concurrency
+  EXPECT_GT(ok.load(), 100);  // the bulk succeeded (sanity)
   server->stop();
 }
 
@@ -955,6 +1058,31 @@ TEST(UvReactorTest, HeaderTimeoutClosesASilentConnection) {
   ASSERT_GE(fd, 0);
   const auto t0 = std::chrono::steady_clock::now();
   EXPECT_EQ(readAll(fd), "");  // Nothing sent: closed at the deadline.
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0)
+                      .count();
+  EXPECT_GE(ms, 80);
+  EXPECT_LT(ms, 2000);
+  close(fd);
+}
+
+// Slowloris: a peer that dribbles a partial header and then stalls must still
+// be closed at the header deadline — partial bytes must not refresh the clock.
+TEST(UvReactorTest, SlowlorisPartialHeaderTimesOut) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "ok");
+  });
+  ServerConfig cfg;
+  cfg.port = 0;
+  cfg.headerTimeoutMs = 100;
+  cfg.keepAliveTimeoutMs = 5000;
+  f.server->configure(cfg);
+  ASSERT_EQ((int64_t)f.server->start().kind, (int64_t)ErrorKind::None);
+  const int fd = connectTo((int)f.server->boundPort());
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "GET /slow HTTP/1.1\r\nHost: x");  // partial head, never completed
+  const auto t0 = std::chrono::steady_clock::now();
+  EXPECT_EQ(readAll(fd), "");  // closed at the deadline despite the dribble
   const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                       std::chrono::steady_clock::now() - t0)
                       .count();
@@ -1671,6 +1799,55 @@ TEST(UvReactorTest, WsPingIsPonged) {
   // Pings never surface as messages.
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
   EXPECT_TRUE(f.emitter.wsSeen().empty());
+  close(fd);
+}
+
+// RFC 6455 §5.4: a control frame may arrive between the fragments of a data
+// message. The PING must be ponged and must not disturb reassembly.
+TEST(UvReactorTest, WsPingInterleavedDuringFragmentationIsPongedAndReassembled) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "unused");
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "/ws", -1, true).kind,
+            ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendWsHandshake(fd, "/ws");
+  EXPECT_EQ(statusOf(readHttpHead(fd)), 101);
+
+  sendWsFrame(fd, 0x1, "hel", false);  // first fragment, FIN=0
+  sendWsFrame(fd, 0x9, "mid");         // PING mid-message
+  std::string payload;
+  bool fin = false;
+  EXPECT_EQ(readWsFrame(fd, payload, &fin), 0xA);  // ponged
+  EXPECT_EQ(payload, "mid");
+  sendWsFrame(fd, 0x0, "lo", true);  // final continuation, FIN=1
+  ASSERT_TRUE(f.waitForWsSeen(1));
+  ASSERT_EQ(f.emitter.wsSeen().size(), 1u);
+  EXPECT_EQ(f.emitter.wsSeen()[0].opcode, 1);
+  EXPECT_EQ(f.emitter.wsSeen()[0].payload, "hello");  // reassembly intact
+  close(fd);
+}
+
+// A zero-length data frame with FIN=1 is a legal empty message.
+TEST(UvReactorTest, WsZeroLengthFrameIsDeliveredAsEmptyMessage) {
+  Fixture f([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "unused");
+  });
+  EXPECT_EQ(f.server->registerRoute(Method::Get, "", "/ws", -1, true).kind,
+            ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendWsHandshake(fd, "/ws");
+  EXPECT_EQ(statusOf(readHttpHead(fd)), 101);
+
+  sendWsFrame(fd, 0x1, "", true);  // empty text frame
+  ASSERT_TRUE(f.waitForWsSeen(1));
+  ASSERT_EQ(f.emitter.wsSeen().size(), 1u);
+  EXPECT_EQ(f.emitter.wsSeen()[0].opcode, 1);
+  EXPECT_EQ(f.emitter.wsSeen()[0].payload, "");
   close(fd);
 }
 

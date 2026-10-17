@@ -20,6 +20,7 @@ add_executable(nitro_server_engine_tests
   engine_units_test.cpp
   wire_test.cpp
   uv_reactor_test.cpp
+  dispatch_controller_test.cpp
   json_writer_test.cpp
   brotli_test.cpp
   "${CMAKE_CURRENT_SOURCE_DIR}/../../src/engine/Router.cpp"

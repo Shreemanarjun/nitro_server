@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <set>
@@ -410,8 +411,10 @@ size_t UvReactor::emitterCountForTesting() {
 Emitter* UvReactor::nextEmitter() {
   std::lock_guard<std::mutex> lk(emitterMutex_);
   if (emitters_.empty()) return nullptr;
+  size_t w = dispatchWidth_.load(std::memory_order_relaxed);
+  if (w == 0 || w > emitters_.size()) w = emitters_.size();
   const uint64_t i = emitterRr_.fetch_add(1);
-  return emitters_[i % emitters_.size()];
+  return emitters_[i % w];
 }
 
 void UvReactor::broadcastEvent(ServerEventKind kind, int64_t requestId,
@@ -470,6 +473,25 @@ StatusResult UvReactor::start(int loops) {
 #endif
   unsigned cores = std::thread::hardware_concurrency();
   int n = loops > 0 ? loops : (cores == 0 ? 4 : (int)cores);
+  // A positive ServerConfig.workerThreads caps the number of event loops below
+  // the core count (0 = one loop per core, the default); an explicit
+  // start(loops) still wins. More loops than cores only oversubscribes, so the
+  // cap is one-directional.
+  if (loops <= 0 && cfg_.workerThreads > 0 && (int)cfg_.workerThreads < n)
+    n = (int)cfg_.workerThreads;
+  // Manual override: pin the dispatch width and disable the adaptive
+  // controller (for benchmarking a fixed width). Otherwise the controller
+  // starts concentrated (width 1, so its first measurement is a valid
+  // single-isolate reading) and sets the width at runtime from there.
+  if (const char* dw = std::getenv("NITRO_DISPATCH")) {
+    const long v = std::strtol(dw, nullptr, 10);
+    if (v >= 0) {
+      dispatchWidth_.store((size_t)v, std::memory_order_relaxed);
+      ctlEnabled_.store(false, std::memory_order_relaxed);
+    }
+  } else {
+    dispatchWidth_.store(1, std::memory_order_relaxed);
+  }
   boundPort_.store(cfg_.port);
   const int backlog = cfg_.backlog > 0 ? (int)cfg_.backlog : 128;
 
@@ -1189,6 +1211,7 @@ void UvReactor::respond(int64_t id, int64_t status,
   if (!running_.load()) return;
   ReqLoc loc;
   if (!lookupReq(id, loc, /*erase=*/true)) return;  // unknown/already answered
+  completions_.fetch_add(1, std::memory_order_release);  // controller throughput signal
   const int64_t kaSecs = (cfg_.keepAliveTimeoutMs + 999) / 1000;
   std::string out = uvBuildHead(status, headers, (int64_t)bodyLen, loc.keepAlive,
                                 kaSecs);
@@ -1241,6 +1264,8 @@ void UvReactor::sendStreamChunk(int64_t id, const uint8_t* chunk, size_t n,
   if (n == 0 && !last) return;  // empty non-terminal chunk: nothing to send
   ReqLoc loc;
   if (!lookupReq(id, loc, /*erase=*/last)) return;
+  if (last)
+    completions_.fetch_add(1, std::memory_order_release);  // same signal as respond()
   std::string out;
   if (n > 0) {
     char sz[32];
@@ -1308,10 +1333,36 @@ void UvReactor::onAsync(uv_async_t* async) {
   }
 }
 
+// Loop[0] sweep: sample this tick's throughput and backlog, let the controller
+// pick the dispatch width, and publish it for nextEmitter. Policy lives in
+// DispatchController; this just gathers the signals.
+void UvReactor::runDispatchController() {
+  if (!ctlEnabled_.load(std::memory_order_acquire)) return;
+  // acquire pairs with the release in respond()/stream completion, so this
+  // sweep sees every answer counted before it samples the rate.
+  const int64_t comp = completions_.load(std::memory_order_acquire);
+  const double answers = (double)(comp - ctlLastCompletions_);
+  ctlLastCompletions_ = comp;
+  int64_t backlog;
+  {
+    std::lock_guard<std::mutex> lk(reqMutex_);
+    backlog = (int64_t)reqLoc_.size();
+  }
+  // Read the isolate count and publish the width together under emitterMutex_ —
+  // the same lock nextEmitter() holds when it reads dispatchWidth_ — so a width
+  // is never paired with a different emitter count, and the publish is ordered.
+  std::lock_guard<std::mutex> lk(emitterMutex_);
+  dispatchWidth_.store(dispatch_.tick(answers, backlog, emitters_.size()),
+                       std::memory_order_relaxed);
+}
+
 // Loop thread: close idle keep-alive connections and time out slow handlers.
 void UvReactor::onSweep(uv_timer_t* timer) {
   Loop* lp = (Loop*)timer->data;
   UvReactor* self = lp->owner;
+  // The adaptive dispatch controller runs once per tick, on loop[0] only.
+  if (!self->loops_.empty() && lp == self->loops_[0].get())
+    self->runDispatchController();
   const auto now = Clock::now();
   std::vector<Conn*> idle;
   std::vector<int64_t> timedOut;  // reqIds whose handler missed its deadline

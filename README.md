@@ -22,13 +22,19 @@ await server.close();
 
 ## Architecture
 
-- One accept loop per server; one native worker thread per live connection
-  from an auto-scaling pool.
-- The worker parses the request, matches it in a segment trie, hands it to
-  Dart over a stream and parks in `poll()`.
-- The Dart thread writes the response with one non-blocking `sendmsg`.
-  Bytes the socket cannot take are queued and flushed by the worker; stream
-  chunks and file bodies (`sendfile`) always go through the worker.
+- A libuv event-loop reactor: one loop per CPU core (capped by
+  `workerThreads`), each with its own `SO_REUSEPORT` listener so the kernel
+  load-balances accepts. A handful of loop threads serve thousands of
+  keep-alive connections — connection state is heap-owned and driven by read
+  events, not a thread per connection. (Windows has no `SO_REUSEPORT`: a single
+  listener there.)
+- Each loop parses the request, matches it in a segment trie, and hands it to
+  Dart over a stream.
+- A handler's response runs on the Dart isolate thread: it enqueues the
+  serialized answer and wakes the connection's loop (`uv_async_send`); the loop
+  writes it (`sendfile` for file bodies). Connections are keyed by a monotonic
+  id looked up on the loop thread, so a response racing a close is dropped,
+  never a use-after-free.
 - Request headers cross the bridge as one packed string and are unpacked
   on first access; query parameters parse on first access.
 - Heads combine per isolate: heads that arrive while the previous bridge
@@ -95,8 +101,8 @@ over the real runner, no sockets.
 | `headerTimeout` | idle timeout | deadline for a new connection's first request head |
 | `writeTimeout` | 30 s | a write with no progress for this long drops the connection and emits `clientError` |
 | `maxConnections`, `maxConnectionsPerIp` | `0` = unlimited | refused at accept |
-| `workerThreads` | `max(64, 4 × cores)` | cap of the worker pool; the pool starts at one thread per core, grows on demand, retires idle threads after 10 s |
-| `isolates` | `1` | Dart isolates running handlers; `0` = half the cores (1–8); requests are dealt round-robin; each isolate runs `setup` |
+| `workerThreads` | `0` | caps the number of libuv event-loop threads; `0` = one per core. A value below the core count runs fewer loops; at or above it, one per core |
+| `isolates` | `1` | Dart isolates available to run handlers; `0` = half the cores (1–8); each isolate runs `setup`. The engine adaptively deals requests across only as many as raise throughput — light handlers stay on one, CPU-bound ones fan out — so setting this to the core count never penalizes light handlers |
 | `wsMaxBufferBytes`, `wsCompression` | 1 MiB, `true` | WebSocket send queue before a 1009 close; negotiate `permessage-deflate` |
 | `tls` | none | any non-empty value throws `ServerTlsException` |
 
@@ -180,8 +186,6 @@ client (`wrk`) and the Go/Node comparison, see
 ## Limits
 
 - HTTP/1.1 only (no HTTP/2).
-- One native thread per live connection: suited to hundreds of concurrent
-  connections, not thousands.
 - `close(drain:)` resets connections still in the kernel backlog only if
   they arrive after the drain's final accept sweep.
 

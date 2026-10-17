@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "Common.h"
+#include "DispatchController.h"  // adaptive dispatch-width policy
 #include "EngineTypes.h"     // Emitter, ServerConfig, StatusResult, ParsedHead
 #include "PendingTable.h"    // payload lifecycle (trackPayload / ack)
 #include "Router.h"
@@ -50,6 +51,15 @@ class UvReactor {
   void addEmitter(Emitter* e);
   void removeEmitter(Emitter* e);
   size_t emitterCountForTesting();
+  // Number of event loops (threads) the server started with. Test seam for the
+  // workerThreads loop-count cap.
+  size_t loopCountForTesting() const { return loops_.size(); }
+  // Pin the dispatch width and freeze the adaptive controller, so a test can
+  // exercise the raw emitter round-robin (0 = deal across every emitter).
+  void setDispatchWidthForTesting(size_t w) {
+    dispatchWidth_.store(w, std::memory_order_relaxed);
+    ctlEnabled_.store(false, std::memory_order_relaxed);
+  }
 
   void configure(const ServerConfig& cfg) { cfg_ = cfg; }
   StatusResult registerRoute(const RouteEntry& e);
@@ -191,6 +201,20 @@ class UvReactor {
   std::mutex emitterMutex_;
   std::vector<Emitter*> emitters_;
   std::atomic<uint64_t> emitterRr_{0};
+  // Active dispatch width: heads deal round-robin over the first N emitters
+  // only (0 = all). Lets a controller concentrate light handlers on one
+  // isolate (others parked, ~0 CPU) and fan CPU-bound handlers out across all.
+  std::atomic<size_t> dispatchWidth_{0};
+
+  // Adaptive dispatch: on loop[0]'s sweep, feed the controller this tick's
+  // answer count and backlog and publish the width it picks to dispatchWidth_.
+  void runDispatchController();
+  DispatchController dispatch_;
+  std::atomic<int64_t> completions_{0};  // handler answers, bumped in respond
+  int64_t ctlLastCompletions_ = 0;       // last value, for the per-tick delta
+  // false when NITRO_DISPATCH / the test seam pins the width; read on the sweep
+  // thread, written from start() and (in tests) another thread, so atomic.
+  std::atomic<bool> ctlEnabled_{true};
   ServerConfig cfg_;
   Router router_;                        // writer: registration; reader: match
   std::atomic<int64_t> boundPort_{0};

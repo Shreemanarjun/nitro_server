@@ -83,20 +83,24 @@ class ServerConfig {
   /// unbounded (the idle timeout still applies).
   final int maxRequestsPerConnection;
 
-  /// Cap on the native worker pool. The pool starts at one thread per CPU
-  /// core and grows on demand up to this cap — self-limiting to the live
-  /// connection count — while idle threads above the floor retire after 10 s.
-  /// The cap bounds concurrency: with more live keep-alive connections than
-  /// the cap, the surplus queue and throughput dips, so raise it for
-  /// high-concurrency servers. `0` means `max(512, 32 × cores)`.
+  /// Caps the number of libuv event-loop threads the engine runs. `0` (the
+  /// default) runs one loop per CPU core, which a handful of threads use to
+  /// serve thousands of keep-alive connections. A positive value below the core
+  /// count runs fewer loops (useful to bound resource use on a big box); at or
+  /// above the core count it stays one per core, since extra loops only
+  /// oversubscribe.
   final int workerThreads;
 
-  /// Dart isolates running handlers behind this server. `1` (default) runs
-  /// everything on the calling isolate. Above 1, requests are dealt
-  /// round-robin across that many isolates — the only way past a single
-  /// isolate's throughput ceiling — and routes must be registered by the
-  /// `setup` function passed to [NitroServer.bind], which runs once per
-  /// isolate. `0` picks a size from the CPU count (half the cores, 1–8).
+  /// Isolates available to run handlers. `1` (default) runs every handler on
+  /// the calling isolate; `0` picks from the CPU count (half the cores, 1–8).
+  /// Above 1, routes must be registered by the `setup` passed to
+  /// [NitroServer.bind], which runs once per isolate.
+  ///
+  /// The engine deals requests across only as many of these isolates as help:
+  /// it keeps light handlers on one (it already does the I/O on every core) and
+  /// fans a CPU-bound handler out across all. So extra isolates are headroom for
+  /// heavy handlers, never a tax on light ones — set it to the core count and
+  /// let the engine decide.
   final int isolates;
 
   /// Live connections accepted at once; further ones are closed at the

@@ -131,7 +131,8 @@ class NitroServer with RouteRegistrar<NitroServer> {
   /// ```
   ///
   /// Any argument left null keeps the default; see [ServerConfig.copyWith]
-  /// for the full set.
+  /// for the full set. [dylibPath] opens the native library from a non-default
+  /// location before binding (otherwise [bind] searches the usual paths).
   static Future<NitroServer> bindWith({
     String? host,
     int? port,
@@ -143,8 +144,10 @@ class NitroServer with RouteRegistrar<NitroServer> {
     int? workerThreads,
     int? isolates,
     TlsConfig? tls,
+    String? dylibPath,
     ServerSetup? setup,
   }) {
+    if (dylibPath != null) loadNitroServerNative(path: dylibPath);
     return bind(
       const ServerConfig().copyWith(
         host: host,
@@ -184,6 +187,13 @@ class NitroServer with RouteRegistrar<NitroServer> {
     host: _config.host,
     port: _port,
   );
+
+  /// A read-only snapshot of the routes registered on this server — each with
+  /// its method, pattern and [RouteKind] (handler, WebSocket or static). Useful
+  /// for a health/route-listing endpoint, debugging, or checking what a
+  /// [reload] produced. On a multi-isolate server every isolate registers the
+  /// same set, so this (the calling isolate's) view represents all of them.
+  List<RegisteredRoute> get routes => _runner.routes;
 
   /// Engine health and lifecycle observations. Broadcast.
   Stream<ServerEvent> get events => _runner.events;
@@ -365,10 +375,16 @@ class NitroServer with RouteRegistrar<NitroServer> {
   /// `package:nitro_server/hot_reload.dart`).
   ///
   /// On a multi-isolate server every helper isolate rebuilds too, re-running
-  /// the [ServerSetup] it was bound with (a [setup] passed here applies to the
-  /// calling isolate only — hot reload passes none, so all isolates stay in
-  /// step). Throws [StateError] when the server was bound without a
+  /// the [ServerSetup] it was bound with. On a multi-isolate server the [setup]
+  /// (or the bound one) is re-run on every helper isolate too, so a [setup]
+  /// passed here must be sendable across isolates (a top-level or static
+  /// function). Throws [StateError] when the server was bound without a
   /// [ServerSetup] and none is passed here — there is nothing to rebuild from.
+  ///
+  /// The rebuild is transactional: the live routes keep serving while [setup]
+  /// registers the new ones, then routes it did not re-register are removed. If
+  /// [setup] throws, its partial additions roll back and the previous routes,
+  /// middleware and fallbacks stay — a bad reload never blanks the server.
   Future<NitroServer> reload([ServerSetup? setup]) async {
     final rebuild = setup ?? _setup;
     if (rebuild == null) {
@@ -378,19 +394,25 @@ class NitroServer with RouteRegistrar<NitroServer> {
       );
     }
     _setup = rebuild;
-    _runner.clearAll();
-    await rebuild(this);
+    await _runner.reload(() async => rebuild(this));
     for (final helper in _helpers) {
-      await helper.reload();
+      await helper.reload(rebuild);
     }
     return this;
   }
+
+  final _closed = Completer<void>();
+
+  /// Completes when [close] is called. Lets add-ons release their own resources
+  /// when the server stops — `enableHotReload` uses it to stop watching.
+  Future<void> get onClose => _closed.future;
 
   /// Stops the server. Without [drain] it stops now: parked requests get
   /// a 503. With [drain] it first closes the listener, answers everything
   /// already accepted (each answer says `Connection: close`) and waits up
   /// to that long for in-flight requests to finish, then stops. Idempotent.
   Future<void> close({Duration? drain}) async {
+    if (!_closed.isCompleted) _closed.complete();
     if (drain != null) await _runner.drain(drain);
     await _runner.close();
     // The engine is stopped: helpers have nothing left to answer.
@@ -450,11 +472,10 @@ class _Helper {
 
   late final StreamIterator<Object?> _queue;
 
-  /// Tells the helper to rebuild its routes from the setup it was bound with
-  /// (which VM hot reload has already patched), matching the main isolate's
-  /// [NitroServer.reload].
-  Future<void> reload() async {
-    _control.send(_HelperBoot.reloadSignal);
+  /// Tells the helper to rebuild its routes from [setup], matching the main
+  /// isolate's [NitroServer.reload]. [setup] must be sendable across isolates.
+  Future<void> reload(ServerSetup setup) async {
+    _control.send(setup);
     await _queue.moveNext(); // 'reloaded'
   }
 
@@ -469,7 +490,6 @@ class _HelperBoot {
   const _HelperBoot(this.key, this.dylibPath, this.setup, this.reply);
 
   static const closeSignal = 'close';
-  static const reloadSignal = 'reload';
 
   final String key;
   final String? dylibPath;
@@ -493,10 +513,10 @@ Future<void> _helperMain(_HelperBoot boot) async {
   boot.reply.send(control.sendPort);
   await for (final message in control) {
     if (message == _HelperBoot.closeSignal) break;
-    if (message == _HelperBoot.reloadSignal) {
-      // The isolate's code is already hot-reloaded; rebuild the routes from it.
-      runner.clearAll();
-      await boot.setup(server);
+    if (message is ServerSetup) {
+      // The isolate's code is already hot-reloaded; rebuild the routes from the
+      // setup the main isolate sent (transactionally, same as the main runner).
+      await runner.reload(() async => message(server));
       boot.reply.send('reloaded');
     }
   }

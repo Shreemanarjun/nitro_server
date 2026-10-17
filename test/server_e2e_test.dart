@@ -239,6 +239,12 @@ Future<void> _whoSetup(NitroServer server) async {
   });
 }
 
+// A different setup, passed to reload() so helpers must receive it (not re-run
+// their bound setup). Top-level so it is sendable across isolates.
+Future<void> _afterSetup(NitroServer server) async {
+  await server.get('/after', (_) async => ResponseContext.text('after'));
+}
+
 void main() {
   final libraryPath = _locateLibrary();
   final skipReason = libraryPath == null
@@ -401,23 +407,34 @@ void main() {
       expect(res.body, 'B');
     }, skip: skipReason);
 
-    test('reload rebuilds every isolate on the live socket', () async {
+    test('reload sends the new setup to every isolate', () async {
       server = await NitroServer.bind(
         const ServerConfig(isolates: 2),
         _whoSetup,
       );
       final port = server!.port;
       expect((await _get(port, '/who')).status, 200);
-      // No-arg reload re-runs the bound setup on the main isolate AND every
-      // helper; if a helper cleared but failed to re-register, its share of
-      // round-robin requests would 404.
-      await server!.reload();
+      expect((await _get(port, '/after')).status, 404);
+      // A custom setup reaches the main isolate AND every helper; round-robin
+      // over 8 requests hits both, so a stale helper would show through.
+      await server!.reload(_afterSetup);
       expect(server!.port, port);
-      final statuses = <int>{};
+      final who = <int>{};
+      final after = <int>{};
       for (var i = 0; i < 8; i++) {
-        statuses.add((await _get(port, '/who')).status);
+        who.add((await _get(port, '/who')).status);
+        after.add((await _get(port, '/after')).status);
       }
-      expect(statuses, {200});
+      expect(who, {404}); // old route gone on every isolate
+      expect(after, {200}); // new route on every isolate
+    }, skip: skipReason);
+
+    test('bindWith opens the native library from dylibPath', () async {
+      server = await NitroServer.bindWith(
+        dylibPath: libraryPath,
+        setup: _whoSetup,
+      );
+      expect((await _get(server!.port, '/who')).status, 200);
     }, skip: skipReason);
 
     test('isolates: 0 picks a size from the CPU count', () async {

@@ -4,14 +4,21 @@
 
 * `NitroServer.bind` opens the native library itself — a Dart CLI no longer
   calls `loadNitroServerNative` first (Flutter still bundles it); the manual
-  loader remains for a non-default path.
+  loader remains for a non-default path, and `bindWith(dylibPath:)` opens one.
 * `server.config` (the resolved `ServerConfig`, with the bound port and isolate
   count) and `server.uri` (the base `http(s)://host:port` URL).
-* `server.reload([setup])`: rebuilds the whole routing surface on the live
-  socket — unregisters every route, clears middleware, resets the 404/500
-  fallbacks, then re-runs `setup` — so added, removed and changed routes take
-  effect without dropping the port or open connections. Every isolate rebuilds
-  on a multi-isolate server.
+* `server.routes`: a read-only snapshot of the registered routes — each a
+  `RegisteredRoute` (method, pattern, `RouteKind`: handler / webSocket /
+  staticResponse) — for a route-listing endpoint, debugging, or checking a
+  `reload`.
+* `server.reload([setup])`: rebuilds the routing surface on the live socket,
+  **transactionally** — the current routes keep serving while `setup` registers
+  the new ones, then routes it did not re-register are dropped; if `setup`
+  throws, its partial additions roll back and the previous routes, middleware
+  and fallbacks stay, so a bad reload never blanks the server. On a multi-isolate
+  server the `setup` is re-run on every helper isolate too (it must be sendable).
+* `server.onClose`: a `Future` that completes when `close()` is called, so
+  add-ons can release resources when the server stops.
 
 ### Hot reload
 
@@ -21,7 +28,8 @@
   running script's own directory (hotreloader watches only `bin`/`lib`/`test`),
   so a server run from anywhere reloads. `setup` must be a top-level or static
   function for a reload to pick up changes. Pass `log:` (e.g. `print`) to trace
-  reload activity; silent otherwise.
+  reload activity; silent otherwise. Stops watching when the server closes
+  (via `server.onClose`).
 
 ## 0.0.1
 

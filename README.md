@@ -52,7 +52,9 @@ await server.close();
 | `server.notFoundHandler`, `server.errorHandler` | custom 404 and 500 answers |
 | `server.unroute(method, pattern)` | removes a route; `RouteNotFoundException` if absent |
 | `server.port`, `server.config`, `server.uri` | the bound port, the resolved `ServerConfig` it started with (port and isolates filled in), and the base URL (`http(s)://host:port`) |
-| `server.reload([setup])` | rebuilds every route on the live socket — re-runs `setup` (or the one `bind` was given), so added, removed and changed routes take effect without dropping the port; single-isolate. Turnkey hot reload: `package:nitro_server/hot_reload.dart` |
+| `server.routes` | read-only snapshot of the registered routes (method, pattern, `RouteKind`: handler/webSocket/static) — for a route-listing endpoint, debugging, or checking a `reload` |
+| `server.reload([setup])` | rebuilds every route on the live socket, transactionally (the old routes keep serving while `setup` runs; a throwing `setup` rolls back and keeps them), across all isolates. Turnkey hot reload: `package:nitro_server/hot_reload.dart` |
+| `server.onClose` | a `Future` that completes when `close()` is called — a hook for add-ons to release resources |
 | `server.events` | lifecycle stream: started, stopped, handler timeout, client error |
 | `server.metrics` | per-route request and 5xx counts, latency p50/p90/p99 |
 | `server.close({drain})` | stops; with `drain:` stops accepting, closes idle connections and waits up to `drain` for in-flight requests |

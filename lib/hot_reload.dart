@@ -81,6 +81,9 @@ Future<HotReloader> enableHotReload(
     },
   );
 
+  // Stop watching when the server stops, so the reloader never outlives it.
+  unawaited(server.onClose.then((_) => reloader.stop()));
+
   final dirs = {...?watch, if (watch == null) ?_scriptDir()};
   log?.call('hot reload: watching ${dirs.join(', ')}');
   Timer? debounce;

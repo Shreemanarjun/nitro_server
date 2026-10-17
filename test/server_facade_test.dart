@@ -359,6 +359,75 @@ void main() {
       },
     );
 
+    test('routes lists each registered route with its kind', () async {
+      Future<ResponseContext> ok(RequestContext _) async =>
+          const ResponseContext();
+      await server.get('/h', ok);
+      await server.post('/p', ok);
+      await server.route(HttpMethod.custom, '/c', ok, customMethod: 'FOO');
+      await server.ws('/w', (_) async {});
+      await server.getStatic('/s', const [1]);
+      expect(server.routes.toSet(), {
+        const RegisteredRoute(
+          method: HttpMethod.get,
+          pattern: '/h',
+          kind: RouteKind.handler,
+        ),
+        const RegisteredRoute(
+          method: HttpMethod.post,
+          pattern: '/p',
+          kind: RouteKind.handler,
+        ),
+        const RegisteredRoute(
+          method: HttpMethod.custom,
+          customMethod: 'FOO',
+          pattern: '/c',
+          kind: RouteKind.handler,
+        ),
+        const RegisteredRoute(
+          method: HttpMethod.get,
+          pattern: '/w',
+          kind: RouteKind.webSocket,
+        ),
+        const RegisteredRoute(
+          method: HttpMethod.get,
+          pattern: '/s',
+          kind: RouteKind.staticResponse,
+        ),
+      });
+      // Value-type surface.
+      final h = server.routes.firstWhere((r) => r.pattern == '/h');
+      expect(h.methodToken, 'GET');
+      expect(h.toString(), 'GET /h (handler)');
+      final c = server.routes.firstWhere((r) => r.pattern == '/c');
+      expect(c.methodToken, 'FOO');
+      expect(h.hashCode, isNot(c.hashCode));
+    });
+
+    test(
+      'a reload whose setup throws rolls back, keeping the old routes',
+      () async {
+        Future<ResponseContext> ok(RequestContext _) async =>
+            const ResponseContext();
+        await server.reload((s) async => s.get('/keep', ok));
+        expect(server.routes.map((r) => r.pattern), ['/keep']);
+        await expectLater(
+          server.reload((s) async {
+            await s.get('/temp', ok);
+            throw StateError('boom');
+          }),
+          throwsStateError,
+        );
+        // The partial route is gone; the previous route survives.
+        expect(server.routes.map((r) => r.pattern), ['/keep']);
+      },
+    );
+
+    test('onClose completes when the server is closed', () async {
+      await server.close();
+      await expectLater(server.onClose, completes);
+    });
+
     test(
       'reload with no argument re-runs the setup given the first time',
       () async {

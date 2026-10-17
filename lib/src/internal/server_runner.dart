@@ -330,6 +330,7 @@ class ServerRunner {
     final token = _tokenOf(method, customToken);
     (_routes[token] ??= {})[pattern] = entry;
     (_registered[token] ??= <String>{}).add(pattern);
+    _reloadTouched?.add(_key(token, pattern));
     // Single-entry mirror of the engine table (see addWsRoute).
     if (token == 'GET') _wsHandlers.remove(pattern);
   }
@@ -371,25 +372,94 @@ class ServerRunner {
     if (method == HttpMethod.get) _wsHandlers.remove(pattern);
   }
 
-  /// Empties the whole routing surface without touching the engine's accept
-  /// loop: unregisters every route (handler, WebSocket, static), drops all
-  /// middleware and resets the 404/500 fallbacks to their defaults. The server
-  /// keeps listening on the same socket. Backs [NitroServer.reload]; a fresh
-  /// [ServerSetup] then rebuilds the routes.
-  void clearAll() {
+  /// A read-only snapshot of every route registered on this runner, classified
+  /// by kind. Backs `NitroServer.routes`.
+  List<RegisteredRoute> get routes {
+    final out = <RegisteredRoute>[];
     for (final entry in _registered.entries) {
+      final token = entry.key;
+      final (method, custom) = HttpMethod.parse(token);
       for (final pattern in entry.value) {
-        final status = _native.unregisterRoute(entry.key, pattern);
-        throwIfFailed(status, operation: 'unregisterRoute($pattern)');
+        final kind = (_routes[token]?.containsKey(pattern) ?? false)
+            ? RouteKind.handler
+            : (token == 'GET' && _wsHandlers.containsKey(pattern))
+            ? RouteKind.webSocket
+            : RouteKind.staticResponse;
+        out.add(
+          RegisteredRoute(
+            method: method,
+            customMethod: custom,
+            pattern: pattern,
+            kind: kind,
+          ),
+        );
       }
     }
-    _registered.clear();
-    _routes.clear();
-    _wsHandlers.clear();
+    return out;
+  }
+
+  /// Keys registered while a [reload] runs, so old routes the fresh setup does
+  /// not re-register can be dropped afterwards. Null outside a reload.
+  Set<String>? _reloadTouched;
+
+  String _key(String token, String pattern) => '$token $pattern';
+
+  Set<String> _registeredKeys() => {
+    for (final e in _registered.entries)
+      for (final p in e.value) _key(e.key, p),
+  };
+
+  void _unregisterKey(String key) {
+    final sp = key.indexOf(' ');
+    final token = key.substring(0, sp);
+    final pattern = key.substring(sp + 1);
+    _native.unregisterRoute(token, pattern);
+    _routes[token]?.remove(pattern);
+    _registered[token]?.remove(pattern);
+    if (token == 'GET') _wsHandlers.remove(pattern);
+  }
+
+  /// Rebuilds the routing surface transactionally on the live socket: the
+  /// current routes keep serving while [runSetup] registers the new ones
+  /// (re-registering a pattern replaces it in place), then routes the fresh
+  /// setup did not touch are removed. If [runSetup] throws, the routes it added
+  /// are rolled back and the previous middleware and fallbacks restored, so a
+  /// bad reload never leaves the server without routes. Backs
+  /// [NitroServer.reload].
+  Future<void> reload(Future<void> Function() runSetup) async {
+    final oldKeys = _registeredKeys();
+    final savedMiddleware = List<Middleware>.of(_middlewares);
+    final savedNotFound = _notFoundHandler;
+    final savedError = _errorHandler;
+    // Re-running setup would otherwise append middleware again; clear it so the
+    // fresh setup rebuilds from empty (old routes keep their composed handlers
+    // until the commit re-composes below).
     _middlewares.clear();
-    _compose = _identity;
     _notFoundHandler = _defaultNotFound;
     _errorHandler = _defaultError;
+    _reloadTouched = <String>{};
+    try {
+      await runSetup();
+    } catch (_) {
+      final touched = _reloadTouched ?? const <String>{};
+      _reloadTouched = null;
+      for (final key in touched) {
+        if (!oldKeys.contains(key)) _unregisterKey(key); // undo new additions
+      }
+      _middlewares
+        ..clear()
+        ..addAll(savedMiddleware);
+      _notFoundHandler = savedNotFound;
+      _errorHandler = savedError;
+      _recompose();
+      rethrow;
+    }
+    final touched = _reloadTouched ?? const <String>{};
+    _reloadTouched = null;
+    for (final key in oldKeys) {
+      if (!touched.contains(key)) _unregisterKey(key); // drop removed routes
+    }
+    _recompose();
   }
 
   /// Registers a static route: the engine answers [status]/[headers]/[body]
@@ -412,6 +482,7 @@ class ServerRunner {
     throwIfFailed(result, operation: 'registerStaticRoute($pattern)');
     _routes[token]?.remove(pattern);
     (_registered[token] ??= <String>{}).add(pattern);
+    _reloadTouched?.add(_key(token, pattern));
     if (method == HttpMethod.get) _wsHandlers.remove(pattern);
   }
 
@@ -438,6 +509,7 @@ class ServerRunner {
     throwIfFailed(status, operation: 'registerRoute($pattern)');
     _routes['GET']?.remove(pattern);
     (_registered['GET'] ??= <String>{}).add(pattern);
+    _reloadTouched?.add(_key('GET', pattern));
     _wsHandlers[pattern] = (handler: handler, protocols: protocols);
   }
 

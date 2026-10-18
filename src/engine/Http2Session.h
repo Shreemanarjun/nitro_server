@@ -8,6 +8,17 @@
 //
 // Gated entirely on NITRO_SERVER_HTTP2: a default build never includes
 // <nghttp2/nghttp2.h> nor compiles any of this.
+//
+// MSVC has no POSIX `ssize_t`, and nghttp2's v1 API (which this session uses)
+// is typed in terms of it — as is this file's own readBody/mem_send/mem_recv.
+// Define it before the nghttp2 include, reusing libuv's `_SSIZE_T_DEFINED`
+// sentinel (uv/win.h sets the same one) so a TU that sees both headers gets no
+// C2371 redefinition. SSIZE_T is intptr_t-wide (64-bit on x64), matching libuv.
+#if defined(_WIN32) && !defined(_SSIZE_T_DEFINED)
+#include <BaseTsd.h>
+typedef SSIZE_T ssize_t;
+#define _SSIZE_T_DEFINED
+#endif
 #include <nghttp2/nghttp2.h>
 
 #include <cstdint>

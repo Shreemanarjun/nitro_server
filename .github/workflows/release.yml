@@ -21,15 +21,19 @@ jobs:
     strategy:
       fail-fast: false
       # `deps` selects how the four dependencies are provisioned as PIC static
-      # archives: Homebrew (macOS) and apt (linux-arm64) ship PIC `.a`, but
-      # Ubuntu's x86-64 apt archives are NOT -fPIC (can't link into a .so), and
-      # Windows has no system libs — so those use vcpkg static triplets (always
-      # built -fPIC). The engine's pkg-config/CONFIG detection finds whichever,
-      # via PKG_CONFIG_PATH + CMAKE_PREFIX_PATH when vcpkg is used.
+      # archives: Homebrew ships PIC `.a` for the native arch, and apt
+      # (linux-arm64) ships PIC `.a` too — but Ubuntu's x86-64 apt archives are
+      # NOT -fPIC (can't link into a .so), Windows has no system libs, and the
+      # Intel-macOS (macos-13) runner is scarce, so those three use vcpkg static
+      # triplets (always built -fPIC). macos-x64 is therefore cross-compiled on
+      # the always-available Apple-Silicon runner: triplet x64-osx makes the
+      # vcpkg toolchain set CMAKE_OSX_ARCHITECTURES=x86_64. The engine's
+      # pkg-config/CONFIG detection finds whichever, via PKG_CONFIG_PATH +
+      # CMAKE_PREFIX_PATH (+ OPENSSL_ROOT_DIR) when vcpkg is used.
       matrix:
         include:
           - { os: macos-14,        tag: macos-arm64,  deps: brew, lib: libnitro_server.dylib, out: libnitro_server-macos-arm64.dylib }
-          - { os: macos-13,        tag: macos-x64,    deps: brew, lib: libnitro_server.dylib, out: libnitro_server-macos-x64.dylib }
+          - { os: macos-14,        tag: macos-x64,    deps: vcpkg, triplet: x64-osx,              lib: libnitro_server.dylib, out: libnitro_server-macos-x64.dylib }
           - { os: ubuntu-24.04-arm, tag: linux-arm64, deps: apt,  lib: libnitro_server.so,    out: libnitro_server-linux-arm64.so }
           - { os: ubuntu-24.04,    tag: linux-x64,    deps: vcpkg, triplet: x64-linux,            lib: libnitro_server.so,  out: libnitro_server-linux-x64.so }
           - { os: windows-latest,  tag: windows-x64,  deps: vcpkg, triplet: x64-windows-static-md, lib: nitro_server.dll,    out: libnitro_server-windows-x64.dll }
@@ -56,7 +60,11 @@ jobs:
             INST="$VCPKG_ROOT/installed/${{ matrix.triplet }}"
             export PKG_CONFIG_PATH="$INST/lib/pkgconfig:$PKG_CONFIG_PATH"
             export PATH="$INST/tools/pkgconf:$VCPKG_ROOT/installed/${{ matrix.triplet }}/tools/pkgconf:$PATH"
-            EXTRA="-DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }} -DCMAKE_PREFIX_PATH=$INST"
+            # Pin OpenSSL to the vcpkg prefix so FindOpenSSL uses it — critical
+            # for the macos-x64 cross-build, where engine.cmake's Homebrew
+            # fallback would otherwise grab the host's arm64 openssl@3.
+            export OPENSSL_ROOT_DIR="$INST"
+            EXTRA="-DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }} -DCMAKE_PREFIX_PATH=$INST -DOPENSSL_ROOT_DIR=$INST"
           fi
           cmake -S src -B build/rel -DCMAKE_BUILD_TYPE=Release \
             -DNITRO_SERVER_HTTP2=ON -DNITRO_SERVER_STATIC_DEPS=ON $EXTRA

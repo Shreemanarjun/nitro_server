@@ -75,9 +75,14 @@ function(nitro_server_attach_libuv target)
   endif()
   # Last-resort fallback (no pkg-config): hint well-known prefixes directly,
   # including the bare `/usr` where Linux distro packages (libuv1-dev) land. A
-  # static build restricts the search to archives (.a) so libuv links statically.
+  # static build restricts the search to archives so libuv links statically
+  # (.lib on MSVC, .a elsewhere).
   if(NITRO_SERVER_STATIC_DEPS)
-    set(CMAKE_FIND_LIBRARY_SUFFIXES .a)  # function-scoped: only affects libuv here
+    if(WIN32)
+      set(CMAKE_FIND_LIBRARY_SUFFIXES .lib)  # function-scoped: only libuv here
+    else()
+      set(CMAKE_FIND_LIBRARY_SUFFIXES .a)
+    endif()
   endif()
   foreach(cand /opt/homebrew /usr/local /usr /opt/homebrew/opt/libuv /usr/local/opt/libuv)
     if(EXISTS "${cand}/include/uv.h")
@@ -108,7 +113,11 @@ function(nitro_server_attach_brotli target)
     if(BROTLI_FOUND)
       set(_brotli_libs ${BROTLI_LIBRARIES})
       if(NITRO_SERVER_STATIC_DEPS)
-        set(CMAKE_FIND_LIBRARY_SUFFIXES .a)  # resolve archives, not the .dylib
+        if(WIN32)
+          set(CMAKE_FIND_LIBRARY_SUFFIXES .lib)  # MSVC static archive
+        else()
+          set(CMAKE_FIND_LIBRARY_SUFFIXES .a)  # resolve archives, not the .dylib
+        endif()
         set(_brotli_a "")
         foreach(_c brotlienc brotlidec brotlicommon)
           find_library(NITRO_BROTLI_${_c}_A NAMES ${_c}
@@ -166,8 +175,13 @@ function(nitro_server_attach_http2 target)
       set(_nghttp2_libs ${NGHTTP2_LIBRARIES})
       if(NITRO_SERVER_STATIC_DEPS)
         # pkg-config's static list is link names the linker still resolves to
-        # the shared lib, so resolve the archive path explicitly.
-        set(CMAKE_FIND_LIBRARY_SUFFIXES .a)
+        # the shared lib, so resolve the archive path explicitly (.lib on MSVC,
+        # .a elsewhere).
+        if(WIN32)
+          set(CMAKE_FIND_LIBRARY_SUFFIXES .lib)
+        else()
+          set(CMAKE_FIND_LIBRARY_SUFFIXES .a)
+        endif()
         find_library(NITRO_NGHTTP2_A NAMES nghttp2
           HINTS ${NGHTTP2_LIBRARY_DIRS} /opt/homebrew/lib /usr/local/lib /usr/lib)
         if(NITRO_NGHTTP2_A)
@@ -235,6 +249,20 @@ function(nitro_server_attach_engine target)
       WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
     target_compile_options(${target} PRIVATE /EHsc)
     target_link_libraries(${target} PRIVATE ws2_32)
+    if(NITRO_SERVER_STATIC_DEPS)
+      # Static OpenSSL + libuv pull in these Win32 import libs transitively.
+      # The pkg-config / manual find_library paths (unlike the CONFIG targets)
+      # don't inherit them, so list them here. Harmless if a target already
+      # carries some; the linker dedupes.
+      target_link_libraries(${target} PRIVATE
+        crypt32 bcrypt advapi32 user32 gdi32          # static OpenSSL 3
+        psapi iphlpapi userenv dbghelp ole32 shell32) # static libuv
+      # Static nghttp2's API is declared __declspec(dllimport) unless the
+      # consumer defines NGHTTP2_STATICLIB (else unresolved __imp_nghttp2_*).
+      if(NITRO_SERVER_HTTP2)
+        target_compile_definitions(${target} PRIVATE NGHTTP2_STATICLIB)
+      endif()
+    endif()
   else()
     target_link_libraries(${target} PRIVATE pthread)
     if(APPLE)

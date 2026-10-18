@@ -12,6 +12,9 @@ analyzer:
     - windows/**
     - macos/**
     - linux/**
+    # Native C++ engine + its gtest suite (not Dart).
+    - src/**
+    - test/cpp/**
     # Generated bridge code is not hand-maintained.
     - lib/src/**.g.dart
 
@@ -25,10 +28,6 @@ linter:
     - unnecessary_const
     - prefer_final_locals
     - prefer_final_in_for_each
-    # safety on an async server
-    - unawaited_futures
-    - cancel_subscriptions
-    - close_sinks
     # clarity
     - directives_ordering
     - unnecessary_parenthesis

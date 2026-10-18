@@ -295,9 +295,7 @@ void main() {
       });
       await Future<void>.delayed(Duration.zero);
 
-      fake.heads.add(
-        fakeHead(requestId: 10, path: '/q', routePattern: '/q'),
-      );
+      fake.heads.add(fakeHead(requestId: 10, path: '/q', routePattern: '/q'));
       await waitFor(10);
       expect(seen!.query, isEmpty);
       expect(seen!.queryParameters, isEmpty);

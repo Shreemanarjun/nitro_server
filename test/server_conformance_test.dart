@@ -397,7 +397,7 @@ void main() {
     group('query strings (RFC 3986 §3.4)', () {
       test('empty, single, multi and encoded params', () async {
         for (final entry in {
-          '/query': {},
+          '/query': <String, String>{},
           '/query?a=1': {'a': '1'},
           '/query?a=1&b=two&c=3': {'a': '1', 'b': 'two', 'c': '3'},
           '/query?q=hello%20world': {'q': 'hello world'},

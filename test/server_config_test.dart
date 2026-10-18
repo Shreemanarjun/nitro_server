@@ -78,9 +78,7 @@ void main() {
     test('none returns the bound port', () {
       expect(
         throwIfFailed(
-          const RawServerStatus(
-            boundPort: 4567,
-          ),
+          const RawServerStatus(boundPort: 4567),
           operation: 'start',
         ),
         4567,

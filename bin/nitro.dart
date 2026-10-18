@@ -3,7 +3,7 @@
 /// ```sh
 /// dart run nitro_server:nitro serve            # run bin/server.dart, JIT + hot reload
 /// dart run nitro_server:nitro serve --aot       # AOT-compile then run (prod-like, no reload)
-/// dart run nitro_server:nitro build             # AOT: dart compile exe → build/<name>
+/// dart run nitro_server:nitro build             # AOT: dart build cli → build/<name>/bundle
 /// dart run nitro_server:nitro build --jit       # JIT snapshot: dart compile jit-snapshot
 /// # once globally activated (`dart pub global activate nitro_server`):
 /// nitro serve | nitro build [entry] [--aot|--jit] [-o out]
@@ -101,49 +101,48 @@ Future<int> _build(List<String> args) async {
     stdout.writeln('→ nitro build (jit snapshot) — $out');
     return _run('dart', ['compile', 'jit-snapshot', '-o', out, entry]);
   }
-  final out = await _compileExe(entry, output: output);
-  if (out == null) return 1;
-  if (_hasFlag(args, '--bundle-deps')) await _bundleTransitiveDeps(out);
+  final exe = await _compileExe(entry, output: output);
+  if (exe == null) return 1;
+  if (_hasFlag(args, '--bundle-deps')) {
+    // The engine lib lives in the bundle's lib/ (sibling of bin/), not next to
+    // the exe. bundle/bin/<exe> -> bundle/lib.
+    final libDir = '${File(exe).parent.parent.path}/lib';
+    await _bundleTransitiveDeps(libDir);
+  }
   return 0;
 }
 
-/// AOT-compiles [entry] to a native executable, returning its path or null.
-/// Copies the native engine library next to the exe so the result is a
-/// self-contained bundle the loader finds regardless of working directory.
+/// AOT-builds [entry] into a self-contained CLI bundle, returning the path to
+/// the compiled executable (under `<out>/bundle/bin/`) or null on failure.
+///
+/// Uses `dart build cli`, not `dart compile exe`: once the package graph has
+/// native-asset build hooks (nitro_server ships one), `dart compile` refuses
+/// and directs you here. `dart build cli` runs the hook — provisioning the
+/// engine library — and bundles it into `<out>/bundle/lib/`, which the runtime
+/// loader resolves via its `<exe>/../lib` candidate (see native_loader.dart).
 Future<String?> _compileExe(String entry, {String? output}) async {
-  final out = output ?? 'build/${_base(entry)}';
-  _ensureDir(out);
-  stdout.writeln('→ compiling (aot exe) — $out');
-  final code = await _run('dart', ['compile', 'exe', '-o', out, entry]);
+  final base = _base(entry);
+  final dir = output ?? 'build/$base';
+  // A stale file from an older `dart compile exe -o build/<base>` run would
+  // collide with the bundle directory dart build cli creates there.
+  final stale = File(dir);
+  if (stale.existsSync()) stale.deleteSync();
+  stdout.writeln('→ building (aot cli bundle) — $dir/bundle');
+  final code = await _run('dart', ['build', 'cli', '-t', entry, '-o', dir]);
   if (code != 0) return null;
-  _bundleDylib(out);
-  return out;
-}
-
-/// Copies the cmake-built native library next to [exePath] so the compiled
-/// server runs standalone (the loader searches the executable's directory).
-void _bundleDylib(String exePath) {
-  final name = nitroServerLibraryName();
-  File? src;
-  for (final candidate in ['build/lib/$name', 'build/$name']) {
-    if (File(candidate).existsSync()) {
-      src = File(candidate);
-      break;
-    }
+  // `dart build cli` writes <dir>/bundle/bin/<exe>; the exe is named for the
+  // entry, but fall back to whatever single executable landed in bin/.
+  final binDir = Directory('$dir/bundle/bin');
+  final named = File('${binDir.path}/$base');
+  if (named.existsSync()) return named.path;
+  final produced = binDir.existsSync()
+      ? binDir.listSync().whereType<File>().toList()
+      : <File>[];
+  if (produced.isEmpty) {
+    stderr.writeln('nitro build: no executable produced under ${binDir.path}');
+    return null;
   }
-  if (src == null) {
-    stdout.writeln(
-      '  note: $name not found under build/ — build the engine with '
-      '`cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release && '
-      'cmake --build build/lib`, or set NITRO_SERVER_DYLIB at run time',
-    );
-    return;
-  }
-  final dest = '${File(exePath).parent.path}/$name';
-  if (File(dest).absolute.path != src.absolute.path) {
-    src.copySync(dest);
-    stdout.writeln('  bundled $name next to the executable');
-  }
+  return produced.first.path;
 }
 
 /// Makes the native-library bundle self-contained for cross-machine deploy:

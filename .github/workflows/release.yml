@@ -65,9 +65,18 @@ jobs:
             # fallback would otherwise grab the host's arm64 openssl@3.
             export OPENSSL_ROOT_DIR="$INST"
             EXTRA="-DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }} -DCMAKE_PREFIX_PATH=$INST -DOPENSSL_ROOT_DIR=$INST"
+            # The vcpkg toolchain doesn't propagate the target arch to our
+            # project, so an x64-osx build defaults to the host (arm64) and
+            # can't link the x86_64 deps. Force it for the macOS cross-build.
+            if [ "${{ matrix.triplet }}" = "x64-osx" ]; then
+              EXTRA="$EXTRA -DCMAKE_OSX_ARCHITECTURES=x86_64"
+            fi
           fi
+          # NATIVE_TUNE=OFF: prebuilts must run on any CPU of their arch, so no
+          # -march=native (it would also break the x86_64-on-arm64 cross-build).
           cmake -S src -B build/rel -DCMAKE_BUILD_TYPE=Release \
-            -DNITRO_SERVER_HTTP2=ON -DNITRO_SERVER_STATIC_DEPS=ON $EXTRA
+            -DNITRO_SERVER_HTTP2=ON -DNITRO_SERVER_STATIC_DEPS=ON \
+            -DNITRO_SERVER_NATIVE_TUNE=OFF $EXTRA
           cmake --build build/rel --config Release --parallel
 
       - name: Stage artifact + SHA-256 sidecar

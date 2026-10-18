@@ -4,6 +4,13 @@ project(nitro_server_library VERSION 0.0.1 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Tune for the build host's CPU (-march=native). ON for local/benchmark builds
+# where producer == consumer. The release pipeline sets it OFF: a distributed
+# prebuilt must run on any CPU of its arch (a lib built on an AVX-512 runner
+# would SIGILL elsewhere), and -march=native is also invalid when cross-
+# compiling (e.g. x86_64 on an Apple-Silicon host).
+option(NITRO_SERVER_NATIVE_TUNE "Optimize for the build host CPU (-march=native)" ON)
+
 # ── Aggressive native optimization flags ──────────────────────────────────────
 # Override CMake's default Release flags with CPU-tuned optimizations.
 # -O3: aggressive inlining + vectorization
@@ -14,11 +21,24 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # -fomit-frame-pointer: free up a register on x86_64
 # -funroll-loops: unroll hot loops (parser, header scan)
 # -ffast-math: allow reordering FP ops (no NaN/Inf sensitivity in HTTP)
-set(CMAKE_C_FLAGS_RELEASE   "-O3 -march=native -mtune=native -DNDEBUG -fomit-frame-pointer -funroll-loops -ffast-math -fno-rtti")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -mtune=native -DNDEBUG -fomit-frame-pointer -funroll-loops -ffast-math -fno-rtti")
-# Link-time optimization at the linker level (requires matching compile flags).
-set(CMAKE_EXE_LINKER_FLAGS_RELEASE  "-flto -O3")
-set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "-flto -O3")
+#
+# MSVC (cl.exe) understands none of this GCC/Clang syntax. Applying it there
+# silently drops CMake's default `/MD /O2`, leaving the build unoptimized AND on
+# the static CRT (/MT) — which mismatches vcpkg's dynamic-CRT deps (the
+# x64-windows-static-md triplet) and fails linking with unresolved __imp_*.
+# So tune only GCC/Clang; MSVC keeps CMake's defaults (/MD /O2 /Ob2 /DNDEBUG).
+if(NOT MSVC)
+  if(NITRO_SERVER_NATIVE_TUNE)
+    set(_nitro_tune "-march=native -mtune=native")
+  else()
+    set(_nitro_tune "")  # portable baseline for distributed prebuilts
+  endif()
+  set(CMAKE_C_FLAGS_RELEASE   "-O3 ${_nitro_tune} -DNDEBUG -fomit-frame-pointer -funroll-loops -ffast-math -fno-rtti")
+  set(CMAKE_CXX_FLAGS_RELEASE "-O3 ${_nitro_tune} -DNDEBUG -fomit-frame-pointer -funroll-loops -ffast-math -fno-rtti")
+  # Link-time optimization at the linker level (requires matching compile flags).
+  set(CMAKE_EXE_LINKER_FLAGS_RELEASE  "-flto -O3")
+  set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "-flto -O3")
+endif()
 
 # ── Optimization guard ───────────────────────────────────────────────────────
 # The Android Gradle Plugin passes the VARIANT name (e.g. "profile") as
@@ -28,7 +48,7 @@ set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "-flto -O3")
 # variant maps to RELEASE and is unaffected, but profile builds shipped
 # unoptimized native code. Give any non-standard config Release-grade flags.
 string(TOUPPER "${CMAKE_BUILD_TYPE}" _NITRO_CFG)
-if(NOT "${_NITRO_CFG}" MATCHES "^(DEBUG|RELEASE|RELWITHDEBINFO|MINSIZEREL|)$")
+if(NOT MSVC AND NOT "${_NITRO_CFG}" MATCHES "^(DEBUG|RELEASE|RELWITHDEBINFO|MINSIZEREL|)$")
   set(CMAKE_C_FLAGS_${_NITRO_CFG} "-O3 -march=native -mtune=native -DNDEBUG -fomit-frame-pointer -funroll-loops -ffast-math -fno-rtti")
   set(CMAKE_CXX_FLAGS_${_NITRO_CFG} "-O3 -march=native -mtune=native -DNDEBUG -fomit-frame-pointer -funroll-loops -ffast-math -fno-rtti")
 endif()

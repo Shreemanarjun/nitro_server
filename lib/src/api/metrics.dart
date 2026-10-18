@@ -155,4 +155,54 @@ class MetricsAccumulator {
             p99Us: _quantile(0.99),
           ),
   );
+
+  /// Flat, isolate-portable form (`[pattern, requests, errors, maxUs, sumUs,
+  /// ...buckets]`) — only ints and a string, so it crosses a `SendPort`. Paired
+  /// with [mergeWire] to aggregate per-isolate metrics into one view.
+  List<Object?> toWire() => [
+    pattern,
+    requests,
+    errors,
+    maxUs,
+    sumUs,
+    ...buckets,
+  ];
+
+  /// Adds another accumulator's [toWire] state into this one — summing counts
+  /// and histogram buckets, taking the larger max. The histograms add exactly,
+  /// so merged quantiles stay as accurate as a single isolate's.
+  void mergeWire(List<Object?> wire) {
+    requests += wire[1] as int;
+    errors += wire[2] as int;
+    maxUs = math.max(maxUs, wire[3] as int);
+    sumUs += wire[4] as int;
+    for (var i = 0; i < _bucketCount; i++) {
+      buckets[i] += wire[5 + i] as int;
+    }
+  }
+}
+
+/// Merges per-isolate metric snapshots into one [ServerMetrics]. Each entry of
+/// [isolates] is a map `{'requests', 'errors', 'inFlight', 'routes'}` where
+/// `routes` is a list of [MetricsAccumulator.toWire] rows. Histograms add, so
+/// aggregate quantiles are as accurate as any single isolate's.
+ServerMetrics mergeIsolateMetrics(List<Map<String, Object?>> isolates) {
+  var requests = 0, errors = 0, inFlight = 0;
+  final accumulators = <String, MetricsAccumulator>{};
+  for (final iso in isolates) {
+    requests += iso['requests'] as int? ?? 0;
+    errors += iso['errors'] as int? ?? 0;
+    inFlight += iso['inFlight'] as int? ?? 0;
+    for (final wire in (iso['routes'] as List? ?? const [])) {
+      final row = (wire as List).cast<Object?>();
+      final pattern = row[0] as String;
+      (accumulators[pattern] ??= MetricsAccumulator(pattern)).mergeWire(row);
+    }
+  }
+  return ServerMetrics(
+    requests: requests,
+    errors: errors,
+    inFlight: inFlight,
+    byRoute: {for (final e in accumulators.entries) e.key: e.value.snapshot()},
+  );
 }

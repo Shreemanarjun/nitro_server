@@ -23,12 +23,15 @@ add_executable(nitro_server_engine_tests
   dispatch_controller_test.cpp
   json_writer_test.cpp
   brotli_test.cpp
+  http2_session_test.cpp
   "${CMAKE_CURRENT_SOURCE_DIR}/../../src/engine/Router.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../src/engine/HttpParse.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../src/engine/JsonWriter.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../src/engine/EngineRegistry.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../src/engine/UvReactor.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../src/engine/Brotli.cpp"
+  # Fully #ifdef NITRO_SERVER_HTTP2-guarded: compiles to nothing by default.
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../src/engine/Http2Session.cpp"
 )
 
 target_include_directories(nitro_server_engine_tests PRIVATE
@@ -91,6 +94,9 @@ if(NOT COMMAND nitro_server_attach_libuv)
 endif()
 nitro_server_attach_libuv(nitro_server_engine_tests)
 nitro_server_attach_brotli(nitro_server_engine_tests)
+# HTTP/2 (nghttp2) — only when -DNITRO_SERVER_HTTP2=ON; defines NITRO_SERVER_HTTP2
+# so Http2Session.cpp and http2_session_test.cpp compile to real code.
+nitro_server_attach_http2(nitro_server_engine_tests)
 
 include(GoogleTest)
 gtest_discover_tests(nitro_server_engine_tests)

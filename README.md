@@ -127,11 +127,11 @@ Server-wide (`server.use`, outermost first), per group, or per route
 (`middleware:`). Also `apiKeyAuth`, `basicAuth`, and `staticFiles(dir)`
 (`sendfile`, `etag`, 304, byte ranges, index files, traversal protection).
 
-> Middleware state lives per isolate. `rateLimit`'s counters are per isolate, so
-> on a multi-isolate server the effective limit is `maxRequests × isolates` —
-> put it behind a shared gateway, or run `isolates: 1`, if you need a hard
-> global limit. It keys clients by `X-Forwarded-For`/`X-Real-IP` (or a custom
-> `keyExtractor`), since the engine does not expose the peer address to
+> `rateLimit`'s counters are in-memory and per isolate, so on a multi-isolate
+> server the effective limit is `maxRequests × isolates` — pass a shared
+> [`RateLimitStore`](#middleware) (or run the default `isolates: 1`) if you need
+> a hard global limit. It keys clients by `X-Forwarded-For`/`X-Real-IP` (or a
+> custom `keyExtractor`), since the engine does not expose the peer address to
 > handlers; without a proxy setting those, all clients share one bucket.
 
 ## Production
@@ -146,8 +146,11 @@ await serveObservability(server);
 // GET /dashboard -> a self-contained auto-refreshing HTML dashboard
 ```
 
-`prometheusFormat(server.metrics)` and `metricsJson(server.metrics)` are pure
-renderers if you want to expose the data your own way.
+`/metrics` and `/dashboard` aggregate across every isolate by default, so what
+you scrape is the whole server. `prometheusFormat(metrics)` and
+`metricsJson(metrics)` are pure renderers if you want to expose the data your own
+way — pass `await server.aggregatedMetrics()` for the cross-isolate view, or
+`server.metrics` for just this isolate's.
 
 ### OpenAPI 3.1 + Swagger UI (generated from your routes)
 
@@ -359,14 +362,6 @@ each reload, calls `server.reload()` to re-run `setup` and diff the route table.
 re-patch a stored anonymous closure); handlers written inline inside `setup`
 are fine.
 
-## Startup banner
-
-`serverBanner(...)` returns a colourful, production-grade startup log — the
-NITRO wordmark, the listen address, isolate/pid/feature facts, every registered
-route (`server.routes`) classified by kind, and labelled endpoint links. It is a
-pure function, so you choose where it goes; pass `color: stdout.supportsAnsiEscapes`
-for colour on a TTY and clean plain text in a pipe or CI log. See `bin/server.dart`.
-
 ## Performance
 
 8-core box, handler `/json`, `wrk`/`oha`:
@@ -388,11 +383,15 @@ coordinated-omission-free latency, overload, CPU/core, memory, AOT vs JIT):
   [`docs/http2.md`](docs/http2.md); terminate h2 at a proxy in the meantime.
 - **Not serverless.** It is a persistent native process (a Dart binary + the
   engine library); it runs on containers/VMs, not on function platforms.
-- **Per-isolate state by default.** `server.metrics` is per isolate (with
-  `isolates > 1`, aggregate externally — Prometheus sums scrapes — or keep the
-  observability endpoints on one isolate). `rateLimit` is per isolate unless you
-  pass a shared [`RateLimitStore`](#middleware), which makes the limit span
-  isolates or hosts.
+- **State is shared by default.** The default build runs one isolate, so all
+  state is already process-wide. When you scale to `isolates > 1`,
+  `serveObservability` (`/metrics`, `/dashboard`) **aggregates every isolate
+  automatically** — a scrape reflects the whole server, not the isolate that
+  answered. The one exception is `rateLimit`: its in-memory counters are
+  per isolate, so the effective limit is `maxRequests × isolates` unless you pass
+  a shared [`RateLimitStore`](#middleware). (`server.metrics` is the sync,
+  this-isolate snapshot; `await server.aggregatedMetrics()` is the cross-isolate
+  sum the observability endpoints use.)
 - **TLS/brotli are build-time.** They require the engine compiled with
   OpenSSL/libbrotli; the default build has them off (terminate TLS at a proxy,
   or build with `-DNITRO_SERVER_TLS=ON`). Once built with TLS, certificates

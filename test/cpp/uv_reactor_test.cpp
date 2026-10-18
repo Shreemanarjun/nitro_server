@@ -2366,6 +2366,72 @@ TEST(UvReactorTest, ChunkedUploadOverTheRouteCapIs413) {
   }
 }
 
+TEST(UvReactorTest, ChunkedStreamBodyOverCapIs413AndFailsTheStream) {
+  // A chunked upload carries no Content-Length, so the non-stream path caps it
+  // in decodeChunked. The streamBody path dispatches the head first, then caps
+  // as the decoded body accrues — otherwise a chunked upload to a streamBody
+  // route streams unbounded data to the handler (DoS).
+  struct ErrEmitter : RecordingEmitter {
+    using RecordingEmitter::RecordingEmitter;
+    std::atomic<int> errors{0};
+    std::atomic<int64_t> lastKind{-1};
+    void emitBodyError(int64_t id, uint8_t* p, size_t n, ErrorKind k) override {
+      errors.fetch_add(1, std::memory_order_relaxed);
+      lastKind.store((int64_t)k, std::memory_order_relaxed);
+      RecordingEmitter::emitBodyError(id, p, n, k);
+    }
+  };
+  ErrEmitter emitter([](Method, const std::string&, const std::string& body) {
+    return std::make_pair(200, "n=" + std::to_string(body.size()));
+  });
+  auto server = std::make_shared<UvReactor>();
+  server->setEmitter(&emitter);
+  EXPECT_EQ(
+      server->registerRoute(Method::Post, "", "/up", -1, false, true, 8).kind,
+      ErrorKind::None);
+  ServerConfig cfg;
+  cfg.port = 0;
+  cfg.defaultTimeoutMs = 5000;
+  server->configure(cfg);
+  ASSERT_EQ((int64_t)server->start().kind, (int64_t)ErrorKind::None);
+  std::atomic<bool> pumping{true};
+  std::thread pump([&] {
+    while (pumping.load()) {
+      RecordingEmitter::Job job{0, 0, ""};
+      if (emitter.takeJob(job)) {
+        std::vector<uint8_t> bytes(job.body.begin(), job.body.end());
+        server->respond(job.requestId, job.status, {}, bytes.data(),
+                        bytes.size());
+      } else {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }
+  });
+  {  // Under the cap: the whole body streams and the handler answers 200.
+    const int fd = connectTo((int)server->boundPort());
+    ASSERT_GE(fd, 0);
+    sendStr(fd, "POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
+                "Connection: close\r\n\r\n4\r\n0123\r\n0\r\n\r\n");
+    EXPECT_EQ(statusOf(readAll(fd)), 200);
+    close(fd);
+  }
+  {  // Over the cap, dribbled across writes so the total trips mid-stream.
+    const int fd = connectTo((int)server->boundPort());
+    ASSERT_GE(fd, 0);
+    sendStr(fd, "POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
+                "Connection: close\r\n\r\n4\r\n0123\r\n");
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    sendStr(fd, "8\r\n456789AB\r\n0\r\n\r\n");  // cumulative 12 > 8-byte cap
+    EXPECT_EQ(statusOf(readAll(fd)), 413);
+    close(fd);
+  }
+  EXPECT_EQ(emitter.errors.load(), 1);
+  EXPECT_EQ(emitter.lastKind.load(), (int64_t)ErrorKind::RequestTooLarge);
+  pumping.store(false);
+  pump.join();
+  server->stop();
+}
+
 TEST(UvReactorTest, RequestSmugglingVectorsAre400) {
   // RFC 9112 §6.1/§6.3.3/§3.2: ambiguous framing is rejected before routing.
   Fixture f(echoAnswer());

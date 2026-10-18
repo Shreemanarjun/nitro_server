@@ -201,8 +201,21 @@ class NitroServer with RouteRegistrar<NitroServer> {
   Stream<ServerEvent> get events => _runner.events;
 
   /// Request counts and latency quantiles per route, for this isolate's
-  /// runner (each helper isolate keeps its own).
+  /// runner (each helper isolate keeps its own). Use [aggregatedMetrics] to sum
+  /// across all isolates.
   ServerMetrics get metrics => _runner.metrics;
+
+  /// Metrics summed across every isolate (this one plus all helpers). Counts
+  /// and latency histograms add, so aggregate quantiles are as accurate as a
+  /// single isolate's — the one view to scrape with `isolates > 1`. With a
+  /// single isolate it equals [metrics].
+  Future<ServerMetrics> aggregatedMetrics() async {
+    final snapshots = <Map<String, Object?>>[_runner.metricsWire()];
+    for (final helper in _helpers) {
+      snapshots.add(await helper.collectMetrics());
+    }
+    return mergeIsolateMetrics(snapshots);
+  }
 
   /// Registers [handler] for [method] + [pattern]. Returns `this`, so
   /// registrations chain: `await server.get(...)` and
@@ -500,6 +513,13 @@ class _Helper {
     await _queue.moveNext(); // 'reloaded'
   }
 
+  /// Asks the helper for its metrics as an isolate-portable map.
+  Future<Map<String, Object?>> collectMetrics() async {
+    _control.send(_HelperBoot.collectSignal);
+    await _queue.moveNext();
+    return (_queue.current as Map).cast<String, Object?>();
+  }
+
   Future<void> close() async {
     _control.send(_HelperBoot.closeSignal);
     await _queue.moveNext(); // 'closed' — the helper's runner is shut.
@@ -518,6 +538,7 @@ class _HelperBoot {
   );
 
   static const closeSignal = 'close';
+  static const collectSignal = 'metrics';
 
   final String key;
   final String? dylibPath;
@@ -546,6 +567,10 @@ Future<void> _helperMain(_HelperBoot boot) async {
   boot.reply.send(control.sendPort);
   await for (final message in control) {
     if (message == _HelperBoot.closeSignal) break;
+    if (message == _HelperBoot.collectSignal) {
+      boot.reply.send(runner.metricsWire());
+      continue;
+    }
     if (message is ServerSetup) {
       // The isolate's code is already hot-reloaded; rebuild the routes from the
       // setup the main isolate sent (transactionally, same as the main runner).

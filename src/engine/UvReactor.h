@@ -176,6 +176,7 @@ class UvReactor {
   void processConn(Conn* c);            // parse + dispatch complete requests
   void emitStreamBytes(Conn* c);        // stream a Content-Length streamBody
   void emitStreamChunked(Conn* c);      // stream a chunked streamBody
+  void abortStreamTooLarge(Conn* c);    // chunked upload over the body cap: 413
   void wsProcess(Conn* c);              // decode WebSocket frames (loop thread)
   void wsCloseConn(Conn* c, int code);  // send a close frame + close (loop thread)
 #ifdef NITRO_SERVER_TLS

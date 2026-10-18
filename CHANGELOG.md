@@ -6,8 +6,11 @@ Flutter, backed by a native multithreaded C++ (libuv) engine over Nitro FFI.
 **Engine** — one event loop per core over `SO_REUSEPORT`; adaptive dispatch
 across isolates (light handlers stay on one, CPU-bound fan out); `sendfile`,
 keep-alive, pipelining, `Expect: 100-continue`, chunked I/O; request-smuggling
-defense; optional TLS/brotli (build-time, OpenSSL/libbrotli) with live cert
-hot-reload (`server.reloadTls`); draining answers the backlog `503` not a drop.
+defense; a slow-loris header deadline (`headerTimeout`) and a `maxBodyBytes`
+cap enforced on every upload path — inline, Content-Length, and chunked
+streaming (`413` before an oversize body can accrue); optional TLS/brotli
+(build-time, OpenSSL/libbrotli) with live cert hot-reload (`server.reloadTls`);
+draining answers the backlog `503` not a drop.
 
 **Routing & handlers** — trie routing (`:param`, `*`, custom verbs, `group`),
 per-route `timeout`/`maxBodyBytes`/`middleware`/`streamBody`; `RequestContext`

@@ -9,7 +9,8 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:nitro_server/nitro_server.dart';
-import 'package:nitro_server/src/api/metrics.dart' show MetricsAccumulator;
+import 'package:nitro_server/src/api/metrics.dart'
+    show MetricsAccumulator, mergeIsolateMetrics;
 import 'package:nitro_server/testing.dart';
 import 'package:test/test.dart';
 
@@ -127,6 +128,44 @@ void main() {
       expect(ok.latency.toString(), contains('n=5'));
       expect(LatencyStats.empty.count, 0);
     });
+
+    test(
+      'mergeIsolateMetrics sums counts and adds histograms across isolates',
+      () {
+        // Two isolates, each with its own accumulator for the same + a distinct
+        // route — the cross-isolate aggregation case.
+        final a = MetricsAccumulator('/x')
+          ..record(50, 200)
+          ..record(60, 500);
+        final b = MetricsAccumulator('/x')..record(70, 200);
+        final c = MetricsAccumulator('/y')..record(10, 200);
+        final merged = mergeIsolateMetrics([
+          {
+            'requests': 2,
+            'errors': 1,
+            'inFlight': 1,
+            'routes': [a.toWire()],
+          },
+          {
+            'requests': 2,
+            'errors': 0,
+            'inFlight': 0,
+            'routes': [b.toWire(), c.toWire()],
+          },
+        ]);
+        expect(merged.requests, 4);
+        expect(merged.errors, 1);
+        expect(merged.inFlight, 1);
+        // /x seen on both isolates → counts add (histograms merged exactly).
+        expect(merged.byRoute['/x']!.requests, 3);
+        expect(merged.byRoute['/x']!.errors, 1);
+        expect(merged.byRoute['/x']!.latency.count, 3);
+        expect(merged.byRoute['/x']!.latency.maxUs, 70);
+        expect(merged.byRoute['/y']!.requests, 1);
+        // An empty snapshot list yields zeroed metrics.
+        expect(mergeIsolateMetrics(const []).requests, 0);
+      },
+    );
 
     test('histogram buckets are monotonic and bounded', () {
       var last = -1;

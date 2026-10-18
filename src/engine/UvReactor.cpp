@@ -302,6 +302,8 @@ struct UvReactor::Conn {
   int64_t bodyRemaining = 0;    // Content-Length bytes still to stream
   int64_t chunkRemaining = 0;   // bytes left in the current chunk (chunked)
   bool chunkNeedCrlf = false;   // consume the CRLF after a chunk's data next
+  int64_t streamMaxBody = -1;   // body cap for the streaming upload (-1 = none)
+  int64_t streamBodyTotal = 0;  // decoded body bytes streamed so far (cap check)
   int64_t writePending = 0;     // bytes queued to the socket, not yet written
   std::chrono::steady_clock::time_point writeStartedAt;  // oldest pending write
   std::chrono::steady_clock::time_point lastActive;   // idle-timeout anchor
@@ -870,6 +872,11 @@ void UvReactor::emitStreamChunked(Conn* c) {
       c->buf.erase(0, take);
       c->chunkRemaining -= (int64_t)take;
       if (c->chunkRemaining == 0) c->chunkNeedCrlf = true;
+      c->streamBodyTotal += (int64_t)take;
+      if (c->streamMaxBody >= 0 && c->streamBodyTotal > c->streamMaxBody) {
+        abortStreamTooLarge(c);  // 413 + error the handler's stream, then close
+        return;
+      }
     }
   }
   if (malformed) {
@@ -891,6 +898,29 @@ void UvReactor::emitStreamChunked(Conn* c) {
     if (c->streamEmitter) c->streamEmitter->emitBodyEnd(c->streamReqId);
     c->streamingBody = false;
   }
+}
+
+// Loop thread: a chunked streamBody upload exceeded its body cap. The head was
+// already dispatched, so (unlike the non-stream path's pre-dispatch 413) we
+// fail the handler's body stream with a terminal error, then answer 413 and
+// close. The reqLoc is dropped first so the handler's late respond() no-ops.
+void UvReactor::abortStreamTooLarge(Conn* c) {
+  const int64_t reqId = c->streamReqId;
+  c->streamingBody = false;
+  ReqLoc loc;
+  lookupReq(reqId, loc, /*erase=*/true);
+  if (c->streamEmitter) {
+    static const char kMsg[] = "request body too large";
+    const size_t n = sizeof(kMsg) - 1;
+    auto* payload = (uint8_t*)std::malloc(n);
+    if (payload) {
+      std::memcpy(payload, kMsg, n);
+      pending_.trackPayload(reqId, payload);
+      c->streamEmitter->emitBodyError(reqId, payload, n,
+                                      ErrorKind::RequestTooLarge);
+    }
+  }
+  writeAnswer(c, uvBuildHead(413, {}, 0, false, 0), false, true);
 }
 
 // Loop thread: dispatch complete buffered requests until one is in flight.
@@ -991,6 +1021,11 @@ void UvReactor::processConn(Conn* c) {
         c->streamReqId = reqId;
         c->streamEmitter = em;
         c->bodyRemaining = chunked ? 0 : clen;
+        // A chunked upload carries no Content-Length, so the cap is enforced as
+        // the decoded body accrues (see emitStreamChunked); a Content-Length
+        // upload was already refused above if it declared more than the cap.
+        c->streamMaxBody = maxBody;
+        c->streamBodyTotal = 0;
         c->buf.erase(0, headEnd + 4);  // drop the head; the rest is body
         c->lastActive = Clock::now();
         if (chunked) emitStreamChunked(c); else emitStreamBytes(c);

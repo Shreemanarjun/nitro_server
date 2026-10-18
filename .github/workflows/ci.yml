@@ -59,6 +59,28 @@ jobs:
       - run: cmake --build build/san --parallel --target nitro_server_engine_tests
       - run: ./build/san/nitro_server_tests/nitro_server_engine_tests
 
+  # HTTP/2 (nghttp2, opt-in): proves the Http2Session serve path compiles and
+  # its self-contained nghttp2 client<->server round-trip passes on both Unix
+  # OSes. Default builds leave NITRO_SERVER_HTTP2 off, so this is the only job
+  # that exercises the h2 code; it is also where cross-OS h2 regressions surface.
+  http2:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev libuv1-dev libbrotli-dev libnghttp2-dev
+      - if: runner.os == 'macOS'
+        run: brew install pkg-config openssl@3 libuv brotli nghttp2
+      - run: >
+          cmake -S src -B build/h2 -DCMAKE_BUILD_TYPE=Debug
+          -DNITRO_SERVER_BUILD_TESTS=ON -DNITRO_SERVER_HTTP2=ON
+      - run: cmake --build build/h2 --parallel --target nitro_server_engine_tests
+      - run: ./build/h2/nitro_server_tests/nitro_server_engine_tests
+
   # Cross-framework comparison (nitro vs dart:io vs shelf vs Go vs Node) across
   # every route and aspect — sequential + under-load p50/p99 latency and
   # throughput. All sides run on the SAME runner through the same driver, so the

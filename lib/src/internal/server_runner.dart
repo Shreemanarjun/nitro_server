@@ -143,6 +143,16 @@ class ServerRunner {
     },
   );
 
+  /// This isolate's metrics as an isolate-portable map (ints, strings, lists),
+  /// for `SendPort` transport and [mergeIsolateMetrics]. See
+  /// [MetricsAccumulator.toWire].
+  Map<String, Object?> metricsWire() => {
+    'requests': _answered,
+    'errors': _errors,
+    'inFlight': _pending.length,
+    'routes': [for (final acc in _metrics.values) acc.toWire()],
+  };
+
   /// Recently answered request ids, insertion-ordered and bounded.
   ///
   /// A duplicate head for an id that already dispatched must never dispatch

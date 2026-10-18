@@ -433,6 +433,32 @@ void main() {
       skip: skipReason,
     );
 
+    test('aggregatedMetrics sums requests across every isolate', () async {
+      server = await NitroServer.bind(
+        const ServerConfig(isolates: 2),
+        _whoSetup,
+      );
+      for (var i = 0; i < 12; i++) {
+        expect((await _get(server!.port, '/who')).status, 200);
+      }
+      // The aggregate totals every request regardless of which isolate served
+      // it, where this-isolate `metrics` only counts its own share.
+      final agg = await server!.aggregatedMetrics();
+      expect(agg.requests, 12);
+      expect(agg.byRoute['/who']!.requests, 12);
+      expect(server!.metrics.requests, lessThanOrEqualTo(12));
+    }, skip: skipReason);
+
+    test('aggregatedMetrics equals metrics with a single isolate', () async {
+      server = await NitroServer.bind();
+      await server!.get('/ok', (_) => ResponseContext.text('ok'));
+      await _get(server!.port, '/ok');
+      await _get(server!.port, '/ok');
+      final agg = await server!.aggregatedMetrics();
+      expect(agg.requests, 2);
+      expect(agg.requests, server!.metrics.requests);
+    }, skip: skipReason);
+
     test('config and uri expose the resolved port and host', () async {
       server = await NitroServer.bind(const ServerConfig(), _whoSetup);
       expect(server!.port, isNot(0));
@@ -973,6 +999,37 @@ void main() {
         (await _get(server!.port, '/big', method: 'POST', body: payload)).body,
         '1000',
       );
+    }, skip: skipReason);
+
+    test('a chunked streamBody upload over the cap is 413 and errors the '
+        'handler stream', () async {
+      server = await NitroServer.bind();
+      Object? streamError;
+      await server!.post('/up', streamBody: true, maxBodyBytes: 8, (
+        request,
+      ) async {
+        try {
+          await for (final _ in request.bodyStream!) {}
+        } catch (e) {
+          streamError = e; // the engine aborted the oversize upload
+        }
+        return ResponseContext.text('unreached');
+      });
+      // A chunked body (no Content-Length) whose decoded size exceeds the cap:
+      // framed by hand so the 413 is discovered mid-stream, after the head.
+      final sock = await Socket.connect('127.0.0.1', server!.port);
+      sock.add(
+        ascii.encode(
+          'POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n'
+          'Connection: close\r\n\r\n4\r\n0123\r\n8\r\n456789AB\r\n0\r\n\r\n',
+        ),
+      );
+      final bytes = await sock
+          .fold<List<int>>([], (acc, d) => acc..addAll(d))
+          .timeout(const Duration(seconds: 2));
+      sock.destroy();
+      expect(ascii.decode(bytes).split('\r\n').first, contains('413'));
+      expect(streamError, isA<StateError>());
     }, skip: skipReason);
 
     test('a peer that stops reading is dropped at the write timeout', () async {

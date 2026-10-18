@@ -56,31 +56,33 @@ Future<void> serveObservability(
         ? ResponseContext.text('ready')
         : ResponseContext.text('draining', status: 503),
   );
-  await server.get(
-    metricsPath,
-    (_) => ResponseContext(
+  await server.get(metricsPath, (_) async {
+    // Aggregated across every isolate by default, so a scrape reflects the
+    // whole server, not just the isolate that answered /metrics.
+    final metrics = await server.aggregatedMetrics();
+    return ResponseContext(
       headers: const {
         'content-type': 'text/plain; version=0.0.4; charset=utf-8',
       },
       body: Uint8List.fromList(
-        utf8.encode(prometheusFormat(server.metrics, prefix: prefix)),
+        utf8.encode(prometheusFormat(metrics, prefix: prefix)),
       ),
-    ),
-  );
+    );
+  });
   if (dashboardPath == null) return;
 
   // JSON feed (polling fallback): a fresh sampler per request still yields the
   // totals; throughput needs successive samples, which the WS feed provides.
   final pollSampler = StatsSampler();
-  await server.get(
-    dashboardDataPath,
-    (_) => ResponseContext(
+  await server.get(dashboardDataPath, (_) async {
+    final metrics = await server.aggregatedMetrics();
+    return ResponseContext(
       headers: const {'content-type': 'application/json; charset=utf-8'},
       body: Uint8List.fromList(
-        utf8.encode(jsonEncode(pollSampler.sample(server.metrics))),
+        utf8.encode(jsonEncode(pollSampler.sample(metrics))),
       ),
-    ),
-  );
+    );
+  });
   // WebSocket feed: one sampler per viewer, pushed every [refreshInterval].
   // Each session is independent; the timer is torn down the instant the peer
   // goes away (a failed send) or the stream ends, and a throwing sample never
@@ -94,12 +96,14 @@ Future<void> serveObservability(
       timer = null;
     }
 
-    void push() {
-      // Defensive teardown paths (peer vanished mid-interval, or a sample
-      // threw): the reliable close path is the `drain` + `finally` below.
+    Future<void> push() async {
+      // Defensive teardown paths (peer vanished mid-interval, a sample threw,
+      // or the cross-isolate aggregate failed): the reliable close path is the
+      // `drain` + `finally` below.
       // coverage:ignore-start
       try {
-        if (session.sendText(jsonEncode(sampler.sample(server.metrics))) < 0) {
+        final metrics = await server.aggregatedMetrics();
+        if (session.sendText(jsonEncode(sampler.sample(metrics))) < 0) {
           stop();
         }
       } catch (_) {
@@ -108,8 +112,8 @@ Future<void> serveObservability(
       // coverage:ignore-end
     }
 
-    push(); // immediate first frame
-    timer = Timer.periodic(refreshInterval, (_) => push());
+    unawaited(push()); // immediate first frame
+    timer = Timer.periodic(refreshInterval, (_) => unawaited(push()));
     try {
       await session.messages.drain<void>(); // until the peer closes
     } finally {

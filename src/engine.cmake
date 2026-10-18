@@ -53,8 +53,9 @@ function(nitro_server_attach_libuv target)
       return()
     endif()
   endif()
-  # Homebrew fallback: hint the well-known prefixes directly.
-  foreach(cand /opt/homebrew /usr/local /opt/homebrew/opt/libuv /usr/local/opt/libuv)
+  # Last-resort fallback (no pkg-config): hint well-known prefixes directly,
+  # including the bare `/usr` where Linux distro packages (libuv1-dev) land.
+  foreach(cand /opt/homebrew /usr/local /usr /opt/homebrew/opt/libuv /usr/local/opt/libuv)
     if(EXISTS "${cand}/include/uv.h")
       target_include_directories(${target} PRIVATE "${cand}/include")
       find_library(NITRO_LIBUV_LIB NAMES uv libuv HINTS "${cand}/lib")
@@ -107,6 +108,44 @@ function(nitro_server_attach_brotli target)
   message(STATUS "nitro_server: Brotli not found; building without it (gzip only)")
 endfunction()
 
+# ── HTTP/2 (nghttp2, optional, off by default) ───────────────────────────────
+# Opt in with -DNITRO_SERVER_HTTP2=ON. When requested AND nghttp2 is found,
+# links it and defines NITRO_SERVER_HTTP2=1 so the engine's (in-progress) h2
+# path compiles; otherwise the engine stays HTTP/1.1-only and never advertises
+# `h2` over ALPN. See docs/http2.md for the implementation plan.
+option(NITRO_SERVER_HTTP2 "Build with HTTP/2 (nghttp2)" OFF)
+function(nitro_server_attach_http2 target)
+  if(NOT NITRO_SERVER_HTTP2)
+    return()
+  endif()
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(NGHTTP2 QUIET libnghttp2)
+    if(NGHTTP2_FOUND)
+      target_include_directories(${target} PRIVATE ${NGHTTP2_INCLUDE_DIRS})
+      target_link_libraries(${target} PRIVATE ${NGHTTP2_LIBRARIES})
+      target_link_directories(${target} PRIVATE ${NGHTTP2_LIBRARY_DIRS})
+      target_compile_definitions(${target} PRIVATE NITRO_SERVER_HTTP2=1)
+      message(STATUS "nitro_server: HTTP/2 enabled (nghttp2 ${NGHTTP2_libnghttp2_VERSION})")
+      return()
+    endif()
+  endif()
+  foreach(cand /opt/homebrew/opt/libnghttp2 /usr/local/opt/libnghttp2
+               /opt/homebrew/opt/nghttp2 /usr/local/opt/nghttp2 /usr /usr/local)
+    if(EXISTS "${cand}/include/nghttp2/nghttp2.h")
+      find_library(NITRO_NGHTTP2_LIB NAMES nghttp2 HINTS "${cand}/lib")
+      if(NITRO_NGHTTP2_LIB)
+        target_include_directories(${target} PRIVATE "${cand}/include")
+        target_link_libraries(${target} PRIVATE "${NITRO_NGHTTP2_LIB}")
+        target_compile_definitions(${target} PRIVATE NITRO_SERVER_HTTP2=1)
+        message(STATUS "nitro_server: HTTP/2 enabled (nghttp2 at ${cand})")
+        return()
+      endif()
+    endif()
+  endforeach()
+  message(FATAL_ERROR "nitro_server: NITRO_SERVER_HTTP2=ON but nghttp2 not found")
+endfunction()
+
 # ── nitro_server engine ────────────────────────────────────────────────────
 # Compiles src/engine/*.cpp and links the result into the plugin library.
 # Mirrors nitro_http's engine.cmake: Apple platforms compile the unity TU
@@ -136,6 +175,7 @@ function(nitro_server_attach_engine target)
   nitro_server_attach_tls(${target})
   nitro_server_attach_libuv(${target})
   nitro_server_attach_brotli(${target})
+  nitro_server_attach_http2(${target})
   if(WIN32)
     target_compile_definitions(${target} PRIVATE
       WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)

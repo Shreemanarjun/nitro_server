@@ -39,9 +39,13 @@ export 'src/api/openapi.dart'
         bearerScheme,
         buildOpenApi,
         inferJsonSchema,
+        oauth2Scheme,
         openApiDocument,
+        openIdConnectScheme,
+        schemaRef,
         serveOpenApi;
 export 'src/api/route_group.dart';
+export 'src/api/schema.dart' show ApiSchema;
 export 'src/api/server.dart';
 export 'src/api/startup_log.dart' show nitroServerAsciiLogo, serverBanner;
 export 'src/api/static_files.dart';

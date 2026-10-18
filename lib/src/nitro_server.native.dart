@@ -429,6 +429,12 @@ abstract class NitroServerNative extends HybridObject {
   /// constructor when configuration is a sub-microsecond FFI call.
   void configureServer(RawServerConfig config);
 
+  /// Hot-swaps the TLS certificate/key on a running TLS server (zero-downtime
+  /// cert rotation). Returns true on success; false if the engine was built
+  /// without TLS or the server was not started with TLS, or the new material
+  /// is invalid.
+  bool reloadTls(RawTlsConfig tls);
+
   RawServerStatus registerRoute(RawRouteConfig route);
 
   /// [method] is the uppercase token (`GET`, `POST`, …) or `*` for

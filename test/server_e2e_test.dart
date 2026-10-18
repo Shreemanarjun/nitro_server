@@ -306,6 +306,61 @@ void main() {
       client.close(force: true);
     }, skip: skipReason);
 
+    test('reloadTls hot-swaps the certificate on a live server', () async {
+      server = await NitroServer.bind(
+        const ServerConfig(
+          tls: TlsConfig(certPem: testCertPem, keyPem: testKeyPem),
+        ),
+      );
+      await server!.get('/s', (_) => ResponseContext.text('ok'));
+
+      Future<String> servedCn() async {
+        String subject = '';
+        final client = HttpClient()
+          ..badCertificateCallback = (cert, host, port) {
+            subject = cert.subject;
+            return true;
+          };
+        final res = await (await client.getUrl(
+          Uri.parse('https://127.0.0.1:${server!.port}/s'),
+        )).close();
+        await res.drain<void>();
+        client.close(force: true);
+        return subject;
+      }
+
+      expect(await servedCn(), contains('localhost'));
+      // Swap to the second cert (distinct CN); returns true.
+      expect(
+        server!.reloadTls(
+          const TlsConfig(certPem: testCert2Pem, keyPem: testKey2Pem),
+        ),
+        isTrue,
+      );
+      // New handshakes now present the reloaded certificate.
+      final after = await servedCn();
+      expect(after, contains('nitro-reloaded.example'));
+      expect(after, isNot(contains('localhost')));
+      // An invalid cert is rejected and the live cert is kept.
+      expect(
+        server!.reloadTls(
+          const TlsConfig(certPem: 'nope', keyPem: testKey2Pem),
+        ),
+        isFalse,
+      );
+      expect(await servedCn(), contains('nitro-reloaded.example'));
+    }, skip: skipReason);
+
+    test('reloadTls returns false on a non-TLS server', () async {
+      server = await NitroServer.bind();
+      expect(
+        server!.reloadTls(
+          const TlsConfig(certPem: testCertPem, keyPem: testKeyPem),
+        ),
+        isFalse,
+      );
+    }, skip: skipReason);
+
     test('a TLS config with a mismatched key fails to start', () async {
       await expectLater(
         NitroServer.bind(
@@ -523,8 +578,9 @@ void main() {
         await Future<void>.delayed(const Duration(milliseconds: 100));
         final closing = server!.close(drain: const Duration(seconds: 5));
         await Future<void>.delayed(const Duration(milliseconds: 100));
-        // Draining: the listener is gone, the in-flight request still lands.
-        await expectLater(_get(port, '/slow'), throwsA(isA<Exception>()));
+        // Draining: a new connection is answered 503 (Connection: close), not
+        // dropped; the in-flight request still lands.
+        expect((await _get(port, '/slow')).status, 503);
         gate.complete();
         expect((await pending).body, 'done');
         await closing;

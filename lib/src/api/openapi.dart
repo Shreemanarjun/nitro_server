@@ -40,6 +40,7 @@ Map<String, Object?> buildOpenApi(
   List<OpenApiServer> servers = const [],
   Map<String, OpenApiOperation> operations = const {},
   Map<String, Map<String, Object?>> securitySchemes = const {},
+  Map<String, Map<String, Object?>> schemas = const {},
   List<Map<String, Object?>> security = const [],
   List<OpenApiTag> tags = const [],
   bool includeNonStandard = true,
@@ -85,9 +86,11 @@ Map<String, Object?> buildOpenApi(
     doc['servers'] = [for (final s in servers) s.toJson()];
   }
   doc['paths'] = paths;
-  if (securitySchemes.isNotEmpty) {
-    doc['components'] = {'securitySchemes': securitySchemes};
-  }
+  final components = <String, Object?>{
+    if (securitySchemes.isNotEmpty) 'securitySchemes': securitySchemes,
+    if (schemas.isNotEmpty) 'schemas': schemas,
+  };
+  if (components.isNotEmpty) doc['components'] = components;
   if (security.isNotEmpty) doc['security'] = security;
   if (tags.isNotEmpty) doc['tags'] = [for (final t in tags) t.toJson()];
   if (additional.isNotEmpty) doc['x-additional-routes'] = additional;
@@ -228,6 +231,7 @@ Map<String, Object?> openApiDocument(
   List<OpenApiServer> servers = const [],
   Map<String, OpenApiOperation> operations = const {},
   Map<String, Map<String, Object?>> securitySchemes = const {},
+  Map<String, Map<String, Object?>> schemas = const {},
   List<Map<String, Object?>> security = const [],
   List<OpenApiTag> tags = const [],
   bool includeNonStandard = true,
@@ -239,6 +243,7 @@ Map<String, Object?> openApiDocument(
   servers: servers,
   operations: operations,
   securitySchemes: securitySchemes,
+  schemas: schemas,
   security: security,
   tags: tags,
   includeNonStandard: includeNonStandard,

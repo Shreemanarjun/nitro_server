@@ -224,6 +224,13 @@ class HybridNitroServerImpl final : public HybridNitroServerNative {
     server_->configure(cfg);
   }
 
+  bool reloadTls(NitroCppBuffer tls) override {
+    const RawTlsConfig raw = RawTlsConfig::fromNative(tls);
+    return server_->reloadTls(raw.certPem, raw.keyPem, raw.certFile,
+                              raw.keyFile)
+               .kind == ErrorKind::None;
+  }
+
   NitroCppBuffer registerRoute(NitroCppBuffer route) override {
     const RawRouteConfig raw = RawRouteConfig::fromNative(route);
     return toStatus(server_->registerRoute(

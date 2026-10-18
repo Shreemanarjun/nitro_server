@@ -562,6 +562,16 @@ class ServerRunner {
     _native.stop();
   }
 
+  /// Hot-swaps the TLS cert/key on the live engine. Returns true on success.
+  bool reloadTls(TlsConfig tls) => _native.reloadTls(
+    RawTlsConfig(
+      certPem: tls.certPem,
+      keyPem: tls.keyPem,
+      certFile: tls.certFile,
+      keyFile: tls.keyFile,
+    ),
+  );
+
   /// Graceful shutdown: stops accepting, marks every further answer
   /// `Connection: close`, and waits until no request is in flight or
   /// [deadline] passes. The caller then closes.

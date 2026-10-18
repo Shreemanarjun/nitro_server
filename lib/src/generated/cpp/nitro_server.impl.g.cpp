@@ -82,6 +82,12 @@ public:
         throw std::runtime_error("Not implemented: configureServer");
     }
 
+    bool reloadTls(NitroCppBuffer tls) override {
+        // TODO: implement reloadTls
+        throw std::runtime_error("Not implemented: reloadTls");
+        // return false;
+    }
+
     NitroCppBuffer registerRoute(NitroCppBuffer route) override {
         // TODO: implement registerRoute
         throw std::runtime_error("Not implemented: registerRoute");

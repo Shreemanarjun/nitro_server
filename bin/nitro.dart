@@ -24,11 +24,13 @@ nitro — dev CLI for nitro_server
 
 usage:
   nitro serve [entry] [--aot]            run a server (default: JIT + hot reload)
-  nitro build [entry] [--jit] [-o out]   compile a server (default: AOT exe)
+  nitro build [entry] [--jit] [--bundle-deps] [-o out]   compile a server
 
   entry   defaults to bin/server.dart
   --aot   serve: compile then run the native exe (no hot reload)
   --jit   build: emit a JIT snapshot instead of a native exe
+  --bundle-deps  build: copy native deps next to the exe + rewrite install
+                 names, for a cross-machine-portable bundle (macOS/Linux)
   -o,--output   build output path (default build/<entry-basename>[.exe])
 ''';
 
@@ -100,7 +102,9 @@ Future<int> _build(List<String> args) async {
     return _run('dart', ['compile', 'jit-snapshot', '-o', out, entry]);
   }
   final out = await _compileExe(entry, output: output);
-  return out == null ? 1 : 0;
+  if (out == null) return 1;
+  if (_hasFlag(args, '--bundle-deps')) await _bundleTransitiveDeps(out);
+  return 0;
 }
 
 /// AOT-compiles [entry] to a native executable, returning its path or null.
@@ -140,6 +144,122 @@ void _bundleDylib(String exePath) {
     src.copySync(dest);
     stdout.writeln('  bundled $name next to the executable');
   }
+}
+
+/// Makes the native-library bundle self-contained for cross-machine deploy:
+/// copies every non-system dynamic dependency next to [exePath] and rewrites
+/// each library's references to `@loader_path/<name>`, so the binary runs
+/// without the build machine's Homebrew/apt libraries. macOS
+/// (`otool`/`install_name_tool`) and Linux (`patchelf`) only; elsewhere, a
+/// note points at Docker.
+Future<void> _bundleTransitiveDeps(String exePath) async {
+  final dir = File(exePath).parent.path;
+  if (Platform.isMacOS) {
+    await _bundleMac(dir);
+  } else if (Platform.isLinux) {
+    await _bundleLinux(dir);
+  } else {
+    stdout.writeln(
+      '  --bundle-deps: unsupported on this OS; use the Docker image for a '
+      'self-contained deploy',
+    );
+  }
+}
+
+/// macOS: BFS over `otool -L`, copying non-system deps and rewriting install
+/// names to `@loader_path`.
+Future<void> _bundleMac(String dir) async {
+  if (!await _hasTool('install_name_tool') || !await _hasTool('otool')) {
+    stdout.writeln(
+      '  --bundle-deps: need Xcode command-line tools (otool, '
+      'install_name_tool)',
+    );
+    return;
+  }
+  final name = nitroServerLibraryName();
+  final root = '$dir/$name';
+  if (!File(root).existsSync()) {
+    stdout.writeln('  --bundle-deps: $name not bundled; nothing to rewrite');
+    return;
+  }
+  final seen = <String>{};
+  final queue = <String>[root];
+  var bundled = 0;
+  while (queue.isNotEmpty) {
+    final lib = queue.removeLast();
+    if (!seen.add(lib)) continue;
+    final out = await Process.run('otool', ['-L', lib]);
+    for (final line in (out.stdout as String).split('\n').skip(1)) {
+      final dep = line.trim().split(' (').first.trim();
+      if (dep.isEmpty || _isSystemLib(dep)) continue;
+      if (!dep.startsWith('/')) continue; // already @rpath/@loader_path
+      final depName = dep.split('/').last;
+      final dest = '$dir/$depName';
+      if (!File(dest).existsSync() && File(dep).existsSync()) {
+        File(dep).copySync(dest);
+        bundled++;
+        queue.add(dest);
+      }
+      await Process.run('install_name_tool', [
+        '-change',
+        dep,
+        '@loader_path/$depName',
+        lib,
+      ]);
+    }
+  }
+  // install_name_tool invalidates the ad-hoc code signature; on Apple Silicon
+  // dyld then refuses to load the dylib. Re-sign each modified library.
+  final signed = await _hasTool('codesign');
+  if (signed) {
+    for (final lib in seen) {
+      await Process.run('codesign', ['--force', '--sign', '-', lib]);
+    }
+  }
+  stdout.writeln(
+    '  --bundle-deps: bundled $bundled native dependency(ies) next to the '
+    'executable (macOS @loader_path${signed ? ', re-signed' : ''})',
+  );
+}
+
+/// Linux: copy non-system `.so` deps and set an `$ORIGIN` rpath with patchelf.
+Future<void> _bundleLinux(String dir) async {
+  if (!await _hasTool('patchelf') || !await _hasTool('ldd')) {
+    stdout.writeln('  --bundle-deps: need patchelf and ldd');
+    return;
+  }
+  final name = nitroServerLibraryName();
+  final root = '$dir/$name';
+  if (!File(root).existsSync()) return;
+  final out = await Process.run('ldd', [root]);
+  var bundled = 0;
+  for (final line in (out.stdout as String).split('\n')) {
+    final arrow = line.indexOf('=> ');
+    if (arrow == -1) continue;
+    final dep = line.substring(arrow + 3).split(' (').first.trim();
+    if (dep.isEmpty || _isSystemLib(dep) || !File(dep).existsSync()) continue;
+    final dest = '$dir/${dep.split('/').last}';
+    if (!File(dest).existsSync()) {
+      File(dep).copySync(dest);
+      bundled++;
+    }
+  }
+  await Process.run('patchelf', ['--set-rpath', r'$ORIGIN', root]);
+  stdout.writeln(
+    '  --bundle-deps: bundled $bundled .so dependency(ies) with '
+    r'an $ORIGIN rpath',
+  );
+}
+
+bool _isSystemLib(String path) =>
+    path.startsWith('/usr/lib/') ||
+    path.startsWith('/System/') ||
+    path.startsWith('/lib/') ||
+    path.startsWith('/lib64/');
+
+Future<bool> _hasTool(String name) async {
+  final r = await Process.run('which', [name]);
+  return r.exitCode == 0;
 }
 
 String _base(String entry) =>

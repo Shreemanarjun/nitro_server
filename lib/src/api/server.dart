@@ -424,6 +424,16 @@ class NitroServer with RouteRegistrar<NitroServer> {
       await helper.close();
     }
   }
+
+  /// Hot-swaps the TLS certificate/key on a running TLS server — zero-downtime
+  /// cert rotation. New handshakes use [tls]; connections already open keep
+  /// their certificate. Returns true on success; false if the engine was built
+  /// without TLS, the server was not started with TLS, or [tls] is invalid.
+  ///
+  /// ```dart
+  /// server.reloadTls(TlsConfig(certPem: newCert, keyPem: newKey));
+  /// ```
+  bool reloadTls(TlsConfig tls) => _runner.reloadTls(tls);
 }
 
 /// One helper isolate: a [ServerRunner] on the same engine key, dealt every

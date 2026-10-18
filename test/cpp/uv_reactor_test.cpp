@@ -1119,12 +1119,14 @@ TEST(UvReactorTest, DrainStopsAcceptingAndClosesAfterAnswers) {
   EXPECT_EQ(headerOf(res, "connection"), "close");
   close(fd);
   EXPECT_EQ(f.server->inFlightRequests(), 0);
-  // New connections are refused: the reactor accepts then closes them, so a
-  // request on one gets no answer.
+  // New connections during drain are answered 503 (Connection: close) — a
+  // clean signal to the backlog rather than a silent drop.
   const int nfd = connectTo(port);
   if (nfd >= 0) {
     sendStr(nfd, "GET /x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
-    EXPECT_TRUE(readAll(nfd).empty());
+    const std::string refused = readAll(nfd);
+    EXPECT_EQ(statusOf(refused), 503);
+    EXPECT_EQ(headerOf(refused, "connection"), "close");
     close(nfd);
   }
 }
@@ -1380,11 +1382,14 @@ TEST(UvReactorTest, DrainServesAnAcceptedConnectionThenRefusesNew) {
   EXPECT_EQ(bodyOf(res), "served");
   EXPECT_EQ(headerOf(res, "connection"), "close");
   close(fd);
-  // A new connection is refused: accepted then closed, so it gets no answer.
+  // A new connection during drain is answered 503 (Connection: close) rather
+  // than dropped, so backlog clients get a clean, meaningful response.
   const int nfd = connectTo(port);
   if (nfd >= 0) {
     sendStr(nfd, "GET /x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
-    EXPECT_TRUE(readAll(nfd).empty());
+    const std::string refused = readAll(nfd);
+    EXPECT_EQ(statusOf(refused), 503);
+    EXPECT_EQ(headerOf(refused, "connection"), "close");
     close(nfd);
   }
 }

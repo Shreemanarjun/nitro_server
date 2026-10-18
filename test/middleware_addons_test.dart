@@ -54,6 +54,56 @@ void main() {
       expect((await client.get('/boom')).status, 500);
       expect(lines.single, matches(RegExp(r'^GET +500 ')));
     });
+
+    test('json mode emits one structured object per request', () async {
+      final lines = <String>[];
+      await client.server.use(accessLog(sink: lines.add, json: true));
+      await client.get('/ok');
+      final obj = jsonDecode(lines.single) as Map<String, Object?>;
+      expect(obj['method'], 'GET');
+      expect(obj['status'], 200);
+      expect(obj['path'], '/ok');
+      expect(obj['latency_us'], isA<int>());
+      expect(lines.single, isNot(contains('\x1b['))); // never coloured
+    });
+  });
+
+  group('requestId', () {
+    test('generates an X-Request-Id when the client sends none', () async {
+      await client.server.use(requestId());
+      await client.server.get('/ok', (_) => ResponseContext.text('ok'));
+      final res = await client.get('/ok');
+      expect(res.headers['x-request-id'], isNotNull);
+      expect(res.headers['x-request-id'], isNotEmpty);
+    });
+
+    test('echoes the client X-Request-Id / X-Correlation-Id', () async {
+      await client.server.use(requestId());
+      await client.server.get('/ok', (_) => ResponseContext.text('ok'));
+      expect(
+        (await client.get(
+          '/ok',
+          headers: {'x-request-id': 'abc123'},
+        )).headers['x-request-id'],
+        'abc123',
+      );
+      expect(
+        (await client.get(
+          '/ok',
+          headers: {'x-correlation-id': 'corr'},
+        )).headers['x-request-id'],
+        'corr',
+      );
+    });
+
+    test('a handler-set id wins', () async {
+      await client.server.use(requestId());
+      await client.server.get(
+        '/ok',
+        (_) => ResponseContext.text('ok').withHeader('x-request-id', 'mine'),
+      );
+      expect((await client.get('/ok')).headers['x-request-id'], 'mine');
+    });
   });
 
   group('rateLimit', () {
@@ -151,6 +201,28 @@ void main() {
 
     test('rejects a non-positive limit', () {
       expect(() => rateLimit(maxRequests: 0), throwsA(isA<AssertionError>()));
+    });
+
+    test('a shared RateLimitStore enforces one limit across servers', () async {
+      // One store shared by two independent servers stands in for a limit
+      // shared across isolates/hosts.
+      final shared = InMemoryRateLimitStore();
+      final a = await NitroTestClient.start();
+      final b = await NitroTestClient.start();
+      addTearDown(a.close);
+      addTearDown(b.close);
+      for (final c in [a, b]) {
+        await c.server.use(
+          rateLimit(maxRequests: 2, store: shared, keyExtractor: (_) => 'k'),
+        );
+        await c.server.get('/ok', (_) => ResponseContext.text('ok'));
+      }
+      // The two allowed hits are counted across BOTH servers; the third — on
+      // either — is limited, proving the shared bucket.
+      expect((await a.get('/ok')).status, 200);
+      expect((await b.get('/ok')).status, 200);
+      expect((await a.get('/ok')).status, 429);
+      expect((await b.get('/ok')).status, 429);
     });
   });
 

@@ -384,20 +384,25 @@ coordinated-omission-free latency, overload, CPU/core, memory, AOT vs JIT):
 
 ## Limitations
 
-- **HTTP/1.1 only** — no HTTP/2 or HTTP/3 yet.
+- **HTTP/1.1 only** — no HTTP/2 or HTTP/3 yet. Design + plan in
+  [`docs/http2.md`](docs/http2.md); terminate h2 at a proxy in the meantime.
 - **Not serverless.** It is a persistent native process (a Dart binary + the
   engine library); it runs on containers/VMs, not on function platforms.
-- **Per-isolate state.** `server.metrics` and middleware state (e.g.
-  `rateLimit`) are per isolate; with `isolates > 1` aggregate externally
-  (Prometheus sums scrapes) or keep operational endpoints on one isolate.
-- **TLS/brotli are build-time.** They require the engine to be compiled with
+- **Per-isolate state by default.** `server.metrics` is per isolate (with
+  `isolates > 1`, aggregate externally — Prometheus sums scrapes — or keep the
+  observability endpoints on one isolate). `rateLimit` is per isolate unless you
+  pass a shared [`RateLimitStore`](#middleware), which makes the limit span
+  isolates or hosts.
+- **TLS/brotli are build-time.** They require the engine compiled with
   OpenSSL/libbrotli; the default build has them off (terminate TLS at a proxy,
-  or build with `-DNITRO_SERVER_TLS=ON`).
+  or build with `-DNITRO_SERVER_TLS=ON`). Once built with TLS, certificates
+  **hot-reload** on a live server via `server.reloadTls(...)`.
 - **Platforms:** iOS (foreground only — listener sockets suspend in the
   background), Android (foreground service), macOS/Linux/Windows (no
   constraints), Web (unsupported).
-- `close(drain:)` resets connections still in the kernel backlog only if they
-  arrive after the drain's final accept sweep.
+- `close(drain:)` answers connections accepted during the drain with `503`
+  (`Connection: close`); a connection still in the kernel backlog at the final
+  listener close may be reset.
 
 ## Dart-only use
 

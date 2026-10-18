@@ -684,6 +684,31 @@ void UvReactor::onConnection(uv_stream_t* server, int status) {
   }
   if (refuse) {
     c->closing = true;
+    // While draining, answer the accepted backlog with a clean 503 (and
+    // `Connection: close`) so clients get a real response instead of a bare
+    // FIN. Plain sockets only — pre-handshake TLS cannot carry a plaintext
+    // reply, so a TLS drain just closes. The write callback frees the request
+    // and closes the connection.
+    if (self->draining_.load() &&
+        self->sslCtx_.load(std::memory_order_acquire) == nullptr) {
+      static const std::string k503 =
+          "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n"
+          "Content-Length: 0\r\n\r\n";
+      auto* req = new uv_write_t;
+      req->data = c;
+      uv_buf_t b = uv_buf_init(const_cast<char*>(k503.data()), k503.size());
+      const int rc = uv_write(
+          req, (uv_stream_t*)&c->handle, &b, 1, [](uv_write_t* w, int) {
+            auto* cc = static_cast<Conn*>(w->data);
+            delete w;
+            uv_close((uv_handle_t*)&cc->handle, &UvReactor::onCloseConn);
+          });
+      if (rc != 0) {
+        delete req;
+        uv_close((uv_handle_t*)&c->handle, &UvReactor::onCloseConn);
+      }
+      return;
+    }
     uv_close((uv_handle_t*)&c->handle, &UvReactor::onCloseConn);
     return;
   }
@@ -692,7 +717,7 @@ void UvReactor::onConnection(uv_stream_t* server, int status) {
   uv_tcp_nodelay(&c->handle, 1);
   c->lastActive = Clock::now();
 #ifdef NITRO_SERVER_TLS
-  if (self->sslCtx_ && !self->tlsInit(c)) {
+  if (self->sslCtx_.load(std::memory_order_acquire) && !self->tlsInit(c)) {
     c->closing = true;
     uv_close((uv_handle_t*)&c->handle, &UvReactor::onCloseConn);
     return;
@@ -1424,6 +1449,31 @@ void UvReactor::onSweep(uv_timer_t* timer) {
 // stop() reaps idle keep-alive connections.
 void UvReactor::beginDrain() { draining_.store(true); }
 
+StatusResult UvReactor::reloadTls(const std::string& certPem,
+                                  const std::string& keyPem,
+                                  const std::string& certFile,
+                                  const std::string& keyFile) {
+#ifdef NITRO_SERVER_TLS
+  if (sslCtx_.load(std::memory_order_acquire) == nullptr) {
+    return {ErrorKind::TlsError, "server was not started with TLS", 0};
+  }
+  void* fresh = nullptr;
+  auto r = buildSslCtx(certPem, keyPem, certFile, keyFile, &fresh);
+  if (r.kind != ErrorKind::None) return r;  // keep the live cert on failure
+  void* old = sslCtx_.exchange(fresh, std::memory_order_acq_rel);
+  // Existing connections' SSL objects hold a ref on `old`; this drops ours, so
+  // the old ctx frees only once the last connection using it closes.
+  if (old) SSL_CTX_free((SSL_CTX*)old);
+  return {};
+#else
+  (void)certPem;
+  (void)keyPem;
+  (void)certFile;
+  (void)keyFile;
+  return {ErrorKind::TlsError, "engine built without TLS", 0};
+#endif
+}
+
 int64_t UvReactor::inFlightRequests() {
   std::lock_guard<std::mutex> lk(reqMutex_);
   return (int64_t)reqLoc_.size();
@@ -1662,7 +1712,10 @@ void UvReactor::wsClose(int64_t connId, int code) {
 #ifdef NITRO_SERVER_TLS
 // ── TLS over libuv (OpenSSL memory BIOs) ─────────────────────────────────────
 
-StatusResult UvReactor::setupTls() {
+StatusResult UvReactor::buildSslCtx(const std::string& certPem,
+                                    const std::string& keyPem,
+                                    const std::string& certFile,
+                                    const std::string& keyFile, void** out) {
   auto fail = [](const std::string& what) -> StatusResult {
     char buf[256] = {0};
     const unsigned long e = ERR_get_error();
@@ -1679,8 +1732,8 @@ StatusResult UvReactor::setupTls() {
   SSL_CTX_set_num_tickets(ctx, 0);
   SSL_CTX_set_alpn_select_cb(ctx, reactorAlpnSelect, nullptr);
 
-  if (!cfg_.tlsCertPem.empty()) {
-    BIO* bio = BIO_new_mem_buf(cfg_.tlsCertPem.data(), (int)cfg_.tlsCertPem.size());
+  if (!certPem.empty()) {
+    BIO* bio = BIO_new_mem_buf(certPem.data(), (int)certPem.size());
     X509* leaf = PEM_read_bio_X509_AUX(bio, nullptr, nullptr, nullptr);
     if (!leaf || SSL_CTX_use_certificate(ctx, leaf) != 1) {
       if (leaf) X509_free(leaf);
@@ -1694,8 +1747,8 @@ StatusResult UvReactor::setupTls() {
     while ((ca = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr)) != nullptr)
       if (SSL_CTX_add0_chain_cert(ctx, ca) != 1) X509_free(ca);
     BIO_free(bio);
-  } else if (!cfg_.tlsCertFile.empty()) {
-    if (SSL_CTX_use_certificate_chain_file(ctx, cfg_.tlsCertFile.c_str()) != 1) {
+  } else if (!certFile.empty()) {
+    if (SSL_CTX_use_certificate_chain_file(ctx, certFile.c_str()) != 1) {
       SSL_CTX_free(ctx);
       return fail("cannot load TLS certificate file");
     }
@@ -1704,8 +1757,8 @@ StatusResult UvReactor::setupTls() {
     return {ErrorKind::TlsError, "TLS requested without a certificate", 0};
   }
 
-  if (!cfg_.tlsKeyPem.empty()) {
-    BIO* bio = BIO_new_mem_buf(cfg_.tlsKeyPem.data(), (int)cfg_.tlsKeyPem.size());
+  if (!keyPem.empty()) {
+    BIO* bio = BIO_new_mem_buf(keyPem.data(), (int)keyPem.size());
     EVP_PKEY* key = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
     BIO_free(bio);
     if (!key || SSL_CTX_use_PrivateKey(ctx, key) != 1) {
@@ -1714,9 +1767,9 @@ StatusResult UvReactor::setupTls() {
       return fail("invalid TLS private key PEM");
     }
     EVP_PKEY_free(key);
-  } else if (!cfg_.tlsKeyFile.empty()) {
-    if (SSL_CTX_use_PrivateKey_file(ctx, cfg_.tlsKeyFile.c_str(),
-                                    SSL_FILETYPE_PEM) != 1) {
+  } else if (!keyFile.empty()) {
+    if (SSL_CTX_use_PrivateKey_file(ctx, keyFile.c_str(), SSL_FILETYPE_PEM) !=
+        1) {
       SSL_CTX_free(ctx);
       return fail("cannot load TLS private key file");
     }
@@ -1728,12 +1781,21 @@ StatusResult UvReactor::setupTls() {
     SSL_CTX_free(ctx);
     return {ErrorKind::TlsError, "certificate and private key do not match", 0};
   }
-  sslCtx_ = ctx;
+  *out = ctx;
+  return {};
+}
+
+StatusResult UvReactor::setupTls() {
+  void* ctx = nullptr;
+  auto r = buildSslCtx(cfg_.tlsCertPem, cfg_.tlsKeyPem, cfg_.tlsCertFile,
+                       cfg_.tlsKeyFile, &ctx);
+  if (r.kind != ErrorKind::None) return r;
+  sslCtx_.store(ctx, std::memory_order_release);
   return {};
 }
 
 bool UvReactor::tlsInit(Conn* c) {
-  c->ssl = SSL_new((SSL_CTX*)sslCtx_);
+  c->ssl = SSL_new((SSL_CTX*)sslCtx_.load(std::memory_order_acquire));
   if (!c->ssl) return false;
   c->rbio = BIO_new(BIO_s_mem());
   c->wbio = BIO_new(BIO_s_mem());
@@ -1820,9 +1882,8 @@ void UvReactor::stop() {
   // acked (frees leak-free in production, where ackBody would have).
   pending_.abortAll();
 #ifdef NITRO_SERVER_TLS
-  if (sslCtx_) {
-    SSL_CTX_free((SSL_CTX*)sslCtx_);
-    sslCtx_ = nullptr;
+  if (void* ctx = sslCtx_.exchange(nullptr, std::memory_order_acq_rel)) {
+    SSL_CTX_free((SSL_CTX*)ctx);
   }
 #endif
 }

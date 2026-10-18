@@ -594,4 +594,149 @@ void main() {
       expect(const ResponseContext().isFile, isFalse);
     });
   });
+
+  group('query parameters', () {
+    test(
+      'queryParamAll keeps every repeated value; queryParam the last',
+      () async {
+        await client.server.get(
+          '/q',
+          (r) => ResponseContext.jsonBody({
+            'all': r.queryParamAll('tag'),
+            'one': r.queryParam('tag'),
+            'missing': r.queryParamAll('nope'),
+          }),
+        );
+        final res = await client.get('/q?tag=a&tag=b&tag=c&x=1');
+        expect(res.json(), {
+          'all': ['a', 'b', 'c'],
+          'one': 'c',
+          'missing': <String>[],
+        });
+      },
+    );
+
+    test('decodes percent-encoding and bare keys', () async {
+      await client.server.get(
+        '/q',
+        (r) => ResponseContext.jsonBody({'v': r.queryParamAll('v')}),
+      );
+      final res = await client.get('/q?v=a%20b&v');
+      expect(res.json(), {
+        'v': ['a b', ''],
+      });
+    });
+  });
+
+  group('Server-Sent Events', () {
+    test('SseEvent.encode formats fields and multi-line data', () {
+      expect(const SseEvent('hello').encode(), 'data: hello\n\n');
+      expect(
+        const SseEvent(
+          'a\nb',
+          event: 'msg',
+          id: '7',
+          retry: Duration(seconds: 2),
+        ).encode(),
+        'event: msg\nid: 7\nretry: 2000\ndata: a\ndata: b\n\n',
+      );
+    });
+
+    test('ResponseContext.sse streams events as text/event-stream', () async {
+      await client.server.get(
+        '/sse',
+        (_) => ResponseContext.sse(
+          Stream.fromIterable([
+            const SseEvent('one'),
+            const SseEvent('two', event: 'tick'),
+          ]),
+        ),
+      );
+      final res = await client.get('/sse');
+      expect(res.headers['content-type'], contains('text/event-stream'));
+      expect(res.headers['cache-control'], 'no-cache');
+      expect(res.text(), 'data: one\n\nevent: tick\ndata: two\n\n');
+    });
+  });
+
+  group('ResponseContext.problem (RFC 7807)', () {
+    test('builds a problem+json body with the standard members', () {
+      final res = ResponseContext.problem(
+        title: 'Invalid body',
+        status: 422,
+        detail: 'name is required',
+        type: 'https://errors.example.com/validation',
+        instance: '/users/7',
+        extensions: {'field': 'name'},
+      );
+      expect(res.status, 422);
+      expect(res.headers['content-type'], contains('application/problem+json'));
+      expect(jsonDecode(utf8.decode(res.bodyBytes)), {
+        'type': 'https://errors.example.com/validation',
+        'title': 'Invalid body',
+        'status': 422,
+        'detail': 'name is required',
+        'instance': '/users/7',
+        'field': 'name',
+      });
+    });
+
+    test('defaults: status 400, about:blank, optional members omitted', () {
+      final res = ResponseContext.problem(title: 'Bad Request');
+      expect(res.status, 400);
+      final body = jsonDecode(utf8.decode(res.bodyBytes)) as Map;
+      expect(body['type'], 'about:blank');
+      expect(body['status'], 400);
+      expect(body.containsKey('detail'), isFalse);
+      expect(body.containsKey('instance'), isFalse);
+    });
+  });
+
+  group('ServerConfig.fromEnv', () {
+    test('overlays present env vars on the base, leaves the rest', () {
+      final config = ServerConfig.fromEnv(const {
+        'HOST': '0.0.0.0',
+        'PORT': '9090',
+        'ISOLATES': '4',
+        'MAX_BODY_BYTES': '2048',
+        'KEEP_ALIVE_TIMEOUT_MS': '1000',
+        'RESPONSE_TIMING': 'false',
+        'WS_COMPRESSION': '0',
+      });
+      expect(config.host, '0.0.0.0');
+      expect(config.port, 9090);
+      expect(config.isolates, 4);
+      expect(config.maxBodyBytes, 2048);
+      expect(config.keepAliveTimeout, const Duration(milliseconds: 1000));
+      expect(config.responseTiming, isFalse);
+      expect(config.wsCompression, isFalse);
+      // Untouched default.
+      expect(config.backlog, const ServerConfig().backlog);
+    });
+
+    test('an empty environment yields the base defaults', () {
+      final config = ServerConfig.fromEnv(
+        const {},
+        base: const ServerConfig(port: 7000),
+      );
+      expect(config.port, 7000);
+      expect(config.host, '127.0.0.1');
+      expect(config.responseTiming, isTrue);
+    });
+
+    test('truthy spellings for booleans', () {
+      expect(
+        ServerConfig.fromEnv(const {'WS_COMPRESSION': 'yes'}).wsCompression,
+        isTrue,
+      );
+      expect(
+        ServerConfig.fromEnv(const {'WS_COMPRESSION': 'on'}).wsCompression,
+        isTrue,
+      );
+      expect(
+        ServerConfig.fromEnv(const {'WS_COMPRESSION': 'nope'}).wsCompression,
+        isFalse,
+      );
+    });
+  });
 }

@@ -548,6 +548,24 @@ void main() {
     });
 
     test(
+      'an array (repeatable) query param emits an array schema + explode',
+      () {
+        final op = opFor(
+          method: HttpMethod.get,
+          const OpenApiOperation(
+            params: [OpenApiParam.query('tag', isArray: true)],
+          ),
+        );
+        final p = (op['parameters'] as List)
+            .cast<Map<String, Object?>>()
+            .single;
+        expect(p['explode'], true);
+        expect((p['schema'] as Map)['type'], 'array');
+        expect(((p['schema'] as Map)['items'] as Map)['type'], 'string');
+      },
+    );
+
+    test(
       'requiresAuth builds the security requirement; [] is explicit public',
       () {
         final secured = opFor(const OpenApiOperation(requiresAuth: ['bearer']));
@@ -715,6 +733,64 @@ void main() {
         'in': 'query',
         'name': 'token',
       });
+      expect(oauth2Scheme(const {'implicit': <String, Object?>{}}), {
+        'type': 'oauth2',
+        'flows': {'implicit': <String, Object?>{}},
+      });
+      expect(openIdConnectScheme('https://id.example.com/.well-known'), {
+        'type': 'openIdConnect',
+        'openIdConnectUrl': 'https://id.example.com/.well-known',
+      });
+      // description rides through on both.
+      expect(
+        oauth2Scheme(const {
+          'implicit': <String, Object?>{},
+        }, description: 'd')['description'],
+        'd',
+      );
+      expect(
+        openIdConnectScheme(
+          'https://x/.well-known',
+          description: 'd',
+        )['description'],
+        'd',
+      );
+    });
+
+    test('reusable components.schemas + schemaRef', () {
+      expect(schemaRef('User'), {r'$ref': '#/components/schemas/User'});
+      final doc = buildOpenApi(
+        const [
+          RegisteredRoute(
+            method: HttpMethod.post,
+            pattern: '/users',
+            kind: RouteKind.handler,
+          ),
+        ],
+        schemas: const {
+          'User': {
+            'type': 'object',
+            'properties': {
+              'id': {'type': 'string'},
+            },
+          },
+        },
+        operations: {
+          'POST /users': OpenApiOperation(
+            requestBodyDoc: OpenApiRequestBody.json(schema: schemaRef('User')),
+          ),
+        },
+      );
+      expect(
+        ((doc['components'] as Map)['schemas'] as Map).containsKey('User'),
+        isTrue,
+      );
+      final body = ((doc['paths'] as Map)['/users'] as Map)['post'] as Map;
+      final schema =
+          (((body['requestBody'] as Map)['content'] as Map)['application/json']
+                  as Map)['schema']
+              as Map;
+      expect(schema, {r'$ref': '#/components/schemas/User'});
     });
   });
 }

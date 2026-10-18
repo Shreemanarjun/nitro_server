@@ -128,6 +128,7 @@ class OpenApiParam {
     this.example,
     this.enumValues,
     this.deprecated = false,
+    this.isArray = false,
   }) : location = 'query';
   const OpenApiParam.header(
     this.name, {
@@ -137,7 +138,13 @@ class OpenApiParam {
     this.example,
     this.enumValues,
     this.deprecated = false,
+    this.isArray = false,
   }) : location = 'header';
+
+  /// A cookie parameter. Note: Swagger UI's browser-based "Try it out" cannot
+  /// set the `Cookie` header from this field (fetch forbids it) — it only
+  /// rides an existing jar cookie when `withCredentials` is on. The field still
+  /// documents the contract; see [OpenApi]/`serveOpenApi`'s `withCredentials`.
   const OpenApiParam.cookie(
     this.name, {
     this.required = false,
@@ -146,6 +153,7 @@ class OpenApiParam {
     this.example,
     this.enumValues,
     this.deprecated = false,
+    this.isArray = false,
   }) : location = 'cookie';
 
   final String name;
@@ -161,15 +169,24 @@ class OpenApiParam {
   final List<Object?>? enumValues;
   final bool deprecated;
 
-  Map<String, Object?> toJson() => {
-    'name': name,
-    'in': location,
-    if (required) 'required': true,
-    if (deprecated) 'deprecated': true,
-    if (description != null) 'description': description,
-    'schema': enumValues == null ? schema : {...schema, 'enum': enumValues},
-    'example': ?example,
-  };
+  /// Repeatable (`?tag=a&tag=b`): wraps [schema] in an array with `explode:true`
+  /// so Swagger renders an add-item input and sends every value. Pair with
+  /// `RequestContext.queryParamAll` on the handler side.
+  final bool isArray;
+
+  Map<String, Object?> toJson() {
+    final item = enumValues == null ? schema : {...schema, 'enum': enumValues};
+    return {
+      'name': name,
+      'in': location,
+      if (required) 'required': true,
+      if (deprecated) 'deprecated': true,
+      if (isArray) 'explode': true,
+      if (description != null) 'description': description,
+      'schema': isArray ? {'type': 'array', 'items': item} : item,
+      'example': ?example,
+    };
+  }
 }
 
 /// A typed request body for one media type, so Swagger renders the right input
@@ -312,3 +329,30 @@ Map<String, Object?> apiKeyScheme({
   String name = 'x-api-key',
   String location = 'header',
 }) => {'type': 'apiKey', 'in': location, 'name': name};
+
+/// An OAuth2 security scheme. [flows] is the raw OpenAPI `flows` object, e.g.
+/// `{'authorizationCode': {'authorizationUrl': …, 'tokenUrl': …, 'scopes': {…}}}`.
+/// Swagger's Authorize dialog drives the chosen flow.
+Map<String, Object?> oauth2Scheme(
+  Map<String, Object?> flows, {
+  String? description,
+}) => {'type': 'oauth2', 'flows': flows, 'description': ?description};
+
+/// An OpenID Connect security scheme pointing at the discovery document
+/// [openIdConnectUrl].
+Map<String, Object?> openIdConnectScheme(
+  String openIdConnectUrl, {
+  String? description,
+}) => {
+  'type': 'openIdConnect',
+  'openIdConnectUrl': openIdConnectUrl,
+  'description': ?description,
+};
+
+/// A JSON-Schema `$ref` to a reusable schema registered under
+/// `components.schemas[name]` (pass it in `buildOpenApi`/`OpenApi`'s `schemas`).
+/// Use it as the `schema:` of an [OpenApiRequestBody]/[OpenApiResponse] or
+/// [OpenApiParam] to share one definition across operations.
+Map<String, Object?> schemaRef(String name) => {
+  r'$ref': '#/components/schemas/$name',
+};

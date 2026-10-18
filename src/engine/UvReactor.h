@@ -87,6 +87,13 @@ class UvReactor {
   /// serving. boundPort() is valid after this returns None.
   StatusResult start(int loops = 0);
   void stop();
+  /// Hot-swaps the TLS certificate/key on a running TLS server: builds a new
+  /// SSL_CTX and atomically replaces the live one, so new handshakes use the
+  /// new cert while existing connections keep theirs. Fails on a non-TLS build
+  /// or a server not started with TLS. Zero-downtime cert rotation.
+  StatusResult reloadTls(const std::string& certPem, const std::string& keyPem,
+                         const std::string& certFile,
+                         const std::string& keyFile);
   /// Graceful shutdown phase one: stop accepting, mark later answers
   /// `Connection: close`; in-flight requests finish. Poll inFlightRequests().
   void beginDrain();
@@ -175,6 +182,11 @@ class UvReactor {
   // TLS over libuv via OpenSSL memory BIOs: ciphertext moves on the socket,
   // plaintext through SSL_read/SSL_write. All on the connection's loop thread.
   StatusResult setupTls();              // build sslCtx_ from cfg_ (once, at start)
+  // Build a fresh SSL_CTX from PEM/file material; shared by setupTls/reloadTls.
+  // Returns the ctx in [*out] on success, else a TlsError StatusResult.
+  StatusResult buildSslCtx(const std::string& certPem, const std::string& keyPem,
+                           const std::string& certFile,
+                           const std::string& keyFile, void** out);
   bool tlsInit(Conn* c);                // new SSL + memory BIOs for [c]
   void tlsOnRead(Conn* c, const char* data, size_t n);  // decrypt + drive
   std::string tlsDrain(Conn* c);        // pull ciphertext out of the write BIO
@@ -231,7 +243,9 @@ class UvReactor {
   std::atomic<int64_t> nextId_{1};
   std::atomic<bool> running_{false};
   std::atomic<bool> draining_{false};
-  void* sslCtx_ = nullptr;  // SSL_CTX*; opaque here to keep OpenSSL out of the header
+  // SSL_CTX*; opaque here to keep OpenSSL out of the header. Atomic: loop
+  // threads read it per accept while reloadTls() may swap it from another.
+  std::atomic<void*> sslCtx_{nullptr};
   std::vector<std::unique_ptr<Loop>> loops_;
   PendingTable pending_;  // body-chunk payload logs (freed on ack / stop)
 

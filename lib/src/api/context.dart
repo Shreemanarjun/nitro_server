@@ -182,6 +182,53 @@ class ServerConfig {
       tls: tls ?? this.tls,
     );
   }
+
+  /// Reads config from [environment] (pass `Platform.environment`), overlaid on
+  /// [base]. Only the variables present are applied, so unset ones keep
+  /// [base]'s value:
+  ///
+  /// `HOST`, `PORT`, `ISOLATES`, `WORKER_THREADS`, `MAX_BODY_BYTES`,
+  /// `MAX_CONNECTIONS`, `MAX_CONNECTIONS_PER_IP`, `KEEP_ALIVE_TIMEOUT_MS`,
+  /// `DEFAULT_TIMEOUT_MS`, `RESPONSE_TIMING` (`true`/`false`/`1`/`0`),
+  /// `WS_COMPRESSION`.
+  ///
+  /// ```dart
+  /// final server = await NitroServer.bind(
+  ///   ServerConfig.fromEnv(Platform.environment),
+  ///   setup,
+  /// );
+  /// ```
+  factory ServerConfig.fromEnv(
+    Map<String, String> environment, {
+    ServerConfig base = const ServerConfig(),
+  }) {
+    int? asInt(String key) => int.tryParse(environment[key] ?? '');
+    Duration? asMs(String key) {
+      final v = asInt(key);
+      return v == null ? null : Duration(milliseconds: v);
+    }
+
+    bool? asBool(String key) {
+      final v = environment[key]?.toLowerCase();
+      if (v == null) return null;
+      return v == 'true' || v == '1' || v == 'yes' || v == 'on';
+    }
+
+    final host = environment['HOST'];
+    return base.copyWith(
+      host: host != null && host.isNotEmpty ? host : null,
+      port: asInt('PORT'),
+      isolates: asInt('ISOLATES'),
+      workerThreads: asInt('WORKER_THREADS'),
+      maxBodyBytes: asInt('MAX_BODY_BYTES'),
+      maxConnections: asInt('MAX_CONNECTIONS'),
+      maxConnectionsPerIp: asInt('MAX_CONNECTIONS_PER_IP'),
+      keepAliveTimeout: asMs('KEEP_ALIVE_TIMEOUT_MS'),
+      defaultTimeout: asMs('DEFAULT_TIMEOUT_MS'),
+      responseTiming: asBool('RESPONSE_TIMING'),
+      wsCompression: asBool('WS_COMPRESSION'),
+    );
+  }
 }
 
 /// Wraps a [RequestHandler]: logging, auth, CORS, compression — anything that
@@ -244,10 +291,32 @@ class RequestContext {
   final Map<String, List<String>>? _headers;
   final String? _packedHeaders;
 
-  /// Query parameters, parsed from [query] on first access.
+  /// Query parameters, parsed from [query] on first access. Repeated keys
+  /// collapse to the last value — use [queryParametersAll] to keep every value.
   late final Map<String, String> queryParameters =
       _queryParameters ??
       (query.isEmpty ? const {} : Uri.splitQueryString(query));
+
+  /// Every query parameter value by name, repeats preserved (`?tag=a&tag=b` →
+  /// `{'tag': ['a', 'b']}`); parsed from [query] on first access.
+  late final Map<String, List<String>> queryParametersAll = _parseQueryAll(
+    query,
+  );
+
+  static Map<String, List<String>> _parseQueryAll(String query) {
+    if (query.isEmpty) return const {};
+    final out = <String, List<String>>{};
+    for (final pair in query.split('&')) {
+      if (pair.isEmpty) continue;
+      final eq = pair.indexOf('=');
+      final key = eq == -1 ? pair : pair.substring(0, eq);
+      final value = eq == -1 ? '' : pair.substring(eq + 1);
+      (out[Uri.decodeQueryComponent(key)] ??= []).add(
+        Uri.decodeQueryComponent(value),
+      );
+    }
+    return out;
+  }
 
   /// Headers by lowercase name, unpacked on first access.
   late final Map<String, List<String>> headers =
@@ -280,6 +349,10 @@ class RequestContext {
 
   /// First value of the query parameter [name], or null.
   String? queryParam(String name) => queryParameters[name];
+
+  /// Every value of the query parameter [name], in order; empty when absent.
+  List<String> queryParamAll(String name) =>
+      queryParametersAll[name] ?? const [];
 
   /// The `:param` capture [name], or null when the route has no such segment.
   String? param(String name) => params[name];
@@ -424,6 +497,20 @@ class ResponseContext {
     cookies: [...cookies, cookie],
   );
 
+  /// This answer with header [name] set to [value] (replacing any existing
+  /// value). Keeps the body, stream, file and cookies intact.
+  ResponseContext withHeader(String name, String value) => ResponseContext(
+    status: status,
+    headers: {...headers, name: value},
+    body: body,
+    bodyStream: bodyStream,
+    streamBufferSize: streamBufferSize,
+    filePath: filePath,
+    fileOffset: fileOffset,
+    fileLength: fileLength,
+    cookies: cookies,
+  );
+
   /// True when this answer is a file ([filePath] != null).
   bool get isFile => filePath != null;
 
@@ -544,6 +631,45 @@ class ResponseContext {
     );
   }
 
+  /// An [RFC 7807](https://www.rfc-editor.org/rfc/rfc7807) `problem+json` error
+  /// — the standard machine-readable error body. [title] is a short summary,
+  /// [status] the HTTP code (default 400); [type] is a URI identifying the
+  /// problem kind (default `about:blank`), [detail] a human explanation,
+  /// [instance] a URI for this occurrence. [extensions] adds custom members.
+  ///
+  /// ```dart
+  /// return ResponseContext.problem(
+  ///   title: 'Invalid body', status: 422, detail: 'name is required',
+  /// );
+  /// ```
+  factory ResponseContext.problem({
+    required String title,
+    int status = 400,
+    String type = 'about:blank',
+    String? detail,
+    String? instance,
+    Map<String, Object?> extensions = const {},
+    Map<String, String> headers = const {},
+  }) {
+    final body = <String, Object?>{
+      'type': type,
+      'title': title,
+      'status': status,
+      'detail': ?detail,
+      'instance': ?instance,
+      ...extensions,
+    };
+    final bytes = JsonUtf8Encoder().convert(body) as Uint8List;
+    return ResponseContext(
+      status: status,
+      headers: {
+        'content-type': 'application/problem+json; charset=utf-8',
+        ...headers,
+      },
+      body: bytes,
+    );
+  }
+
   /// Answers a redirect to [url] with an empty body. [status] must be one of
   /// the redirect codes (301, 302, 303, 307, 308); the default is 302.
   factory ResponseContext.redirect(String url, {int status = 302}) {
@@ -619,11 +745,62 @@ class ResponseContext {
     );
   }
 
+  /// Server-Sent Events (`text/event-stream`): each [SseEvent] is encoded and
+  /// streamed to the client as it arrives (unbuffered, so events are not
+  /// delayed). Sets `cache-control: no-cache`.
+  ///
+  /// ```dart
+  /// await server.get('/events', (_) => ResponseContext.sse(
+  ///   Stream.periodic(const Duration(seconds: 1), (i) => SseEvent('tick $i')),
+  /// ));
+  /// ```
+  factory ResponseContext.sse(
+    Stream<SseEvent> events, {
+    Map<String, String> headers = const {},
+  }) {
+    return ResponseContext(
+      headers: {
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-cache',
+        ...headers,
+      },
+      bodyStream: events.map(
+        (e) => Uint8List.fromList(utf8.encode(e.encode())),
+      ),
+    );
+  }
+
   /// The bytes placed on the wire (empty for a null body). The empty body is
   /// one shared instance — treat it as immutable.
   Uint8List get bodyBytes => body ?? _emptyBody;
 
   static final Uint8List _emptyBody = Uint8List(0);
+}
+
+/// One Server-Sent Event (see [ResponseContext.sse]). [data] is the payload
+/// (multi-line data is split into one `data:` line each); [event], [id] and
+/// [retry] are the optional SSE fields.
+class SseEvent {
+  const SseEvent(this.data, {this.event, this.id, this.retry});
+
+  final String data;
+  final String? event;
+  final String? id;
+  final Duration? retry;
+
+  /// The wire form: optional `event:`/`id:`/`retry:` lines, one `data:` line
+  /// per line of [data], terminated by a blank line.
+  String encode() {
+    final b = StringBuffer();
+    if (event != null) b.write('event: $event\n');
+    if (id != null) b.write('id: $id\n');
+    if (retry != null) b.write('retry: ${retry!.inMilliseconds}\n');
+    for (final line in data.split('\n')) {
+      b.write('data: $line\n');
+    }
+    b.write('\n');
+    return b.toString();
+  }
 }
 
 /// Answers one request. Sync or async: a handler returning a

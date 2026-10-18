@@ -10,6 +10,7 @@ import '../internal/ansi.dart';
 import 'brotli.dart';
 import 'context.dart';
 import 'http_method.dart';
+import 'schema.dart';
 
 /// One colourful, aligned line per answered request — method, status, latency
 /// (microseconds under 1ms, else ms), path and client IP:
@@ -25,12 +26,32 @@ import 'http_method.dart';
 /// formatted before the call, so any `void Function(String)` works). [color]
 /// defaults to whether stdout is a TTY, so piped/CI output stays plain; force
 /// it either way for a custom sink.
-Middleware accessLog({void Function(String line)? sink, bool? color}) {
+///
+/// Pass [json] `true` for one structured JSON object per line instead — ready
+/// to ship to a log aggregator:
+///
+/// ```json
+/// {"method":"GET","status":200,"latency_us":843,"path":"/users/42","ip":"127.0.0.1"}
+/// ```
+Middleware accessLog({
+  void Function(String line)? sink,
+  bool? color,
+  bool json = false,
+}) {
   final log =
       // ignore: avoid_print
       sink ?? print;
-  final on = color ?? stdout.supportsAnsiEscapes;
+  final on = !json && (color ?? stdout.supportsAnsiEscapes);
   String format(String method, int status, int micros, String path, String ip) {
+    if (json) {
+      return jsonEncode({
+        'method': method,
+        'status': status,
+        'latency_us': micros,
+        'path': path,
+        if (ip.isNotEmpty) 'ip': ip,
+      });
+    }
     final m = ansi(method.padRight(6), methodHue(method), on: on);
     final s = ansi(status.toString().padRight(3), statusHue(status), on: on);
     final t = ansi(formatLatency(micros).padLeft(8), '2', on: on);
@@ -69,6 +90,70 @@ Middleware accessLog({void Function(String line)? sink, bool? color}) {
       );
       rethrow;
     }
+  };
+}
+
+/// Ensures every answer carries an `X-Request-Id` for correlation: echoes the
+/// client's `X-Request-Id` (or `X-Correlation-Id`) when present, else generates
+/// one. Handlers read it from the request header; clients and logs read it off
+/// the response. Put it outermost so every downstream answer is stamped.
+///
+/// ```dart
+/// await server.use(requestId());
+/// ```
+Middleware requestId({
+  String headerName = 'x-request-id',
+  String Function()? generator,
+}) {
+  final gen = generator ?? _randomId;
+  final name = headerName.toLowerCase();
+  return (request, next) async {
+    final incoming = request.header(name) ?? request.header('x-correlation-id');
+    final id = (incoming != null && incoming.isNotEmpty) ? incoming : gen();
+    final response = await next(request);
+    // Handler-set value wins; otherwise stamp ours.
+    return response.headers.containsKey(name)
+        ? response
+        : response.withHeader(name, id);
+  };
+}
+
+var _idCounter = 0;
+
+/// A compact, collision-resistant-enough request id for correlation (not a
+/// security token): time-seeded base-36 + a per-isolate counter.
+String _randomId() {
+  final n = DateTime.now().microsecondsSinceEpoch;
+  final c = _idCounter = (_idCounter + 1) & 0xffffff;
+  return '${n.toRadixString(36)}${c.toRadixString(36).padLeft(2, '0')}';
+}
+
+/// Validates the JSON request body against [schema] before the handler runs —
+/// the same [ApiSchema] you document the body with, so the contract and the
+/// check never drift. A malformed body answers `400`, a schema violation `422`
+/// (both `application/problem+json`, the errors under an `errors` member); a
+/// valid body passes through. Use on body-bearing routes (not `streamBody`).
+///
+/// ```dart
+/// await server.post('/users', createUser, middleware: [validateJsonBody(user)]);
+/// ```
+Middleware validateJsonBody(ApiSchema schema) {
+  return (request, next) async {
+    Object? decoded;
+    try {
+      decoded = request.json();
+    } on FormatException {
+      return ResponseContext.problem(title: 'Invalid JSON body');
+    }
+    final errors = schema.validate(decoded);
+    if (errors.isNotEmpty) {
+      return ResponseContext.problem(
+        title: 'Request body failed validation',
+        status: 422,
+        extensions: {'errors': errors},
+      );
+    }
+    return next(request);
   };
 }
 
@@ -226,13 +311,15 @@ String? _headerValue(Map<String, String> headers, String name) {
 /// ```
 ///
 /// The client key comes from [keyExtractor]; the default reads the first hop of
-/// `X-Forwarded-For`, then `X-Real-IP` — the headers a reverse proxy or load
-/// balancer sets. **Without a proxy setting those, every client shares one
-/// bucket** (the engine does not surface the peer address to handlers): put
-/// this behind a proxy, or pass a [keyExtractor] that derives a key you trust
-/// (an API key, a session id). Counts live in memory and reset each [window];
-/// expired keys are evicted lazily, so memory tracks the number of *active*
-/// keys per window, not total clients seen.
+/// `X-Forwarded-For`, then `X-Real-IP`, then the peer's `clientIp` — so it keys
+/// per client with or without a proxy. Pass a [keyExtractor] for a key you
+/// trust instead (an API key, a session id).
+///
+/// Counts live in [store] and reset each [window]. The default
+/// [InMemoryRateLimitStore] is **per isolate**, so with `isolates > 1` the
+/// effective limit is `maxRequests × isolates`. For a limit shared across
+/// isolates or hosts, pass a [RateLimitStore] backed by a shared counter
+/// (Redis, a coordinator isolate, …).
 ///
 /// `ponytail: fixed window (a burst can straddle two windows for up to 2x over
 /// a window boundary); switch to a token bucket if smooth pacing matters.`
@@ -241,22 +328,15 @@ Middleware rateLimit({
   Duration window = const Duration(minutes: 1),
   String Function(RequestContext request)? keyExtractor,
   ResponseContext Function(Duration retryAfter)? onLimit,
+  RateLimitStore? store,
 }) {
   assert(maxRequests > 0, 'maxRequests must be positive');
-  final windows = <String, _RateWindow>{};
+  final backing = store ?? InMemoryRateLimitStore();
   final keyOf = keyExtractor ?? _clientKey;
   return (request, next) async {
-    final key = keyOf(request);
-    final now = DateTime.now();
-    final w = windows[key];
-    if (w == null || !now.isBefore(w.resetAt)) {
-      // New or expired window: start fresh and evict others that have expired.
-      windows.removeWhere((_, other) => !now.isBefore(other.resetAt));
-      windows[key] = _RateWindow(resetAt: now.add(window), count: 1);
-      return next(request);
-    }
-    if (w.count >= maxRequests) {
-      final retryAfter = w.resetAt.difference(now);
+    final hit = await backing.hit(keyOf(request), window);
+    if (hit.count > maxRequests) {
+      final retryAfter = hit.resetAt.difference(DateTime.now());
       final seconds = retryAfter.inSeconds + 1;
       if (onLimit != null) return onLimit(retryAfter);
       return ResponseContext(
@@ -268,25 +348,54 @@ Middleware rateLimit({
         body: _bytes('rate limit exceeded'),
       );
     }
-    w.count++;
     return next(request);
   };
 }
 
-class _RateWindow {
-  _RateWindow({required this.resetAt, required this.count});
+/// One hit recorded against a rate-limit key: the running [count] in the
+/// current window and when that window [resetAt].
+class RateLimitHit {
+  const RateLimitHit({required this.count, required this.resetAt});
+  final int count;
   final DateTime resetAt;
-  int count;
+}
+
+/// Backing store for [rateLimit]. [hit] records one request for [key] in a
+/// window of [window] and returns the running count (post-increment) and reset
+/// time — it must be atomic per key. Implement it over a shared counter for a
+/// limit that spans isolates or hosts; the default is [InMemoryRateLimitStore].
+abstract interface class RateLimitStore {
+  FutureOr<RateLimitHit> hit(String key, Duration window);
+}
+
+/// The default per-isolate, in-memory fixed-window store. Expired keys are
+/// evicted lazily, so memory tracks *active* keys per window, not total seen.
+class InMemoryRateLimitStore implements RateLimitStore {
+  final _windows = <String, RateLimitHit>{};
+
+  @override
+  RateLimitHit hit(String key, Duration window) {
+    final now = DateTime.now();
+    final current = _windows[key];
+    if (current == null || !now.isBefore(current.resetAt)) {
+      _windows.removeWhere((_, other) => !now.isBefore(other.resetAt));
+      return _windows[key] = RateLimitHit(count: 1, resetAt: now.add(window));
+    }
+    return _windows[key] = RateLimitHit(
+      count: current.count + 1,
+      resetAt: current.resetAt,
+    );
+  }
 }
 
 /// Default rate-limit key: first hop of `X-Forwarded-For`, then `X-Real-IP`,
-/// then a single shared bucket (`*`) when neither is present.
+/// then the socket peer `clientIp`, then a single shared bucket (`*`).
 String _clientKey(RequestContext request) {
   final fwd = request.header('x-forwarded-for');
   if (fwd != null && fwd.isNotEmpty) return fwd.split(',').first.trim();
   final real = request.header('x-real-ip');
   if (real != null && real.isNotEmpty) return real.trim();
-  return '*';
+  return request.clientIp.isNotEmpty ? request.clientIp : '*';
 }
 
 /// HTTP Bearer-token auth: requires `Authorization: Bearer <token>` and calls

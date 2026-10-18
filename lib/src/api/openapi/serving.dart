@@ -33,6 +33,7 @@ Future<void> serveOpenApi(
   List<OpenApiServer> servers = const [],
   Map<String, OpenApiOperation> operations = const {},
   Map<String, Map<String, Object?>> securitySchemes = const {},
+  Map<String, Map<String, Object?>> schemas = const {},
   List<Map<String, Object?>> security = const [],
   List<OpenApiTag> tags = const [],
   bool includeNonStandard = true,
@@ -52,6 +53,7 @@ Future<void> serveOpenApi(
         servers: servers,
         operations: operations,
         securitySchemes: securitySchemes,
+        schemas: schemas,
         security: security,
         tags: tags,
         includeNonStandard: includeNonStandard,
@@ -105,6 +107,7 @@ class OpenApi {
     this.description,
     this.servers = const [],
     this.securitySchemes = const {},
+    this.schemas = const {},
     this.security = const [],
     this.tags = const [],
     this.includeNonStandard = true,
@@ -120,6 +123,9 @@ class OpenApi {
   final String? description;
   final List<OpenApiServer> servers;
   final Map<String, Map<String, Object?>> securitySchemes;
+
+  /// Reusable `components.schemas` referenced via [schemaRef].
+  final Map<String, Map<String, Object?>> schemas;
   final List<Map<String, Object?>> security;
   final List<OpenApiTag> tags;
   final bool includeNonStandard;
@@ -263,6 +269,7 @@ class OpenApi {
     servers: servers,
     operations: _operations,
     securitySchemes: securitySchemes,
+    schemas: schemas,
     security: security,
     tags: tags,
     includeNonStandard: includeNonStandard,
@@ -284,6 +291,7 @@ class OpenApi {
     servers: servers,
     operations: _operations,
     securitySchemes: securitySchemes,
+    schemas: schemas,
     security: security,
     tags: tags,
     includeNonStandard: includeNonStandard,

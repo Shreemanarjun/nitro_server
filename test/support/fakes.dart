@@ -37,7 +37,6 @@ class FakeNitroServerNative extends NitroServerNative
   final registerFailures = <String, RawServerStatus>{};
   final unregisterFailures = <String, RawServerStatus>{};
   RawServerStatus startResult = const RawServerStatus(
-    errorKind: RawServerErrorKind.none,
     boundPort: 8080,
   );
 
@@ -86,14 +85,14 @@ class FakeNitroServerNative extends NitroServerNative
   RawServerStatus registerRoute(RawRouteConfig route) {
     registered.add(route);
     return registerFailures[route.pattern] ??
-        const RawServerStatus(errorKind: RawServerErrorKind.none);
+        const RawServerStatus();
   }
 
   @override
   RawServerStatus unregisterRoute(String method, String pattern) {
     unregistered.add((method, pattern));
     return unregisterFailures[pattern] ??
-        const RawServerStatus(errorKind: RawServerErrorKind.none);
+        const RawServerStatus();
   }
 
   @override
@@ -112,7 +111,7 @@ class FakeNitroServerNative extends NitroServerNative
       body: body,
     ));
     return registerFailures[pattern] ??
-        const RawServerStatus(errorKind: RawServerErrorKind.none);
+        const RawServerStatus();
   }
 
   @override

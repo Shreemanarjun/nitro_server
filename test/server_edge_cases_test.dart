@@ -7,10 +7,10 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
-import 'package:test/test.dart';
 import 'package:nitro_server/nitro_server.dart';
 import 'package:nitro_server/src/internal/server_runner.dart';
 import 'package:nitro_server/src/nitro_server.native.dart';
+import 'package:test/test.dart';
 
 import 'support/fakes.dart';
 
@@ -139,7 +139,7 @@ void main() {
       await Future<void>.delayed(Duration.zero);
 
       fake.heads.add(
-        RawIncomingRequest(
+        const RawIncomingRequest(
           requestId: 4,
           method: RawServerMethod.custom,
           customMethod: 'PURGE',
@@ -155,7 +155,7 @@ void main() {
     test('a wrong custom token does not match', () async {
       await addGet('/cache');
       fake.heads.add(
-        RawIncomingRequest(
+        const RawIncomingRequest(
           requestId: 5,
           method: RawServerMethod.custom,
           customMethod: 'BAN',
@@ -247,7 +247,6 @@ void main() {
           method: RawServerMethod.post,
           path: '/zb',
           hasBody: true,
-          contentLength: 0,
           routePattern: '/zb',
         ),
       );
@@ -297,7 +296,7 @@ void main() {
       await Future<void>.delayed(Duration.zero);
 
       fake.heads.add(
-        fakeHead(requestId: 10, path: '/q', query: '', routePattern: '/q'),
+        fakeHead(requestId: 10, path: '/q', routePattern: '/q'),
       );
       await waitFor(10);
       expect(seen!.query, isEmpty);
@@ -846,7 +845,7 @@ void main() {
 
     test('status and headers ride the wire untouched', () async {
       runner.addRoute(HttpMethod.post, '', '/made', null, (_) async {
-        return ResponseContext(
+        return const ResponseContext(
           status: 201,
           headers: {'location': '/made/1', 'x-n': 'v'},
         );
@@ -894,9 +893,8 @@ void main() {
         return const ResponseContext();
       });
       fake.heads.add(
-        RawIncomingRequest(
+        const RawIncomingRequest(
           requestId: 209,
-          method: RawServerMethod.get,
           path: '/fold',
           packedHeaders: 'X-Token\u0000a\u0000x-token\u0000b',
           routePattern: '/fold',
@@ -1575,8 +1573,8 @@ void main() {
 
     test('close is idempotent and drops late sends', () async {
       final session = await openSession(609);
-      await session.close(1000);
-      await session.close(1000);
+      await session.close();
+      await session.close();
       await Future<void>.delayed(const Duration(milliseconds: 20));
       expect(fake.wsClosed.where((c) => c.$1 == 609), hasLength(1));
       session.sendText('late');

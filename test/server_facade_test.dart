@@ -5,12 +5,13 @@
 import 'dart:async';
 import 'dart:isolate';
 import 'dart:typed_data';
-import 'package:test/test.dart';
+
 import 'package:nitro_server/nitro_server.dart';
 import 'package:nitro_server/src/internal/instance_keys.dart';
 import 'package:nitro_server/src/internal/native_attach.dart';
 import 'package:nitro_server/src/internal/server_runner.dart';
 import 'package:nitro_server/src/nitro_server.native.dart';
+import 'package:test/test.dart';
 
 import 'support/fakes.dart';
 
@@ -688,7 +689,7 @@ void main() {
       fake.chunks.addError(StateError('bridge hiccup'));
       fake.events.addError(StateError('bridge hiccup'));
       await pump();
-      fake.heads.add(fakeHead(requestId: 42, path: '/', routePattern: '/'));
+      fake.heads.add(fakeHead(requestId: 42));
       for (var i = 0; i < 200; i++) {
         if (fake.responded.any((r) => r.requestId == 42)) break;
         await Future<void>.delayed(const Duration(milliseconds: 5));

@@ -20,10 +20,7 @@ Future<void> _setup(NitroServer server) async {
     (_) => ResponseContext.jsonBody({'message': 'Hello, World!'}),
   );
   await server.get('/plaintext', (_) => ResponseContext.text('Hello, World!'));
-  await server.get(
-    '/work',
-    (_) => ResponseContext.jsonBody({'r': _burn()}),
-  );
+  await server.get('/work', (_) => ResponseContext.jsonBody({'r': _burn()}));
 }
 
 Future<void> main(List<String> args) async {

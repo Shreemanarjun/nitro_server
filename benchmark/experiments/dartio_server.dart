@@ -13,7 +13,7 @@ Future<HttpServer> _bind(int port) async {
   s.listen((req) {
     final r = req.response;
     r.headers.contentType = ContentType.text;
-    final body = 'hello';
+    const body = 'hello';
     r.contentLength = body.length;
     r.write(body);
     r.close();

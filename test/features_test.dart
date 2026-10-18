@@ -273,7 +273,7 @@ void main() {
     });
 
     test('rejects non-multipart and malformed bodies loudly', () {
-      final ok = 'multipart/form-data; boundary=b';
+      const ok = 'multipart/form-data; boundary=b';
       expect(
         () => parseMultipart(Uint8List(0), 'text/plain'),
         throwsFormatException,

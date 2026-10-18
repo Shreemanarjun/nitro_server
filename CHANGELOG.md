@@ -1,148 +1,78 @@
-## 0.0.2
+## 1.0.0
 
-### Server
+First stable release. A production HTTP/1.1 + WebSocket server for Dart and
+Flutter, backed by a native multithreaded C++ (libuv) engine over Nitro FFI.
 
-* `NitroServer.bind` opens the native library itself — a Dart CLI no longer
-  calls `loadNitroServerNative` first (Flutter still bundles it); the manual
-  loader remains for a non-default path, and `bindWith(dylibPath:)` opens one.
-* `server.config` (the resolved `ServerConfig`, with the bound port and isolate
-  count) and `server.uri` (the base `http(s)://host:port` URL).
-* `server.routes`: a read-only snapshot of the registered routes — each a
-  `RegisteredRoute` (method, pattern, `RouteKind`: handler / webSocket /
-  staticResponse) — for a route-listing endpoint, debugging, or checking a
-  `reload`.
-* `server.reload([setup])`: rebuilds the routing surface on the live socket,
-  **transactionally** — the current routes keep serving while `setup` registers
-  the new ones, then routes it did not re-register are dropped; if `setup`
-  throws, its partial additions roll back and the previous routes, middleware
-  and fallbacks stay, so a bad reload never blanks the server. On a multi-isolate
-  server the `setup` is re-run on every helper isolate too (it must be sendable).
-* `server.onClose`: a `Future` that completes when `close()` is called, so
-  add-ons can release resources when the server stops.
+### Server & routing
 
-### Engine
-
-* Adaptive request dispatch across isolates. The engine now hill-climbs how many
-  of the configured `isolates` it deals requests to, by measured throughput: a
-  light / IO-bound handler stays on one isolate (the cores-wide engine already
-  does the I/O, so fanning out only adds coordination cost), while a CPU-bound
-  or head-of-line-blocked handler fans out across every isolate. So `isolates`
-  can be set to the core count for any workload — extra isolates are headroom
-  for heavy handlers, never a tax on light ones. On an 8-core box the same
-  config serves `/json` at ~115k req/s and a CPU-bound handler at ~38k, each
-  within ~2% of its hand-tuned optimum, with no knobs.
-* `ServerConfig.workerThreads` now caps the number of libuv event loops (`0` =
-  one per CPU core, the default; a value below the core count runs fewer loop
-  threads). It was previously accepted but unused by the event-loop engine.
-* Upgraded to `nitro` 0.7.11: a native read-buffer leak in the completion
-  batcher is fixed, and `@nitroFast` native throws surface as `HybridException`
-  in debug builds (free in release).
-
-### Hot reload
-
-* Opt-in `package:nitro_server/hot_reload.dart` (`enableHotReload(server)`)
-  wires `reload()` to VM hot reload via `hotreloader` — a dev-dependency you
-  add, so the core package ships no runtime dependency. It also watches the
-  running script's own directory (hotreloader watches only `bin`/`lib`/`test`),
-  so a server run from anywhere reloads. `setup` must be a top-level or static
-  function for a reload to pick up changes. Pass `log:` (e.g. `print`) to trace
-  reload activity; silent otherwise. Stops watching when the server closes
-  (via `server.onClose`).
-
-## 0.0.1
-
-Initial release.
-
-### Server
-
-* HTTP/1.1 with keep-alive, pipelining, `Expect: 100-continue`, chunked
-  uploads, chunked and file responses.
-* Request-smuggling defense (RFC 9112 §6.1/§6.3.3/§3.2): rejects
-  Content-Length with Transfer-Encoding, duplicated Content-Length, and a
-  missing or duplicated Host on HTTP/1.1 with 400 before routing.
+* `NitroServer.bind([config, setup])` opens the native library itself and starts
+  listening; port `0` picks a free port. `bindWith(dylibPath:)` loads a specific
+  library.
 * Trie routing: `:param`, trailing `*`, static > param > wildcard,
-  method-specific > `all`, HEAD falls back to GET.
-* `staticRoute` / `getStatic`: a fixed-response route answered entirely inside
-  the engine — the request never crosses into Dart, so it serves at raw engine
-  speed (~122k req/s vs dart:io's ~96k on a saturating load, ~60% over nitro's
-  own handler path). The engine frames `Content-Length`/`Connection` and
-  answers HEAD headers-only; ideal for health checks, static assets, and
-  cached bodies. `getStatic` is the GET shorthand; `staticRoute` takes any
-  method (custom included). See `benchmark/README.md`.
+  method-specific > `all`, HEAD falls back to GET. Verb shorthands
+  (`get`/`post`/`put`/`delete`/`patch`/`head`/`options`/`all`), `route` for
+  custom verbs, `group(prefix)` for prefixed sub-routers, `unroute`.
 * Per-route `timeout`, `maxBodyBytes`, `middleware`, `streamBody`.
-* `ServerConfig`: `maxBodyBytes`, `keepAliveTimeout`,
-  `maxRequestsPerConnection`, `headerTimeout`, `writeTimeout`,
-  `maxConnections`, `maxConnectionsPerIp`, `workerThreads`, `isolates`,
-  `wsMaxBufferBytes`, `wsCompression`.
-* `close(drain:)`: final accept sweep, idle connections closed, in-flight
-  requests awaited up to the deadline.
-* Events: started, stopped, handler timeout, client error (write timeout).
-* `server.metrics`: per-route request and 5xx counts, latency
-  p50/p90/p99.
+* `server.config`, `server.uri`, `server.routes` (a `RegisteredRoute` snapshot),
+  `server.events`, `server.metrics`, `server.onClose`.
+* `server.reload([setup])`: rebuilds the routing surface on the live socket,
+  transactionally (old routes serve until the new ones register; a throwing
+  `setup` rolls back), across all isolates.
+* `close({drain})`: stop now, or drain in-flight requests up to a deadline.
 
 ### Handlers
 
-* `RequestContext`: headers, cookies, params, query, body, `bodyStream`,
-  `text()`, `jsonMap()`, `jsonList()`, `jsonAs<T>()`, `multipart()`.
-* `ResponseContext`: `text`, `json`, `jsonBody`, `html`, `bytes`,
-  `redirect`, `stream`, `file`, `withCookie`; several `set-cookie` headers
-  per answer.
-* Middleware: server-wide, per group, per route; `cors()`, `accessLog()`,
-  `compress()`.
-* `staticFiles(dir)`: content types, `etag`, `last-modified`, 304, byte
-  ranges (206/416), index files, traversal protection.
-* Sync handlers are answered without a Future.
+* `RequestContext`: `headers`, `cookies`, `params`, `query`, `body`,
+  `bodyStream`, `text()`, `jsonMap()`, `jsonList()`, `jsonAs<T>()`, `multipart()`.
+* `ResponseContext`: `text`, `json`, `jsonBody`, `html`, `bytes`, `redirect`,
+  `stream`, `file`, `withCookie`. Sync handlers answer without a `Future`.
 
 ### WebSocket
 
-* RFC 6455 handshake and frame loop in the engine; text, binary, ping/pong,
-  close codes.
-* Non-blocking sends with a per-session queue; `sendText`/`sendBytes`
-  return the queued byte count; `bufferedBytes`; 1009 past
-  `wsMaxBufferBytes`.
-* `permessage-deflate` (RFC 7692, no context takeover).
-* Subprotocol selection: `server.ws(pattern, handler, protocols: [...])`
-  picks the first offered match, refuses a no-overlap offer with 400, and
-  exposes it as `WsSession.protocol`.
-* Sealed `WsMessage`: `WsText`, `WsBinary`.
+* RFC 6455 handshake and frame loop in the engine; text/binary, ping/pong, close
+  codes, `permessage-deflate` (RFC 7692), subprotocol selection.
+* `WsSession`: `messages`, `sendText`/`sendBytes`, `bufferedBytes`, `compressed`,
+  `close(code)`; 1009 past `wsMaxBufferBytes`.
+
+### Middleware & production add-ons
+
+* Built-in middleware: `cors()`, `compress()` (gzip/brotli), `accessLog()`,
+  `rateLimit()` (per-client fixed window), `bearerAuth()`/`apiKeyAuth()`/
+  `basicAuth()`.
+* `serveObservability(server)`: `/healthz`, `/readyz` (503 while draining),
+  Prometheus `/metrics`, and a self-contained live `/dashboard`
+  (`prometheusFormat`/`metricsJson` are the pure renderers).
+* OpenAPI 3.1 generated from the registered routes: `serveOpenApi(server)` serves
+  `/openapi.json` + Swagger UI at `/docs`; the `OpenApi` wrapper captures
+  per-route docs inline at registration; non-HTTP routes (WebSocket, custom
+  verbs) are surfaced under `x-additional-routes`.
+* `shutdownOnSignals(server)`: graceful SIGTERM/SIGINT drain (`GracefulShutdown`
+  can also be triggered programmatically).
+* `staticFiles(dir)`: `sendfile`, `etag`, `last-modified`, 304, byte ranges,
+  index files, traversal protection.
 
 ### Engine
 
-* Direct-write answers: the answering thread writes the response with one
-  non-blocking `sendmsg`; workers park in `poll()` on the socket and a wake
-  pipe; partial writes are flushed by the worker.
-* Stream chunks are queued to the worker and coalesced per flush.
-* Auto-scaling worker pool: one thread per core, growth on demand up to
-  `workerThreads`, idle retirement after 10 s.
-* Round-robin dispatch across `isolates` runners; every message of a
-  request goes to the runner that received its head.
-* Bodies up to 64 KiB are emitted as one chunk plus one complete head;
-  larger bodies are read in 64 KiB blocks.
-* Leaf-call FFI path for `respond`, `startStream` and `sendStreamChunk`
-  over reusable native buffers (0.18 µs per call vs 0.7 µs generated, AOT).
-* Request headers cross the bridge as one packed string (`packedHeaders`)
-  and unpack on first access; `queryParameters` parses on first access.
-* Heads coalesce per isolate under load: heads that arrive while the previous
-  bridge post is in flight cross as one message.
-* `sendfile` for file answers (read + `SSL_write` fallback under TLS).
-* TLS via OpenSSL when built with it (`ServerConfig.tls`): HTTP/1.1 and
-  `wss://` over TLS 1.2+, ALPN `http/1.1`, PEM strings or files, cert/key
-  validated at `start()`. TLS I/O is confined to the worker thread; the
-  non-TLS direct-write path is unchanged.
+* libuv reactor: one event loop per core over `SO_REUSEPORT`; connection state
+  is read-event driven, not a thread per connection.
+* Adaptive dispatch: deals requests across only as many of the configured
+  `isolates` as raise throughput — light handlers stay on one, CPU-bound/mixed
+  ones fan out — so `isolates` can be the core count for any workload.
+* Direct-write answers (one non-blocking `sendmsg`), `sendfile` for files,
+  per-isolate head coalescing, leaf-call FFI for `respond`/stream.
+* HTTP/1.1 with keep-alive, pipelining, `Expect: 100-continue`, chunked uploads,
+  chunked/file responses. Request-smuggling defense (RFC 9112).
+* TLS via OpenSSL when built with it (`ServerConfig.tls`): HTTP/1.1 + `wss://`,
+  ALPN `http/1.1`.
 
-### Tooling
+### Tooling & deployment
 
-* Dart-only mode: `loadNitroServerNative()`, `NITRO_SERVER_DYLIB`.
-* `NitroTestClient` (`package:nitro_server/testing.dart`).
-* `benchmark/compare.dart`: dart:io vs shelf vs nitro, client isolates,
-  `--raw` (now including `POST /echo 1m`), `--isolates`, `--cooldown`,
-  `--json`; WebSocket echo cases (text, binary, permessage-deflate).
-* `tool/coverage.sh`: 100% line gate over `lib/`, `coverage:ignore`
-  markers honoured.
-* `tool/cpp_coverage.sh`: clang source-based line gate over `src/engine`.
-* `-DNITRO_SERVER_SANITIZE=thread|address|undefined`: instrumented engine
-  test build.
-* `tool/fuzz.sh`: libFuzzer targets for the request-head parser, the
-  WebSocket frame parser, and a live socket-level server.
-* `.github/workflows/ci.yml`: suites, both coverage gates, and the thread
-  and address sanitizers on Linux and macOS.
+* `package:nitro_server/testing.dart`: `NitroTestClient`, an in-memory client
+  over the real runner (no sockets, no native library).
+* `package:nitro_server/hot_reload.dart`: `enableHotReload(server)` wires VM hot
+  reload to `reload()` (opt-in `hotreloader` dev-dependency).
+* Deployment: multi-stage `Dockerfile`, `docker-compose.yml`, `fly.toml`,
+  `netlify.toml` (static-frontend proxy), and `bin/server.dart` reference
+  entrypoint. Guide: `docs/deployment.md`.
+* 100% Dart line coverage and a C++ engine coverage gate; ThreadSanitizer and
+  AddressSanitizer in CI; libFuzzer targets for the head/frame parsers.

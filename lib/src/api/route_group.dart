@@ -3,8 +3,8 @@ library;
 
 import 'context.dart';
 import 'http_method.dart';
-import 'server.dart';
 import 'route_registrar.dart';
+import 'server.dart';
 import 'ws.dart';
 
 /// A path-prefixed view of a [NitroServer].

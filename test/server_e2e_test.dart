@@ -22,16 +22,16 @@
 
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 import 'dart:ffi';
 import 'dart:io';
 import 'dart:isolate';
+import 'dart:typed_data';
 
-import 'package:test/test.dart';
 import 'package:nitro_server/nitro_server.dart';
 import 'package:nitro_server/src/internal/instance_keys.dart';
 import 'package:nitro_server/src/internal/native_attach.dart';
 import 'package:nitro_server/src/nitro_server.native.dart';
+import 'package:test/test.dart';
 
 import 'support/tls_cert.dart';
 
@@ -355,25 +355,28 @@ void main() {
       skip: skipReason,
     );
 
-    test('isolates: 2 spawns a helper; adaptive dispatch concentrates light load',
-        () async {
-      server = await NitroServer.bind(
-        const ServerConfig(isolates: 2),
-        _whoSetup,
-      );
-      expect(server!.isolates, 2);
-      final seen = <String>{};
-      for (var i = 0; i < 8; i++) {
-        final res = await _get(server!.port, '/who');
-        expect(res.status, 200);
-        seen.add(res.body);
-      }
-      // Light, sequential requests never back up, so adaptive dispatch keeps
-      // them on one isolate (fanning out would only add coordination cost). The
-      // helper is spawned and has run `setup`; it stays parked until a workload
-      // the engine measures as worth parallelizing arrives.
-      expect(seen, hasLength(1));
-    }, skip: skipReason);
+    test(
+      'isolates: 2 spawns a helper; adaptive dispatch concentrates light load',
+      () async {
+        server = await NitroServer.bind(
+          const ServerConfig(isolates: 2),
+          _whoSetup,
+        );
+        expect(server!.isolates, 2);
+        final seen = <String>{};
+        for (var i = 0; i < 8; i++) {
+          final res = await _get(server!.port, '/who');
+          expect(res.status, 200);
+          seen.add(res.body);
+        }
+        // Light, sequential requests never back up, so adaptive dispatch keeps
+        // them on one isolate (fanning out would only add coordination cost). The
+        // helper is spawned and has run `setup`; it stays parked until a workload
+        // the engine measures as worth parallelizing arrives.
+        expect(seen, hasLength(1));
+      },
+      skip: skipReason,
+    );
 
     test('config and uri expose the resolved port and host', () async {
       server = await NitroServer.bind(const ServerConfig(), _whoSetup);
@@ -752,7 +755,6 @@ void main() {
       final big = 'compressible text ' * 200;
       final socket = await WebSocket.connect(
         'ws://127.0.0.1:${server!.port}/deflate',
-        compression: CompressionOptions.compressionDefault,
       );
       // dart:io's `WebSocket.extensions` is always empty; the proof that
       // deflate is on is the handler's `compressed` check plus the bytes
@@ -774,7 +776,6 @@ void main() {
       });
       final socket = await WebSocket.connect(
         'ws://127.0.0.1:${server!.port}/plain',
-        compression: CompressionOptions.compressionDefault,
       );
       socket.add('p');
       expect(await socket.first, 'p');
@@ -1114,7 +1115,7 @@ void main() {
       );
 
       final socket = await Socket.connect('127.0.0.1', server!.port);
-      addTearDown(() => socket.destroy());
+      addTearDown(socket.destroy);
       socket.add(ascii.encode('GET /h HTTP/1.1\r\nHost: x\r\n\r\n'));
       // Drain the one framed response through a persistent listener; the
       // socket must then go quiet…
@@ -1161,7 +1162,7 @@ void main() {
       );
 
       final socket = await Socket.connect('127.0.0.1', server!.port);
-      addTearDown(() => socket.destroy());
+      addTearDown(socket.destroy);
       final received = BytesBuilder(copy: false);
       final done = Completer<void>();
       socket.listen(
@@ -1289,7 +1290,7 @@ void main() {
       });
 
       final socket = await Socket.connect('127.0.0.1', server!.port);
-      addTearDown(() => socket.destroy());
+      addTearDown(socket.destroy);
       // StreamIterator holds one subscription for its life: no pause quirk.
       final it = StreamIterator<Uint8List>(socket);
       final buf = BytesBuilder(copy: false);
@@ -1322,7 +1323,7 @@ void main() {
     }, skip: skipReason);
 
     test('a second bind on the same port fails to bind', () async {
-      server = await NitroServer.bind(const ServerConfig(port: 0));
+      server = await NitroServer.bind();
       final port = server!.port;
       await expectLater(
         NitroServer.bind(ServerConfig(port: port)),
@@ -1334,7 +1335,6 @@ void main() {
       await expectLater(
         NitroServer.bind(
           const ServerConfig(
-            port: 0,
             tls: TlsConfig(certPem: 'x', keyPem: 'y'),
           ),
         ),

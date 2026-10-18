@@ -1,0 +1,349 @@
+import 'package:nitro_server/nitro_server.dart';
+import 'package:nitro_server/testing.dart';
+import 'package:test/test.dart';
+
+void main() {
+  group('buildOpenApi', () {
+    test('maps routes, templates params, sets info', () {
+      final doc = buildOpenApi(
+        const [
+          RegisteredRoute(
+            method: HttpMethod.get,
+            pattern: '/users/:id',
+            kind: RouteKind.handler,
+          ),
+          RegisteredRoute(
+            method: HttpMethod.post,
+            pattern: '/users',
+            kind: RouteKind.handler,
+          ),
+          RegisteredRoute(
+            method: HttpMethod.get,
+            pattern: '/files/*',
+            kind: RouteKind.staticResponse,
+          ),
+        ],
+        title: 'My API',
+        version: '2.0.0',
+        description: 'desc',
+      );
+      expect(doc['openapi'], '3.1.0');
+      expect((doc['info'] as Map)['title'], 'My API');
+      expect((doc['info'] as Map)['version'], '2.0.0');
+      expect((doc['info'] as Map)['description'], 'desc');
+
+      final paths = doc['paths'] as Map<String, Object?>;
+      expect(
+        paths.keys,
+        containsAll(['/users/{id}', '/users', '/files/{wildcard}']),
+      );
+
+      final get = (paths['/users/{id}'] as Map)['get'] as Map;
+      expect(get['summary'], 'GET /users/:id');
+      final params = get['parameters'] as List;
+      expect(params, hasLength(1));
+      expect((params.first as Map)['name'], 'id');
+      expect((params.first as Map)['in'], 'path');
+
+      // POST /users has no path params -> no parameters key.
+      expect((paths['/users'] as Map)['post'], isNot(contains('parameters')));
+
+      // staticResponse keeps a 200 described as such.
+      final sr = (paths['/files/{wildcard}'] as Map)['get'] as Map;
+      expect(
+        ((sr['responses'] as Map)['200'] as Map)['description'],
+        'Static response',
+      );
+    });
+
+    test('expands `all`; surfaces WebSocket + custom verbs as additional', () {
+      const routes = [
+        RegisteredRoute(
+          method: HttpMethod.all,
+          pattern: '/any',
+          kind: RouteKind.handler,
+        ),
+        RegisteredRoute(
+          method: HttpMethod.get,
+          pattern: '/ws',
+          kind: RouteKind.webSocket,
+        ),
+        RegisteredRoute(
+          method: HttpMethod.custom,
+          customMethod: 'REPORT',
+          pattern: '/report',
+          kind: RouteKind.handler,
+        ),
+      ];
+      final doc = buildOpenApi(routes);
+      final paths = doc['paths'] as Map<String, Object?>;
+      expect(paths.keys, ['/any']); // only `all` is an operation
+      final ops = (paths['/any'] as Map).keys.toSet();
+      expect(ops, containsAll(['get', 'post', 'put', 'patch', 'delete']));
+      expect(((paths['/any'] as Map)['post'] as Map)['summary'], 'POST /any');
+
+      // Non-operation routes are captured, not dropped.
+      final extra = doc['x-additional-routes'] as List;
+      expect(extra, contains(equals({'path': '/ws', 'type': 'websocket'})));
+      expect(
+        extra,
+        contains(
+          equals({'method': 'REPORT', 'path': '/report', 'type': 'custom'}),
+        ),
+      );
+
+      // includeNonStandard: false drops them entirely.
+      final lean = buildOpenApi(routes, includeNonStandard: false);
+      expect(lean.containsKey('x-additional-routes'), isFalse);
+    });
+
+    test('empty pattern becomes root path', () {
+      final doc = buildOpenApi(const [
+        RegisteredRoute(
+          method: HttpMethod.get,
+          pattern: '',
+          kind: RouteKind.handler,
+        ),
+      ]);
+      expect((doc['paths'] as Map).keys, ['/']);
+    });
+
+    test('templates multiple params and a param+wildcard mix', () {
+      final doc = buildOpenApi(const [
+        RegisteredRoute(
+          method: HttpMethod.get,
+          pattern: '/a/:x/b/:y',
+          kind: RouteKind.handler,
+        ),
+        RegisteredRoute(
+          method: HttpMethod.get,
+          pattern: '/tree/:root/*',
+          kind: RouteKind.handler,
+        ),
+      ]);
+      final paths = doc['paths'] as Map<String, Object?>;
+      final p1 = (paths['/a/{x}/b/{y}'] as Map)['get'] as Map;
+      expect(
+        [for (final p in p1['parameters'] as List) (p as Map)['name']],
+        ['x', 'y'],
+      );
+      final p2 = (paths['/tree/{root}/{wildcard}'] as Map)['get'] as Map;
+      expect(
+        [for (final p in p2['parameters'] as List) (p as Map)['name']],
+        ['root', 'wildcard'],
+      );
+    });
+
+    test('merges GET and POST on the same path into one item', () {
+      final doc = buildOpenApi(const [
+        RegisteredRoute(
+          method: HttpMethod.get,
+          pattern: '/thing',
+          kind: RouteKind.handler,
+        ),
+        RegisteredRoute(
+          method: HttpMethod.post,
+          pattern: '/thing',
+          kind: RouteKind.handler,
+        ),
+      ]);
+      final item = (doc['paths'] as Map)['/thing'] as Map;
+      expect(item.keys.toSet(), {'get', 'post'});
+    });
+
+    test('enriches a specific operation and adds servers/security/tags', () {
+      final doc = buildOpenApi(
+        const [
+          RegisteredRoute(
+            method: HttpMethod.get,
+            pattern: '/users/:id',
+            kind: RouteKind.handler,
+          ),
+        ],
+        servers: const [
+          OpenApiServer('https://api.example.com', description: 'prod'),
+        ],
+        securitySchemes: const {
+          'bearer': {'type': 'http', 'scheme': 'bearer'},
+        },
+        security: const [
+          {'bearer': <String>[]},
+        ],
+        tags: const [OpenApiTag('users', description: 'User ops')],
+        operations: const {
+          'GET /users/:id': OpenApiOperation(
+            summary: 'Fetch a user',
+            description: 'Returns one user',
+            tags: ['users'],
+            deprecated: true,
+            parameters: [
+              {
+                'name': 'verbose',
+                'in': 'query',
+                'schema': {'type': 'boolean'},
+              },
+            ],
+            requestBody: {'required': false},
+            responses: {
+              '200': {'description': 'the user'},
+              '404': {'description': 'missing'},
+            },
+            security: [
+              {'bearer': <String>[]},
+            ],
+          ),
+        },
+      );
+      expect((doc['servers'] as List).first, {
+        'url': 'https://api.example.com',
+        'description': 'prod',
+      });
+      expect(((doc['components'] as Map)['securitySchemes'] as Map)['bearer'], {
+        'type': 'http',
+        'scheme': 'bearer',
+      });
+      expect(doc['security'], [
+        {'bearer': <String>[]},
+      ]);
+      expect((doc['tags'] as List).first, {
+        'name': 'users',
+        'description': 'User ops',
+      });
+
+      final op = ((doc['paths'] as Map)['/users/{id}'] as Map)['get'] as Map;
+      expect(op['summary'], 'Fetch a user');
+      expect(op['description'], 'Returns one user');
+      expect(op['tags'], ['users']);
+      expect(op['deprecated'], true);
+      expect(op['requestBody'], {'required': false});
+      expect((op['responses'] as Map).keys, containsAll(['200', '404']));
+      expect(op['security'], [
+        {'bearer': <String>[]},
+      ]);
+      // path param + the extra query param, in order.
+      final names = [
+        for (final p in op['parameters'] as List) (p as Map)['name'],
+      ];
+      expect(names, ['id', 'verbose']);
+    });
+
+    test('server/tag without a description omit the field', () {
+      final doc = buildOpenApi(
+        const [],
+        servers: const [OpenApiServer('http://localhost:8080')],
+        tags: const [OpenApiTag('core')],
+      );
+      expect((doc['servers'] as List).first, {'url': 'http://localhost:8080'});
+      expect((doc['tags'] as List).first, {'name': 'core'});
+      expect(doc.containsKey('security'), isFalse); // none supplied
+      expect(doc.containsKey('components'), isFalse);
+    });
+  });
+
+  group('serveOpenApi', () {
+    late NitroTestClient client;
+    setUp(() => NitroTestClient.start().then((c) => client = c));
+    tearDown(() => client.close());
+
+    test('serves /openapi.json and a version-pinned Swagger UI page', () async {
+      await client.server.get('/ping', (_) => ResponseContext.text('pong'));
+      await serveOpenApi(
+        client.server,
+        title: 'Ping API',
+        uiTitle: 'Ping Docs',
+        swaggerUiVersion: '5.17.14',
+      );
+
+      final spec = await client.get('/openapi.json');
+      expect(spec.status, 200);
+      expect(spec.headers['content-type'], contains('application/json'));
+      final json = spec.json() as Map<String, Object?>;
+      expect((json['info'] as Map)['title'], 'Ping API');
+      expect((json['paths'] as Map).containsKey('/ping'), isTrue);
+
+      final docs = await client.get('/docs');
+      expect(docs.status, 200);
+      expect(docs.text(), contains('swagger-ui-dist@5.17.14'));
+      expect(docs.text(), contains('Ping Docs'));
+      expect(docs.text(), contains('/openapi.json'));
+      expect(docs.text(), contains('deepLinking: true'));
+    });
+
+    test('docsPath null serves only the spec', () async {
+      await serveOpenApi(client.server, docsPath: null, path: '/spec.json');
+      expect((await client.get('/spec.json')).status, 200);
+      expect((await client.get('/docs')).status, 404);
+    });
+
+    test(
+      'defaults: UI title falls back to the API title, UI pinned to v5',
+      () async {
+        await serveOpenApi(client.server, title: 'Defaulted');
+        final docs = await client.get('/docs');
+        expect(docs.status, 200);
+        expect(docs.text(), contains('<title>Defaulted</title>'));
+        expect(docs.text(), contains('swagger-ui-dist@5/'));
+      },
+    );
+  });
+
+  group('OpenApi (seamless wrapper)', () {
+    late NitroTestClient client;
+    setUp(() => NitroTestClient.start().then((c) => client = c));
+    tearDown(() => client.close());
+
+    test('registers real routes and documents them inline', () async {
+      final api = OpenApi(client.server, title: 'Wrapped', version: '9.9');
+      await api.get(
+        '/users/:id',
+        (r) => ResponseContext.text('u${r.param('id')}'),
+        doc: const OpenApiOperation(
+          summary: 'Fetch a user',
+          responses: {
+            '200': {'description': 'the user'},
+          },
+        ),
+      );
+      await api.post(
+        '/users',
+        (_) => ResponseContext.text('made', status: 201),
+      );
+      await api.put('/users/:id', (_) => ResponseContext.text('up'));
+      await api.patch('/users/:id', (_) => ResponseContext.text('pa'));
+      await api.delete('/users/:id', (_) => ResponseContext.text('del'));
+      await api.route(
+        HttpMethod.options,
+        '/users',
+        (_) => ResponseContext.text('opt'),
+        doc: const OpenApiOperation(summary: 'Preflight'),
+      );
+
+      // The routes actually serve.
+      expect((await client.get('/users/7')).text(), 'u7');
+      expect((await client.post('/users')).status, 201);
+
+      // document() reflects the inline docs.
+      final doc = api.document();
+      expect((doc['info'] as Map)['title'], 'Wrapped');
+      final getOp = ((doc['paths'] as Map)['/users/{id}'] as Map)['get'] as Map;
+      expect(getOp['summary'], 'Fetch a user');
+      expect((getOp['responses'] as Map).containsKey('200'), isTrue);
+      // Undocumented route gets the auto skeleton.
+      final postOp = ((doc['paths'] as Map)['/users'] as Map)['post'] as Map;
+      expect(postOp['summary'], 'POST /users');
+      final optOp = ((doc['paths'] as Map)['/users'] as Map)['options'] as Map;
+      expect(optOp['summary'], 'Preflight');
+
+      // serve() exposes it.
+      await api.serve();
+      final spec = await client.get('/openapi.json');
+      expect(spec.status, 200);
+      expect(
+        (((spec.json() as Map)['paths'] as Map)['/users/{id}'] as Map)
+            .containsKey('get'),
+        isTrue,
+      );
+      expect((await client.get('/docs')).status, 200);
+    });
+  });
+}

@@ -197,9 +197,9 @@ class NitroTestClient {
   static Uint8List _encodeBody(Object? body) => switch (body) {
     null => Uint8List(0),
     // Uint8List first: it implements List<int>, and the first match wins.
-    Uint8List bytes => bytes,
-    List<int> bytes => Uint8List.fromList(bytes),
-    String text => Uint8List.fromList(utf8.encode(text)),
+    final Uint8List bytes => bytes,
+    final List<int> bytes => Uint8List.fromList(bytes),
+    final String text => Uint8List.fromList(utf8.encode(text)),
     Map _ => Uint8List.fromList(utf8.encode(jsonEncode(body))),
     _ => throw ArgumentError.value(
       body,
@@ -290,7 +290,6 @@ class NitroTestClient {
     _native.heads.add(
       RawIncomingRequest(
         requestId: id,
-        method: RawServerMethod.get,
         path: clean,
         query: query,
         packedHeaders: packHeaders((headers ?? const {}).entries),
@@ -433,7 +432,7 @@ class _InMemoryNative extends NitroServerNative with NitroServerNativeDefaults {
   @override
   RawServerStatus registerRoute(RawRouteConfig route) {
     routes.add(route);
-    return const RawServerStatus(errorKind: RawServerErrorKind.none);
+    return const RawServerStatus();
   }
 
   @override
@@ -456,7 +455,7 @@ class _InMemoryNative extends NitroServerNative with NitroServerNativeDefaults {
         body: Uint8List.fromList(body),
       ),
     ));
-    return const RawServerStatus(errorKind: RawServerErrorKind.none);
+    return const RawServerStatus();
   }
 
   @override
@@ -471,14 +470,14 @@ class _InMemoryNative extends NitroServerNative with NitroServerNativeDefaults {
       );
     }
     routes.removeAt(index);
-    return const RawServerStatus(errorKind: RawServerErrorKind.none);
+    return const RawServerStatus();
   }
 
   // The client never binds, drains or counts wire state.
   // coverage:ignore-start
   @override
   RawServerStatus start() {
-    return const RawServerStatus(errorKind: RawServerErrorKind.none);
+    return const RawServerStatus();
   }
 
   @override

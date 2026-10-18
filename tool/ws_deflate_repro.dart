@@ -48,7 +48,7 @@ Future<int> _spawn(int port, int perConn, int millis, bool deflate) =>
 
 Future<void> main() async {
   loadNitroServerNative();
-  final mode = const bool.fromEnvironment('dart.vm.product') ? 'AOT' : 'JIT';
+  const mode = bool.fromEnvironment('dart.vm.product') ? 'AOT' : 'JIT';
   final seqMs = _envi('SEQ_MS', 2000);
   final iso = _envi('ISO', 4);
   final conn = _envi('CONN', 8);
@@ -57,7 +57,7 @@ Future<void> main() async {
   final ka = _envi('KA', 1) == 1;
 
   final server = await NitroServer.bind(
-    ServerConfig(port: 0, isolates: 1, maxRequestsPerConnection: ka ? 0 : 100),
+    ServerConfig(maxRequestsPerConnection: ka ? 0 : 100),
   );
   await server.ws('/ws', (s) async {
     await for (final m in s.messages) {

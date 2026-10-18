@@ -18,10 +18,10 @@ import 'dart:ffi';
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:test/test.dart';
 import 'package:nitro_server/nitro_server.dart';
 import 'package:nitro_server/src/internal/instance_keys.dart';
 import 'package:nitro_server/src/internal/native_attach.dart';
+import 'package:test/test.dart';
 
 String? _locateLibrary() {
   final override = Platform.environment['NITRO_SERVER_DYLIB'];

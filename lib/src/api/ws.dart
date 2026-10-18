@@ -149,7 +149,7 @@ Uint8List wsInflate(Uint8List payload) {
 Uint8List _drainFilter(RawZLibFilter filter) {
   final out = BytesBuilder(copy: false);
   while (true) {
-    final chunk = filter.processed(flush: true, end: false);
+    final chunk = filter.processed();
     if (chunk == null) break;
     out.add(chunk);
   }

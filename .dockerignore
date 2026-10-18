@@ -1,0 +1,20 @@
+# Build outputs and local artifacts — the image rebuilds the native lib itself.
+build/
+.dart_tool/
+coverage/
+**/*.so
+**/*.dylib
+**/*.dll
+# Platform scaffolding not needed to build the server.
+android/
+ios/
+macos/
+linux/
+windows/
+example/
+test/
+benchmark/
+docs/
+.git/
+.github/
+*.iml

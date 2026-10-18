@@ -498,10 +498,7 @@ class ServerRunner {
     _ensureListening();
     final status = _native.registerRoute(
       RawRouteConfig(
-        method: RawServerMethod.get,
-        customMethod: '',
         pattern: pattern,
-        timeoutMs: -1,
         isWebSocket: true,
         wsProtocols: protocols.join(','),
       ),

@@ -4,10 +4,10 @@
 // per-chunk ack accounting, event re-broadcast, register failure mapping.
 import 'dart:typed_data';
 
-import 'package:test/test.dart';
 import 'package:nitro_server/nitro_server.dart';
 import 'package:nitro_server/src/internal/server_runner.dart';
 import 'package:nitro_server/src/nitro_server.native.dart';
+import 'package:test/test.dart';
 
 import 'support/fakes.dart';
 
@@ -384,7 +384,7 @@ void main() {
     });
 
     test('start configures then starts, returning the bound port', () {
-      const config = ServerConfig(port: 0, host: '127.0.0.1');
+      const config = ServerConfig();
       final port = runner.start(config);
       expect(port, 8080);
       expect(fake.configureCalls, 1);

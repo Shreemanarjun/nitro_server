@@ -3,10 +3,10 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
-import 'package:test/test.dart';
 import 'package:nitro_server/nitro_server.dart';
 import 'package:nitro_server/src/internal/raw_mapping.dart';
 import 'package:nitro_server/src/nitro_server.native.dart';
+import 'package:test/test.dart';
 
 void main() {
   group('HttpMethod', () {
@@ -79,7 +79,6 @@ void main() {
       expect(
         throwIfFailed(
           const RawServerStatus(
-            errorKind: RawServerErrorKind.none,
             boundPort: 4567,
           ),
           operation: 'start',
@@ -289,7 +288,7 @@ void main() {
       expect(list, [1, 2]);
       expect(withBody('"text"').jsonAs<String>(), 'text');
       // Valid JSON of the wrong shape fails loudly, never a late cast error.
-      expect(() => object.jsonList(), throwsFormatException);
+      expect(object.jsonList, throwsFormatException);
       expect(() => withBody('[1]').jsonMap(), throwsFormatException);
       expect(() => withBody('{').jsonMap(), throwsFormatException);
     });

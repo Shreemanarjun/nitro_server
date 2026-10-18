@@ -4,9 +4,9 @@
 import 'dart:async';
 
 import 'package:nitro/nitro.dart';
-import 'package:test/test.dart';
 import 'package:nitro_server/nitro_server.dart';
 import 'package:nitro_server/testing.dart';
+import 'package:test/test.dart';
 
 void main() {
   late NitroTestClient client;

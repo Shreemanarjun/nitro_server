@@ -1,0 +1,13 @@
+# Local/compose deploy. `docker compose up --build`.
+services:
+  nitro:
+    build: .
+    image: nitro-server
+    ports:
+      - "8080:8080"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8080
+    restart: unless-stopped
+    # Give the SIGTERM drain (15s in bin/server.dart) time before SIGKILL.
+    stop_grace_period: 20s

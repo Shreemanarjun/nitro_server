@@ -1,0 +1,78 @@
+# Builds the self-contained engine prebuilts and attaches them to the GitHub
+# Release for a `v*` tag. Each is built with ALL features
+# (`-DNITRO_SERVER_HTTP2=ON` + TLS + brotli) and `-DNITRO_SERVER_STATIC_DEPS=ON`
+# so libuv/OpenSSL/brotli/nghttp2 are statically linked — one file, no system
+# libraries on the consumer. `hook/build.dart` downloads the matching asset by
+# `libnitro_server-<os>-<arch>.<ext>` and verifies the `.sha256` sidecar.
+#
+# Asset names MUST match hook/build.dart: <os> in {macos,linux,windows},
+# <arch> in {arm64,x64} (Architecture.name), <ext> in {dylib,so,dll}.
+name: release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write  # create the release + upload assets
+
+jobs:
+  prebuilt:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14,       tag: macos-arm64,   lib: libnitro_server.dylib, out: libnitro_server-macos-arm64.dylib }
+          - { os: macos-13,       tag: macos-x64,     lib: libnitro_server.dylib, out: libnitro_server-macos-x64.dylib }
+          - { os: ubuntu-24.04,   tag: linux-x64,     lib: libnitro_server.so,    out: libnitro_server-linux-x64.so }
+          - { os: ubuntu-24.04-arm, tag: linux-arm64, lib: libnitro_server.so,    out: libnitro_server-linux-arm64.so }
+          - { os: windows-latest, tag: windows-x64,   lib: nitro_server.dll,      out: libnitro_server-windows-x64.dll }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Dependencies with their static archives. macOS (Homebrew) and Linux
+      # (apt -dev packages) ship the `.a`; the engine's pkg-config/CONFIG
+      # detection + NITRO_SERVER_STATIC_DEPS pick them. Windows uses the vcpkg
+      # static triplet (TLS + libuv today; brotli/h2 parity is a follow-up —
+      # the engine's brotli/nghttp2 detection is pkg-config-based).
+      - if: runner.os == 'macOS'
+        run: brew install cmake pkg-config openssl@3 libuv brotli nghttp2
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake pkg-config libssl-dev libuv1-dev libbrotli-dev libnghttp2-dev
+      - if: runner.os == 'Windows'
+        run: vcpkg install libuv openssl --triplet x64-windows-static-md
+
+      - name: Configure + build (all features, static deps)
+        shell: bash
+        run: |
+          EXTRA=""
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            EXTRA="-DCMAKE_TOOLCHAIN_FILE=$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows-static-md"
+          fi
+          cmake -S src -B build/rel -DCMAKE_BUILD_TYPE=Release \
+            -DNITRO_SERVER_HTTP2=ON -DNITRO_SERVER_STATIC_DEPS=ON $EXTRA
+          cmake --build build/rel --config Release --parallel
+
+      - name: Stage artifact + SHA-256 sidecar
+        shell: bash
+        run: |
+          mkdir -p dist
+          # Locate the built library (generator layout varies).
+          SRC=$(find build/rel -name '${{ matrix.lib }}' -type f | head -1)
+          test -n "$SRC" || { echo "library ${{ matrix.lib }} not found"; exit 1; }
+          cp "$SRC" "dist/${{ matrix.out }}"
+          cd dist
+          if command -v shasum >/dev/null; then
+            shasum -a 256 "${{ matrix.out }}" > "${{ matrix.out }}.sha256"
+          else
+            certutil -hashfile "${{ matrix.out }}" SHA256 | sed -n 2p | tr -d ' \r' > "${{ matrix.out }}.sha256"
+          fi
+          cat "${{ matrix.out }}.sha256"
+
+      - name: Upload to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/${{ matrix.out }}
+            dist/${{ matrix.out }}.sha256

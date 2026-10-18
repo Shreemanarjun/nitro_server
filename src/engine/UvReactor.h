@@ -141,6 +141,13 @@ class UvReactor {
       std::string bytes;
       bool keepAlive;
       bool finish;  // true = last write of the answer (resume/close after)
+      // HTTP/2: when set, onAsync routes this to the connection's Http2Session
+      // (respond on the loop thread) instead of writing HTTP/1.1 bytes. `bytes`
+      // carries the response body; the head fields ride alongside.
+      bool isH2 = false;
+      int64_t h2ReqId = 0;
+      int h2Status = 0;
+      std::vector<Header> h2Headers;
     };
     std::vector<Pending> queue;
     bool stopping = false;  // set cross-thread; acted on by onAsync (loop thread)
@@ -161,6 +168,7 @@ class UvReactor {
     int64_t connId;
     bool isHead;
     bool keepAlive;
+    bool isH2 = false;  // answer routes to the conn's Http2Session, not raw write
   };
 
   static void onConnection(uv_stream_t* server, int status);
@@ -177,6 +185,11 @@ class UvReactor {
   void emitStreamBytes(Conn* c);        // stream a Content-Length streamBody
   void emitStreamChunked(Conn* c);      // stream a chunked streamBody
   void abortStreamTooLarge(Conn* c);    // chunked upload over the body cap: 413
+#ifdef NITRO_SERVER_HTTP2
+  void createH2Session(Conn* c);        // attach an Http2Session (loop thread)
+  bool feedH2(Conn* c);                 // feed buffered bytes to the session
+  int loopIndexOf(const Conn* c) const; // this conn's loop index, for reqLoc
+#endif
   void wsProcess(Conn* c);              // decode WebSocket frames (loop thread)
   void wsCloseConn(Conn* c, int code);  // send a close frame + close (loop thread)
 #ifdef NITRO_SERVER_TLS
@@ -253,6 +266,18 @@ class UvReactor {
   // reqId -> where to send the answer. Guarded (respond is cross-thread).
   std::mutex reqMutex_;
   std::unordered_map<int64_t, ReqLoc> reqLoc_;
+#ifdef NITRO_SERVER_HTTP2
+  // h2 has no chunked framing: a streamed response (startStream + chunks) is
+  // buffered per request and sent as one DATA body on the terminal chunk.
+  // ponytail: buffers the whole streamed body — true per-frame h2 DATA
+  // streaming is the documented long-tail. Guarded by reqMutex_.
+  struct H2StreamAccum {
+    int status = 0;
+    std::vector<Header> headers;
+    std::string body;
+  };
+  std::unordered_map<int64_t, H2StreamAccum> h2StreamAccum_;
+#endif
   // WebSocket connId -> loop index, for cross-thread wsSend/wsClose routing.
   std::unordered_map<int64_t, int> wsConnLoop_;
   // Live connections per remote IP, for maxConnectionsPerIp. Accepts land on

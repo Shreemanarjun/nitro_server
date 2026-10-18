@@ -567,15 +567,22 @@ void main() {
       expect(base.writeTimeout, const Duration(seconds: 30));
       expect(base.wsMaxBufferBytes, 1024 * 1024);
       expect(base.wsCompression, isTrue);
+      expect(
+        base.protocol,
+        HttpProtocol.http2,
+      ); // ships all protocols by default
       final c = base.copyWith(
         writeTimeout: const Duration(seconds: 1),
         wsMaxBufferBytes: 4096,
         wsCompression: false,
+        protocol: HttpProtocol.http1,
       );
       expect(c.writeTimeout, const Duration(seconds: 1));
       expect(c.wsMaxBufferBytes, 4096);
       expect(c.wsCompression, isFalse);
+      expect(c.protocol, HttpProtocol.http1);
       expect(c.copyWith(port: 1).wsMaxBufferBytes, 4096);
+      expect(c.copyWith(port: 1).protocol, HttpProtocol.http1); // sticky
       expect(
         () => ServerConfig(wsMaxBufferBytes: 0),
         throwsA(isA<AssertionError>()),
@@ -775,6 +782,28 @@ void main() {
       expect(
         ServerConfig.fromEnv(const {'WS_COMPRESSION': 'nope'}).wsCompression,
         isFalse,
+      );
+    });
+
+    test('HTTP_PROTOCOL parses the protocol enum', () {
+      expect(const ServerConfig().protocol, HttpProtocol.http2); // default
+      expect(
+        ServerConfig.fromEnv(const {'HTTP_PROTOCOL': 'http1.1'}).protocol,
+        HttpProtocol.http1,
+      );
+      expect(
+        ServerConfig.fromEnv(const {'HTTP_PROTOCOL': 'h2'}).protocol,
+        HttpProtocol.http2,
+      );
+      expect(
+        ServerConfig.fromEnv(const {'HTTP_PROTOCOL': '3'}).protocol,
+        HttpProtocol.http3,
+      );
+      // Unset / unknown leaves the base default untouched.
+      expect(ServerConfig.fromEnv(const {}).protocol, HttpProtocol.http2);
+      expect(
+        ServerConfig.fromEnv(const {'HTTP_PROTOCOL': 'spdy'}).protocol,
+        HttpProtocol.http2,
       );
     });
   });

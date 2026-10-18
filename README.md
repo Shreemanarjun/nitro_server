@@ -29,9 +29,64 @@ Future<void> main() async {
 dart pub add nitro_server
 ```
 
-The native engine library is built from source with cmake (see
-[Developing](#developing)); `bind` loads it automatically. For containers, use
-the provided [`Dockerfile`](Dockerfile).
+**No toolchain needed for released versions.** A native-assets build hook
+([`hook/build.dart`](hook/build.dart)) runs on `dart build`/`run`/`test`: it
+downloads the prebuilt engine for your OS+arch from the matching GitHub release
+(SHA-256-verified), and `dart build cli` bundles it beside the executable. The
+prebuilts are **self-contained** — libuv/OpenSSL/brotli/nghttp2 statically
+linked, all protocols compiled in — so a consumer needs **no cmake and no system
+libraries**. (Pick the protocol at runtime with `ServerConfig(protocol:)`.) For
+containers, the provided [`Dockerfile`](Dockerfile) bakes everything in.
+
+### Prerequisites (only for building from source)
+
+You only need a toolchain to build the engine yourself — on an unreleased
+version, an exotic OS/arch the release doesn't cover, or with
+`NITRO_SERVER_BUILD_FROM_SOURCE=1`. That needs a **C++17 compiler**,
+**CMake ≥ 3.10**, and the Dart SDK (≥ 3.12) or Flutter SDK (≥ 3.10), plus a few
+native libraries. Only **libuv** is required; the rest unlock optional features
+and are **auto-detected at build time** (present → enabled, absent → cleanly
+skipped):
+
+| Library | Enables | Required? |
+|---------|---------|-----------|
+| **libuv** | the reactor I/O core | **yes** (build fails without it) |
+| OpenSSL 3 | TLS / HTTPS (and h2 over TLS) | optional, auto-detected |
+| libbrotli | `compress()` `br` encoding (else gzip) | optional, auto-detected |
+| nghttp2 | **HTTP/2** (also pass `-DNITRO_SERVER_HTTP2=ON`) | optional |
+
+**Install everything in one shot** — the simplest path, so you never hit a
+piecemeal "libX not found" during the build:
+
+```sh
+# macOS (Homebrew)
+brew install cmake pkg-config libuv openssl@3 brotli nghttp2
+
+# Debian / Ubuntu
+sudo apt-get install -y cmake pkg-config libuv1-dev libssl-dev libbrotli-dev libnghttp2-dev
+
+# Windows (vcpkg) — then configure with the vcpkg toolchain file
+vcpkg install libuv openssl brotli nghttp2 --triplet x64-windows
+```
+
+Then build the engine (TLS/brotli light up automatically from the libs above;
+add the flag to also get HTTP/2):
+
+```sh
+cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release -DNITRO_SERVER_HTTP2=ON
+cmake --build build/lib --parallel
+```
+
+Minimal build (HTTP/1.1 + WebSocket only, no TLS/brotli/h2) needs just libuv:
+`brew install cmake libuv` / `apt-get install -y cmake libuv1-dev`. Detection
+uses `pkg-config` then CMake config then Homebrew prefixes; point it at a custom
+location with `-DOPENSSL_ROOT_DIR=…` or `PKG_CONFIG_PATH`.
+
+**For deployment, avoid the prerequisites on the target host entirely:**
+`dart run nitro_server:nitro build --bundle-deps` compiles a self-contained
+executable with libuv/OpenSSL/brotli/nghttp2 copied next to it and the load
+paths rewritten (macOS/Linux) — copy the folder and run, no system libs needed.
+Or ship the [`Dockerfile`](Dockerfile) image, which has them baked in.
 
 ## Features
 
@@ -276,6 +331,7 @@ final server = await NitroServer.bind(
 | `wsMaxBufferBytes`, `wsCompression` | 1 MiB, `true` | WebSocket send queue before a 1009 close; negotiate `permessage-deflate` |
 | `responseTiming` | `true` | add `Server-Timing: app;dur=<ms>` (dispatch→answer) to every handler answer; browsers show it in DevTools. Set `false` to shave one string per response at peak throughput |
 | `tls` | none | `TlsConfig(certPem:, keyPem:)` or `certFile`/`keyFile`; throws `ServerTlsException` unless the engine was built with OpenSSL |
+| `protocol` | `HttpProtocol.http2` | highest HTTP version to negotiate, in one knob: `http1` (HTTP/1.1 only), `http2` (adds `h2` via ALPN/h2c, falls back to 1.1), `http3` (reserved). Caps at what the engine was built with |
 
 ## Testing
 
@@ -322,8 +378,10 @@ a convenience, not a requirement.
 and the loader searches the executable's own directory first — so `build/server`
 runs from any working directory. Keep the `.dylib`/`.so`/`.dll` beside the
 binary when you move it. The native library still links its system deps (libuv,
-and OpenSSL/brotli if built in); to run on a machine without them, deploy the
-provided [`Dockerfile`](Dockerfile), which bundles everything.
+and OpenSSL/brotli/nghttp2 if built in); to run on a host without them, build
+with **`nitro build --bundle-deps`** (copies every native dep next to the exe
+and rewrites the load paths — see [Prerequisites](#prerequisites)) or deploy the
+provided [`Dockerfile`](Dockerfile), which bakes them in.
 
 ## Hot reload
 
@@ -379,8 +437,14 @@ coordinated-omission-free latency, overload, CPU/core, memory, AOT vs JIT):
 
 ## Limitations
 
-- **HTTP/1.1 only** — no HTTP/2 or HTTP/3 yet. Design + plan in
-  [`docs/http2.md`](docs/http2.md); terminate h2 at a proxy in the meantime.
+- **HTTP/2** ships in the engine when built with `-DNITRO_SERVER_HTTP2=ON`
+  (+ nghttp2): live over TLS (ALPN `h2`) and h2c, 136/145 h2spec — see
+  [`docs/http2.md`](docs/http2.md) / [`docs/conformance.md`](docs/conformance.md).
+  It is **on by default and selectable per server at runtime** —
+  `ServerConfig(protocol: HttpProtocol.http1)` forces HTTP/1.1, `.http2` enables
+  h2 — no rebuild needed. The default engine build (no flag) is HTTP/1.1 +
+  WebSocket. **HTTP/3** is not implemented ([`docs/http3.md`](docs/http3.md));
+  terminate h3 at a proxy.
 - **Not serverless.** It is a persistent native process (a Dart binary + the
   engine library); it runs on containers/VMs, not on function platforms.
 - **State is shared by default.** The default build runs one isolate, so all

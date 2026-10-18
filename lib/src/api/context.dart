@@ -31,6 +31,24 @@ class TlsConfig {
       keyFile.isNotEmpty;
 }
 
+/// The highest HTTP version a server negotiates (see [ServerConfig.protocol]).
+/// Each level includes the ones below it: HTTP/1.1 is always served, and a
+/// higher value *additionally* offers that version, with older clients falling
+/// back. A level beyond what the engine was built with is capped to the built-in
+/// maximum.
+enum HttpProtocol {
+  /// HTTP/1.1 only (plus WebSocket). No `h2`/`h3` negotiation.
+  http1,
+
+  /// Up to HTTP/2 — negotiate `h2` over TLS (ALPN) or h2c prior-knowledge, and
+  /// fall back to HTTP/1.1. The default. Needs the engine built with HTTP/2.
+  http2,
+
+  /// Up to HTTP/3 (QUIC). Not yet implemented — currently behaves as [http2]
+  /// (see docs/http3.md); reserved so configs are forward-compatible.
+  http3,
+}
+
 /// Tuning for one bound server.
 class ServerConfig {
   /// [host] is an IPv4 literal (`'127.0.0.1'`), the wildcard `'0.0.0.0'`,
@@ -52,6 +70,7 @@ class ServerConfig {
     this.writeTimeout = const Duration(seconds: 30),
     this.wsMaxBufferBytes = 1024 * 1024,
     this.wsCompression = true,
+    this.protocol = HttpProtocol.http2,
     this.responseTiming = true,
     this.tls = const TlsConfig(),
   }) : assert(port >= 0 && port <= 65535, 'port out of range: $port'),
@@ -128,6 +147,16 @@ class ServerConfig {
   /// Negotiate `permessage-deflate` when a WebSocket client offers it.
   final bool wsCompression;
 
+  /// Highest HTTP version this server negotiates, in one knob. HTTP/1.1 (and
+  /// WebSocket) is always served; a higher setting *additionally* offers that
+  /// version — [HttpProtocol.http2] negotiates `h2` over TLS (ALPN) or h2c and
+  /// falls back to HTTP/1.1 for older clients. Defaults to
+  /// [HttpProtocol.http2]; set [HttpProtocol.http1] to force HTTP/1.1 without
+  /// rebuilding the engine. Requires the engine built with support for the
+  /// version (e.g. `-DNITRO_SERVER_HTTP2=ON`); otherwise it caps at what was
+  /// built in.
+  final HttpProtocol protocol;
+
   /// Add a `Server-Timing: app;dur=<ms>` header to every handler answer —
   /// the time from dispatch to answer, which browsers surface in DevTools
   /// (Network → Timing) and any client can read. On by default; set `false`
@@ -158,6 +187,7 @@ class ServerConfig {
     Duration? writeTimeout,
     int? wsMaxBufferBytes,
     bool? wsCompression,
+    HttpProtocol? protocol,
     bool? responseTiming,
     TlsConfig? tls,
   }) {
@@ -178,6 +208,7 @@ class ServerConfig {
       writeTimeout: writeTimeout ?? this.writeTimeout,
       wsMaxBufferBytes: wsMaxBufferBytes ?? this.wsMaxBufferBytes,
       wsCompression: wsCompression ?? this.wsCompression,
+      protocol: protocol ?? this.protocol,
       responseTiming: responseTiming ?? this.responseTiming,
       tls: tls ?? this.tls,
     );
@@ -214,6 +245,19 @@ class ServerConfig {
       return v == 'true' || v == '1' || v == 'yes' || v == 'on';
     }
 
+    HttpProtocol? asProtocol(String key) {
+      switch (environment[key]?.toLowerCase().replaceAll('.', '')) {
+        case 'http1' || 'http11' || '1' || '11':
+          return HttpProtocol.http1;
+        case 'http2' || 'h2' || '2':
+          return HttpProtocol.http2;
+        case 'http3' || 'h3' || '3':
+          return HttpProtocol.http3;
+        case _:
+          return null;
+      }
+    }
+
     final host = environment['HOST'];
     return base.copyWith(
       host: host != null && host.isNotEmpty ? host : null,
@@ -227,6 +271,7 @@ class ServerConfig {
       defaultTimeout: asMs('DEFAULT_TIMEOUT_MS'),
       responseTiming: asBool('RESPONSE_TIMING'),
       wsCompression: asBool('WS_COMPRESSION'),
+      protocol: asProtocol('HTTP_PROTOCOL'),
     );
   }
 }

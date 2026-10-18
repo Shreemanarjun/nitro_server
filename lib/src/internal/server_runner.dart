@@ -556,6 +556,9 @@ class ServerRunner {
         writeTimeoutMs: config.writeTimeout.inMilliseconds,
         wsMaxBufferBytes: config.wsMaxBufferBytes,
         wsCompression: config.wsCompression,
+        // HTTP/1.1 is always served; the engine's h2 path turns on for http2
+        // and above (h3 is not implemented yet, so it caps at h2).
+        http2: config.protocol != HttpProtocol.http1,
         tls: RawTlsConfig(
           certPem: config.tls.certPem,
           keyPem: config.tls.keyPem,

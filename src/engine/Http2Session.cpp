@@ -22,11 +22,14 @@ namespace nitroserver {
 // (only non-throwing ops) and returns an nghttp2 error code on trouble.
 
 Http2Session::Http2Session(Emitter* emitter, const Router& router, WriteSink sink,
-                           std::string clientIp)
+                           std::string clientIp, int64_t maxBodyBytes,
+                           IdAllocator allocId)
     : emitter_(emitter),
       router_(router),
       sink_(std::move(sink)),
-      clientIp_(std::move(clientIp)) {
+      clientIp_(std::move(clientIp)),
+      maxBodyBytes_(maxBodyBytes),
+      allocId_(std::move(allocId)) {
   nghttp2_session_callbacks* cbs = nullptr;
   nghttp2_session_callbacks_new(&cbs);
   nghttp2_session_callbacks_set_on_begin_headers_callback(cbs, onBeginHeaders);
@@ -115,9 +118,16 @@ int Http2Session::onHeader(nghttp2_session*, const nghttp2_frame* frame,
 int Http2Session::onDataChunk(nghttp2_session*, uint8_t, int32_t streamId,
                               const uint8_t* data, size_t len, void* user) {
   auto* self = static_cast<Http2Session*>(user);
-  if (Stream* st = self->streamFor(streamId)) {
-    st->body.append(reinterpret_cast<const char*>(data), len);
+  Stream* st = self->streamFor(streamId);
+  if (!st || st->rejected) return 0;  // already refused: stop buffering (bound)
+  // Enforce the body cap as it accrues — catches a chunked upload or a client
+  // that under-declared content-length. Refuse before the handler ever runs.
+  if (self->maxBodyBytes_ > 0 &&
+      static_cast<int64_t>(st->body.size() + len) > self->maxBodyBytes_) {
+    self->rejectOversize(streamId, st);
+    return 0;
   }
+  st->body.append(reinterpret_cast<const char*>(data), len);
   return 0;
 }
 
@@ -127,7 +137,7 @@ int Http2Session::onDataChunk(nghttp2_session*, uint8_t, int32_t streamId,
 // routing, not for streaming uploads. To stream, move emitHead to the HEADERS
 // frame (bodyComplete=false) and emit per onDataChunk; emitBodyEnd on last DATA.
 void Http2Session::emitComplete(Stream* st, int32_t streamId) {
-  st->requestId = nextId_++;
+  st->requestId = allocId_ ? allocId_() : nextId_++;
   reqToStream_[st->requestId] = streamId;
   const MatchResult m = router_.match(st->method, st->customMethod, st->path);
   const bool hasBody = !st->body.empty();
@@ -151,16 +161,44 @@ void Http2Session::emitComplete(Stream* st, int32_t streamId) {
 
 int Http2Session::onFrameRecv(nghttp2_session*, const nghttp2_frame* frame,
                               void* user) {
+  auto* self = static_cast<Http2Session*>(user);
+  // A declared body over the cap: refuse on the HEADERS frame, before the body
+  // arrives (parity with the HTTP/1.1 "413 before buffering" path).
+  if (frame->hd.type == NGHTTP2_HEADERS &&
+      frame->headers.cat == NGHTTP2_HCAT_REQUEST) {
+    if (Stream* st = self->streamFor(frame->hd.stream_id)) {
+      if (!st->rejected && self->maxBodyBytes_ > 0 &&
+          st->contentLength > self->maxBodyBytes_) {
+        self->rejectOversize(frame->hd.stream_id, st);
+      }
+    }
+  }
   // Request complete when END_STREAM lands on the HEADERS (bodyless GET) or the
   // final DATA (POST). nghttp2 has already enforced pseudo-header validity.
   if ((frame->hd.type == NGHTTP2_HEADERS || frame->hd.type == NGHTTP2_DATA) &&
       (frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
-    auto* self = static_cast<Http2Session*>(user);
     if (Stream* st = self->streamFor(frame->hd.stream_id)) {
-      self->emitComplete(st, frame->hd.stream_id);
+      if (!st->rejected) self->emitComplete(st, frame->hd.stream_id);
     }
   }
   return 0;
+}
+
+// A request body exceeded the cap. The head has not been emitted yet (we emit
+// only at END_STREAM), so there is no handler to abort: answer 413 directly,
+// drop what we buffered, and mark the stream so END_STREAM does not dispatch.
+// Only queue the frame here — feed()'s epilogue pumps it (mem_send must not be
+// called re-entrantly from inside a recv callback).
+void Http2Session::rejectOversize(int32_t streamId, Stream* st) {
+  st->rejected = true;
+  st->body.clear();
+  st->body.shrink_to_fit();
+  std::string status = std::to_string(413);
+  static const char kStatus[] = ":status";
+  nghttp2_nv nv[] = {{reinterpret_cast<uint8_t*>(const_cast<char*>(kStatus)),
+                      reinterpret_cast<uint8_t*>(status.data()),
+                      sizeof(kStatus) - 1, status.size(), NGHTTP2_NV_FLAG_NONE}};
+  nghttp2_submit_response(sess_, streamId, nv, 1, nullptr);
 }
 
 int Http2Session::onStreamClose(nghttp2_session*, int32_t streamId, uint32_t,
@@ -188,12 +226,16 @@ ssize_t Http2Session::readBody(nghttp2_session*, int32_t, uint8_t* buf,
 void Http2Session::respond(int64_t requestId, int status,
                            const std::vector<Header>& headers,
                            std::string body) {
+  if (stopped_) return;  // draining/torn down: a late answer is a no-op
   const auto it = reqToStream_.find(requestId);
   if (it == reqToStream_.end()) return;  // stream already closed/reset
   const int32_t streamId = it->second;
   Stream* st = streamFor(streamId);
   if (!st) return;
-  st->respBody = std::move(body);
+  // A HEAD response carries the same headers a GET would but no body bytes
+  // (RFC 9110 §9.3.2), matching the HTTP/1.1 path's HEAD handling.
+  const bool isHead = st->method == Method::Head;
+  st->respBody = isHead ? std::string{} : std::move(body);
   st->respOff = 0;
 
   // Build the nghttp2_nv array: :status first, then regular headers. The
@@ -241,6 +283,7 @@ void Http2Session::pump() {
 }
 
 bool Http2Session::feed(const uint8_t* data, size_t len) {
+  if (stopped_) return false;  // draining/torn down: ignore stray inbound bytes
   const ssize_t rv = nghttp2_session_mem_recv(sess_, data, len);
   if (rv < 0) return false;  // fatal: caller tears the connection down
   pump();

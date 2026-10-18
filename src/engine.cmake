@@ -1,3 +1,12 @@
+# ── Static dependency linking (optional) ─────────────────────────────────────
+# -DNITRO_SERVER_STATIC_DEPS=ON links libuv/OpenSSL/brotli/nghttp2 as static
+# archives so the engine library is self-contained — the shape the release
+# prebuilts ship (`hook/build.dart` downloads one, no system libs needed). Needs
+# the static archives (`.a`/`.lib`) installed for each dep; the release workflow
+# arranges that per platform. Off by default: a normal build links the usual
+# shared libraries.
+option(NITRO_SERVER_STATIC_DEPS "Statically link native deps into the engine" OFF)
+
 # ── TLS (OpenSSL, optional) ──────────────────────────────────────────────────
 # Links OpenSSL and defines NITRO_SERVER_TLS when it is found; otherwise the
 # engine builds without TLS and `supportsTls()` reports false (a TLS config
@@ -11,6 +20,9 @@ function(nitro_server_attach_tls target)
         break()
       endif()
     endforeach()
+  endif()
+  if(NITRO_SERVER_STATIC_DEPS)
+    set(OPENSSL_USE_STATIC_LIBS ON)  # honoured by FindOpenSSL: picks lib*.a
   endif()
   find_package(OpenSSL QUIET)
   if(OpenSSL_FOUND)
@@ -32,7 +44,10 @@ endfunction()
 function(nitro_server_attach_libuv target)
   find_package(libuv CONFIG QUIET)
   if(libuv_FOUND)
-    if(TARGET libuv::uv)
+    # Static build prefers the static archive target (libuv::uv_a).
+    if(NITRO_SERVER_STATIC_DEPS AND TARGET libuv::uv_a)
+      target_link_libraries(${target} PRIVATE libuv::uv_a)
+    elseif(TARGET libuv::uv)
       target_link_libraries(${target} PRIVATE libuv::uv)
     elseif(TARGET libuv::uv_a)
       target_link_libraries(${target} PRIVATE libuv::uv_a)
@@ -45,8 +60,13 @@ function(nitro_server_attach_libuv target)
   if(PkgConfig_FOUND)
     pkg_check_modules(LIBUV QUIET libuv)
     if(LIBUV_FOUND)
+      if(NITRO_SERVER_STATIC_DEPS AND LIBUV_STATIC_LIBRARIES)
+        set(_uv_libs ${LIBUV_STATIC_LIBRARIES})
+      else()
+        set(_uv_libs ${LIBUV_LIBRARIES})
+      endif()
       target_include_directories(${target} PRIVATE ${LIBUV_INCLUDE_DIRS})
-      target_link_libraries(${target} PRIVATE ${LIBUV_LIBRARIES})
+      target_link_libraries(${target} PRIVATE ${_uv_libs})
       target_link_directories(${target} PRIVATE ${LIBUV_LIBRARY_DIRS})
       target_compile_definitions(${target} PRIVATE NITRO_SERVER_LIBUV=1)
       message(STATUS "nitro_server: libuv found (pkg-config ${LIBUV_VERSION})")
@@ -54,7 +74,11 @@ function(nitro_server_attach_libuv target)
     endif()
   endif()
   # Last-resort fallback (no pkg-config): hint well-known prefixes directly,
-  # including the bare `/usr` where Linux distro packages (libuv1-dev) land.
+  # including the bare `/usr` where Linux distro packages (libuv1-dev) land. A
+  # static build restricts the search to archives (.a) so libuv links statically.
+  if(NITRO_SERVER_STATIC_DEPS)
+    set(CMAKE_FIND_LIBRARY_SUFFIXES .a)  # function-scoped: only affects libuv here
+  endif()
   foreach(cand /opt/homebrew /usr/local /usr /opt/homebrew/opt/libuv /usr/local/opt/libuv)
     if(EXISTS "${cand}/include/uv.h")
       target_include_directories(${target} PRIVATE "${cand}/include")
@@ -82,8 +106,25 @@ function(nitro_server_attach_brotli target)
   if(PkgConfig_FOUND)
     pkg_check_modules(BROTLI QUIET libbrotlienc libbrotlidec libbrotlicommon)
     if(BROTLI_FOUND)
+      set(_brotli_libs ${BROTLI_LIBRARIES})
+      if(NITRO_SERVER_STATIC_DEPS)
+        set(CMAKE_FIND_LIBRARY_SUFFIXES .a)  # resolve archives, not the .dylib
+        set(_brotli_a "")
+        foreach(_c brotlienc brotlidec brotlicommon)
+          find_library(NITRO_BROTLI_${_c}_A NAMES ${_c}
+            HINTS ${BROTLI_LIBRARY_DIRS} /opt/homebrew/lib /usr/local/lib /usr/lib)
+          if(NITRO_BROTLI_${_c}_A)
+            list(APPEND _brotli_a ${NITRO_BROTLI_${_c}_A})
+          endif()
+        endforeach()
+        # enc+dec+common must all resolve as archives, else keep the shared libs.
+        list(LENGTH _brotli_a _n)
+        if(_n EQUAL 3)
+          set(_brotli_libs ${_brotli_a})
+        endif()
+      endif()
       target_include_directories(${target} PRIVATE ${BROTLI_INCLUDE_DIRS})
-      target_link_libraries(${target} PRIVATE ${BROTLI_LIBRARIES})
+      target_link_libraries(${target} PRIVATE ${_brotli_libs})
       target_link_directories(${target} PRIVATE ${BROTLI_LIBRARY_DIRS})
       target_compile_definitions(${target} PRIVATE NITRO_SERVER_BROTLI=1)
       message(STATUS "nitro_server: Brotli enabled (pkg-config ${BROTLI_libbrotlienc_VERSION})")
@@ -110,9 +151,9 @@ endfunction()
 
 # ── HTTP/2 (nghttp2, optional, off by default) ───────────────────────────────
 # Opt in with -DNITRO_SERVER_HTTP2=ON. When requested AND nghttp2 is found,
-# links it and defines NITRO_SERVER_HTTP2=1 so the engine's (in-progress) h2
-# path compiles; otherwise the engine stays HTTP/1.1-only and never advertises
-# `h2` over ALPN. See docs/http2.md for the implementation plan.
+# links it and defines NITRO_SERVER_HTTP2=1 so the engine serves HTTP/2 (ALPN
+# `h2` over TLS, and h2c); otherwise the engine stays HTTP/1.1-only and never
+# advertises `h2` over ALPN. See docs/http2.md.
 option(NITRO_SERVER_HTTP2 "Build with HTTP/2 (nghttp2)" OFF)
 function(nitro_server_attach_http2 target)
   if(NOT NITRO_SERVER_HTTP2)
@@ -122,8 +163,19 @@ function(nitro_server_attach_http2 target)
   if(PkgConfig_FOUND)
     pkg_check_modules(NGHTTP2 QUIET libnghttp2)
     if(NGHTTP2_FOUND)
+      set(_nghttp2_libs ${NGHTTP2_LIBRARIES})
+      if(NITRO_SERVER_STATIC_DEPS)
+        # pkg-config's static list is link names the linker still resolves to
+        # the shared lib, so resolve the archive path explicitly.
+        set(CMAKE_FIND_LIBRARY_SUFFIXES .a)
+        find_library(NITRO_NGHTTP2_A NAMES nghttp2
+          HINTS ${NGHTTP2_LIBRARY_DIRS} /opt/homebrew/lib /usr/local/lib /usr/lib)
+        if(NITRO_NGHTTP2_A)
+          set(_nghttp2_libs ${NITRO_NGHTTP2_A})
+        endif()
+      endif()
       target_include_directories(${target} PRIVATE ${NGHTTP2_INCLUDE_DIRS})
-      target_link_libraries(${target} PRIVATE ${NGHTTP2_LIBRARIES})
+      target_link_libraries(${target} PRIVATE ${_nghttp2_libs})
       target_link_directories(${target} PRIVATE ${NGHTTP2_LIBRARY_DIRS})
       target_compile_definitions(${target} PRIVATE NITRO_SERVER_HTTP2=1)
       message(STATUS "nitro_server: HTTP/2 enabled (nghttp2 ${NGHTTP2_libnghttp2_VERSION})")
@@ -158,6 +210,8 @@ set(NITRO_SERVER_ENGINE_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/engine/EngineRegistry.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/engine/UvReactor.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/engine/Brotli.cpp"
+  # Fully #ifdef NITRO_SERVER_HTTP2-guarded: compiles to nothing by default.
+  "${CMAKE_CURRENT_SOURCE_DIR}/engine/Http2Session.cpp"
 )
 
 function(nitro_server_attach_engine target)

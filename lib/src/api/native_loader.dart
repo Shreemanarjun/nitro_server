@@ -72,6 +72,10 @@ List<String> nitroServerLibraryCandidates({
     // self-contained layouts for a `dart compile exe` binary.
     '$exeDir/$name',
     '$exeDir/lib/$name',
+    // `dart build cli` bundles the native-assets library one level up, in
+    // `<bundle>/lib/` beside `<bundle>/bin/<exe>` — so the build hook's
+    // prebuilt is found at run time (see hook/build.dart).
+    '$exeDir/../lib/$name',
     // cmake outputs relative to the working directory (dev / `dart run`).
     'build/lib/$name',
     'build/$name',

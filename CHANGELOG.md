@@ -10,7 +10,9 @@ defense; a slow-loris header deadline (`headerTimeout`) and a `maxBodyBytes`
 cap enforced on every upload path — inline, Content-Length, and chunked
 streaming (`413` before an oversize body can accrue); optional TLS/brotli
 (build-time, OpenSSL/libbrotli) with live cert hot-reload (`server.reloadTls`);
-draining answers the backlog `503` not a drop.
+optional **HTTP/2** (`-DNITRO_SERVER_HTTP2=ON` + nghttp2) served live over TLS
+(ALPN `h2`) and h2c, sharing the HTTP/1.1 routing/middleware/handler path
+(136/145 h2spec, ASan/TSan-clean); draining answers the backlog `503` not a drop.
 
 **Routing & handlers** — trie routing (`:param`, `*`, custom verbs, `group`),
 per-route `timeout`/`maxBodyBytes`/`middleware`/`streamBody`; `RequestContext`

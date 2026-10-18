@@ -28,6 +28,11 @@
 
 #include "UvReactor.h"
 
+#ifdef NITRO_SERVER_HTTP2
+#include <nghttp2/nghttp2.h>
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"  // v1 ssize_t API
+#endif
+
 #ifdef NITRO_SERVER_TLS
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -3005,6 +3010,88 @@ TEST(TlsTest, CertAndKeyLoadFromFiles) {
 }
 #endif  // NITRO_SERVER_TLS
 
+
+#ifdef NITRO_SERVER_HTTP2
+// A minimal in-process nghttp2 client that drives the reactor over a REAL socket
+// via h2c prior-knowledge. Exercises the whole reactor h2 wiring end to end —
+// preface detection, createH2Session, feedH2 on the loop thread, and the
+// Dart-thread respond() hop through onAsync — so it runs under ASan/TSan in CI
+// (the UvReactor's own thread-crossing, not just Http2Session in isolation).
+namespace h2client {
+struct Resp { int status = 0; std::string body; bool closed = false; };
+inline int onHeaderR(nghttp2_session*, const nghttp2_frame*, const uint8_t* n,
+                     size_t nl, const uint8_t* v, size_t vl, uint8_t, void* ud) {
+  if (nl == 7 && std::memcmp(n, ":status", 7) == 0)
+    ((Resp*)ud)->status = std::atoi(std::string((const char*)v, vl).c_str());
+  return 0;
+}
+inline int onData(nghttp2_session*, uint8_t, int32_t, const uint8_t* d, size_t l,
+                  void* ud) {
+  ((Resp*)ud)->body.append((const char*)d, l);
+  return 0;
+}
+inline int onClose(nghttp2_session*, int32_t, uint32_t, void* ud) {
+  ((Resp*)ud)->closed = true;
+  return 0;
+}
+inline Resp get(int fd, const char* path) {
+  Resp r;
+  timeval tv{3, 0};
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  nghttp2_session_callbacks* cbs = nullptr;
+  nghttp2_session_callbacks_new(&cbs);
+  nghttp2_session_callbacks_set_on_header_callback(cbs, onHeaderR);
+  nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, onData);
+  nghttp2_session_callbacks_set_on_stream_close_callback(cbs, onClose);
+  nghttp2_session* s = nullptr;
+  nghttp2_session_client_new(&s, cbs, &r);
+  nghttp2_session_callbacks_del(cbs);
+  nghttp2_settings_entry iv[] = {{NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 65535}};
+  nghttp2_submit_settings(s, NGHTTP2_FLAG_NONE, iv, 1);
+  const nghttp2_nv nv[] = {
+      {(uint8_t*)":method", (uint8_t*)"GET", 7, 3, NGHTTP2_NV_FLAG_NONE},
+      {(uint8_t*)":scheme", (uint8_t*)"http", 7, 4, NGHTTP2_NV_FLAG_NONE},
+      {(uint8_t*)":authority", (uint8_t*)"x", 10, 1, NGHTTP2_NV_FLAG_NONE},
+      {(uint8_t*)":path", (uint8_t*)path, 5, std::strlen(path),
+       NGHTTP2_NV_FLAG_NONE}};
+  nghttp2_submit_request(s, nullptr, nv, 4, nullptr, &r);
+  uint8_t buf[8192];
+  for (int round = 0; round < 200 && !r.closed; round++) {
+    const uint8_t* out = nullptr;
+    for (ssize_t n; (n = nghttp2_session_mem_send(s, &out)) > 0;) {
+      ssize_t off = 0;
+      while (off < n) {
+        ssize_t w = write(fd, out + off, (size_t)(n - off));
+        if (w <= 0) break;
+        off += w;
+      }
+    }
+    if (r.closed) break;
+    ssize_t rd = read(fd, buf, sizeof(buf));
+    if (rd <= 0) break;
+    if (nghttp2_session_mem_recv(s, buf, (size_t)rd) < 0) break;
+  }
+  nghttp2_session_del(s);
+  return r;
+}
+}  // namespace h2client
+
+TEST(UvReactorTest, Http2cPriorKnowledgeServedOverTheReactor) {
+  Fixture f([](Method, const std::string& p, const std::string&) {
+    return std::make_pair(200, "h2:" + p);
+  });
+  ASSERT_EQ(f.server->registerRoute(Method::Get, "", "/hello", -1).kind,
+            ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  const h2client::Resp r = h2client::get(fd, "/hello");
+  EXPECT_TRUE(r.closed);           // stream completed
+  EXPECT_EQ(r.status, 200);        // answered over the reactor's h2 path
+  EXPECT_EQ(r.body, "h2:/hello");  // the Dart-thread respond() hopped to the loop
+  close(fd);
+}
+#endif  // NITRO_SERVER_HTTP2
 
 }  // namespace
 

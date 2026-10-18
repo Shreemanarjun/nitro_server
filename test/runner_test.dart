@@ -390,7 +390,18 @@ void main() {
       expect(fake.configureCalls, 1);
       expect(fake.lastConfig!.host, '127.0.0.1');
       expect(fake.lastConfig!.port, 0);
+      expect(fake.lastConfig!.http2, isTrue); // default protocol http2 -> h2 on
       expect(fake.startCalls, 1);
+    });
+
+    test('protocol http1 disables h2 in the bridge config', () {
+      runner.start(const ServerConfig(protocol: HttpProtocol.http1));
+      expect(fake.lastConfig!.http2, isFalse);
+    });
+
+    test('protocol http3 still enables the h2 path (h3 caps at h2 today)', () {
+      runner.start(const ServerConfig(protocol: HttpProtocol.http3));
+      expect(fake.lastConfig!.http2, isTrue);
     });
 
     test('start failure throws the mapped exception', () {

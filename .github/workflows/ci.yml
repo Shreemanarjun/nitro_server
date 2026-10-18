@@ -59,16 +59,24 @@ jobs:
       - run: cmake --build build/san --parallel --target nitro_server_engine_tests
       - run: ./build/san/nitro_server_tests/nitro_server_engine_tests
 
-  # HTTP/2 (nghttp2, opt-in): proves the Http2Session serve path compiles and
-  # its self-contained nghttp2 client<->server round-trip passes on both Unix
-  # OSes. Default builds leave NITRO_SERVER_HTTP2 off, so this is the only job
-  # that exercises the h2 code; it is also where cross-OS h2 regressions surface.
+  # HTTP/2 (nghttp2, opt-in): the Http2Session serve path + the reactor wiring
+  # (preface/ALPN detection, feedH2 on the loop thread, the Dart-thread respond()
+  # hop through onAsync). Runs the engine suite — the self-contained nghttp2
+  # client<->server round-trips AND the reactor-level h2c integration test —
+  # plain + under ASan + under TSan, on both Unix OSes. Default builds leave
+  # NITRO_SERVER_HTTP2 off, so this is the only job exercising the h2 code and
+  # where cross-OS / thread-safety h2 regressions surface. The sanitizer env is
+  # job-level so the build-time gtest_discover_tests run sees it too.
   http2:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        sanitizer: ['', address, thread]
     runs-on: ${{ matrix.os }}
+    env:
+      TSAN_OPTIONS: halt_on_error=1
+      ASAN_OPTIONS: detect_leaks=0:detect_container_overflow=0
     steps:
       - uses: actions/checkout@v4
       - if: runner.os == 'Linux'
@@ -78,6 +86,7 @@ jobs:
       - run: >
           cmake -S src -B build/h2 -DCMAKE_BUILD_TYPE=Debug
           -DNITRO_SERVER_BUILD_TESTS=ON -DNITRO_SERVER_HTTP2=ON
+          -DNITRO_SERVER_SANITIZE=${{ matrix.sanitizer }}
       - run: cmake --build build/h2 --parallel --target nitro_server_engine_tests
       - run: ./build/h2/nitro_server_tests/nitro_server_engine_tests
 

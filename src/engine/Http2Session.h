@@ -17,43 +17,53 @@
 #include <vector>
 
 #include "EngineTypes.h"
+#include "ProtocolSession.h"
 #include "Router.h"
 
 namespace nitroserver {
 
-/// One HTTP/2 connection. Not thread-safe: every call happens on the owning
-/// reactor's loop thread, the same contract as UvReactor's per-connection state.
-class Http2Session {
+/// One HTTP/2 connection — the nghttp2-backed [ProtocolSession]. Not thread-safe:
+/// every call happens on the owning reactor's loop thread, the same contract as
+/// UvReactor's per-connection state.
+class Http2Session final : public ProtocolSession {
  public:
-  using WriteSink = std::function<void(const uint8_t*, size_t)>;
+  /// Allocates the request id passed to the Emitter. Reactor integration injects
+  /// the reactor's shared counter so ids are unique across every connection; the
+  /// default (empty) uses a per-session counter, correct for a lone session.
+  using IdAllocator = std::function<int64_t()>;
 
+  /// [maxBodyBytes] caps a request body (`<= 0` means unlimited); an over-cap
+  /// upload is refused `413` before the handler runs, the h2 analogue of the
+  /// HTTP/1.1 cap. [allocId] — see IdAllocator.
   Http2Session(Emitter* emitter, const Router& router, WriteSink sink,
-               std::string clientIp);
+               std::string clientIp, int64_t maxBodyBytes = -1,
+               IdAllocator allocId = {});
   ~Http2Session();
   Http2Session(const Http2Session&) = delete;
   Http2Session& operator=(const Http2Session&) = delete;
 
   /// Feed inbound bytes. Runs recv callbacks synchronously, then flushes
   /// outbound frames. Returns false on a fatal session error (caller closes).
-  bool feed(const uint8_t* data, size_t len);
+  bool feed(const uint8_t* data, size_t len) override;
 
   /// The Dart answer path. [requestId] maps back to the h2 stream; [body] is
   /// moved into per-stream state that lives until the data provider hits EOF.
-  /// A no-op if the stream was already closed/reset.
-  ///
-  /// Precondition (reactor integration): the caller must ensure the owning
-  /// connection is still live before dispatching here — this class cannot see
-  /// the reactor's `running_`/drain state, so a late answer arriving after the
-  /// session is torn down must be filtered at the reactor boundary.
+  /// A no-op if the stream was already closed/reset, or after [stop].
   void respond(int64_t requestId, int status, const std::vector<Header>& headers,
-               std::string body);
+               std::string body) override;
+
+  /// Marks the session shutting down: [feed] and [respond] become no-ops. The
+  /// reactor calls this on drain/teardown so a late answer (or stray inbound
+  /// bytes) arriving in the stop window can never drive a half-dead session —
+  /// the liveness guard the standalone class can own without seeing `running_`.
+  void stop() override { stopped_ = true; }
 
   /// Drain nghttp2's outbound queue to the sink. Called by feed()/respond();
   /// exposed so the reactor can pump after a blocked socket drains.
-  void pump();
+  void pump() override;
 
-  bool wantRead() const;   // nghttp2_session_want_read
-  bool wantWrite() const;  // nghttp2_session_want_write
+  bool wantRead() const override;   // nghttp2_session_want_read
+  bool wantWrite() const override;  // nghttp2_session_want_write
 
  private:
   struct Stream {
@@ -66,8 +76,9 @@ class Http2Session {
     std::string authority;
     std::vector<Header> headers;
     int64_t contentLength = -1;
-    std::string body;      // accumulated request body (POST)
-    std::string respBody;  // response body; outlives respond() until read EOF
+    bool rejected = false;  // over the body cap: 413 sent, do not emit/buffer
+    std::string body;       // accumulated request body (POST)
+    std::string respBody;   // response body; outlives respond() until read EOF
     size_t respOff = 0;
     std::vector<nghttp2_nv> nva;       // scratch for submit_response2
     std::vector<std::string> nvStore;  // backing bytes for nva
@@ -88,17 +99,17 @@ class Http2Session {
 
   Stream* streamFor(int32_t streamId);
   void emitComplete(Stream* st, int32_t streamId);
+  void rejectOversize(int32_t streamId, Stream* st);  // 413 + mark rejected
 
   Emitter* emitter_;
   const Router& router_;
   WriteSink sink_;
   std::string clientIp_;
+  int64_t maxBodyBytes_ = -1;  // request body cap; <= 0 = unlimited
+  IdAllocator allocId_;        // empty => use the per-session nextId_
+  bool stopped_ = false;       // set by stop(): feed/respond become no-ops
   nghttp2_session* sess_ = nullptr;
-  // Per-session request ids, fine standalone. Reactor integration MUST inject
-  // the reactor's shared id allocator instead (UvReactor uses one atomic for
-  // all conn+request ids) — otherwise ids collide across connections and an
-  // answer routes to the wrong one. See docs/http2.md "Remaining" §4.
-  int64_t nextId_ = 1;
+  int64_t nextId_ = 1;  // fallback id source when allocId_ is empty
   // streams_ owns the Stream objects (session_del does not fire on_stream_close
   // for open streams, so the destructor frees whatever remains here).
   std::unordered_map<int32_t, Stream*> streams_;      // h2 stream id -> state

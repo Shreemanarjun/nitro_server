@@ -215,6 +215,7 @@ class HybridNitroServerImpl final : public HybridNitroServerNative {
     cfg.writeTimeoutMs = raw.writeTimeoutMs;
     cfg.wsMaxBufferBytes = raw.wsMaxBufferBytes;
     cfg.wsCompression = raw.wsCompression;
+    cfg.http2 = raw.http2;
     cfg.tlsRequested = !raw.tls.certPem.empty() || !raw.tls.keyPem.empty() ||
                        !raw.tls.certFile.empty() || !raw.tls.keyFile.empty();
     cfg.tlsCertPem = raw.tls.certPem;

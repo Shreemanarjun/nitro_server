@@ -27,6 +27,10 @@
 
 #include "WsCodec.h"
 
+#ifdef NITRO_SERVER_HTTP2
+#include "Http2Session.h"
+#endif
+
 #ifdef NITRO_SERVER_TLS
 #include <openssl/err.h>
 #include <openssl/pem.h>
@@ -82,11 +86,28 @@ int uvPortOf(const sockaddr_storage& ss) {
 }
 
 #ifdef NITRO_SERVER_TLS
-// ALPN: prefer http/1.1 when the client offers it; otherwise no selection.
+// ALPN: the server's preference list. With HTTP/2 built in, offer `h2` ahead of
+// `http/1.1` (SSL_select_next_proto walks the server list in order, picking the
+// first the client also offers); otherwise only `http/1.1`. A client that offers
+// neither gets no selection and falls back to HTTP/1.1.
 int reactorAlpnSelect(SSL*, const unsigned char** out, unsigned char* outlen,
-                      const unsigned char* in, unsigned int inlen, void*) {
+                      const unsigned char* in, unsigned int inlen, void* arg) {
   static const unsigned char h11[] = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
-  if (SSL_select_next_proto((unsigned char**)out, outlen, h11, sizeof(h11), in,
+  const unsigned char* prefs = h11;
+  unsigned int prefsLen = sizeof(h11);
+#ifdef NITRO_SERVER_HTTP2
+  // `arg` points at the reactor's runtime http2 flag (cfg_.http2). Offer `h2`
+  // ahead of `http/1.1` only while it is on, so a server can disable HTTP/2 at
+  // runtime (clients then negotiate http/1.1). SSL_select_next_proto walks the
+  // server list in order, picking the first the client also offers.
+  static const unsigned char both[] = {2,   'h', '2', 8,   'h', 't',
+                                        't', 'p', '/', '1', '.', '1'};
+  if (arg && *static_cast<const bool*>(arg)) {
+    prefs = both;
+    prefsLen = sizeof(both);
+  }
+#endif
+  if (SSL_select_next_proto((unsigned char**)out, outlen, prefs, prefsLen, in,
                             inlen) == OPENSSL_NPN_NEGOTIATED) {
     return SSL_TLSEXT_ERR_OK;
   }
@@ -304,6 +325,12 @@ struct UvReactor::Conn {
   bool chunkNeedCrlf = false;   // consume the CRLF after a chunk's data next
   int64_t streamMaxBody = -1;   // body cap for the streaming upload (-1 = none)
   int64_t streamBodyTotal = 0;  // decoded body bytes streamed so far (cap check)
+#ifdef NITRO_SERVER_HTTP2
+  // Set once this connection negotiated HTTP/2 (ALPN `h2`, or the h2c prior-
+  // knowledge preface). When present, inbound bytes feed it and the HTTP/1.1
+  // parser is bypassed; freed with the Conn.
+  std::unique_ptr<Http2Session> h2;
+#endif
   int64_t writePending = 0;     // bytes queued to the socket, not yet written
   std::chrono::steady_clock::time_point writeStartedAt;  // oldest pending write
   std::chrono::steady_clock::time_point lastActive;   // idle-timeout anchor
@@ -923,9 +950,91 @@ void UvReactor::abortStreamTooLarge(Conn* c) {
   writeAnswer(c, uvBuildHead(413, {}, 0, false, 0), false, true);
 }
 
+#ifdef NITRO_SERVER_HTTP2
+int UvReactor::loopIndexOf(const Conn* c) const {
+  for (size_t i = 0; i < loops_.size(); i++)
+    if (loops_[i].get() == c->lp) return (int)i;
+  return 0;
+}
+
+// Loop thread: attach an Http2Session to a connection that negotiated h2 (ALPN
+// or the h2c preface). The write-sink routes outbound frames through writeRaw
+// (which encrypts when the conn is TLS); the injected id allocator pulls from
+// the reactor's shared counter and registers reqLoc_ with isH2 so a Dart
+// respond() routes back to this session on this loop. pump() sends the server
+// SETTINGS preface immediately. All on the loop thread — nghttp2 is never
+// touched off it (respond() hops here via onAsync).
+void UvReactor::createH2Session(Conn* c) {
+  const int loopIdx = loopIndexOf(c);
+  const int64_t cid = c->id;
+  const int64_t cap = cfg_.maxBodyBytes;
+  Emitter* em = nextEmitter();
+  c->h2 = std::make_unique<Http2Session>(
+      em, router_,
+      [this, c](const uint8_t* d, size_t n) {
+        writeRaw(c, std::string((const char*)d, n));
+      },
+      c->clientIp, cap, [this, cid, loopIdx]() -> int64_t {
+        const int64_t id = nextId_.fetch_add(1);
+        std::lock_guard<std::mutex> lk(reqMutex_);
+        reqLoc_[id] = ReqLoc{loopIdx, cid, false, false, true};
+        return id;
+      });
+  c->h2->pump();  // flush the server connection preface (SETTINGS)
+}
+
+// Loop thread: hand buffered inbound bytes to the h2 session; close on a fatal
+// protocol error, or once the session is finished. Returns false on a fatal
+// error (the connection is being torn down).
+bool UvReactor::feedH2(Conn* c) {
+  bool fatal = false;
+  if (!c->buf.empty()) {
+    if (!c->h2->feed((const uint8_t*)c->buf.data(), c->buf.size())) fatal = true;
+    c->buf.clear();
+  }
+  // Close once the session is finished: nghttp2 wants neither read nor write
+  // after it terminates the connection (GOAWAY on a protocol error, or the
+  // peer's GOAWAY). Leaving the socket half-open makes a conformant peer wait
+  // for a close that never comes (h2spec "expected connection closed"). A
+  // healthy keep-alive h2 connection always still wants to read, so this never
+  // closes one mid-serve. feed() already pumped any GOAWAY out before this.
+  const bool done = !c->h2->wantRead() && !c->h2->wantWrite();
+  if ((fatal || done) && !c->closing) {
+    c->closing = true;
+    if (!uv_is_closing((uv_handle_t*)&c->handle))
+      uv_close((uv_handle_t*)&c->handle, &UvReactor::onCloseConn);
+  }
+  return !fatal;
+}
+#endif  // NITRO_SERVER_HTTP2
+
 // Loop thread: dispatch complete buffered requests until one is in flight.
 void UvReactor::processConn(Conn* c) {
   if (c->streamingBody) return;  // a streamBody upload owns the buffer
+#ifdef NITRO_SERVER_HTTP2
+  if (c->h2) { feedH2(c); return; }  // already h2: all inbound feeds the session
+  // h2c prior-knowledge: a fresh PLAINTEXT connection whose first bytes are the
+  // HTTP/2 connection preface. (TLS h2 is negotiated via ALPN in tlsOnRead.)
+  {
+#ifdef NITRO_SERVER_TLS
+    const bool plaintext = (c->ssl == nullptr);
+#else
+    const bool plaintext = true;
+#endif
+    if (cfg_.http2 && plaintext && c->served == 0 && !c->busy &&
+        !c->buf.empty()) {
+      static const char kH2Preface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+      const size_t pn = sizeof(kH2Preface) - 1;  // 24
+      const size_t have = c->buf.size() < pn ? c->buf.size() : pn;
+      if (std::memcmp(c->buf.data(), kH2Preface, have) == 0) {
+        if (c->buf.size() < pn) return;  // partial preface: await the rest
+        createH2Session(c);
+        feedH2(c);
+        return;
+      }
+    }
+  }
+#endif
   while (!c->busy && !c->closing) {
     const size_t headEnd = c->buf.find("\r\n\r\n");
     if (headEnd == std::string::npos) {
@@ -1275,6 +1384,24 @@ void UvReactor::respond(int64_t id, int64_t status,
   ReqLoc loc;
   if (!lookupReq(id, loc, /*erase=*/true)) return;  // unknown/already answered
   completions_.fetch_add(1, std::memory_order_release);  // controller throughput signal
+#ifdef NITRO_SERVER_HTTP2
+  if (loc.isH2) {  // hand the answer to the loop thread's Http2Session (onAsync)
+    Loop* lp = loops_[loc.loopIdx].get();
+    Loop::Pending p;
+    p.connId = loc.connId;
+    p.isH2 = true;
+    p.h2ReqId = id;
+    p.h2Status = (int)status;
+    p.h2Headers = headers;
+    if (body && bodyLen) p.bytes.assign((const char*)body, bodyLen);
+    {
+      std::lock_guard<std::mutex> lk(lp->qMutex);
+      lp->queue.push_back(std::move(p));
+    }
+    uv_async_send(&lp->async);
+    return;
+  }
+#endif
   const int64_t kaSecs = (cfg_.keepAliveTimeoutMs + 999) / 1000;
   std::string out = uvBuildHead(status, headers, (int64_t)bodyLen, loc.keepAlive,
                                 kaSecs);
@@ -1289,6 +1416,13 @@ void UvReactor::startStream(int64_t id, int64_t status,
   if (!running_.load()) return;  // no-op after stop() (see respond)
   ReqLoc loc;
   if (!lookupReq(id, loc, /*erase=*/false)) return;
+#ifdef NITRO_SERVER_HTTP2
+  if (loc.isH2) {  // buffer the streamed response; flush on the terminal chunk
+    std::lock_guard<std::mutex> lk(reqMutex_);
+    h2StreamAccum_[id] = H2StreamAccum{(int)status, headers, {}};
+    return;
+  }
+#endif
   std::string out;
   out.reserve(160);
   out.append("HTTP/1.1 ");
@@ -1326,9 +1460,45 @@ void UvReactor::sendStreamChunk(int64_t id, const uint8_t* chunk, size_t n,
   if (chunk == nullptr) n = 0;
   if (n == 0 && !last) return;  // empty non-terminal chunk: nothing to send
   ReqLoc loc;
-  if (!lookupReq(id, loc, /*erase=*/last)) return;
-  if (last)
+  if (!lookupReq(id, loc, /*erase=*/false)) return;  // peek; erase per protocol
+#ifdef NITRO_SERVER_HTTP2
+  if (loc.isH2) {  // accumulate; on the terminal chunk flush as one h2 response
+    Loop::Pending p;
+    bool flush = false;
+    {
+      std::lock_guard<std::mutex> lk(reqMutex_);
+      auto it = h2StreamAccum_.find(id);
+      if (it == h2StreamAccum_.end()) return;  // no startStream / already flushed
+      if (n > 0) it->second.body.append((const char*)chunk, n);
+      if (last) {
+        p.connId = loc.connId;
+        p.isH2 = true;
+        p.h2ReqId = id;
+        p.h2Status = it->second.status;
+        p.h2Headers = std::move(it->second.headers);
+        p.bytes = std::move(it->second.body);
+        h2StreamAccum_.erase(it);
+        reqLoc_.erase(id);
+        flush = true;
+      }
+    }
+    if (flush) {
+      completions_.fetch_add(1, std::memory_order_release);
+      Loop* lp = loops_[loc.loopIdx].get();
+      {
+        std::lock_guard<std::mutex> lk(lp->qMutex);
+        lp->queue.push_back(std::move(p));
+      }
+      uv_async_send(&lp->async);
+    }
+    return;
+  }
+#endif
+  if (last) {  // HTTP/1.1: release the request on the terminal chunk
+    ReqLoc tmp;
+    lookupReq(id, tmp, /*erase=*/true);
     completions_.fetch_add(1, std::memory_order_release);  // same signal as respond()
+  }
   std::string out;
   if (n > 0) {
     char sz[32];
@@ -1357,12 +1527,30 @@ void UvReactor::onAsync(uv_async_t* async) {
   // (and one send syscall), not N. Merging stops at — and includes — the
   // entry that finishes the response, so keep-alive framing is unchanged.
   for (size_t i = 0; i < batch.size();) {
+#ifdef NITRO_SERVER_HTTP2
+    if (batch[i].isH2) {  // an h2 answer: respond on the loop thread, no merge
+      auto hit = lp->conns.find(batch[i].connId);
+      if (hit != lp->conns.end() && !hit->second->closing && hit->second->h2) {
+        Conn* hc = hit->second;
+        hc->h2->respond(batch[i].h2ReqId, batch[i].h2Status,
+                        batch[i].h2Headers, std::move(batch[i].bytes));
+        if (!hc->h2->wantRead() && !hc->h2->wantWrite()) {  // session finished
+          hc->closing = true;
+          if (!uv_is_closing((uv_handle_t*)&hc->handle))
+            uv_close((uv_handle_t*)&hc->handle, &UvReactor::onCloseConn);
+        }
+      }
+      ++i;
+      continue;
+    }
+#endif
     const int64_t cid = batch[i].connId;
     std::string merged = std::move(batch[i].bytes);
     bool keepAlive = batch[i].keepAlive;
     bool finish = batch[i].finish;
     size_t j = i + 1;
-    while (!finish && j < batch.size() && batch[j].connId == cid) {
+    while (!finish && j < batch.size() && batch[j].connId == cid &&
+           !batch[j].isH2) {
       merged.append(batch[j].bytes);
       keepAlive = batch[j].keepAlive;
       finish = batch[j].finish;
@@ -1765,7 +1953,10 @@ StatusResult UvReactor::buildSslCtx(const std::string& certPem,
                             SSL_MODE_AUTO_RETRY);
   SSL_CTX_set_options(ctx, SSL_OP_NO_RENEGOTIATION | SSL_OP_NO_TICKET);
   SSL_CTX_set_num_tickets(ctx, 0);
-  SSL_CTX_set_alpn_select_cb(ctx, reactorAlpnSelect, nullptr);
+  // Pass the runtime http2 flag so the ALPN callback offers `h2` only while it
+  // is enabled. cfg_ outlives every SSL_CTX built from it (set at configure,
+  // before start/reload); the flag is read at negotiation time.
+  SSL_CTX_set_alpn_select_cb(ctx, reactorAlpnSelect, &cfg_.http2);
 
   if (!certPem.empty()) {
     BIO* bio = BIO_new_mem_buf(certPem.data(), (int)certPem.size());
@@ -1878,6 +2069,15 @@ void UvReactor::tlsOnRead(Conn* c, const char* data, size_t n) {
       return;  // handshake needs more bytes
     }
     c->tlsHandshakeDone = true;
+#ifdef NITRO_SERVER_HTTP2
+    // ALPN picked h2: drive this connection through the Http2Session from here
+    // on (processConn's `if (c->h2)` branch below feeds it the decrypted bytes).
+    const unsigned char* proto = nullptr;
+    unsigned int plen = 0;
+    SSL_get0_alpn_selected(c->ssl, &proto, &plen);
+    if (cfg_.http2 && proto && plen == 2 && std::memcmp(proto, "h2", 2) == 0)
+      createH2Session(c);
+#endif
   }
   char plain[16384];
   int r;

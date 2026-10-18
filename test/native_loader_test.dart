@@ -42,6 +42,7 @@ void main() {
         '/env/lib.dylib',
         '/exe/$name',
         '/exe/lib/$name',
+        '/exe/../lib/$name',
         'build/lib/$name',
         'build/$name',
       ],
@@ -51,7 +52,13 @@ void main() {
         environment: const {'NITRO_SERVER_DYLIB': ''},
         executableDir: '/exe',
       ),
-      ['/exe/$name', '/exe/lib/$name', 'build/lib/$name', 'build/$name'],
+      [
+        '/exe/$name',
+        '/exe/lib/$name',
+        '/exe/../lib/$name',
+        'build/lib/$name',
+        'build/$name',
+      ],
     );
     // The process environment and real executable dir are the defaults.
     expect(nitroServerLibraryCandidates(), contains('build/lib/$name'));

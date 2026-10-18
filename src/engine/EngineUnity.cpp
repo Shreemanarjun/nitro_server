@@ -5,5 +5,6 @@
 #include "HttpParse.cpp"
 #include "JsonWriter.cpp"
 #include "EngineRegistry.cpp"
-#include "UvReactor.cpp"  // compiles to nothing unless NITRO_SERVER_LIBUV
-#include "Brotli.cpp"     // stubs unless NITRO_SERVER_BROTLI
+#include "UvReactor.cpp"     // compiles to nothing unless NITRO_SERVER_LIBUV
+#include "Brotli.cpp"        // stubs unless NITRO_SERVER_BROTLI
+#include "Http2Session.cpp"  // compiles to nothing unless NITRO_SERVER_HTTP2

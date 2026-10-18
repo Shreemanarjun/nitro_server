@@ -30,6 +30,10 @@ struct ServerConfig {
   int64_t writeTimeoutMs = 30000;   // <= 0: 30 s.
   int64_t wsMaxBufferBytes = 1 << 20;  // <= 0: 1 MiB.
   bool wsCompression = true;
+  // Negotiate HTTP/2 (ALPN `h2` over TLS, and the h2c prior-knowledge preface)
+  // when the engine was built with it. Default on; a server can turn it off to
+  // force HTTP/1.1 without rebuilding. Ignored in a non-HTTP/2 build.
+  bool http2 = true;
   bool tlsRequested = false;
   // TLS identity (see RawTlsConfig). PEM strings win over file paths.
   std::string tlsCertPem;

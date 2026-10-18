@@ -181,6 +181,11 @@ class RawServerConfig {
 
   /// Negotiate `permessage-deflate` (RFC 7692) when a client offers it.
   final bool wsCompression;
+
+  /// Negotiate HTTP/2 (ALPN `h2` over TLS, and the h2c prior-knowledge preface)
+  /// when the engine was built with it. Default on; set false to force
+  /// HTTP/1.1 without rebuilding. A no-op in an engine built without HTTP/2.
+  final bool http2;
   final RawTlsConfig tls;
 
   const RawServerConfig({
@@ -198,6 +203,7 @@ class RawServerConfig {
     this.writeTimeoutMs = 30000,
     this.wsMaxBufferBytes = 1048576,
     this.wsCompression = true,
+    this.http2 = true,
     this.tls = const RawTlsConfig(),
   });
 }

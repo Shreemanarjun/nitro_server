@@ -4,7 +4,7 @@
 /// dart run nitro_server:nitro serve            # run bin/server.dart, JIT + hot reload
 /// dart run nitro_server:nitro serve --aot       # AOT-compile then run (prod-like, no reload)
 /// dart run nitro_server:nitro build             # AOT: dart build cli → build/<name>/bundle
-/// dart run nitro_server:nitro build --jit       # JIT snapshot: dart compile jit-snapshot
+/// dart run nitro_server:nitro build --jit       # kernel snapshot → run with: dart build/<name>.dill
 /// # once globally activated (`dart pub global activate nitro_server`):
 /// nitro serve | nitro build [entry] [--aot|--jit] [-o out]
 /// ```
@@ -28,7 +28,7 @@ usage:
 
   entry   defaults to bin/server.dart
   --aot   serve: compile then run the native exe (no hot reload)
-  --jit   build: emit a JIT snapshot instead of a native exe
+  --jit   build: emit a kernel snapshot (run: dart <out>.dill) not a native exe
   --bundle-deps  build: copy native deps next to the exe + rewrite install
                  names, for a cross-machine-portable bundle (macOS/Linux)
   -o,--output   build output path (default build/<entry-basename>[.exe])
@@ -53,9 +53,19 @@ Future<void> main(List<String> args) async {
   }
 }
 
-/// Positional entry (first non-flag arg) or the default.
-String _entry(List<String> args) =>
-    args.firstWhere((a) => !a.startsWith('-'), orElse: () => 'bin/server.dart');
+/// Positional entry (first non-flag arg) or the default. Skips the value of
+/// `-o`/`--output` so `nitro build -o out/app` isn't read as entry `out/app`.
+String _entry(List<String> args) {
+  for (var i = 0; i < args.length; i++) {
+    final a = args[i];
+    if (a == '-o' || a == '--output') {
+      i++; // step over the option's value
+      continue;
+    }
+    if (!a.startsWith('-')) return a;
+  }
+  return 'bin/server.dart';
+}
 
 bool _hasFlag(List<String> args, String flag) => args.contains(flag);
 
@@ -96,10 +106,14 @@ Future<int> _build(List<String> args) async {
   }
   final output = _option(args, ['-o', '--output']);
   if (_hasFlag(args, '--jit')) {
-    final out = output ?? 'build/${_base(entry)}.jit';
+    // A kernel snapshot, not `dart compile jit-snapshot`: jit-snapshot trains
+    // by RUNNING the entry, which never returns for a server (it hangs). Kernel
+    // compiles without executing and runs under the JIT via `dart <out>`,
+    // starting faster than source.
+    final out = output ?? 'build/${_base(entry)}.dill';
     _ensureDir(out);
-    stdout.writeln('→ nitro build (jit snapshot) — $out');
-    return _run('dart', ['compile', 'jit-snapshot', '-o', out, entry]);
+    stdout.writeln('→ nitro build (kernel snapshot) — $out   (run: dart $out)');
+    return _run('dart', ['compile', 'kernel', '-o', out, entry]);
   }
   final exe = await _compileExe(entry, output: output);
   if (exe == null) return 1;
@@ -146,17 +160,16 @@ Future<String?> _compileExe(String entry, {String? output}) async {
 }
 
 /// Makes the native-library bundle self-contained for cross-machine deploy:
-/// copies every non-system dynamic dependency next to [exePath] and rewrites
-/// each library's references to `@loader_path/<name>`, so the binary runs
-/// without the build machine's Homebrew/apt libraries. macOS
-/// (`otool`/`install_name_tool`) and Linux (`patchelf`) only; elsewhere, a
-/// note points at Docker.
-Future<void> _bundleTransitiveDeps(String exePath) async {
-  final dir = File(exePath).parent.path;
+/// copies every non-system dynamic dependency into [libDir] (the bundle's
+/// `lib/`, where the engine library lives) and rewrites each library's
+/// references to `@loader_path/<name>`, so the binary runs without the build
+/// machine's Homebrew/apt libraries. macOS (`otool`/`install_name_tool`) and
+/// Linux (`patchelf`) only; elsewhere, a note points at Docker.
+Future<void> _bundleTransitiveDeps(String libDir) async {
   if (Platform.isMacOS) {
-    await _bundleMac(dir);
+    await _bundleMac(libDir);
   } else if (Platform.isLinux) {
-    await _bundleLinux(dir);
+    await _bundleLinux(libDir);
   } else {
     stdout.writeln(
       '  --bundle-deps: unsupported on this OS; use the Docker image for a '

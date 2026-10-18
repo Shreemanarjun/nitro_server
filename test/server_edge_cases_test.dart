@@ -392,7 +392,10 @@ void main() {
         routePattern: '/logged',
       );
       expect(response.status, 200);
-      expect(lines.single, matches(r'"GET /logged" 200 \d+ms'));
+      expect(
+        lines.single,
+        matches(RegExp(r'^GET +200 +\d+(\.\d+)?(µs|ms) +/logged')),
+      );
     });
 
     test('accessLog records 500s for throwing handlers', () async {
@@ -409,7 +412,10 @@ void main() {
         path: '/blogged',
         routePattern: '/blogged',
       );
-      expect(lines.single, matches(r'"/blogged" 500 \d+ms'));
+      expect(
+        lines.single,
+        matches(RegExp(r'^GET +500 +\d+(\.\d+)?(µs|ms) +/blogged')),
+      );
     });
 
     test('middleware applies to routes registered before use()', () async {

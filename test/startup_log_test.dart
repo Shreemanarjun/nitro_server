@@ -101,7 +101,7 @@ void main() {
     expect(out, contains('█   █ █████ █████'));
   });
 
-  test('every route is listed with its kind, plain and coloured', () {
+  test('every route is listed, grouped by type and sorted by pattern', () {
     final plain = serverBanner(
       title: 'srv',
       uri: uri,
@@ -112,9 +112,16 @@ void main() {
     expect(plain, contains('GET'));
     expect(plain, contains('PURGE'));
     expect(plain, contains('/users/:id'));
-    expect(plain, contains('handler'));
-    expect(plain, contains('websocket'));
-    expect(plain, contains('static'));
+    // Section headers, in order.
+    final handlersAt = plain.indexOf('handlers');
+    final websocketsAt = plain.indexOf('websockets');
+    final staticAt = plain.indexOf('static');
+    expect(handlersAt, greaterThanOrEqualTo(0));
+    expect(websocketsAt, greaterThan(handlersAt));
+    expect(staticAt, greaterThan(websocketsAt));
+    // Within the handlers group, patterns are sorted ascending.
+    expect(plain.indexOf('/c'), lessThan(plain.indexOf('/opt')));
+    expect(plain.indexOf('/opt'), lessThan(plain.indexOf('/users')));
 
     // Coloured output tints each method by kind/verb.
     final colour = serverBanner(title: 'srv', uri: uri, routes: routes);

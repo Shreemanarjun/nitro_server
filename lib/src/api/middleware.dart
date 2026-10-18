@@ -3,42 +3,70 @@ library;
 
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io' show GZipCodec;
+import 'dart:io' show GZipCodec, stdout;
 import 'dart:typed_data';
 
+import '../internal/ansi.dart';
 import 'brotli.dart';
 import 'context.dart';
 import 'http_method.dart';
 
-/// Apache-style access log, one line per answered request:
+/// One colourful, aligned line per answered request — method, status, latency
+/// (microseconds under 1ms, else ms), path and client IP:
 ///
 /// ```text
-/// 127.0.0.1 "GET /users/42" 200 3ms
+/// GET    200    843µs  /users/42   127.0.0.1
+/// POST   201   1.21ms  /users      127.0.0.1
+/// GET    404    312µs  /missing    127.0.0.1
 /// ```
 ///
-/// [sink] defaults to `print` — fine for development, but pass a real logger
-/// in production (the line is formatted before the call, so any
-/// `void Function(String)` works).
-Middleware accessLog({void Function(String line)? sink}) {
+/// Method and status are tinted by kind/class, the latency is dimmed. [sink]
+/// defaults to `print` — pass a real logger in production (the line is
+/// formatted before the call, so any `void Function(String)` works). [color]
+/// defaults to whether stdout is a TTY, so piped/CI output stays plain; force
+/// it either way for a custom sink.
+Middleware accessLog({void Function(String line)? sink, bool? color}) {
   final log =
       // ignore: avoid_print
       sink ?? print;
+  final on = color ?? stdout.supportsAnsiEscapes;
+  String format(String method, int status, int micros, String path, String ip) {
+    final m = ansi(method.padRight(6), methodHue(method), on: on);
+    final s = ansi(status.toString().padRight(3), statusHue(status), on: on);
+    final t = ansi(formatLatency(micros).padLeft(8), '2', on: on);
+    final tail = ip.isEmpty ? '' : '  ${ansi(ip, '2', on: on)}';
+    return '$m $s $t  $path$tail';
+  }
+
   return (request, next) async {
     final stopwatch = Stopwatch()..start();
+    final method = request.method == HttpMethod.custom
+        ? request.customMethod
+        : request.method.token;
     try {
       final response = await next(request);
       stopwatch.stop();
-      final method = request.method == HttpMethod.custom
-          ? request.customMethod
-          : request.method.token;
       log(
-        '"$method ${request.path}" ${response.status} '
-        '${stopwatch.elapsed.inMilliseconds}ms',
+        format(
+          method,
+          response.status,
+          stopwatch.elapsedMicroseconds,
+          request.path,
+          request.clientIp,
+        ),
       );
       return response;
-    } catch (error) {
+    } catch (_) {
       stopwatch.stop();
-      log('"${request.path}" 500 ${stopwatch.elapsed.inMilliseconds}ms');
+      log(
+        format(
+          method,
+          500,
+          stopwatch.elapsedMicroseconds,
+          request.path,
+          request.clientIp,
+        ),
+      );
       rethrow;
     }
   };

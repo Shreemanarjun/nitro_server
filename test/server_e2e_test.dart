@@ -830,6 +830,16 @@ void main() {
       expect(res.body, '127.0.0.1');
     }, skip: skipReason);
 
+    test('accessLog records the client IP off the socket', () async {
+      final lines = <String>[];
+      server = await NitroServer.bind();
+      await server!.use(accessLog(sink: lines.add, color: false));
+      await server!.get('/ok', (_) => ResponseContext.text('ok'));
+      await _get(server!.port, '/ok');
+      expect(lines, isNotEmpty);
+      expect(lines.last, contains('127.0.0.1'));
+    }, skip: skipReason);
+
     test('answers carry a Server-Timing header by default', () async {
       server = await NitroServer.bind();
       await server!.get('/t', (_) => ResponseContext.text('hi'));

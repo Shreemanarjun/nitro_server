@@ -16,6 +16,46 @@ void main() {
   });
   tearDown(() => client.close());
 
+  group('accessLog', () {
+    test('plain format: method, status, latency, path (no colour)', () async {
+      final lines = <String>[];
+      await client.server.use(accessLog(sink: lines.add, color: false));
+      expect((await client.get('/ok')).status, 200);
+      expect(lines, hasLength(1));
+      expect(lines.single, isNot(contains('\x1b[')));
+      expect(
+        lines.single,
+        matches(RegExp(r'^GET +200 +\d+(\.\d+)?(µs|ms) +/ok')),
+      );
+    });
+
+    test('colour wraps the line in ANSI', () async {
+      final lines = <String>[];
+      await client.server.use(accessLog(sink: lines.add, color: true));
+      await client.get('/ok');
+      expect(lines.single, contains('\x1b['));
+    });
+
+    test('a slow handler logs milliseconds', () async {
+      final lines = <String>[];
+      await client.server.use(accessLog(sink: lines.add, color: false));
+      await client.server.get('/slow', (_) async {
+        await Future<void>.delayed(const Duration(milliseconds: 3));
+        return ResponseContext.text('slow');
+      });
+      await client.get('/slow');
+      expect(lines.single, contains('ms'));
+    });
+
+    test('a throwing handler is logged as 500 and rethrown', () async {
+      final lines = <String>[];
+      await client.server.use(accessLog(sink: lines.add, color: false));
+      await client.server.get('/boom', (_) => throw StateError('x'));
+      expect((await client.get('/boom')).status, 500);
+      expect(lines.single, matches(RegExp(r'^GET +500 ')));
+    });
+  });
+
   group('rateLimit', () {
     test('allows up to the limit then answers 429 with Retry-After', () async {
       await client.server.use(rateLimit(maxRequests: 3));

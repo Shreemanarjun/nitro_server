@@ -378,6 +378,41 @@ void main() {
       expect(docs.text(), contains('Ping Docs'));
       expect(docs.text(), contains('/openapi.json'));
       expect(docs.text(), contains('deepLinking: true'));
+      // Swagger UI runtime config: Authorize persists, Try-it-out is open,
+      // credentials off by default.
+      expect(docs.text(), contains('persistAuthorization: true'));
+      expect(docs.text(), contains('tryItOutEnabled: true'));
+      expect(docs.text(), contains('withCredentials: false'));
+    });
+
+    test('UI config flags are configurable', () async {
+      await serveOpenApi(
+        client.server,
+        persistAuthorization: false,
+        tryItOutEnabled: false,
+        withCredentials: true,
+      );
+      final docs = await client.get('/docs');
+      expect(docs.text(), contains('persistAuthorization: false'));
+      expect(docs.text(), contains('tryItOutEnabled: false'));
+      expect(docs.text(), contains('withCredentials: true'));
+    });
+
+    test('the Swagger HTML neutralises injection in config values', () async {
+      await serveOpenApi(
+        client.server,
+        path: "/spec</script><x>'.json",
+        title: '<script>alert(1)</script>"',
+        swaggerUiVersion: '5"><img>',
+      );
+      final html = (await client.get('/docs')).text();
+      // The spec path lands in a JS string: no raw </script> breakout, no raw <.
+      expect(html, isNot(contains('/spec</script>')));
+      expect(html, contains(r'\x3C'));
+      // The title (HTML text) and version (HTML attribute) are escaped.
+      expect(html, isNot(contains('<script>alert(1)')));
+      expect(html, contains('&lt;script&gt;'));
+      expect(html, contains('5&quot;&gt;&lt;img&gt;'));
     });
 
     test('docsPath null serves only the spec', () async {
@@ -455,6 +490,231 @@ void main() {
         isTrue,
       );
       expect((await client.get('/docs')).status, 200);
+    });
+  });
+
+  group('typed params / security / body / responses', () {
+    // Builds one operation for `doc` and returns its operation map.
+    Map<String, Object?> opFor(
+      OpenApiOperation doc, {
+      HttpMethod method = HttpMethod.post,
+      String pattern = '/x',
+    }) {
+      final built = buildOpenApi(
+        [
+          RegisteredRoute(
+            method: method,
+            pattern: pattern,
+            kind: RouteKind.handler,
+          ),
+        ],
+        operations: {'${method.token} $pattern': doc},
+      );
+      return ((built['paths'] as Map)[pattern] as Map)[method.token
+              .toLowerCase()]
+          as Map<String, Object?>;
+    }
+
+    test('OpenApiParam renders query/header/cookie inputs', () {
+      final op = opFor(
+        method: HttpMethod.get,
+        const OpenApiOperation(
+          params: [
+            OpenApiParam.query(
+              'q',
+              required: true,
+              description: 'text',
+              example: 'ada',
+            ),
+            OpenApiParam.query('sort', enumValues: ['asc', 'desc']),
+            OpenApiParam.header('X-Request-Id', deprecated: true),
+            OpenApiParam.cookie('session'),
+          ],
+        ),
+      );
+      final params = (op['parameters'] as List).cast<Map<String, Object?>>();
+      final q = params.firstWhere((p) => p['name'] == 'q');
+      expect(q['in'], 'query');
+      expect(q['required'], true);
+      expect(q['description'], 'text');
+      expect(q['example'], 'ada');
+      final sort = params.firstWhere((p) => p['name'] == 'sort');
+      expect((sort['schema'] as Map)['enum'], ['asc', 'desc']);
+      final h = params.firstWhere((p) => p['name'] == 'X-Request-Id');
+      expect(h['in'], 'header');
+      expect(h['deprecated'], true);
+      expect(h.containsKey('required'), isFalse); // default false omitted
+      expect(params.firstWhere((p) => p['name'] == 'session')['in'], 'cookie');
+    });
+
+    test(
+      'requiresAuth builds the security requirement; [] is explicit public',
+      () {
+        final secured = opFor(const OpenApiOperation(requiresAuth: ['bearer']));
+        expect(secured['security'], [
+          {'bearer': <String>[]},
+        ]);
+        final public = opFor(const OpenApiOperation(requiresAuth: []));
+        expect(public['security'], <Object?>[]);
+      },
+    );
+
+    test('raw security wins over requiresAuth', () {
+      final op = opFor(
+        const OpenApiOperation(
+          requiresAuth: ['bearer'],
+          security: [
+            {'apiKey': <String>[]},
+          ],
+        ),
+      );
+      expect(op['security'], [
+        {'apiKey': <String>[]},
+      ]);
+    });
+
+    test('requestBodyDoc covers every media type', () {
+      Map<String, Object?> body(OpenApiRequestBody b) =>
+          opFor(OpenApiOperation(requestBodyDoc: b))['requestBody']
+              as Map<String, Object?>;
+
+      final json = body(
+        const OpenApiRequestBody.json(example: {'a': 1}, required: true),
+      );
+      expect(json['required'], true);
+      final jsonMt = (json['content'] as Map)['application/json'] as Map;
+      expect((jsonMt['schema'] as Map)['type'], 'object');
+      expect(jsonMt['example'], {'a': 1});
+
+      final named = body(
+        const OpenApiRequestBody.json(
+          examples: {
+            'one': {'value': 1},
+          },
+        ),
+      );
+      final namedMt = (named['content'] as Map)['application/json'] as Map;
+      expect(namedMt.containsKey('examples'), isTrue);
+      expect(namedMt.containsKey('example'), isFalse);
+
+      final form = body(const OpenApiRequestBody.form());
+      expect(
+        (form['content'] as Map).containsKey(
+          'application/x-www-form-urlencoded',
+        ),
+        isTrue,
+      );
+
+      final multi = body(
+        const OpenApiRequestBody.multipart(
+          schema: {'type': 'object'},
+          encoding: {'file': <String, Object?>{}},
+        ),
+      );
+      final multiMt = (multi['content'] as Map)['multipart/form-data'] as Map;
+      expect(multiMt.containsKey('encoding'), isTrue);
+
+      final text = body(const OpenApiRequestBody.text(example: 'hi'));
+      final textMt = (text['content'] as Map)['text/plain'] as Map;
+      expect((textMt['schema'] as Map)['type'], 'string');
+
+      final bin = body(const OpenApiRequestBody.binary(required: true));
+      final binMt = (bin['content'] as Map)['application/octet-stream'] as Map;
+      expect((binMt['schema'] as Map)['format'], 'binary');
+    });
+
+    test('request body precedence: raw > doc > example > auto', () {
+      final raw = opFor(
+        const OpenApiOperation(
+          requestBody: {'required': true},
+          requestBodyDoc: OpenApiRequestBody.binary(),
+          requestExample: {'a': 1},
+        ),
+      );
+      expect(raw['requestBody'], {'required': true});
+
+      final doc = opFor(
+        const OpenApiOperation(
+          requestBodyDoc: OpenApiRequestBody.text(),
+          requestExample: {'a': 1},
+        ),
+      );
+      expect(
+        ((doc['requestBody'] as Map)['content'] as Map).containsKey(
+          'text/plain',
+        ),
+        isTrue,
+      );
+    });
+
+    test('responseExample + description + extraResponses', () {
+      final op = opFor(
+        const OpenApiOperation(
+          responseDescription: 'the thing',
+          responseExample: {'id': 1},
+          extraResponses: {
+            '404': OpenApiResponse('missing', example: {'error': 'no'}),
+            '500': OpenApiResponse('boom'),
+          },
+        ),
+      );
+      final responses = op['responses'] as Map;
+      final ok = responses['200'] as Map;
+      expect(ok['description'], 'the thing');
+      final okMt = (ok['content'] as Map)['application/json'] as Map;
+      expect(okMt['example'], {'id': 1});
+      expect((okMt['schema'] as Map)['type'], 'object');
+      // 404 carries content; 500 is description-only.
+      expect(((responses['404'] as Map)['content'] as Map).isNotEmpty, isTrue);
+      expect((responses['500'] as Map).containsKey('content'), isFalse);
+    });
+
+    test('successStatus keys the auto response (e.g. 201 for a create)', () {
+      final op = opFor(
+        const OpenApiOperation(
+          successStatus: 201,
+          responseExample: {'ok': true},
+          extraResponses: {'400': OpenApiResponse('bad')},
+        ),
+      );
+      final responses = op['responses'] as Map;
+      expect(responses.containsKey('201'), isTrue);
+      expect(responses.containsKey('200'), isFalse);
+      expect(responses.containsKey('400'), isTrue);
+    });
+
+    test('OpenApiResponse with a named examples map and explicit schema', () {
+      const r = OpenApiResponse(
+        'ok',
+        schema: {'type': 'string'},
+        examples: {
+          'a': {'value': 'x'},
+        },
+      );
+      final json = r.toJson();
+      final mt = (json['content'] as Map)['application/json'] as Map;
+      expect((mt['schema'] as Map)['type'], 'string');
+      expect(mt.containsKey('examples'), isTrue);
+    });
+
+    test('security scheme helpers emit valid objects', () {
+      expect(bearerScheme(), {'type': 'http', 'scheme': 'bearer'});
+      expect(bearerScheme(bearerFormat: 'JWT'), {
+        'type': 'http',
+        'scheme': 'bearer',
+        'bearerFormat': 'JWT',
+      });
+      expect(basicScheme(), {'type': 'http', 'scheme': 'basic'});
+      expect(apiKeyScheme(), {
+        'type': 'apiKey',
+        'in': 'header',
+        'name': 'x-api-key',
+      });
+      expect(apiKeyScheme(name: 'token', location: 'query'), {
+        'type': 'apiKey',
+        'in': 'query',
+        'name': 'token',
+      });
     });
   });
 }

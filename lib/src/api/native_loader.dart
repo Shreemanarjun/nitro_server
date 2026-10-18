@@ -50,17 +50,29 @@ String nitroServerLibraryName({String? operatingSystem}) {
 }
 
 /// Candidate locations for the cmake-built library, in priority order:
-/// [path], then `NITRO_SERVER_DYLIB` from [environment] (default: the
-/// process environment), then the conventional cmake outputs.
+/// [path], then `NITRO_SERVER_DYLIB` from [environment] (default: the process
+/// environment), then locations next to the running executable (so a compiled
+/// standalone binary finds its dylib no matter the working directory), then the
+/// conventional cmake outputs relative to [Directory.current].
+///
+/// [executableDir] defaults to the directory of [Platform.resolvedExecutable]
+/// (the compiled binary under AOT, the `dart` VM under `dart run`). A test seam.
 List<String> nitroServerLibraryCandidates({
   String? path,
   Map<String, String>? environment,
+  String? executableDir,
 }) {
   final name = nitroServerLibraryName();
   final override = (environment ?? Platform.environment)['NITRO_SERVER_DYLIB'];
+  final exeDir = executableDir ?? File(Platform.resolvedExecutable).parent.path;
   return [
     ?path,
     if (override != null && override.isNotEmpty) override,
+    // Next to the executable, and a conventional `lib/` beside it — the
+    // self-contained layouts for a `dart compile exe` binary.
+    '$exeDir/$name',
+    '$exeDir/lib/$name',
+    // cmake outputs relative to the working directory (dev / `dart run`).
     'build/lib/$name',
     'build/$name',
   ];

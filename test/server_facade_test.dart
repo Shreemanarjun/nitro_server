@@ -314,7 +314,11 @@ void main() {
         ),
       );
       expect(lines, hasLength(1));
-      expect(lines.single, startsWith('"PURGE /p" 200 '));
+      // New format: method · status · latency(µs/ms) · path, plain off a TTY.
+      expect(
+        lines.single,
+        matches(RegExp(r'^PURGE +200 +\d+(\.\d+)?(µs|ms) +/p$')),
+      );
     });
   });
 

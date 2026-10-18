@@ -11,7 +11,7 @@
 ///   version: '1.0.0',
 ///   uri: server.uri,
 ///   isolates: server.config.isolates,
-///   routes: server.routes,                 // every registered route, listed
+///   routes: server.routes,                 // grouped by type, sorted by path
 ///   links: {'docs': '/docs', 'dashboard': '/dashboard'},
 ///   logo: nitroServerAsciiLogo,            // the big NITRO wordmark
 ///   color: stdout.supportsAnsiEscapes,
@@ -19,6 +19,7 @@
 /// ```
 library;
 
+import '../internal/ansi.dart';
 import 'http_method.dart';
 
 /// The NITRO wordmark, as a CLI-style block banner. Pass it to
@@ -30,36 +31,30 @@ const String nitroServerAsciiLogo = '''
 █  ██   █     █   █  █  █   █
 █   █ █████   █   █   █  ███''';
 
-/// ANSI SGR codes, applied only when [on] is true.
-String _c(String s, String code, bool on) => on ? '\x1b[${code}m$s\x1b[0m' : s;
+/// Route kinds in display order, with their section label.
+const _routeSections = [
+  (RouteKind.handler, 'handlers'),
+  (RouteKind.webSocket, 'websockets'),
+  (RouteKind.staticResponse, 'static'),
+];
 
-/// SGR colour for a route's method/kind, so the list scans at a glance.
-String _methodColor(RegisteredRoute r) => switch (r.kind) {
-  RouteKind.webSocket => '35', // magenta
-  RouteKind.staticResponse => '34', // blue
-  RouteKind.handler => switch (r.methodToken) {
-    'GET' || 'HEAD' => '32', // green
-    'POST' || 'PUT' || 'PATCH' => '33', // yellow
-    'DELETE' => '31', // red
-    _ => '36', // cyan
-  },
-};
-
-/// The label shown in the `kind` column.
-String _kindLabel(RouteKind kind) => switch (kind) {
-  RouteKind.handler => 'handler',
-  RouteKind.webSocket => 'websocket',
-  RouteKind.staticResponse => 'static',
+/// SGR colour for a route row: WebSocket magenta, static blue, else by verb.
+String _routeHue(RegisteredRoute r) => switch (r.kind) {
+  RouteKind.webSocket => '35',
+  RouteKind.staticResponse => '34',
+  RouteKind.handler => methodHue(r.methodToken),
 };
 
 /// Builds the startup banner for a server listening at [uri].
 ///
-/// [routes] (typically `server.routes`) are listed with method, pattern and
-/// kind. [links] maps a short label to a path (`/docs`) or an absolute URL
-/// (`https://…`); paths are resolved against [uri]. [facts] adds short notes
-/// to the metadata row (e.g. `'hot reload on'`); [extra] adds trailing note
-/// lines. [logo] is printed above the heading (see [nitroServerAsciiLogo]).
-/// [color] turns ANSI colour on; keep it off for non-TTY output.
+/// [routes] (typically `server.routes`) are listed **grouped by kind**
+/// (handlers, websockets, static) and **sorted by pattern** within each group,
+/// so a route is easy to find. [links] maps a short label to a path (`/docs`)
+/// or an absolute URL (`https://…`); paths are resolved against [uri]. [facts]
+/// adds short notes to the metadata row (e.g. `'hot reload on'`); [extra] adds
+/// trailing note lines. [logo] is printed above the heading (see
+/// [nitroServerAsciiLogo]). [color] turns ANSI colour on; keep it off for
+/// non-TTY output.
 String serverBanner({
   required String title,
   required Uri uri,
@@ -77,41 +72,45 @@ String serverBanner({
   b.writeln();
   if (logo != null) {
     for (final line in logo.split('\n')) {
-      b.writeln('  ${_c(line, '1;36', color)}');
+      b.writeln('  ${ansi(line, '1;36', on: color)}');
     }
     b.writeln();
   }
 
   final heading = version == null ? title : '$title v$version';
-  b.writeln('  ${_c('◆', '36', color)} ${_c(heading, '1;36', color)}');
-  b.writeln('  ${_c('listening on', '2', color)} ${_c('$uri', '1;32', color)}');
+  b.writeln(
+    '  ${ansi('◆', '36', on: color)} ${ansi(heading, '1;36', on: color)}',
+  );
+  b.writeln(
+    '  ${ansi('listening on', '2', on: color)} ${ansi('$uri', '1;32', on: color)}',
+  );
 
   final allFacts = <String>[
     'isolates $isolates',
     if (pid != null) 'pid $pid',
     ...facts,
   ];
-  b.writeln('  ${_c(allFacts.join('  ·  '), '2', color)}');
+  b.writeln('  ${ansi(allFacts.join('  ·  '), '2', on: color)}');
 
   if (routes.isNotEmpty) {
     b.writeln();
-    b.writeln('  ${_c('routes', '1', color)}');
-    final methodWidth = routes
-        .map((r) => r.methodToken.length)
-        .fold(3, (a, b) => a > b ? a : b);
-    final patternWidth = routes
-        .map((r) => r.pattern.length)
-        .fold(0, (a, b) => a > b ? a : b);
-    for (final r in routes) {
-      final method = _c(
-        r.methodToken.padRight(methodWidth),
-        _methodColor(r),
-        color,
-      );
-      final pattern = r.pattern.padRight(patternWidth);
-      b.writeln(
-        '  ${_c('·', '2', color)} $method  $pattern  ${_c(_kindLabel(r.kind), '2', color)}',
-      );
+    b.writeln('  ${ansi('routes', '1', on: color)}');
+    for (final (kind, label) in _routeSections) {
+      final group = routes.where((r) => r.kind == kind).toList()
+        ..sort((a, b) => a.pattern.compareTo(b.pattern));
+      if (group.isEmpty) continue;
+      b.writeln('  ${ansi(label, '2', on: color)}');
+      final methodWidth = group
+          .map((r) => r.methodToken.length)
+          .fold(3, (a, b) => a > b ? a : b);
+      for (final r in group) {
+        final method = ansi(
+          r.methodToken.padRight(methodWidth),
+          _routeHue(r),
+          on: color,
+        );
+        b.writeln('    ${ansi('·', '2', on: color)} $method  ${r.pattern}');
+      }
     }
   }
 
@@ -126,14 +125,14 @@ String serverBanner({
           ? entry.value
           : '$uri'.replaceFirst(RegExp(r'/$'), '') + entry.value;
       b.writeln(
-        '  ${_c('→', '36', color)} ${_c(label, '1', color)}  ${_c(target, '2;4', color)}',
+        '  ${ansi('→', '36', on: color)} ${ansi(label, '1', on: color)}  ${ansi(target, '2;4', on: color)}',
       );
     }
   }
 
   if (extra.isNotEmpty) b.writeln();
   for (final line in extra) {
-    b.writeln('  ${_c(line, '2', color)}');
+    b.writeln('  ${ansi(line, '2', on: color)}');
   }
   return b.toString();
 }

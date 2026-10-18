@@ -59,21 +59,24 @@ jobs:
       - run: cmake --build build/san --parallel --target nitro_server_engine_tests
       - run: ./build/san/nitro_server_tests/nitro_server_engine_tests
 
-  # Runs the cross-framework comparison (nitro vs dart:io vs shelf vs Go) and
-  # prints the table to the job log. Not a pass/fail gate on the numbers — it
-  # fails only if a server crashes or a client can't complete a request.
+  # Cross-framework comparison (nitro vs dart:io vs shelf vs Go vs Node) across
+  # every route and aspect — sequential + under-load p50/p99 latency and
+  # throughput. All sides run on the SAME runner through the same driver, so the
+  # absolute numbers depend on the runner but the RELATIVE standings are fair and
+  # reproducible by anyone: the full table is published to the run's job summary
+  # and the raw JSON is uploaded as an artifact. Not a pass/fail gate on the
+  # numbers — it fails only if a server crashes or a client can't complete a
+  # request.
   benchmark:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    # Comparison numbers, not a correctness gate. Non-blocking with a timeout:
-    # the full 32-connection load sweep can stall the reactor on the 2-core CI
-    # runners (a reactor-under-load issue tracked separately), and a benchmark
-    # must never hang the pipeline or gate merges on throughput.
+    # Comparison numbers, not a correctness gate. Non-blocking with a timeout so
+    # a slow runner never hangs the pipeline or gates merges on throughput.
     continue-on-error: true
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
@@ -82,6 +85,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y clang libssl-dev libuv1-dev libbrotli-dev
       - if: runner.os == 'macOS'
@@ -90,7 +96,41 @@ jobs:
       - run: cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release
       - run: cmake --build build/lib --parallel
       - run: mkdir -p build/benchmark && dart compile exe benchmark/compare.dart -o build/benchmark/compare
-      - run: ./build/benchmark/compare --quick --keep-alive
+      # Keep-alive: the headline, hardware-neutral comparison (throughput + tail
+      # latency, every route, every framework). Captured to a table + JSON.
+      - name: Cross-framework comparison (keep-alive)
+        run: |
+          ./build/benchmark/compare --keep-alive \
+            --json build/benchmark/results-${{ matrix.os }}.json \
+            | tee build/benchmark/table-${{ matrix.os }}.md
+      # Render the comparison onto the run's Summary page so anyone can read it
+      # without digging through logs.
+      - name: Publish comparison to the job summary
+        if: always()
+        run: |
+          {
+            echo "## Benchmark — ${{ matrix.os }}"
+            echo ""
+            echo "All frameworks ran on the **same** CI runner through the same driver."
+            echo "Absolute numbers depend on the runner; the **relative** standings are the"
+            echo "comparable, reproducible result. Reproduce locally with:"
+            echo ""
+            echo '```sh'
+            echo "cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release && cmake --build build/lib"
+            echo "dart run benchmark/compare.dart --keep-alive"
+            echo '```'
+            echo ""
+            cat build/benchmark/table-${{ matrix.os }}.md
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ matrix.os }}
+          path: |
+            build/benchmark/results-${{ matrix.os }}.json
+            build/benchmark/table-${{ matrix.os }}.md
+          if-no-files-found: warn
 
   # Windows uses a single libuv listener (no SO_REUSEPORT). This job proves the
   # engine compiles and links on Windows/MSVC; the gtest suite is a POSIX-socket

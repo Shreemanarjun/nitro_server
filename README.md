@@ -55,22 +55,14 @@ tightest p99, ~2.4× the per-core efficiency of Go/Node — see
 
 ## How it works
 
-- A **libuv reactor**: one event loop per CPU core, each with its own
-  `SO_REUSEPORT` listener, so the kernel load-balances accepts. A handful of
-  loop threads serve thousands of keep-alive connections — connection state is
-  heap-owned and read-event driven, not a thread per connection. (Windows has no
-  `SO_REUSEPORT`: a single listener there.)
-- Each loop parses the request, matches it in a segment trie, and hands it to a
-  Dart isolate over a stream. The handler's answer is enqueued and the
-  connection's loop is woken (`uv_async_send`) to write it (`sendfile` for
-  files). A response racing a connection close is dropped, never a
-  use-after-free.
-- **Adaptive dispatch.** Requests are dealt across only as many of the
-  configured `isolates` as actually raise throughput: a light/IO-bound handler
-  stays on one isolate (the engine already parallelizes the I/O), while a
-  CPU-bound or head-of-line-blocked workload fans out across all. So you can set
-  `isolates` to the core count for any workload — extra isolates are headroom
-  for heavy handlers, never a tax on light ones.
+A **libuv reactor** runs one event loop per CPU core, each with its own
+`SO_REUSEPORT` listener (one listener on Windows), so a handful of loop threads
+serve thousands of keep-alive connections — read-event driven, not a thread per
+connection. Each loop parses and trie-matches the request, hands it to a Dart
+isolate, then writes the answer (`sendfile` for files). **Adaptive dispatch**
+deals requests across only as many `isolates` as raise throughput — light
+handlers stay on one, CPU-bound ones fan out — so you set `isolates` to the core
+count for any workload.
 
 ## Routing & handlers
 
@@ -161,30 +153,66 @@ renderers if you want to expose the data your own way.
 
 The spec is built automatically from the registered routes. Use `serveOpenApi`
 for a zero-config spec, or the `OpenApi` wrapper to embed docs *inline* where you
-declare each route:
+declare each route. Typed helpers make **body, query/header params, and auth**
+all render and work in Swagger UI's "Try it out" — no raw OpenAPI maps:
 
 ```dart
-final api = OpenApi(server, title: 'My API', version: '1.0.0');
+final api = OpenApi(
+  server,
+  title: 'My API',
+  // Declaring schemes lights up Swagger's "Authorize" button.
+  securitySchemes: {'bearer': bearerScheme(bearerFormat: 'JWT')},
+);
 
+// Query + header inputs, and a response model.
 await api.get(
-  '/users/:id',
-  getUser,
+  '/search',
+  search,
   doc: const OpenApiOperation(
-    summary: 'Fetch a user',
-    responses: {
-      '200': {'description': 'the user'},
-      '404': {'description': 'not found'},
-    },
+    summary: 'Search',
+    params: [
+      OpenApiParam.query('q', required: true, example: 'ada'),
+      OpenApiParam.query('page', schema: {'type': 'integer'}),
+      OpenApiParam.header('X-Request-Id'),
+    ],
+    responseExample: {'total': 0},
   ),
 );
+
+// Request body: the schema + "Try it out" editor are inferred from the sample.
 await api.post(
   '/users',
   createUser,
   doc: const OpenApiOperation(
     summary: 'Create a user',
-    // Pre-fills Swagger's body editor; the schema is inferred from this.
     requestExample: {'name': 'Ada', 'email': 'ada@example.com'},
+    extraResponses: {'400': OpenApiResponse('Invalid body')},
   ),
+);
+
+// Non-JSON bodies: a file picker, a raw/binary input, form fields…
+await api.post(
+  '/upload',
+  upload,
+  doc: const OpenApiOperation(
+    requestBodyDoc: OpenApiRequestBody.multipart(
+      schema: {
+        'type': 'object',
+        'properties': {
+          'file': {'type': 'string', 'format': 'binary'},
+        },
+      },
+    ),
+  ),
+);
+
+// Auth: `requiresAuth` shows the padlock and sends the credential. Wire the
+// matching middleware so the live route enforces it.
+await api.get(
+  '/me',
+  me,
+  middleware: [bearerAuth((t) => t == token)],
+  doc: const OpenApiOperation(requiresAuth: ['bearer']),
 );
 
 await api.serve(); // GET /openapi.json + Swagger UI at /docs
@@ -192,10 +220,12 @@ await api.serve(); // GET /openapi.json + Swagger UI at /docs
 
 Path params become `{param}`; `all` routes expand across the verbs; WebSocket and
 custom-verb routes are surfaced under `x-additional-routes` so nothing is
-dropped. **POST/PUT/PATCH always get a JSON `requestBody`** so Swagger UI shows a
-body input even with no doc; `requestExample:` pre-fills that editor and infers
-the schema (`inferJsonSchema`), and a raw `requestBody:` gives full control.
-Declare `servers`/`securitySchemes`/`tags` on the wrapper or `serveOpenApi`.
+dropped. **POST/PUT/PATCH always get a JSON `requestBody`** so Swagger shows a
+body input even with no doc. Auth helpers cover all three families —
+`bearerScheme()`, `apiKeyScheme()`, `basicScheme()` — and the Swagger page keeps
+the Authorize token across reloads (`persistAuthorization`) with "Try it out"
+open by default. Raw `parameters`/`requestBody`/`responses`/`security` remain as
+full-control escape hatches.
 
 ### Graceful shutdown
 
@@ -259,6 +289,31 @@ expect(res.status, 200);
 expect(res.text(), 'u42');
 await client.close();
 ```
+
+## Running: the `nitro` CLI
+
+The package ships a `nitro` executable to run or compile a server entrypoint —
+JIT with hot reload for dev, AOT for production:
+
+```sh
+# Run (default: bin/server.dart, JIT + hot reload via the VM service)
+dart run nitro_server:nitro serve
+dart run nitro_server:nitro serve bin/api.dart     # a different entrypoint
+dart run nitro_server:nitro serve --aot            # compile, then run (prod-like)
+
+# Compile
+dart run nitro_server:nitro build                  # AOT exe → build/server
+dart run nitro_server:nitro build --jit            # JIT snapshot
+dart run nitro_server:nitro build -o dist/api      # custom output path
+
+# Globally activated (dart pub global activate nitro_server):
+nitro serve      # same commands, shorter
+nitro build
+```
+
+`serve` is just `dart run --enable-vm-service <entry>`; `build` wraps
+`dart compile exe`/`jit-snapshot`. Run those directly if you prefer — the CLI is
+a convenience, not a requirement.
 
 ## Hot reload
 

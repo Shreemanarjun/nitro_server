@@ -13,6 +13,11 @@ import 'package:test/test.dart';
 ResponseContext getUser(RequestContext r) =>
     ResponseContext.jsonBody({'id': r.param('id')});
 ResponseContext createUser(RequestContext r) => ResponseContext.text('made');
+ResponseContext search(RequestContext r) =>
+    ResponseContext.jsonBody({'q': null});
+ResponseContext upload(RequestContext r) => ResponseContext.text('ok');
+ResponseContext me(RequestContext r) => ResponseContext.jsonBody({'ok': true});
+const token = 'dev';
 ResponseContext handleUpload(RequestContext r) => ResponseContext.text('ok');
 ResponseContext dashboard(RequestContext r) => ResponseContext.text('admin');
 ResponseContext report(RequestContext r) => ResponseContext.text('report');
@@ -77,19 +82,54 @@ Future<void> middleware(NitroServer server) async {
 Future<void> production(NitroServer server) async {
   await serveObservability(server);
 
-  final api = OpenApi(server, title: 'My API');
+  final api = OpenApi(
+    server,
+    title: 'My API',
+    securitySchemes: {'bearer': bearerScheme(bearerFormat: 'JWT')},
+  );
+
   await api.get(
-    '/users/:id',
-    getUser,
+    '/search',
+    search,
     doc: const OpenApiOperation(
-      summary: 'Fetch a user',
-      responses: {
-        '200': {'description': 'the user'},
-        '404': {'description': 'not found'},
-      },
+      summary: 'Search',
+      params: [
+        OpenApiParam.query('q', required: true, example: 'ada'),
+        OpenApiParam.query('page', schema: {'type': 'integer'}),
+        OpenApiParam.header('X-Request-Id'),
+      ],
+      responseExample: {'total': 0},
     ),
   );
-  await api.post('/users', createUser);
+  await api.post(
+    '/users',
+    createUser,
+    doc: const OpenApiOperation(
+      summary: 'Create a user',
+      requestExample: {'name': 'Ada', 'email': 'ada@example.com'},
+      extraResponses: {'400': OpenApiResponse('Invalid body')},
+    ),
+  );
+  await api.post(
+    '/upload',
+    upload,
+    doc: const OpenApiOperation(
+      requestBodyDoc: OpenApiRequestBody.multipart(
+        schema: {
+          'type': 'object',
+          'properties': {
+            'file': {'type': 'string', 'format': 'binary'},
+          },
+        },
+      ),
+    ),
+  );
+  await api.get(
+    '/me',
+    me,
+    middleware: [bearerAuth((t) => t == token)],
+    doc: const OpenApiOperation(requiresAuth: ['bearer']),
+  );
   await api.serve();
 
   shutdownOnSignals(server, drain: const Duration(seconds: 15));

@@ -29,22 +29,31 @@ void main() {
     );
   });
 
-  test('candidates: explicit path, then env override, then cmake outputs', () {
+  test('candidates: path, env, next-to-exe, then cmake outputs', () {
     final name = nitroServerLibraryName();
     expect(
       nitroServerLibraryCandidates(
         path: '/x/lib.dylib',
         environment: const {'NITRO_SERVER_DYLIB': '/env/lib.dylib'},
+        executableDir: '/exe',
       ),
-      ['/x/lib.dylib', '/env/lib.dylib', 'build/lib/$name', 'build/$name'],
+      [
+        '/x/lib.dylib',
+        '/env/lib.dylib',
+        '/exe/$name',
+        '/exe/lib/$name',
+        'build/lib/$name',
+        'build/$name',
+      ],
     );
     expect(
       nitroServerLibraryCandidates(
         environment: const {'NITRO_SERVER_DYLIB': ''},
+        executableDir: '/exe',
       ),
-      ['build/lib/$name', 'build/$name'],
+      ['/exe/$name', '/exe/lib/$name', 'build/lib/$name', 'build/$name'],
     );
-    // The process environment is the default source.
+    // The process environment and real executable dir are the defaults.
     expect(nitroServerLibraryCandidates(), contains('build/lib/$name'));
   });
 

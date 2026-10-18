@@ -1,88 +1,36 @@
 ## 1.0.0
 
-First stable release. A production HTTP/1.1 + WebSocket server for Dart and
+First stable release — a production HTTP/1.1 + WebSocket server for Dart and
 Flutter, backed by a native multithreaded C++ (libuv) engine over Nitro FFI.
 
-### Server & routing
+**Engine** — one event loop per core over `SO_REUSEPORT`; adaptive dispatch
+across isolates (light handlers stay on one, CPU-bound fan out); `sendfile`,
+keep-alive, pipelining, `Expect: 100-continue`, chunked I/O; request-smuggling
+defense; optional TLS/brotli (build-time, OpenSSL/libbrotli).
 
-* `NitroServer.bind([config, setup])` opens the native library itself and starts
-  listening; port `0` picks a free port. `bindWith(dylibPath:)` loads a specific
-  library.
-* Trie routing: `:param`, trailing `*`, static > param > wildcard,
-  method-specific > `all`, HEAD falls back to GET. Verb shorthands
-  (`get`/`post`/`put`/`delete`/`patch`/`head`/`options`/`all`), `route` for
-  custom verbs, `group(prefix)` for prefixed sub-routers, `unroute`.
-* Per-route `timeout`, `maxBodyBytes`, `middleware`, `streamBody`.
-* `server.config`, `server.uri`, `server.routes` (a `RegisteredRoute` snapshot),
-  `server.events`, `server.metrics`, `server.onClose`.
-* `server.reload([setup])`: rebuilds the routing surface on the live socket,
-  transactionally (old routes serve until the new ones register; a throwing
-  `setup` rolls back), across all isolates.
-* `close({drain})`: stop now, or drain in-flight requests up to a deadline.
+**Routing & handlers** — trie routing (`:param`, `*`, custom verbs, `group`),
+per-route `timeout`/`maxBodyBytes`/`middleware`/`streamBody`; `RequestContext`
+(`params`, `query`, `headers`, `cookies`, `body`/`bodyStream`, `clientIp`,
+`jsonMap`/`jsonAs<T>`/`multipart`); `ResponseContext` (text/json/bytes/stream/
+file/redirect/cookies); `Server-Timing` header on every answer; live
+`reload([setup])` and graceful `close({drain})`.
 
-### Handlers
+**Middleware & production** — `cors`, `compress` (gzip/brotli), colourful
+`accessLog`, `rateLimit`, `bearerAuth`/`apiKeyAuth`/`basicAuth`;
+`serveObservability` (`/healthz`, `/readyz`, Prometheus `/metrics`, live
+`/dashboard`); `staticFiles` (etag, ranges, sendfile); `shutdownOnSignals`.
 
-* `RequestContext`: `headers`, `cookies`, `params`, `query`, `body`,
-  `bodyStream`, `clientIp` (peer address off the socket), `text()`, `jsonMap()`,
-  `jsonList()`, `jsonAs<T>()`, `multipart()`.
-* `ResponseContext`: `text`, `json`, `jsonBody`, `html`, `bytes`, `redirect`,
-  `stream`, `file`, `withCookie`. Sync handlers answer without a `Future`.
-* Every handler answer carries a `Server-Timing: app;dur=<ms>` header (dispatch
-  to answer), on by default; disable with `ServerConfig(responseTiming: false)`.
+**OpenAPI + Swagger UI** — `serveOpenApi` / the `OpenApi` wrapper generate the
+spec from your routes, with everything Swagger needs working out of the box:
+typed bodies (`OpenApiRequestBody`, JSON/form/multipart/binary), query/header/
+cookie params (`OpenApiParam`), auth that drives the Authorize button
+(`bearerScheme`/`apiKeyScheme`/`basicScheme` + `requiresAuth`), and response
+models (`responseExample`, `successStatus`, `OpenApiResponse`).
 
-### WebSocket
+**Tooling** — in-memory `NitroTestClient`; `enableHotReload`; the `nitro` CLI
+(`serve` JIT+hot-reload / `build` AOT or JIT snapshot); `serverBanner` startup
+banner; Docker/Fly/Cloud-Run/Netlify deploy recipes (`docs/deployment.md`).
 
-* RFC 6455 handshake and frame loop in the engine; text/binary, ping/pong, close
-  codes, `permessage-deflate` (RFC 7692), subprotocol selection.
-* `WsSession`: `messages`, `sendText`/`sendBytes`, `bufferedBytes`, `compressed`,
-  `close(code)`; 1009 past `wsMaxBufferBytes`.
-
-### Middleware & production add-ons
-
-* Built-in middleware: `cors()`, `compress()` (gzip/brotli), `accessLog()`,
-  `rateLimit()` (per-client fixed window), `bearerAuth()`/`apiKeyAuth()`/
-  `basicAuth()`.
-* `serveObservability(server)`: `/healthz`, `/readyz` (503 while draining),
-  Prometheus `/metrics`, and a self-contained live `/dashboard`
-  (`prometheusFormat`/`metricsJson` are the pure renderers).
-* OpenAPI 3.1 generated from the registered routes: `serveOpenApi(server)` serves
-  `/openapi.json` + Swagger UI at `/docs`; the `OpenApi` wrapper captures
-  per-route docs inline at registration; non-HTTP routes (WebSocket, custom
-  verbs) are surfaced under `x-additional-routes`. POST/PUT/PATCH get a JSON
-  `requestBody` automatically (Swagger shows a body input); `requestExample`
-  pre-fills it and infers the schema (`inferJsonSchema`); a raw `requestBody`
-  gives full control.
-* `shutdownOnSignals(server)`: graceful SIGTERM/SIGINT drain (`GracefulShutdown`
-  can also be triggered programmatically).
-* `staticFiles(dir)`: `sendfile`, `etag`, `last-modified`, 304, byte ranges,
-  index files, traversal protection.
-
-### Engine
-
-* libuv reactor: one event loop per core over `SO_REUSEPORT`; connection state
-  is read-event driven, not a thread per connection.
-* Adaptive dispatch: deals requests across only as many of the configured
-  `isolates` as raise throughput — light handlers stay on one, CPU-bound/mixed
-  ones fan out — so `isolates` can be the core count for any workload.
-* Direct-write answers (one non-blocking `sendmsg`), `sendfile` for files,
-  per-isolate head coalescing, leaf-call FFI for `respond`/stream.
-* HTTP/1.1 with keep-alive, pipelining, `Expect: 100-continue`, chunked uploads,
-  chunked/file responses. Request-smuggling defense (RFC 9112).
-* TLS via OpenSSL when built with it (`ServerConfig.tls`): HTTP/1.1 + `wss://`,
-  ALPN `http/1.1`.
-
-### Tooling & deployment
-
-* `package:nitro_server/testing.dart`: `NitroTestClient`, an in-memory client
-  over the real runner (no sockets, no native library).
-* `package:nitro_server/hot_reload.dart`: `enableHotReload(server)` wires VM hot
-  reload to `reload()` (JIT + `--enable-vm-service`; unavailable, and throws, in
-  an AOT build — guard it).
-* `serverBanner(...)` + `nitroServerAsciiLogo`: a colourful startup banner
-  listing the listen address, feature facts, every registered route and labelled
-  endpoint links; plain text off a TTY.
-* Deployment: multi-stage `Dockerfile`, `docker-compose.yml`, `fly.toml`,
-  `netlify.toml` (static-frontend proxy), and `bin/server.dart` reference
-  entrypoint. Guide: `docs/deployment.md`.
-* 100% Dart line coverage and a C++ engine coverage gate; ThreadSanitizer and
-  AddressSanitizer in CI; libFuzzer targets for the head/frame parsers.
+**Quality** — 100% Dart line coverage, ≥90% C++ engine coverage, ThreadSanitizer
++ AddressSanitizer + libFuzzer in CI, and a reproducible cross-framework
+benchmark (vs dart:io/shelf/Go/Node) published on every CI run.

@@ -2,12 +2,15 @@
 /// builds. It demonstrates every route type (text/JSON/params/query/body/bytes,
 /// all verbs, wildcard, streaming, WebSocket, a prefixed group) plus the
 /// production add-ons: middleware (CORS, compression, access log, rate limit,
-/// bearer auth), OpenAPI + Swagger UI, the live metrics dashboard, graceful
-/// shutdown, and hot reload. Reads `HOST`/`PORT` from the environment.
+/// bearer/API-key/basic auth), OpenAPI + Swagger UI (query + header inputs,
+/// request bodies, response models, a working Authorize for all three auth
+/// families), the live metrics dashboard, graceful shutdown, and hot reload.
+/// Reads `HOST`/`PORT` from the environment.
 ///
-/// Run locally with hot reload on: `dart run bin/server.dart` — edit a handler
-/// in [setup] and save, the routes rebuild on the live socket (no port drop).
-/// In a container it is AOT-compiled (no hot reload); see `Dockerfile`.
+/// Run locally with hot reload on: `dart run --enable-vm-service bin/server.dart`
+/// (or `dart run nitro_server:serve`). Edit a handler in [setup] and save — the
+/// routes rebuild on the live socket. In a container it is AOT-compiled (no hot
+/// reload); see `Dockerfile`.
 library;
 
 import 'dart:convert';
@@ -22,59 +25,131 @@ import 'package:nitro_server/nitro_server.dart';
 Future<void> setup(NitroServer server) async {
   final env = Platform.environment;
 
-  // Server-wide middleware (outermost first).
+  // Server-wide middleware (outermost first). The access log is colourful and
+  // shows method · status · latency (µs/ms) · path · client IP.
   await server.use(accessLog());
   await server.use(cors());
   await server.use(compress());
 
-  // Documented routes via the OpenAPI wrapper: each registers a real route and
-  // captures its spec inline.
+  // Documented routes via the OpenApi wrapper. Security schemes are declared
+  // once here so Swagger's "Authorize" covers bearer, API-key and basic; each
+  // protected route opts in with `requiresAuth`. `servers` is left empty so
+  // Try-it-out targets whatever origin served /docs (proxy/https safe).
   final api = OpenApi(
     server,
     title: 'nitro_server example',
     description: 'Every route type, documented from code.',
-    servers: const [OpenApiServer('http://localhost:8080')],
+    securitySchemes: {
+      'bearer': bearerScheme(bearerFormat: 'JWT'),
+      'apiKey': apiKeyScheme(), // defaults to the x-api-key header
+      'basic': basicScheme(),
+    },
   );
 
   await api.get(
     '/',
-    (_) => ResponseContext.text('nitro_server up now ! enjoy'),
-    doc: const OpenApiOperation(summary: 'Liveness text'),
+    (_) => ResponseContext.text('nitro_server up now ! enjoy love'),
+    doc: const OpenApiOperation(
+      summary: 'Liveness text',
+      responseDescription: 'Plain-text liveness string',
+    ),
   );
 
-  // Path param + JSON response.
+  // Path param + JSON response, with a response model shown in Swagger.
   await api.get(
     '/users/:id',
     (request) => ResponseContext.jsonBody({'id': request.param('id')}),
-    doc: const OpenApiOperation(summary: 'Fetch a user by id'),
+    doc: const OpenApiOperation(
+      summary: 'Fetch a user by id',
+      // Matches the handler's actual shape.
+      responseExample: {'id': '42'},
+    ),
   );
 
-  // Query parameters.
+  // Query + header parameters: Swagger renders inputs and sends them.
   await api.get(
     '/search',
     (request) => ResponseContext.jsonBody({
       'q': request.queryParam('q'),
       'page': request.queryParam('page') ?? '1',
+      'requestId': request.header('x-request-id'),
     }),
-    doc: const OpenApiOperation(summary: 'Search with ?q=&page='),
-  );
-
-  // JSON request body in, JSON out.
-  await api.post(
-    '/users',
-    (request) =>
-        ResponseContext.jsonBody({'created': request.jsonMap()}, status: 201),
     doc: const OpenApiOperation(
-      summary: 'Create a user from a JSON body',
-      requestExample: {'name': 'Ada', 'email': 'ada@example.com', 'age': 36},
+      summary: 'Search with ?q=&page=&sort=',
+      params: [
+        OpenApiParam.query(
+          'q',
+          required: true,
+          description: 'search text',
+          example: 'ada',
+        ),
+        OpenApiParam.query('page', schema: {'type': 'integer'}, example: 1),
+        OpenApiParam.query('sort', enumValues: ['asc', 'desc'], example: 'asc'),
+        OpenApiParam.header('X-Request-Id', description: 'Correlation id'),
+      ],
     ),
   );
 
-  // Raw bytes echo.
+  // JSON request body in, JSON out. The handler validates the body, so the
+  // documented 201/400 match what it actually returns.
+  await api.post(
+    '/users',
+    (request) {
+      final Map<String, Object?> body;
+      try {
+        body = request.jsonMap();
+      } on FormatException {
+        return ResponseContext.jsonBody({'error': 'bad body'}, status: 400);
+      }
+      return ResponseContext.jsonBody({'created': body}, status: 201);
+    },
+    doc: const OpenApiOperation(
+      summary: 'Create a user from a JSON body',
+      requestExample: {'name': 'Ada', 'email': 'ada@example.com', 'age': 36},
+      successStatus: 201,
+      responseExample: {
+        'created': {'name': 'Ada'},
+      },
+      extraResponses: {
+        '400': OpenApiResponse(
+          'Invalid JSON body',
+          example: {'error': 'bad body'},
+        ),
+      },
+    ),
+  );
+
+  // Raw bytes echo — documented as a binary (octet-stream) body so Swagger
+  // shows a file/raw input instead of a JSON editor.
   await api.put(
     '/echo',
     (request) => ResponseContext.bytes(request.body),
-    doc: const OpenApiOperation(summary: 'Echo the request body'),
+    doc: const OpenApiOperation(
+      summary: 'Echo the request body',
+      requestBodyDoc: OpenApiRequestBody.binary(),
+    ),
+  );
+
+  // Multipart upload with a file field — Swagger renders a file picker.
+  await api.post(
+    '/upload',
+    (request) {
+      final parts = request.multipart();
+      return ResponseContext.jsonBody({'parts': parts.length});
+    },
+    doc: const OpenApiOperation(
+      summary: 'Upload a file (multipart/form-data)',
+      requestBodyDoc: OpenApiRequestBody.multipart(
+        required: true,
+        schema: {
+          'type': 'object',
+          'properties': {
+            'file': {'type': 'string', 'format': 'binary'},
+            'name': {'type': 'string'},
+          },
+        },
+      ),
+    ),
   );
 
   await api.patch(
@@ -104,11 +179,42 @@ Future<void> setup(NitroServer server) async {
     doc: const OpenApiOperation(summary: 'Five chunks, 100ms apart'),
   );
 
-  // A prefixed group with its own middleware: rate-limited, bearer-protected.
-  final secure = server.group('/api/v1');
-  await secure.use(rateLimit(maxRequests: 100));
-  await secure.use(bearerAuth((token) => token == (env['API_TOKEN'] ?? 'dev')));
-  await secure.get('/me', (_) => ResponseContext.jsonBody({'ok': true}));
+  // Protected routes — one per auth family. Each declares `requiresAuth` so
+  // Swagger shows the padlock and sends the credential, and wires the matching
+  // middleware so the live route actually enforces it. Dev creds: bearer token
+  // `dev`, API key `dev`, basic `admin:dev`.
+  await api.get(
+    '/api/v1/me',
+    (_) => ResponseContext.jsonBody({'ok': true}),
+    middleware: [
+      rateLimit(maxRequests: 100),
+      bearerAuth((token) => token == (env['API_TOKEN'] ?? 'dev')),
+    ],
+    doc: const OpenApiOperation(
+      summary: 'Who am I (bearer — token: dev)',
+      requiresAuth: ['bearer'],
+    ),
+  );
+
+  await api.get(
+    '/api/v1/key',
+    (_) => ResponseContext.jsonBody({'ok': true}),
+    middleware: [apiKeyAuth((key) => key == (env['API_KEY'] ?? 'dev'))],
+    doc: const OpenApiOperation(
+      summary: 'API-key protected (x-api-key: dev)',
+      requiresAuth: ['apiKey'],
+    ),
+  );
+
+  await api.get(
+    '/api/v1/admin',
+    (_) => ResponseContext.jsonBody({'ok': true}),
+    middleware: [basicAuth((user, pass) => user == 'admin' && pass == 'dev')],
+    doc: const OpenApiOperation(
+      summary: 'Basic protected (admin:dev)',
+      requiresAuth: ['basic'],
+    ),
+  );
 
   // Static files from ./public (serves index.html; 404 if the dir is absent).
   await server.get('/static/*', staticFiles('public'));
@@ -130,6 +236,7 @@ Future<void> setup(NitroServer server) async {
 }
 
 Future<void> main() async {
+  final startup = Stopwatch()..start();
   final env = Platform.environment;
   final host = env['HOST'] ?? '0.0.0.0';
   final port = int.tryParse(env['PORT'] ?? '') ?? 8080;
@@ -139,12 +246,12 @@ Future<void> main() async {
     setup,
   );
 
-  // Always try hot reload: it attaches under `dart run` (JIT + VM service) and
-  // is gracefully unavailable in an AOT build. Edit a handler in [setup], save,
-  // and the routes rebuild on the live socket.
+  // Always try hot reload: it attaches under `dart run --enable-vm-service`
+  // (JIT) and is gracefully unavailable in an AOT build. Edit a handler in
+  // [setup], save, and the routes rebuild on the live socket.
   var hotReload = false;
   try {
-    await enableHotReload(server);
+    await enableHotReload(server, log: (m) => stdout.writeln('  ↻ $m'));
     hotReload = true;
   } catch (_) {
     // AOT or VM service disabled: serve normally, no reload.
@@ -153,6 +260,7 @@ Future<void> main() async {
   // Graceful drain on SIGTERM/SIGINT (containers, Ctrl-C).
   shutdownOnSignals(server, drain: const Duration(seconds: 15));
 
+  startup.stop();
   stdout.writeln(
     serverBanner(
       title: 'nitro_server',
@@ -170,6 +278,7 @@ Future<void> main() async {
         'ready': '/readyz',
       },
       facts: [
+        'started in ${startup.elapsedMilliseconds}ms',
         'hot reload ${hotReload ? 'on' : 'off'}',
         'timing ${server.config.responseTiming ? 'on' : 'off'}',
       ],

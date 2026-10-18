@@ -124,8 +124,22 @@ Future<void> testingSnippet() async {
 // README: Hot reload
 Future<void> hotReload() async {
   final server = await NitroServer.bind(const ServerConfig(port: 8080), setup);
-  await enableHotReload(server);
+  try {
+    await enableHotReload(server); // re-runs `setup` after each hot reload
+  } catch (_) {
+    // AOT or no VM service: serve without reload.
+  }
 }
+
+// README: Startup banner
+String banner(NitroServer server) => serverBanner(
+  title: 'nitro_server',
+  version: '1.0.0',
+  logo: nitroServerAsciiLogo,
+  uri: server.uri,
+  routes: server.routes,
+  links: const {'docs': '/docs'},
+);
 
 // README: Dart-only use / loader
 Future<void> loader() async {

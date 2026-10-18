@@ -44,6 +44,7 @@ the provided [`Dockerfile`](Dockerfile).
 - Observability: Prometheus `/metrics`, `/healthz`, `/readyz`, and a live
   WebSocket-pushed dashboard.
 - OpenAPI 3.1 + Swagger UI generated from the routes.
+- `Server-Timing` response-time header on every answer; colourful startup banner.
 - Graceful drain on SIGTERM/SIGINT; transactional hot reload.
 - Typed public API (no `dynamic`); in-memory test client.
 - Deploy recipes: Docker, Fly.io, Cloud Run, Kubernetes, Netlify.
@@ -96,9 +97,9 @@ HEAD falls back to GET. A handler that outlives its route `timeout` is dropped
 after the client gets a 408; a throwing handler answers 500.
 
 `RequestContext`: `method`, `path`, `query`, `queryParameters`, `headers`,
-`cookies`, `params`, `body`, `bodyStream` (with `streamBody: true`), `text()`,
-`jsonMap()`, `jsonList()`, `jsonAs<T>()`, `multipart()`, `header(name)`,
-`param(name)`, `queryParam(name)`.
+`cookies`, `params`, `body`, `bodyStream` (with `streamBody: true`), `clientIp`
+(the peer address off the socket), `text()`, `jsonMap()`, `jsonList()`,
+`jsonAs<T>()`, `multipart()`, `header(name)`, `param(name)`, `queryParam(name)`.
 
 `ResponseContext`: `text`, `json`, `jsonBody`, `jsonMap`, `html`, `bytes`,
 `redirect`, `stream`, `file`; `withCookie(SetCookie(...))`. Sync handlers are
@@ -176,16 +177,25 @@ await api.get(
     },
   ),
 );
-await api.post('/users', createUser); // documented with the auto skeleton
+await api.post(
+  '/users',
+  createUser,
+  doc: const OpenApiOperation(
+    summary: 'Create a user',
+    // Pre-fills Swagger's body editor; the schema is inferred from this.
+    requestExample: {'name': 'Ada', 'email': 'ada@example.com'},
+  ),
+);
 
 await api.serve(); // GET /openapi.json + Swagger UI at /docs
 ```
 
 Path params become `{param}`; `all` routes expand across the verbs; WebSocket and
 custom-verb routes are surfaced under `x-additional-routes` so nothing is
-dropped. Enrich individual operations (request/response schemas, tags, security)
-via `OpenApiOperation`, and declare `servers`/`securitySchemes`/`tags` on the
-wrapper or `serveOpenApi`.
+dropped. **POST/PUT/PATCH always get a JSON `requestBody`** so Swagger UI shows a
+body input even with no doc; `requestExample:` pre-fills that editor and infers
+the schema (`inferJsonSchema`), and a raw `requestBody:` gives full control.
+Declare `servers`/`securitySchemes`/`tags` on the wrapper or `serveOpenApi`.
 
 ### Graceful shutdown
 
@@ -231,6 +241,7 @@ final server = await NitroServer.bind(
 | `workerThreads` | `0` | caps the libuv event-loop threads; `0` = one per core |
 | `isolates` | `1` | Dart isolates available to run handlers; `0` = half the cores (1–8); each runs `setup`. Adaptive dispatch uses only as many as help |
 | `wsMaxBufferBytes`, `wsCompression` | 1 MiB, `true` | WebSocket send queue before a 1009 close; negotiate `permessage-deflate` |
+| `responseTiming` | `true` | add `Server-Timing: app;dur=<ms>` (dispatch→answer) to every handler answer; browsers show it in DevTools. Set `false` to shave one string per response at peak throughput |
 | `tls` | none | `TlsConfig(certPem:, keyPem:)` or `certFile`/`keyFile`; throws `ServerTlsException` unless the engine was built with OpenSSL |
 
 ## Testing
@@ -252,23 +263,47 @@ await client.close();
 ## Hot reload
 
 `server.reload([setup])` rebuilds the whole routing surface on the live socket,
-transactionally. Wire it to VM hot reload with the opt-in helper (add
-`hotreloader` to `dev_dependencies`):
+transactionally — added, removed and changed routes all take effect without
+dropping the port or open connections, across every isolate. `enableHotReload`
+(in `package:nitro_server/hot_reload.dart`) wires that to the VM's hot reload:
 
 ```dart
 import 'package:nitro_server/nitro_server.dart';
 import 'package:nitro_server/hot_reload.dart';
 
+Future<void> setup(NitroServer server) async {
+  await server.get('/hello', (_) => ResponseContext.text('hi'));
+}
+
 Future<void> main() async {
   final server = await NitroServer.bind(const ServerConfig(port: 8080), setup);
-  await enableHotReload(server); // re-runs `setup` after each hot reload
+  try {
+    await enableHotReload(server); // re-runs `setup` after each hot reload
+  } catch (_) {
+    // AOT or no VM service: serve without reload.
+  }
 }
 ```
 
-Run with `dart run --enable-vm-service bin/server.dart`, then edit a handler and
-save. `setup` must be a **top-level or static function** (Dart hot reload doesn't
-re-patch a stored anonymous closure); handlers written inline inside `setup` are
-fine.
+**Availability.** Hot reload needs a running VM service, so it works under
+`dart run --enable-vm-service bin/server.dart` (JIT) and is unavailable in an
+AOT build (`dart compile exe`) — `enableHotReload` throws there, so guard it as
+above and your server runs normally. The bundled `bin/server.dart` does exactly
+this and prints `hot reload on`/`off` in its startup banner.
+
+**How it works.** `enableHotReload` watches your source directories and, after
+each reload, calls `server.reload()` to re-run `setup` and diff the route table.
+`setup` must be a **top-level or static function** (Dart hot reload doesn't
+re-patch a stored anonymous closure); handlers written inline inside `setup`
+are fine.
+
+## Startup banner
+
+`serverBanner(...)` returns a colourful, production-grade startup log — the
+NITRO wordmark, the listen address, isolate/pid/feature facts, every registered
+route (`server.routes`) classified by kind, and labelled endpoint links. It is a
+pure function, so you choose where it goes; pass `color: stdout.supportsAnsiEscapes`
+for colour on a TTY and clean plain text in a pipe or CI log. See `bin/server.dart`.
 
 ## Performance
 
@@ -293,8 +328,6 @@ coordinated-omission-free latency, overload, CPU/core, memory, AOT vs JIT):
 - **Per-isolate state.** `server.metrics` and middleware state (e.g.
   `rateLimit`) are per isolate; with `isolates > 1` aggregate externally
   (Prometheus sums scrapes) or keep operational endpoints on one isolate.
-- **No client IP in handlers.** Derive clients from proxy headers
-  (`X-Forwarded-For`/`X-Real-IP`).
 - **TLS/brotli are build-time.** They require the engine to be compiled with
   OpenSSL/libbrotli; the default build has them off (terminate TLS at a proxy,
   or build with `-DNITRO_SERVER_TLS=ON`).

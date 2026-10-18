@@ -217,6 +217,7 @@ class RequestContext {
     required this.routePattern,
     required this.body,
     this.bodyStream,
+    this.clientIp = '',
   }) : _packedHeaders = null;
 
   /// The runner's form: headers arrive packed (`name\u0000value` pairs
@@ -231,6 +232,7 @@ class RequestContext {
     required this.routePattern,
     required this.body,
     this.bodyStream,
+    this.clientIp = '',
   }) : _headers = null,
        _queryParameters = null;
 
@@ -252,6 +254,13 @@ class RequestContext {
       _headers ?? unpackHeaders(_packedHeaders!);
   final Map<String, String> params;
   final String routePattern;
+
+  /// The peer's IP (`127.0.0.1`, `::1`, …) as the engine read it off the
+  /// socket, or empty when unavailable (the in-memory test client, or a
+  /// platform that could not resolve it). This is the direct peer; behind a
+  /// reverse proxy it is the proxy's address, so prefer `X-Forwarded-For`
+  /// there.
+  final String clientIp;
 
   /// The assembled body. Empty on a route registered with `streamBody`,
   /// where the bytes arrive on [bodyStream] instead.

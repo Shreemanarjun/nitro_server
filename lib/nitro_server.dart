@@ -32,9 +32,11 @@ export 'src/api/openapi.dart'
         OpenApiServer,
         OpenApiTag,
         buildOpenApi,
+        inferJsonSchema,
         openApiDocument,
         serveOpenApi;
 export 'src/api/route_group.dart';
 export 'src/api/server.dart';
+export 'src/api/startup_log.dart' show nitroServerAsciiLogo, serverBanner;
 export 'src/api/static_files.dart';
 export 'src/api/ws.dart';

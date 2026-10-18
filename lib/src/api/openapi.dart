@@ -54,6 +54,7 @@ class OpenApiOperation {
     this.deprecated = false,
     this.parameters,
     this.requestBody,
+    this.requestExample,
     this.responses,
     this.security,
   });
@@ -66,8 +67,14 @@ class OpenApiOperation {
   /// Extra parameters (query/header/cookie) appended after the path params.
   final List<Map<String, Object?>>? parameters;
 
-  /// A raw OpenAPI `requestBody` object.
+  /// A raw OpenAPI `requestBody` object. Full control; wins over
+  /// [requestExample] and the auto body.
   final Map<String, Object?>? requestBody;
+
+  /// A sample JSON request body. Shortcut that builds an `application/json`
+  /// [requestBody] with this value as its `example`, so Swagger UI pre-fills
+  /// the "Try it out" editor. Ignored when [requestBody] is set.
+  final Object? requestExample;
 
   /// Status code -> raw OpenAPI response object. Replaces the default `200`.
   final Map<String, Map<String, Object?>>? responses;
@@ -150,6 +157,52 @@ Map<String, Object?> buildOpenApi(
   return doc;
 }
 
+/// Methods that carry a request body, so Swagger UI should offer a body input.
+const _bodyMethods = {'POST', 'PUT', 'PATCH'};
+
+/// Infers an OpenAPI 3.1 schema from a sample JSON [value] — so a
+/// `requestExample` or any JSON sample becomes a typed schema automatically.
+/// Objects map each key to its value's schema; arrays take the first element's
+/// schema (empty array → any item); `null`/unknown → any (`{}`). Exported for
+/// building schemas by hand too.
+Map<String, Object?> inferJsonSchema(Object? value) {
+  if (value is bool) return const {'type': 'boolean'};
+  if (value is int) return const {'type': 'integer'};
+  if (value is num) return const {'type': 'number'};
+  if (value is String) return const {'type': 'string'};
+  if (value is List) {
+    return {
+      'type': 'array',
+      'items': value.isEmpty
+          ? const <String, Object?>{}
+          : inferJsonSchema(value.first),
+    };
+  }
+  if (value is Map) {
+    return {
+      'type': 'object',
+      'properties': {
+        for (final e in value.entries) '${e.key}': inferJsonSchema(e.value),
+      },
+    };
+  }
+  return const {}; // null or an unsupported type: any
+}
+
+/// An `application/json` request body. Freeform object by default (Swagger
+/// shows an editable JSON field); with [example] the editor is pre-filled.
+Map<String, Object?> _jsonRequestBody({Object? example}) => {
+  'required': false,
+  'content': {
+    'application/json': {
+      'schema': example != null
+          ? inferJsonSchema(example)
+          : const {'type': 'object', 'additionalProperties': true},
+      'example': ?example,
+    },
+  },
+};
+
 /// One operation object: the auto skeleton (summary, path params, `200`) with
 /// [extra] enrichment layered on top (supplied fields win).
 Map<String, Object?> _operation(
@@ -176,7 +229,16 @@ Map<String, Object?> _operation(
   if (extra != null && extra.tags.isNotEmpty) op['tags'] = extra.tags;
   if (extra?.deprecated ?? false) op['deprecated'] = true;
   if (parameters.isNotEmpty) op['parameters'] = parameters;
-  if (extra?.requestBody != null) op['requestBody'] = extra!.requestBody;
+  // Body-bearing methods always get a requestBody so Swagger UI shows a body
+  // input, even when the route described none. An explicit `requestBody` wins;
+  // a `requestExample` builds a JSON body pre-filled with that sample; else a
+  // body method falls back to a freeform JSON object.
+  final requestBody =
+      extra?.requestBody ??
+      (extra?.requestExample != null
+          ? _jsonRequestBody(example: extra!.requestExample)
+          : (_bodyMethods.contains(method) ? _jsonRequestBody() : null));
+  if (requestBody != null) op['requestBody'] = requestBody;
   if (extra?.security != null) op['security'] = extra!.security;
   op['responses'] =
       extra?.responses ??

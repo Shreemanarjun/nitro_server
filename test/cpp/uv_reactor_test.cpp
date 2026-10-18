@@ -260,6 +260,7 @@ class RecordingEmitter : public Emitter {
     std::vector<RouteParam> params;
     std::vector<Header> headers;
     std::string body;
+    std::string clientIp;
   };
 
   /// One decoded WebSocket event.
@@ -283,7 +284,8 @@ class RecordingEmitter : public Emitter {
                 const std::string& query, const std::vector<Header>& headers,
                 int64_t, bool hasBody, bool bodyComplete,
                 const std::string& routePattern,
-                const std::vector<RouteParam>& params) override {
+                const std::vector<RouteParam>& params,
+                const std::string& clientIp) override {
     std::lock_guard<std::mutex> lk(mutex_);
     Seen& s = partial_[requestId];
     s.requestId = requestId;
@@ -293,6 +295,7 @@ class RecordingEmitter : public Emitter {
     s.routePattern = routePattern;
     s.params = params;
     s.headers = headers;
+    s.clientIp = clientIp;
     if (!hasBody || bodyComplete) {
       auto [status, body] = answer_(method, path, s.body);
       jobs_.push_back({requestId, status, body});
@@ -1251,9 +1254,10 @@ TEST(UvReactorTest, StreamBodyRouteEmitsHeadBeforeChunks) {
                   const std::string& p, const std::string& q,
                   const std::vector<Header>& h, int64_t cl, bool hasBody,
                   bool complete, const std::string& rp,
-                  const std::vector<RouteParam>& params) override {
+                  const std::vector<RouteParam>& params,
+                  const std::string& clientIp) override {
       { std::lock_guard<std::mutex> lk(m); order.push_back(complete ? "head-complete" : "head"); }
-      RecordingEmitter::emitHead(id, method, c, p, q, h, cl, hasBody, complete, rp, params);
+      RecordingEmitter::emitHead(id, method, c, p, q, h, cl, hasBody, complete, rp, params, clientIp);
     }
     void emitBodyData(int64_t id, uint8_t* payload, size_t n) override {
       { std::lock_guard<std::mutex> lk(m); order.push_back("data"); }

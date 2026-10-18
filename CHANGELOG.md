@@ -23,9 +23,12 @@ Flutter, backed by a native multithreaded C++ (libuv) engine over Nitro FFI.
 ### Handlers
 
 * `RequestContext`: `headers`, `cookies`, `params`, `query`, `body`,
-  `bodyStream`, `text()`, `jsonMap()`, `jsonList()`, `jsonAs<T>()`, `multipart()`.
+  `bodyStream`, `clientIp` (peer address off the socket), `text()`, `jsonMap()`,
+  `jsonList()`, `jsonAs<T>()`, `multipart()`.
 * `ResponseContext`: `text`, `json`, `jsonBody`, `html`, `bytes`, `redirect`,
   `stream`, `file`, `withCookie`. Sync handlers answer without a `Future`.
+* Every handler answer carries a `Server-Timing: app;dur=<ms>` header (dispatch
+  to answer), on by default; disable with `ServerConfig(responseTiming: false)`.
 
 ### WebSocket
 
@@ -45,7 +48,10 @@ Flutter, backed by a native multithreaded C++ (libuv) engine over Nitro FFI.
 * OpenAPI 3.1 generated from the registered routes: `serveOpenApi(server)` serves
   `/openapi.json` + Swagger UI at `/docs`; the `OpenApi` wrapper captures
   per-route docs inline at registration; non-HTTP routes (WebSocket, custom
-  verbs) are surfaced under `x-additional-routes`.
+  verbs) are surfaced under `x-additional-routes`. POST/PUT/PATCH get a JSON
+  `requestBody` automatically (Swagger shows a body input); `requestExample`
+  pre-fills it and infers the schema (`inferJsonSchema`); a raw `requestBody`
+  gives full control.
 * `shutdownOnSignals(server)`: graceful SIGTERM/SIGINT drain (`GracefulShutdown`
   can also be triggered programmatically).
 * `staticFiles(dir)`: `sendfile`, `etag`, `last-modified`, 304, byte ranges,
@@ -70,7 +76,11 @@ Flutter, backed by a native multithreaded C++ (libuv) engine over Nitro FFI.
 * `package:nitro_server/testing.dart`: `NitroTestClient`, an in-memory client
   over the real runner (no sockets, no native library).
 * `package:nitro_server/hot_reload.dart`: `enableHotReload(server)` wires VM hot
-  reload to `reload()` (opt-in `hotreloader` dev-dependency).
+  reload to `reload()` (JIT + `--enable-vm-service`; unavailable, and throws, in
+  an AOT build — guard it).
+* `serverBanner(...)` + `nitroServerAsciiLogo`: a colourful startup banner
+  listing the listen address, feature facts, every registered route and labelled
+  endpoint links; plain text off a TTY.
 * Deployment: multi-stage `Dockerfile`, `docker-compose.yml`, `fly.toml`,
   `netlify.toml` (static-frontend proxy), and `bin/server.dart` reference
   entrypoint. Guide: `docs/deployment.md`.

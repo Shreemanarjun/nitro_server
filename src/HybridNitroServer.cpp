@@ -58,7 +58,8 @@ class BridgeEmitter final : public Emitter {
                 const std::string& query, const std::vector<Header>& headers,
                 int64_t contentLength, bool hasBody, bool bodyComplete,
                 const std::string& routePattern,
-                const std::vector<RouteParam>& params) override {
+                const std::vector<RouteParam>& params,
+                const std::string& clientIp) override {
     RawIncomingRequest req;
     req.requestId = requestId;
     req.method = static_cast<RawServerMethod>(method);
@@ -79,6 +80,7 @@ class BridgeEmitter final : public Emitter {
     req.hasBody = hasBody;
     req.bodyComplete = bodyComplete;
     req.routePattern = routePattern;
+    req.clientIp = clientIp;
     for (const auto& p : params) {
       RawRouteParam rp;
       rp.name = p.name;

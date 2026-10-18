@@ -71,7 +71,8 @@ class Emitter {
                         const std::vector<Header>& headers,
                         int64_t contentLength, bool hasBody, bool bodyComplete,
                         const std::string& routePattern,
-                        const std::vector<RouteParam>& params) = 0;
+                        const std::vector<RouteParam>& params,
+                        const std::string& clientIp) = 0;
   virtual void emitBodyData(int64_t requestId, uint8_t* payload, size_t n) = 0;
   virtual void emitBodyEnd(int64_t requestId) = 0;
   /// Terminal error chunk. [payload] is malloc-owned and already tracked in

@@ -275,6 +275,11 @@ class RawIncomingRequest {
   final String routePattern;
   final List<RawRouteParam> params;
 
+  /// The peer's IP (`127.0.0.1`, `::1`, …), or empty when the engine could not
+  /// read it. The engine's own view of the socket, so it cannot be spoofed by
+  /// a request header (behind a proxy, still prefer `X-Forwarded-For`).
+  final String clientIp;
+
   const RawIncomingRequest({
     required this.requestId,
     this.method = RawServerMethod.get,
@@ -287,6 +292,7 @@ class RawIncomingRequest {
     this.bodyComplete = false,
     this.routePattern = '',
     this.params = const [],
+    this.clientIp = '',
   });
 }
 

@@ -2,25 +2,25 @@
 /// builds. It demonstrates every route type (text/JSON/params/query/body/bytes,
 /// all verbs, wildcard, streaming, WebSocket, a prefixed group) plus the
 /// production add-ons: middleware (CORS, compression, access log, rate limit,
-/// bearer auth), OpenAPI + Swagger UI, the live metrics dashboard, and graceful
-/// shutdown. Reads `HOST`/`PORT` from the environment.
+/// bearer auth), OpenAPI + Swagger UI, the live metrics dashboard, graceful
+/// shutdown, and hot reload. Reads `HOST`/`PORT` from the environment.
 ///
-/// Run locally: `dart run bin/server.dart` (after building the native lib, see
-/// README). In a container it is AOT-compiled; see `Dockerfile`.
+/// Run locally with hot reload on: `dart run bin/server.dart` — edit a handler
+/// in [setup] and save, the routes rebuild on the live socket (no port drop).
+/// In a container it is AOT-compiled (no hot reload); see `Dockerfile`.
 library;
 
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:nitro_server/hot_reload.dart';
 import 'package:nitro_server/nitro_server.dart';
 
-Future<void> main() async {
+/// Registers every route and middleware. Top-level (not an inline closure) so
+/// hot reload can re-patch it and so it runs identically on every isolate.
+Future<void> setup(NitroServer server) async {
   final env = Platform.environment;
-  final host = env['HOST'] ?? '0.0.0.0';
-  final port = int.tryParse(env['PORT'] ?? '') ?? 8080;
-
-  final server = await NitroServer.bind(ServerConfig(host: host, port: port));
 
   // Server-wide middleware (outermost first).
   await server.use(accessLog());
@@ -38,7 +38,7 @@ Future<void> main() async {
 
   await api.get(
     '/',
-    (_) => ResponseContext.text('nitro_server up'),
+    (_) => ResponseContext.text('nitro_server up now ! enjoy'),
     doc: const OpenApiOperation(summary: 'Liveness text'),
   );
 
@@ -64,7 +64,10 @@ Future<void> main() async {
     '/users',
     (request) =>
         ResponseContext.jsonBody({'created': request.jsonMap()}, status: 201),
-    doc: const OpenApiOperation(summary: 'Create a user from a JSON body'),
+    doc: const OpenApiOperation(
+      summary: 'Create a user from a JSON body',
+      requestExample: {'name': 'Ada', 'email': 'ada@example.com', 'age': 36},
+    ),
   );
 
   // Raw bytes echo.
@@ -77,7 +80,10 @@ Future<void> main() async {
   await api.patch(
     '/users/:id',
     (request) => ResponseContext.jsonBody({'patched': request.param('id')}),
-    doc: const OpenApiOperation(summary: 'Patch a user'),
+    doc: const OpenApiOperation(
+      summary: 'Patch a user',
+      requestExample: {'email': 'new@example.com'},
+    ),
   );
 
   await api.delete(
@@ -121,13 +127,55 @@ Future<void> main() async {
   // Operational endpoints (single handler isolate, so metrics are consistent).
   await serveObservability(server); // /metrics, /healthz, /readyz, /dashboard
   await api.serve(); // /openapi.json, /docs
+}
+
+Future<void> main() async {
+  final env = Platform.environment;
+  final host = env['HOST'] ?? '0.0.0.0';
+  final port = int.tryParse(env['PORT'] ?? '') ?? 8080;
+
+  final server = await NitroServer.bind(
+    ServerConfig(host: host, port: port),
+    setup,
+  );
+
+  // Always try hot reload: it attaches under `dart run` (JIT + VM service) and
+  // is gracefully unavailable in an AOT build. Edit a handler in [setup], save,
+  // and the routes rebuild on the live socket.
+  var hotReload = false;
+  try {
+    await enableHotReload(server);
+    hotReload = true;
+  } catch (_) {
+    // AOT or VM service disabled: serve normally, no reload.
+  }
 
   // Graceful drain on SIGTERM/SIGINT (containers, Ctrl-C).
   shutdownOnSignals(server, drain: const Duration(seconds: 15));
 
-  stdout.writeln('nitro_server listening on ${server.uri}');
   stdout.writeln(
-    '  docs: ${server.uri}/docs   dashboard: ${server.uri}/dashboard',
+    serverBanner(
+      title: 'nitro_server',
+      version: '1.0.0',
+      logo: nitroServerAsciiLogo,
+      uri: server.uri,
+      isolates: server.config.isolates,
+      pid: pid,
+      routes: server.routes,
+      links: const {
+        'docs': '/docs',
+        'dashboard': '/dashboard',
+        'metrics': '/metrics',
+        'health': '/healthz',
+        'ready': '/readyz',
+      },
+      facts: [
+        'hot reload ${hotReload ? 'on' : 'off'}',
+        'timing ${server.config.responseTiming ? 'on' : 'off'}',
+      ],
+      extra: const ['ready · press Ctrl-C to stop'],
+      color: stdout.supportsAnsiEscapes,
+    ),
   );
   await server.onClose;
 }

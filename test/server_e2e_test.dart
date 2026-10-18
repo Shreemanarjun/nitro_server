@@ -819,6 +819,17 @@ void main() {
       }
     }, skip: skipReason);
 
+    test('a handler sees the client IP off the socket', () async {
+      server = await NitroServer.bind();
+      await server!.get(
+        '/whoami',
+        (request) => ResponseContext.text(request.clientIp),
+      );
+      final res = await _get(server!.port, '/whoami');
+      // The _get helper connects over IPv4 loopback.
+      expect(res.body, '127.0.0.1');
+    }, skip: skipReason);
+
     test('answers carry a Server-Timing header by default', () async {
       server = await NitroServer.bind();
       await server!.get('/t', (_) => ResponseContext.text('hi'));

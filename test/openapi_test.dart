@@ -151,6 +151,117 @@ void main() {
       expect(item.keys.toSet(), {'get', 'post'});
     });
 
+    test('body methods get a default JSON requestBody; GET does not', () {
+      final doc = buildOpenApi(const [
+        RegisteredRoute(
+          method: HttpMethod.get,
+          pattern: '/a',
+          kind: RouteKind.handler,
+        ),
+        RegisteredRoute(
+          method: HttpMethod.post,
+          pattern: '/a',
+          kind: RouteKind.handler,
+        ),
+        RegisteredRoute(
+          method: HttpMethod.put,
+          pattern: '/a',
+          kind: RouteKind.handler,
+        ),
+        RegisteredRoute(
+          method: HttpMethod.patch,
+          pattern: '/a',
+          kind: RouteKind.handler,
+        ),
+      ]);
+      final item = (doc['paths'] as Map)['/a'] as Map;
+      expect((item['get'] as Map).containsKey('requestBody'), isFalse);
+      for (final m in ['post', 'put', 'patch']) {
+        final body = (item[m] as Map)['requestBody'] as Map;
+        final schema =
+            ((body['content'] as Map)['application/json'] as Map)['schema']
+                as Map;
+        expect(schema['type'], 'object');
+      }
+    });
+
+    test('requestExample builds an inferred JSON schema and example', () {
+      final doc = buildOpenApi(
+        const [
+          RegisteredRoute(
+            method: HttpMethod.post,
+            pattern: '/users',
+            kind: RouteKind.handler,
+          ),
+        ],
+        operations: const {
+          'POST /users': OpenApiOperation(
+            requestExample: {
+              'name': 'Ada',
+              'age': 36,
+              'admin': true,
+              'tags': ['x'],
+            },
+          ),
+        },
+      );
+      final op = ((doc['paths'] as Map)['/users'] as Map)['post'] as Map;
+      final json =
+          ((op['requestBody'] as Map)['content'] as Map)['application/json']
+              as Map;
+      expect(json['example'], {
+        'name': 'Ada',
+        'age': 36,
+        'admin': true,
+        'tags': ['x'],
+      });
+      final props = (json['schema'] as Map)['properties'] as Map;
+      expect((props['name'] as Map)['type'], 'string');
+      expect((props['age'] as Map)['type'], 'integer');
+      expect((props['admin'] as Map)['type'], 'boolean');
+      expect((props['tags'] as Map)['type'], 'array');
+      expect(((props['tags'] as Map)['items'] as Map)['type'], 'string');
+    });
+
+    test('an explicit requestBody wins over the auto body', () {
+      final doc = buildOpenApi(
+        const [
+          RegisteredRoute(
+            method: HttpMethod.post,
+            pattern: '/x',
+            kind: RouteKind.handler,
+          ),
+        ],
+        operations: const {
+          'POST /x': OpenApiOperation(requestBody: {'required': true}),
+        },
+      );
+      final op = ((doc['paths'] as Map)['/x'] as Map)['post'] as Map;
+      expect(op['requestBody'], {'required': true});
+    });
+
+    test('inferJsonSchema maps every JSON type', () {
+      expect(inferJsonSchema(true), {'type': 'boolean'});
+      expect(inferJsonSchema(1), {'type': 'integer'});
+      expect(inferJsonSchema(1.5), {'type': 'number'});
+      expect(inferJsonSchema('s'), {'type': 'string'});
+      expect(inferJsonSchema(const []), {
+        'type': 'array',
+        'items': <String, Object?>{},
+      });
+      expect(inferJsonSchema([1]), {
+        'type': 'array',
+        'items': {'type': 'integer'},
+      });
+      expect(inferJsonSchema(null), <String, Object?>{});
+      expect(inferJsonSchema(const {'a': 's'}), {
+        'type': 'object',
+        'properties': {
+          'a': {'type': 'string'},
+        },
+      });
+    });
+
     test('enriches a specific operation and adds servers/security/tags', () {
       final doc = buildOpenApi(
         const [

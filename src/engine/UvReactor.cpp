@@ -290,6 +290,7 @@ struct UvReactor::Conn {
   bool closing = false;
   bool counted = false;    // admitted: liveConns_ (+ per-IP) incremented for it
   std::string peerIp;      // remote IP, for the per-IP cap (empty = not counted)
+  std::string clientIp;    // remote IP, always set, reported to handlers
   int64_t served = 0;  // completed requests (header vs keep-alive timeout)
   int64_t reqIdInFlight = -1;  // dispatched handler awaiting respond (for 408)
   bool continueSent = false;   // sent 100 Continue for the current request
@@ -663,6 +664,7 @@ void UvReactor::onConnection(uv_stream_t* server, int status) {
       peerIp = ip;
     }
   }
+  c->clientIp = peerIp;  // reported to handlers; independent of the per-IP cap
   // Admit or refuse: over the global cap, while draining, or over the per-IP
   // cap, accept then close so the backlog drains instead of wedging. Counting
   // happens here (guarded — accepts land on every loop thread) and is released
@@ -957,7 +959,8 @@ void UvReactor::processConn(Conn* c) {
         if (em)
           em->emitHead(reqId, head.method, head.customMethod, path, query,
                        head.headers, clen, /*hasBody=*/true,
-                       /*bodyComplete=*/false, m.route->pattern, m.params);
+                       /*bodyComplete=*/false, m.route->pattern, m.params,
+                       c->clientIp);
         c->streamingBody = true;
         c->streamChunked = chunked;
         c->streamReqId = reqId;
@@ -1075,7 +1078,7 @@ void UvReactor::processConn(Conn* c) {
       // head" form: it races the two streams and can dispatch an empty body.)
       em->emitHead(reqId, head.method, head.customMethod, path, query,
                    head.headers, clen, hasBody, /*bodyComplete=*/!hasBody,
-                   m.route->pattern, m.params);
+                   m.route->pattern, m.params, c->clientIp);
       if (hasBody) {
         auto* payload = (uint8_t*)std::malloc(bodyBytes.size());
         if (payload) {
@@ -1516,7 +1519,7 @@ void UvReactor::wsHandshake(Conn* c, const ParsedHead& head,
   if (c->wsEmitter) {
     c->wsEmitter->emitHead(c->id, head.method, head.customMethod, path, query,
                            head.headers, 0, false, true, m.route->pattern,
-                           m.params);
+                           m.params, c->clientIp);
   }
   wsProcess(c);  // handle any frames already buffered
 }

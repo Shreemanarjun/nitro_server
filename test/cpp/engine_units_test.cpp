@@ -20,8 +20,8 @@ class NullEmitter final : public Emitter {
  public:
   void emitHead(int64_t, Method, const std::string&, const std::string&,
                 const std::string&, const std::vector<Header>&, int64_t, bool,
-                bool, const std::string&,
-                const std::vector<RouteParam>&) override {}
+                bool, const std::string&, const std::vector<RouteParam>&,
+                const std::string&) override {}
   void emitBodyData(int64_t, uint8_t*, size_t) override {}
   void emitBodyEnd(int64_t) override {}
   void emitBodyError(int64_t, uint8_t*, size_t, ErrorKind) override {}

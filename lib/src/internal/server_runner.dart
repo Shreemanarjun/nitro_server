@@ -819,6 +819,7 @@ class ServerRunner {
       // allocating per request.
       body: pending.body.isEmpty ? _emptyBody : pending.body.toBytes(),
       bodyStream: pending.stream?.stream,
+      clientIp: head.clientIp,
     );
     if (entry == null) {
       final ws = _wsHandlers[head.routePattern];

@@ -2,6 +2,7 @@
 // precedence, body/header/query delivery, and the documented divergences
 // (direct 404s, no timeouts). No native library, no sockets.
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:nitro/nitro.dart';
 import 'package:nitro_server/nitro_server.dart';
@@ -422,5 +423,35 @@ void main() {
 
   test('websocket to a missing route throws', () async {
     await expectLater(client.ws('/ghost'), throwsStateError);
+  });
+
+  group('response timing', () {
+    test('every answer carries a well-formed Server-Timing header', () async {
+      await client.server.get('/t', (_) => ResponseContext.text('hi'));
+      final res = await client.get('/t');
+      final timing = res.headers['server-timing'];
+      expect(timing, isNotNull);
+      // `app;dur=<milliseconds>` — the W3C shape browsers surface in DevTools.
+      expect(timing, matches(RegExp(r'^app;dur=\d+\.\d{3}$')));
+    });
+
+    test('a streamed answer carries it too', () async {
+      await client.server.get(
+        '/s',
+        (_) => ResponseContext.stream(
+          Stream.value(Uint8List.fromList('x'.codeUnits)),
+        ),
+      );
+      final res = await client.get('/s');
+      expect(res.headers['server-timing'], matches(RegExp(r'^app;dur=')));
+    });
+
+    test('responseTiming: false omits the header', () async {
+      final quiet = await NitroTestClient.start(responseTiming: false);
+      addTearDown(quiet.close);
+      await quiet.server.get('/t', (_) => ResponseContext.text('hi'));
+      final res = await quiet.get('/t');
+      expect(res.headers.containsKey('server-timing'), isFalse);
+    });
   });
 }

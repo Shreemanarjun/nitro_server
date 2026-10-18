@@ -642,7 +642,7 @@ void UvReactor::onConnection(uv_stream_t* server, int status) {
   UvReactor* self = lp->owner;
   Conn* c = new Conn();
   c->lp = lp;
-  c->id = self->nextConnId_.fetch_add(1);
+  c->id = self->nextId_.fetch_add(1);
   c->handle.data = c;
   uv_tcp_init(&lp->loop, &c->handle);
   if (uv_accept(server, (uv_stream_t*)&c->handle) != 0) {
@@ -933,7 +933,7 @@ void UvReactor::processConn(Conn* c) {
     if (clen > 0 || chunked) {
       if (m.matched && m.route->streamBody &&
           !(m.route->maxBodyBytes >= 0 && clen > m.route->maxBodyBytes)) {
-        const int64_t reqId = nextReqId_.fetch_add(1);
+        const int64_t reqId = nextId_.fetch_add(1);
         int loopIdx = 0;
         for (size_t i = 0; i < loops_.size(); i++)
           if (loops_[i].get() == c->lp) { loopIdx = (int)i; break; }
@@ -1049,7 +1049,7 @@ void UvReactor::processConn(Conn* c) {
       continue;
     }
     // Handler route: dispatch to Dart, one in flight, answered via respond().
-    const int64_t reqId = nextReqId_.fetch_add(1);
+    const int64_t reqId = nextId_.fetch_add(1);
     int loopIdx = 0;
     for (size_t i = 0; i < loops_.size(); i++)
       if (loops_[i].get() == c->lp) { loopIdx = (int)i; break; }

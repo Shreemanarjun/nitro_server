@@ -132,16 +132,18 @@ final class FastCalls {
   bool _disposed = false;
 
   /// Answers [requestId]. Same contract as the generated `respond`.
-  /// [setCookies] are sent as one `set-cookie` header each.
+  /// [setCookies] are sent as one `set-cookie` header each. A non-negative
+  /// [timingUs] appends one `Server-Timing` header (see [serverTiming]).
   void respond(
     int requestId,
     int status,
     Map<String, String> headers,
     Uint8List body, [
     List<String> setCookies = const [],
+    int timingUs = -1,
   ]) {
     if (_disposed) return;
-    _encodeHeaders(headers, setCookies);
+    _encodeHeaders(headers, setCookies, timingUs);
     _stageBody(body);
     _respond(
       _instanceId,
@@ -155,15 +157,17 @@ final class FastCalls {
     _check();
   }
 
-  /// Same contract as the generated `startStream`.
+  /// Same contract as the generated `startStream`. A non-negative [timingUs]
+  /// appends one `Server-Timing` header (see [serverTiming]).
   void startStream(
     int requestId,
     int status,
     Map<String, String> headers, [
     List<String> setCookies = const [],
+    int timingUs = -1,
   ]) {
     if (_disposed) return;
-    _encodeHeaders(headers, setCookies);
+    _encodeHeaders(headers, setCookies, timingUs);
     _startStream(_instanceId, requestId, status, _headers, _err);
     _check();
   }
@@ -194,29 +198,47 @@ final class FastCalls {
     if (bytes.isNotEmpty) _bodyView.setRange(0, bytes.length, bytes);
   }
 
-  void _encodeHeaders(Map<String, String> headers, List<String> setCookies) {
-    final need = headerListBytes(headers, setCookies);
+  void _encodeHeaders(
+    Map<String, String> headers,
+    List<String> setCookies, [
+    int timingUs = -1,
+  ]) {
+    final timing = timingUs >= 0 ? serverTiming(timingUs) : null;
+    final need = headerListBytes(headers, setCookies, timing);
     if (need > _headerCap) _growHeaders(need);
-    encodeHeaderList(headers, _headerView, _headerData, setCookies);
+    encodeHeaderList(headers, _headerView, _headerData, setCookies, timing);
   }
 
-  /// Upper bound on the encoded size of [headers] plus [setCookies]: 3 bytes
-  /// per UTF-16 unit (the UTF-8 worst case) plus the fixed framing.
+  /// The `Server-Timing` value for a response that took [us] microseconds:
+  /// `app;dur=<milliseconds>` (the W3C shape browsers surface in DevTools).
+  /// One source of truth for both the fast path and the generated path.
+  static String serverTiming(int us) =>
+      'app;dur=${(us / 1000).toStringAsFixed(3)}';
+
+  /// Upper bound on the encoded size of [headers] plus [setCookies] plus an
+  /// optional `server-timing: [timing]` header: 3 bytes per UTF-16 unit (the
+  /// UTF-8 worst case) plus the fixed framing.
   static int headerListBytes(
     Map<String, String> headers, [
     List<String> setCookies = const [],
+    String? timing,
   ]) {
-    var need = 8 + 8 * (headers.length + setCookies.length);
+    final extra = timing != null ? 1 : 0;
+    var need = 8 + 8 * (headers.length + setCookies.length + extra);
     for (final entry in headers.entries) {
       need += 8 + 3 * (entry.key.length + entry.value.length);
     }
     for (final cookie in setCookies) {
       need += 8 + 3 * (_setCookie.length + cookie.length);
     }
+    if (timing != null) {
+      need += 8 + 3 * (_serverTiming.length + timing.length);
+    }
     return need;
   }
 
   static const _setCookie = 'set-cookie';
+  static const _serverTiming = 'server-timing';
 
   /// Encodes [headers] as an indexed `List<RawHeader>` argument into [view]
   /// (which must hold [headerListBytes]): `[i32 payloadLen][i32 count]
@@ -230,8 +252,10 @@ final class FastCalls {
     Uint8List view,
     ByteData data, [
     List<String> setCookies = const [],
+    String? timing,
   ]) {
-    final count = headers.length + setCookies.length;
+    final extra = timing != null ? 1 : 0;
+    final count = headers.length + setCookies.length + extra;
     data.setInt32(4, count, Endian.little);
     var pos = 8 + 8 * count;
     var i = 0;
@@ -245,6 +269,12 @@ final class FastCalls {
       data.setInt64(8 + 8 * i, pos - 4, Endian.little);
       pos = _putString(pos, _setCookie, view, data);
       pos = _putString(pos, cookie, view, data);
+      i++;
+    }
+    if (timing != null) {
+      data.setInt64(8 + 8 * i, pos - 4, Endian.little);
+      pos = _putString(pos, _serverTiming, view, data);
+      pos = _putString(pos, timing, view, data);
       i++;
     }
     data.setInt32(0, pos - 4, Endian.little);

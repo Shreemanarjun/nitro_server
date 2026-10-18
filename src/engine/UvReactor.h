@@ -220,8 +220,15 @@ class UvReactor {
   std::atomic<int64_t> boundPort_{0};
   int reservedPort_ = 0;  // app-level port claim, released on stop()
   std::atomic<int64_t> liveConns_{0};
-  std::atomic<int64_t> nextReqId_{1};
-  std::atomic<int64_t> nextConnId_{1};
+  // One id space for both HTTP request ids and connection ids. They key the
+  // same maps downstream — PendingTable (payload logs) here, and the Dart
+  // runner's `_pending` map (a WebSocket open is emitted as a head keyed by
+  // its connection id). Drawing both from one counter makes every id globally
+  // unique, so a connection id can never collide with a request id. Separate
+  // counters both starting at 1 caused HTTP requests to be dropped whenever a
+  // request id swept past a live WebSocket connection id, and risked a
+  // double-free when their PendingTable payload logs aliased.
+  std::atomic<int64_t> nextId_{1};
   std::atomic<bool> running_{false};
   std::atomic<bool> draining_{false};
   void* sslCtx_ = nullptr;  // SSL_CTX*; opaque here to keep OpenSSL out of the header

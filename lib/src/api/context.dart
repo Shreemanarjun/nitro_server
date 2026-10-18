@@ -52,6 +52,7 @@ class ServerConfig {
     this.writeTimeout = const Duration(seconds: 30),
     this.wsMaxBufferBytes = 1024 * 1024,
     this.wsCompression = true,
+    this.responseTiming = true,
     this.tls = const TlsConfig(),
   }) : assert(port >= 0 && port <= 65535, 'port out of range: $port'),
        assert(wsMaxBufferBytes > 0, 'wsMaxBufferBytes must be positive'),
@@ -126,13 +127,21 @@ class ServerConfig {
 
   /// Negotiate `permessage-deflate` when a WebSocket client offers it.
   final bool wsCompression;
+
+  /// Add a `Server-Timing: app;dur=<ms>` header to every handler answer —
+  /// the time from dispatch to answer, which browsers surface in DevTools
+  /// (Network → Timing) and any client can read. On by default; set `false`
+  /// to shave one small string per response off the hot path when you are
+  /// chasing peak throughput. Answers the engine serves itself (static files,
+  /// a rejected oversized body) carry no app timing.
+  final bool responseTiming;
   final TlsConfig tls;
 
   /// A copy with any of [host], [port], [backlog], [maxBodyBytes],
   /// [defaultTimeout], [keepAliveTimeout], [maxRequestsPerConnection],
   /// [workerThreads], [isolates], [maxConnections], [maxConnectionsPerIp],
-  /// [headerTimeout], [writeTimeout], [wsMaxBufferBytes], [wsCompression]
-  /// or [tls] replaced.
+  /// [headerTimeout], [writeTimeout], [wsMaxBufferBytes], [wsCompression],
+  /// [responseTiming] or [tls] replaced.
   ServerConfig copyWith({
     String? host,
     int? port,
@@ -149,6 +158,7 @@ class ServerConfig {
     Duration? writeTimeout,
     int? wsMaxBufferBytes,
     bool? wsCompression,
+    bool? responseTiming,
     TlsConfig? tls,
   }) {
     return ServerConfig(
@@ -168,6 +178,7 @@ class ServerConfig {
       writeTimeout: writeTimeout ?? this.writeTimeout,
       wsMaxBufferBytes: wsMaxBufferBytes ?? this.wsMaxBufferBytes,
       wsCompression: wsCompression ?? this.wsCompression,
+      responseTiming: responseTiming ?? this.responseTiming,
       tls: tls ?? this.tls,
     );
   }

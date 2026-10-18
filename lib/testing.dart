@@ -74,9 +74,11 @@ class NitroTestClient {
   /// [StateError] (there are no route timeouts here to do it).
   static Future<NitroTestClient> start({
     Duration responseTimeout = const Duration(seconds: 5),
+    bool responseTiming = true,
   }) async {
     final native = _InMemoryNative();
-    final runner = ServerRunner(native);
+    final runner = ServerRunner(native)
+      ..responseTimingForTesting = responseTiming;
     return NitroTestClient._(runner, native, responseTimeout);
   }
 

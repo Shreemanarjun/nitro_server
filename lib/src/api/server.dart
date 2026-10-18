@@ -89,6 +89,8 @@ class NitroServer with RouteRegistrar<NitroServer> {
         key: key,
         setup: setup!,
         dylibPath: loadedNitroServerNativePath,
+        wsCompression: config.wsCompression,
+        responseTiming: config.responseTiming,
       );
     }
     server._port = runner.start(config);
@@ -437,6 +439,8 @@ class _Helper {
     required String key,
     required ServerSetup setup,
     required String? dylibPath,
+    required bool wsCompression,
+    required bool responseTiming,
   }) async {
     final helpers = <_Helper>[];
     for (var i = 0; i < count; i++) {
@@ -445,7 +449,14 @@ class _Helper {
       // port, so a failure surfaces here instead of hanging `bind`.
       await Isolate.spawn(
         _helperMain,
-        _HelperBoot(key, dylibPath, setup, replies.sendPort),
+        _HelperBoot(
+          key,
+          dylibPath,
+          setup,
+          replies.sendPort,
+          wsCompression,
+          responseTiming,
+        ),
         debugName: 'nitro_server:$key:${i + 1}',
         onError: replies.sendPort,
       );
@@ -487,7 +498,14 @@ class _Helper {
 }
 
 class _HelperBoot {
-  const _HelperBoot(this.key, this.dylibPath, this.setup, this.reply);
+  const _HelperBoot(
+    this.key,
+    this.dylibPath,
+    this.setup,
+    this.reply,
+    this.wsCompression,
+    this.responseTiming,
+  );
 
   static const closeSignal = 'close';
 
@@ -495,6 +513,8 @@ class _HelperBoot {
   final String? dylibPath;
   final ServerSetup setup;
   final SendPort reply;
+  final bool wsCompression;
+  final bool responseTiming;
 }
 
 /// Helper isolate entry: same key, own runner, same routes, then wait for
@@ -508,7 +528,10 @@ Future<void> _helperMain(_HelperBoot boot) async {
   // never read (the main isolate owns lifecycle and holds the real config).
   final server = NitroServer._(runner, const ServerConfig());
   await boot.setup(server);
-  runner.prepareHelper();
+  runner.prepareHelper(
+    wsCompression: boot.wsCompression,
+    responseTiming: boot.responseTiming,
+  );
   final control = ReceivePort();
   boot.reply.send(control.sendPort);
   await for (final message in control) {

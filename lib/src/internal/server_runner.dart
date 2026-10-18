@@ -121,6 +121,10 @@ class ServerRunner {
   /// when the native side is a fake, in which case the generated bindings
   /// answer. Bound on [start], released on [close].
   FastCalls? _fast;
+
+  /// When true, every handler answer carries a `Server-Timing` header with
+  /// the dispatch-to-answer time. Set from [ServerConfig.responseTiming].
+  bool _responseTiming = true;
   final _pending = <int, _Pending>{};
 
   /// Per-route metrics, keyed by pattern (`*unmatched*` for not-found).
@@ -264,6 +268,11 @@ class ServerRunner {
   /// fake's broadcast streams drop a head emitted before any subscriber, and
   /// in production a request can never arrive before `start()` subscribed.
   void ensureListeningForTesting() => _ensureListening();
+
+  /// Test seam: the in-memory client has no `start()` to read config, so it
+  /// sets the `Server-Timing` toggle directly (mirrors
+  /// [ServerConfig.responseTiming]).
+  set responseTimingForTesting(bool value) => _responseTiming = value;
 
   /// Marks [requestId] answered: drops the in-flight entry, records the
   /// id so a stale duplicate head can never dispatch again, and sends the
@@ -520,6 +529,7 @@ class ServerRunner {
     _ensureListening();
     _fast ??= _bindFast();
     _wsCompression = config.wsCompression;
+    _responseTiming = config.responseTiming;
     _native.configureServer(
       RawServerConfig(
         host: config.host,
@@ -574,10 +584,11 @@ class ServerRunner {
   /// Readies a runner that will not call [start] — a helper isolate behind
   /// a server another isolate started: subscribe the streams and bind the
   /// fast path, so the first dealt request finds everything in place.
-  void prepareHelper({bool wsCompression = true}) {
+  void prepareHelper({bool wsCompression = true, bool responseTiming = true}) {
     _ensureListening();
     _fast ??= _bindFast();
     _wsCompression = wsCompression;
+    _responseTiming = responseTiming;
   }
 
   /// The fast path needs a real engine instance behind [_native]; a fake
@@ -857,13 +868,20 @@ class ServerRunner {
   /// this path, so a custom error page may stream too.
   void _deliver(int requestId, ResponseContext response) {
     _record(requestId, response.status);
+    // Dispatch-to-answer time, emitted as `Server-Timing`. Computed once here
+    // (the pending entry is still live) and reused by whichever answer path
+    // runs. -1 when timing is off or the request is already gone.
+    final pending = _pending[requestId];
+    final timingUs = (_responseTiming && pending != null)
+        ? _clock.elapsedMicroseconds - pending.startedUs
+        : -1;
     if (response.bodyStream != null) {
-      _answerStream(requestId, response);
+      _answerStream(requestId, response, timingUs);
     } else if (response.filePath case final path?) {
-      _answerFile(requestId, response, path);
+      _answerFile(requestId, response, path, timingUs);
       _complete(requestId);
     } else {
-      _answer(requestId, response);
+      _answer(requestId, response, timingUs);
       _complete(requestId);
     }
   }
@@ -881,13 +899,18 @@ class ServerRunner {
 
   /// A file answer: the engine writes the head now and sends the bytes
   /// from a native worker. Rare enough to ride the generated binding.
-  void _answerFile(int requestId, ResponseContext response, String path) {
+  void _answerFile(
+    int requestId,
+    ResponseContext response,
+    String path,
+    int timingUs,
+  ) {
     if (_closed) return;
     try {
       _native.respondFile(
         requestId,
         response.status,
-        _rawHeaders(response),
+        _rawHeaders(response, timingUs),
         path,
         response.fileOffset,
         response.fileLength,
@@ -920,7 +943,7 @@ class ServerRunner {
     }
   }
 
-  void _answer(int requestId, ResponseContext response) {
+  void _answer(int requestId, ResponseContext response, int timingUs) {
     if (_closed) return;
     try {
       final fast = _fast;
@@ -931,12 +954,13 @@ class ServerRunner {
           response.headers,
           response.bodyBytes,
           _setCookies(response),
+          timingUs,
         );
       } else {
         _native.respond(
           requestId,
           response.status,
-          _rawHeaders(response),
+          _rawHeaders(response, timingUs),
           response.bodyBytes,
         );
       }
@@ -949,8 +973,11 @@ class ServerRunner {
   /// Headerless answers (the common small-response case) share one canonical
   /// empty list instead of allocating a fresh growable one. Cookies ride as
   /// one `set-cookie` header each.
-  static List<RawHeader> _rawHeaders(ResponseContext response) {
-    if (response.headers.isEmpty && response.cookies.isEmpty) {
+  static List<RawHeader> _rawHeaders(
+    ResponseContext response, [
+    int timingUs = -1,
+  ]) {
+    if (response.headers.isEmpty && response.cookies.isEmpty && timingUs < 0) {
       return const <RawHeader>[];
     }
     return [
@@ -958,6 +985,11 @@ class ServerRunner {
         RawHeader(name: entry.key, value: entry.value),
       for (final cookie in response.cookies)
         RawHeader(name: 'set-cookie', value: cookie.toHeaderValue()),
+      if (timingUs >= 0)
+        RawHeader(
+          name: 'server-timing',
+          value: FastCalls.serverTiming(timingUs),
+        ),
     ];
   }
 
@@ -971,7 +1003,7 @@ class ServerRunner {
   /// answered, so a stale duplicate head can never dispatch again. A stream
   /// error truncates rather than hangs: the client sees a clean terminator
   /// after the bytes so far.
-  void _answerStream(int requestId, ResponseContext response) {
+  void _answerStream(int requestId, ResponseContext response, int timingUs) {
     if (_closed) return;
     try {
       final fast = _fast;
@@ -981,9 +1013,14 @@ class ServerRunner {
           response.status,
           response.headers,
           _setCookies(response),
+          timingUs,
         );
       } else {
-        _native.startStream(requestId, response.status, _rawHeaders(response));
+        _native.startStream(
+          requestId,
+          response.status,
+          _rawHeaders(response, timingUs),
+        );
       }
     } catch (_) {
       // The timeout won before the first byte (or the server went away):
@@ -1075,6 +1112,15 @@ class ServerRunner {
             .header('sec-websocket-extensions')
             ?.contains('permessage-deflate') ??
         false;
+    // The upgrade head rode `_pending` only to carry itself through `_dispatch`
+    // to here; the live socket is tracked in `_wsSessions`, never `_pending`.
+    // Dropping it now keeps WebSocket ids out of the request-id map for good:
+    // the entry does not linger for the connection's lifetime (a per-socket
+    // leak), and nothing downstream can mistake this id for an in-flight HTTP
+    // request. The engine already draws request and connection ids from one
+    // counter so they cannot collide, but a request map that simply never
+    // holds a socket needs no such luck.
+    _pending.remove(connectionId);
     final session = _WsSessionImpl(
       connectionId,
       handshake,

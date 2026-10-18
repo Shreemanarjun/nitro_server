@@ -782,6 +782,61 @@ void main() {
       await socket.close();
     }, skip: skipReason);
 
+    test('open WebSockets never shadow later HTTP requests', () async {
+      // Regression guard for the id-space collision: the engine once drew
+      // connection ids and request ids from two counters that both started at
+      // 1, and a WebSocket open rode the request-id map keyed by its
+      // connection id. A live socket therefore parked an entry whose key a
+      // later HTTP request id would eventually equal — and that request was
+      // silently dropped (handler never ran, client hung). Both ids now come
+      // from one counter, so every id is unique; this proves no HTTP request
+      // disappears while sockets at low ids stay open.
+      server = await NitroServer.bind();
+      await server!.get('/ping', (_) => ResponseContext.text('pong'));
+      await server!.ws('/echo', (session) async {
+        await for (final m in session.messages) {
+          session.sendText(m.text ?? '');
+        }
+      });
+      // Hold several sockets open at the lowest connection ids.
+      final sockets = <WebSocket>[];
+      for (var i = 0; i < 5; i++) {
+        sockets.add(
+          await WebSocket.connect('ws://127.0.0.1:${server!.port}/echo'),
+        );
+      }
+      // Fire enough HTTP requests that their ids sweep past every live socket
+      // id. Under the old two-counter design, the ones whose id matched a live
+      // socket id were dropped; here every one must be answered.
+      final statuses = <int>[];
+      for (var i = 0; i < 40; i++) {
+        statuses.add((await _get(server!.port, '/ping')).status);
+      }
+      expect(statuses, everyElement(200));
+      expect(statuses, hasLength(40));
+      for (final s in sockets) {
+        await s.close();
+      }
+    }, skip: skipReason);
+
+    test('answers carry a Server-Timing header by default', () async {
+      server = await NitroServer.bind();
+      await server!.get('/t', (_) => ResponseContext.text('hi'));
+      final res = await _get(server!.port, '/t');
+      final timing = res.headers.value('server-timing');
+      expect(timing, isNotNull);
+      expect(timing, matches(RegExp(r'^app;dur=\d+\.\d{3}$')));
+    }, skip: skipReason);
+
+    test('responseTiming: false drops the Server-Timing header', () async {
+      server = await NitroServer.bind(
+        const ServerConfig(responseTiming: false),
+      );
+      await server!.get('/t', (_) => ResponseContext.text('hi'));
+      final res = await _get(server!.port, '/t');
+      expect(res.headers.value('server-timing'), isNull);
+    }, skip: skipReason);
+
     test('a session over its send buffer is closed with 1009', () async {
       server = await NitroServer.bind(
         const ServerConfig(wsMaxBufferBytes: 64 * 1024),

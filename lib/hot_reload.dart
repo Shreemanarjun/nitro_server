@@ -81,25 +81,49 @@ Future<HotReloader> enableHotReload(
     },
   );
 
-  // Stop watching when the server stops, so the reloader never outlives it.
-  unawaited(server.onClose.then((_) => reloader.stop()));
+  // Tear everything down when the server stops — cancel the watchers and the
+  // pending debounce BEFORE stopping the reloader, so a save racing shutdown
+  // never fires a reload against a disposed VM service.
+  var stopped = false;
+  final watchers = <StreamSubscription<FileSystemEvent>>[];
+  Timer? debounce;
+  Future<void> teardown() async {
+    if (stopped) return;
+    stopped = true;
+    debounce?.cancel();
+    for (final w in watchers) {
+      await w.cancel();
+    }
+    await reloader.stop();
+  }
+
+  unawaited(server.onClose.then((_) => teardown()));
 
   final dirs = {...?watch, if (watch == null) ?_scriptDir()};
   log?.call('hot reload: watching ${dirs.join(', ')}');
-  Timer? debounce;
   for (final dir in dirs) {
     if (!Directory(dir).existsSync()) continue;
-    Directory(dir).watch(recursive: true).listen((event) {
-      if (!event.path.endsWith('.dart')) return;
-      final path = event.path;
-      // Trailing debounce: fire after the writes settle, so an editor's
-      // temp-file-then-rename save is fully on disk before the VM re-reads it.
-      debounce?.cancel();
-      debounce = Timer(const Duration(milliseconds: 300), () {
-        log?.call('hot reload: $path changed, reloading');
-        unawaited(reloader.reloadCode());
-      });
-    });
+    watchers.add(
+      Directory(dir).watch(recursive: true).listen((event) {
+        if (stopped || !event.path.endsWith('.dart')) return;
+        final path = event.path;
+        // Trailing debounce: fire after the writes settle, so an editor's
+        // temp-file-then-rename save is fully on disk before the VM re-reads it.
+        debounce?.cancel();
+        debounce = Timer(const Duration(milliseconds: 300), () async {
+          if (stopped) return;
+          log?.call('hot reload: $path changed, reloading');
+          try {
+            await reloader.reloadCode();
+          } catch (error, stack) {
+            // A reload can fail (a compile error in the edit) or race shutdown
+            // (the VM service connection disposes mid-reload). Log it with the
+            // stack trace; never let it crash the running server.
+            stderr.writeln('nitro_server: hot reload skipped: $error\n$stack');
+          }
+        });
+      }),
+    );
   }
   return reloader;
 }

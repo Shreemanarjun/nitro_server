@@ -315,6 +315,13 @@ nitro build
 `dart compile exe`/`jit-snapshot`. Run those directly if you prefer — the CLI is
 a convenience, not a requirement.
 
+**Standalone binary.** `nitro build` copies the engine library next to the exe,
+and the loader searches the executable's own directory first — so `build/server`
+runs from any working directory. Keep the `.dylib`/`.so`/`.dll` beside the
+binary when you move it. The native library still links its system deps (libuv,
+and OpenSSL/brotli if built in); to run on a machine without them, deploy the
+provided [`Dockerfile`](Dockerfile), which bundles everything.
+
 ## Hot reload
 
 `server.reload([setup])` rebuilds the whole routing surface on the live socket,

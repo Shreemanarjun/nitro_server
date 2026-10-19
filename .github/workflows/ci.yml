@@ -179,3 +179,44 @@ jobs:
           -DVCPKG_TARGET_TRIPLET=x64-windows
       - name: Build
         run: cmake --build build/lib --config Release
+
+  # Diagnostic (NON-gating): the residual x86-Linux-CI flake is a reborn server's
+  # first GET hanging after an in-process engine reset — rare, and unreproducible
+  # on Apple Silicon even under a deliberate 3s uv_run stall (cold-start is
+  # self-healing, proven 2026-10-19). This job compresses it: tool/stress_reset.dart
+  # repeats the exact bind -> reset -> rebind -> GET lifecycle hundreds of times,
+  # and we run several instances CONCURRENTLY on the 2-core x86 runner to recreate
+  # the scheduler + socket-I/O contention the real flake needs. A tight per-GET
+  # timeout makes a stall fail fast and print the exact iteration/timing.
+  #   green  => the stall did not reproduce even at this density (vindicates the
+  #            retry mitigation in server_e2e_test.dart; the flake is environmental).
+  #   red    => ground-truth repro captured; attach the real reactor fix to it.
+  # continue-on-error keeps the workflow green while this gathers data; flip it to
+  # a gate once it is trusted stable-green (or delete it once the flake is closed).
+  reset-stress:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - run: sudo apt-get update && sudo apt-get install -y clang libssl-dev libuv1-dev libbrotli-dev
+      - run: flutter pub get
+      # Build the native asset once up front so the concurrent `dart run`s below
+      # hit an already-built, up-to-date hook (no build race between them).
+      - name: Warm the native-assets build hook
+        run: dart run tool/stress_reset.dart 1
+      - name: Stress — concurrent bind/reset/rebind under 2-core contention
+        run: |
+          set -u
+          fail=0
+          for round in 1 2; do
+            echo "=== round $round ==="
+            pids=()
+            for n in 1 2 3; do
+              NITRO_STRESS_TIMEOUT_MS=3000 dart run tool/stress_reset.dart 250 & pids+=($!)
+            done
+            for p in "${pids[@]}"; do wait "$p" || fail=1; done
+          done
+          exit $fail

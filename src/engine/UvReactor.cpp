@@ -19,7 +19,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -55,28 +54,6 @@ std::set<int>& boundPorts() {
   return s;
 }
 
-// Env-gated request-lifecycle trace for the x86 reborn-stall hunt
-// (NITRO_RESET_DIAG=1). Zero cost unless the env var is set (checked once).
-// Each line carries a steady-clock millisecond stamp, so a stall shows up as a
-// time gap before the stage that never prints. See tool/stress_reset.dart and
-// the ci-tls-flakiness memory. Remove once the stall is understood.
-bool rdiagOn() {
-  static const bool on = std::getenv("NITRO_RESET_DIAG") != nullptr;
-  return on;
-}
-void rdiag(const char* fmt, ...) {
-  if (!rdiagOn()) return;
-  const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                           Clock::now().time_since_epoch())
-                           .count();
-  char buf[256];
-  va_list ap;
-  va_start(ap, fmt);
-  std::vsnprintf(buf, sizeof(buf), fmt, ap);
-  va_end(ap);
-  std::fprintf(stderr, "[RDIAG %lld] %s\n", ms, buf);
-  std::fflush(stderr);
-}
 
 // Fills [ss] for [host]:[port]; returns the address family. A host that is
 // neither a v4 nor v6 literal falls back to IPv4 loopback.
@@ -449,16 +426,12 @@ void UvReactor::addEmitter(Emitter* e) {
   for (Emitter* x : emitters_)
     if (x == e) return;
   emitters_.push_back(e);
-  rdiag("addEmitter engine=%p emitter=%p count=%zu", (void*)this, (void*)e,
-        emitters_.size());
 }
 
 void UvReactor::removeEmitter(Emitter* e) {
   std::lock_guard<std::mutex> lk(emitterMutex_);
   emitters_.erase(std::remove(emitters_.begin(), emitters_.end(), e),
                   emitters_.end());
-  rdiag("removeEmitter engine=%p emitter=%p count=%zu", (void*)this, (void*)e,
-        emitters_.size());
 }
 
 size_t UvReactor::emitterCountForTesting() {
@@ -716,8 +689,6 @@ void UvReactor::onConnection(uv_stream_t* server, int status) {
     uv_close((uv_handle_t*)&c->handle, &UvReactor::onCloseConn);
     return;
   }
-  rdiag("accept conn=%lld port=%d", (long long)c->id,
-        (int)self->boundPort_.load());
   // Peer IP, for the per-IP cap.
   std::string peerIp;
   {
@@ -888,7 +859,6 @@ void UvReactor::readCb(uv_stream_t* s, ssize_t nread, const uv_buf_t* b) {
     return;
   }
   if (nread == 0) return;
-  rdiag("read conn=%lld nread=%lld", (long long)c->id, (long long)nread);
 #ifdef NITRO_SERVER_TLS
   if (c->ssl) {
     c->lp->owner->tlsOnRead(c, b->base, (size_t)nread);  // decrypts + processes
@@ -1317,12 +1287,7 @@ void UvReactor::processConn(Conn* c) {
         c->hasDeadline = true;
       }
     }
-    Emitter* em = nextEmitter();
-    rdiag("dispatch req=%lld conn=%lld loop=%d port=%d engine=%p emitter=%p "
-          "count=%zu path=%s",
-          (long long)reqId, (long long)c->id, loopIdx, (int)boundPort_.load(),
-          (void*)this, (void*)em, emitterCountForTesting(), path.c_str());
-    if (em) {
+    if (Emitter* em = nextEmitter()) {
       const bool hasBody = clen > 0;
       // Head first (bodyComplete=false when a body follows), then the body as
       // one chunk, then the end marker — the runner accumulates until end,
@@ -1414,8 +1379,6 @@ void UvReactor::onWrite(uv_write_t* req, int status) {
   Conn* c = ctx->c;
   const bool keepAlive = ctx->keepAlive;
   const bool finish = ctx->finish;
-  rdiag("onWrite conn=%lld status=%d finish=%d", (long long)c->id, status,
-        finish ? 1 : 0);
   c->writePending -= (int64_t)ctx->payload->size();
   if (c->writePending < 0) c->writePending = 0;
   delete ctx->payload;
@@ -1470,15 +1433,9 @@ void UvReactor::respond(int64_t id, int64_t status,
   // no-op. The higher layer stops dispatching before shutdown; this guard
   // hardens the narrow stop()-vs-respond() window (a late uv_async_send on a
   // closing async handle) rather than relying on that contract alone.
-  rdiag("respond req=%lld running=%d", (long long)id, running_.load() ? 1 : 0);
   if (!running_.load()) return;
   ReqLoc loc;
-  if (!lookupReq(id, loc, /*erase=*/true)) {  // unknown/already answered
-    rdiag("respond-miss req=%lld (no reqLoc)", (long long)id);
-    return;
-  }
-  rdiag("respond-loc req=%lld loop=%d conn=%lld", (long long)id, loc.loopIdx,
-        (long long)loc.connId);
+  if (!lookupReq(id, loc, /*erase=*/true)) return;  // unknown/already answered
   completions_.fetch_add(1, std::memory_order_release);  // controller throughput signal
 #ifdef NITRO_SERVER_HTTP2
   if (loc.isH2) {  // hand the answer to the loop thread's Http2Session (onAsync)
@@ -1698,18 +1655,9 @@ void UvReactor::onAsync(uv_async_t* async) {
     }
     i = j;
     auto it = lp->conns.find(cid);
-    if (it == lp->conns.end()) {  // closed before the answer landed
-      rdiag("drain conn=%lld NOT-in-loop (dropped) bytes=%zu", (long long)cid,
-            merged.size());
-      continue;
-    }
+    if (it == lp->conns.end()) continue;  // closed before the answer landed
     Conn* c = it->second;
-    if (c->closing) {
-      rdiag("drain conn=%lld closing (dropped)", (long long)cid);
-      continue;
-    }
-    rdiag("drain conn=%lld writing bytes=%zu finish=%d", (long long)cid,
-          merged.size(), finish ? 1 : 0);
+    if (c->closing) continue;
     lp->owner->writeAnswer(c, std::move(merged), keepAlive, finish);
   }
   if (stopping) {

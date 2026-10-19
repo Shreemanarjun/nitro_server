@@ -39,6 +39,18 @@ dev_dependencies:
   test: ^1.25.0
   benchmark_harness: ^2.4.0
 
+# TEMPORARY (do not commit): benchmark the in-progress upstream fix for the
+# @nitroFast per-call dispatch cost under load (nitro_ecosystem#58 — test-then-CAS
+# in arm() so hot multi-isolate/SSE workloads skip the contended CAS). Remove
+# once the fix is published to pub.dev.
+dependency_overrides:
+  nitro:
+    path: ../../flutter_package/nitro_ecosystem/packages/nitro
+  nitro_generator:
+    path: ../../flutter_package/nitro_ecosystem/packages/nitro_generator
+  nitro_annotations:
+    path: ../../flutter_package/nitro_ecosystem/packages/nitro_annotations
+
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
 

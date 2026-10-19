@@ -467,6 +467,12 @@ final Converter<List<int>, dynamic> _jsonFromUtf8 = const Utf8Decoder().fuse(
   const JsonDecoder(),
 );
 
+/// Default [ResponseContext.streamBufferSize] for the `stream`/`sse` factories:
+/// coalesce events up to 64 KiB per event-loop turn into one bridge crossing.
+/// Large enough to collapse a burst of tiny SSE events, small enough to bound a
+/// single crossing; the turn-boundary flush keeps paced feeds real-time.
+const int _defaultStreamBufferSize = 64 * 1024;
+
 /// The answer a [RequestHandler] returns. One value or a byte stream: the
 /// handler resolves one [ResponseContext] and the runner answers exactly
 /// once — either a single body ([body]) or chunked transfer-encoding
@@ -519,14 +525,16 @@ class ResponseContext {
   final Stream<Uint8List>? bodyStream;
 
   /// Coalesces stream events into fewer wire chunks: events accumulate until
-  /// [streamBufferSize] bytes are pending, then cross the bridge as one
-  /// chunk; the remainder flushes when the stream ends. Zero (the default)
-  /// forwards every event immediately — the right choice for real-time
-  /// feeds (SSE), where delaying bytes to fill a buffer breaks semantics.
-  /// Set it for throughput-oriented streams whose events are tiny: twenty
-  /// 8-byte SSE events cost twenty bridge crossings unbuffered, one
-  /// buffered. Batching delays bytes until the buffer fills or the stream
-  /// ends — never use it when the consumer waits on each event.
+  /// [streamBufferSize] bytes are pending OR the event-loop turn ends,
+  /// whichever comes first, then cross the bridge as one chunk; the remainder
+  /// flushes when the stream ends. The turn-boundary flush means buffering
+  /// never stalls a paced feed — each event still reaches the client on its
+  /// own turn — so it is safe for real-time SSE, while a burst (e.g.
+  /// `Stream.fromIterable`) collapses into one crossing instead of paying a
+  /// native call per tiny event. The [ResponseContext.stream]/[sse] factories
+  /// default to coalescing ([_defaultStreamBufferSize]); zero forwards every
+  /// event immediately (strict per-event, no turn-coalescing) for feeds that
+  /// must put each event on the wire the instant it is produced.
   final int streamBufferSize;
 
   /// True when this answer streams ([bodyStream] != null).
@@ -784,8 +792,13 @@ class ResponseContext {
   /// Framing headers (`content-length`, `transfer-encoding`, `connection`)
   /// are engine-owned and ignored if passed.
   ///
-  /// Pass [bufferSize] to coalesce tiny events into fewer bridge crossings
-  /// (see [streamBufferSize]); leave it zero for real-time feeds.
+  /// [bufferSize] coalesces tiny events into fewer bridge crossings (see
+  /// [streamBufferSize]) — it defaults to coalescing because each event
+  /// otherwise pays a full native call, which dominates under load. Buffering
+  /// is turn-safe: a burst collapses into one crossing while a paced feed
+  /// still flushes on its own event-loop turn (never stalling). Pass
+  /// `bufferSize: 0` for strict per-event delivery when the consumer must see
+  /// every event the instant it is produced.
   ///
   /// ```dart
   /// await server.get('/events', (_) async {
@@ -803,7 +816,7 @@ class ResponseContext {
     int status = 200,
     Map<String, String> headers = const {},
     String contentType = 'application/octet-stream',
-    int bufferSize = 0,
+    int bufferSize = _defaultStreamBufferSize,
   }) {
     return ResponseContext(
       status: status,
@@ -822,9 +835,15 @@ class ResponseContext {
   ///   Stream.periodic(const Duration(seconds: 1), (i) => SseEvent('tick $i')),
   /// ));
   /// ```
+  ///
+  /// [bufferSize] coalesces events emitted in the same event-loop turn into
+  /// one bridge crossing (see [streamBufferSize]); it defaults to coalescing
+  /// — turn-safe, so a paced feed still flushes each event on its own turn.
+  /// Pass `bufferSize: 0` for strict per-event delivery.
   factory ResponseContext.sse(
     Stream<SseEvent> events, {
     Map<String, String> headers = const {},
+    int bufferSize = _defaultStreamBufferSize,
   }) {
     return ResponseContext(
       headers: {
@@ -835,6 +854,7 @@ class ResponseContext {
       bodyStream: events.map(
         (e) => Uint8List.fromList(utf8.encode(e.encode())),
       ),
+      streamBufferSize: bufferSize,
     );
   }
 

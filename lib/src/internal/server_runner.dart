@@ -1073,40 +1073,54 @@ class ServerRunner {
       return _complete(requestId);
     }
     // A positive [streamBufferSize] coalesces events into fewer bridge
-    // crossings; zero forwards every event immediately (real-time feeds).
+    // crossings — the win that keeps SSE/streaming off the per-event FFI tax
+    // (each tiny event otherwise pays a full native call). It flushes on
+    // EITHER the size threshold OR the next event-loop turn: a burst (e.g.
+    // `Stream.fromIterable`) collapses into one crossing, while a paced
+    // real-time feed still flushes promptly on its own turn and never stalls
+    // below the threshold. [streamBufferSize] == 0 opts out — strict
+    // per-event delivery for feeds that need every event on the wire now.
     final bufferSize = response.streamBufferSize;
     final BytesBuilder? pending = bufferSize > 0
         ? BytesBuilder(copy: false)
         : null;
-    void send(Uint8List bytes) {
-      if (_closed || bytes.isEmpty) return;
-      _sendChunk(requestId, bytes, false);
+    Timer? flushTimer;
+    void flush() {
+      final acc = pending;
+      if (acc != null && acc.isNotEmpty && !_closed) {
+        final bytes = acc.toBytes();
+        acc.clear();
+        _sendChunk(requestId, bytes, false);
+      }
     }
 
     void onEvent(Uint8List chunk) {
       if (chunk.isEmpty) return;
       final acc = pending;
       if (acc == null) {
-        send(chunk);
+        if (!_closed) _sendChunk(requestId, chunk, false); // bufferSize 0
         return;
       }
       acc.add(chunk);
       if (acc.length >= bufferSize) {
-        final bytes = acc.toBytes();
-        acc.clear();
-        send(bytes);
+        flushTimer?.cancel();
+        flushTimer = null;
+        flush();
+      } else {
+        // Coalesce the rest of this turn's events, then flush next turn.
+        flushTimer ??= Timer(Duration.zero, () {
+          flushTimer = null;
+          flush();
+        });
       }
     }
 
     void onEnd() {
       // Flush the remainder before the terminal chunk: bytes already
       // accepted must reach the client even when the stream errors.
-      final acc = pending;
-      if (acc != null && acc.isNotEmpty) {
-        final rest = acc.toBytes();
-        acc.clear();
-        send(rest);
-      }
+      flushTimer?.cancel();
+      flushTimer = null;
+      flush();
       _finishStream(requestId);
     }
 

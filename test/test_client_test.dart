@@ -338,52 +338,57 @@ void main() {
   });
 
   test('buffered streams coalesce chunks with identical bytes', () async {
+    Stream<Uint8List> body() => Stream.fromIterable([
+      Uint8List.fromList('a'.codeUnits),
+      Uint8List.fromList('bc'.codeUnits),
+      Uint8List.fromList('def'.codeUnits),
+    ]);
     await client.server.get('/buf', (_) async {
-      return ResponseContext.stream(
-        Stream.fromIterable([
-          Uint8List.fromList('a'.codeUnits),
-          Uint8List.fromList('bc'.codeUnits),
-          Uint8List.fromList('def'.codeUnits),
-        ]),
-        bufferSize: 1024,
-      );
+      return ResponseContext.stream(body(), bufferSize: 1024);
     });
+    // No bufferSize: the factory defaults to coalescing, so a same-turn burst
+    // collapses to one crossing just like an explicit buffer.
+    await client.server.get('/def', (_) async {
+      return ResponseContext.stream(body());
+    });
+    // bufferSize: 0 opts into strict per-event delivery (three crossings).
     await client.server.get('/raw', (_) async {
-      return ResponseContext.stream(
-        Stream.fromIterable([
-          Uint8List.fromList('a'.codeUnits),
-          Uint8List.fromList('bc'.codeUnits),
-          Uint8List.fromList('def'.codeUnits),
-        ]),
-      );
+      return ResponseContext.stream(body(), bufferSize: 0);
     });
     final before = client.streamChunkCount;
     final buffered = await client.get('/buf');
     final afterBuffered = client.streamChunkCount;
+    final def = await client.get('/def');
+    final afterDef = client.streamChunkCount;
     final raw = await client.get('/raw');
     final afterRaw = client.streamChunkCount;
     expect(buffered.text(), 'abcdef');
+    expect(def.text(), 'abcdef');
     expect(raw.text(), 'abcdef');
-    // 6 bytes under a 1024-byte buffer: one crossing. Unbuffered: three.
+    // 6 bytes under a 1024-byte buffer: one crossing. Default coalesces the
+    // burst to one too. Explicit bufferSize 0 forwards each event: three.
     expect(afterBuffered - before, 1);
-    expect(afterRaw - afterBuffered, 3);
+    expect(afterDef - afterBuffered, 1);
+    expect(afterRaw - afterDef, 3);
   });
 
   test('buffered streams flush partial buffers at end', () async {
     await client.server.get('/part', (_) async {
       return ResponseContext.stream(
         Stream.fromIterable([
-          Uint8List.fromList('abcdef'.codeUnits),
-          Uint8List.fromList('gh'.codeUnits),
+          Uint8List.fromList('ab'.codeUnits), // buffered; arms a turn-flush
+          Uint8List.fromList('cdefg'.codeUnits), // crosses 5B: flush now,
+          // cancelling the armed turn-flush
+          Uint8List.fromList('hi'.codeUnits), // remainder, flushed at end
         ]),
         bufferSize: 5,
       );
     });
     final before = client.streamChunkCount;
     final response = await client.get('/part');
-    // 6 bytes flush as one chunk at threshold, 2 remainder at end: two
-    // crossings, bytes identical and ordered.
-    expect(response.text(), 'abcdefgh');
+    // 'ab'+'cdefg' = 7 bytes cross the 5-byte threshold as one chunk, 'hi'
+    // flushes at end: two crossings, bytes identical and ordered.
+    expect(response.text(), 'abcdefghi');
     expect(client.streamChunkCount - before, 2);
   });
 

@@ -472,7 +472,16 @@ Emitter* UvReactor::nextEmitter() {
   size_t w = dispatchWidth_.load(std::memory_order_relaxed);
   if (w == 0 || w > emitters_.size()) w = emitters_.size();
   const uint64_t i = emitterRr_.fetch_add(1);
-  return emitters_[i % w];
+  // Dispatch across the MOST-RECENTLY-registered `w` emitters, not the first
+  // `w`. Emitters are appended in registration order, so the current
+  // incarnation's sinks are always at the back. A hot restart reuses a server
+  // key and re-resolves an instance whose predecessor's (now-dead) emitter is
+  // still registered at the front until its bridge is finalized; selecting from
+  // the front (`i % w`) could hand a request to that dead isolate, which never
+  // responds (the client then hangs to its timeout). Selecting from the back
+  // keeps the live sink; when every emitter is current (w == size, the common
+  // case) this is identical to round-robining the whole list.
+  return emitters_[emitters_.size() - w + (i % w)];
 }
 
 void UvReactor::broadcastEvent(ServerEventKind kind, int64_t requestId,

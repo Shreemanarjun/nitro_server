@@ -224,3 +224,49 @@ jobs:
             for p in "${pids[@]}"; do wait "$p" || fail=1; done
           done
           exit $fail
+
+  # Diagnostic (NON-gating): the isolated reset-stress loop above is GREEN on
+  # x86, yet the full e2e suite's reborn GET hangs under load — so the stall
+  # needs the in-suite context. This job reproduces the real failing command
+  # (tool/coverage.sh) under deliberate 2-vCPU CPU contention with the engine's
+  # env-gated lifecycle trace (NITRO_RESET_DIAG) on, and dumps the trace tail
+  # when it reproduces. The last RDIAG stage before a time gap localizes the
+  # stall: accept -> read -> dispatch -> respond -> respond-loc -> drain ->
+  # onWrite. CPU-only load (no extra sockets) so it does not perturb the suite's
+  # own ports. Remove this job and the NITRO_RESET_DIAG trace once understood.
+  reset-diag:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - run: sudo apt-get update && sudo apt-get install -y lcov clang llvm libssl-dev libuv1-dev libbrotli-dev
+      - run: flutter pub get
+      - run: cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build/lib --parallel
+      - name: Reproduce the reborn stall under CPU contention and capture the trace
+        run: |
+          set -u
+          # Saturate the 2 vCPUs so the suite runs under the scheduler contention
+          # the flake needs (CPU-only — no extra sockets to perturb the tests).
+          yes >/dev/null & h1=$!
+          yes >/dev/null & h2=$!
+          hit=0
+          for i in $(seq 1 8); do
+            echo "=== coverage.sh run $i (NITRO_RESET_DIAG, under load) ==="
+            if ! NITRO_RESET_DIAG=1 bash tool/coverage.sh >"run_$i.log" 2>&1; then
+              echo "### REPRODUCED on run $i"
+              echo "--- last 150 RDIAG lines (stall = last stage before a time gap) ---"
+              grep RDIAG "run_$i.log" | tail -150
+              echo "--- failure context ---"
+              grep -E "stragglers|PEM cert|TimeoutException|Error:|[0-9]+ tests" "run_$i.log" | tail -40
+              hit=1
+              break
+            fi
+            echo "run $i: passed"
+          done
+          kill "$h1" "$h2" 2>/dev/null || true
+          [ "$hit" = "1" ] || echo "### did NOT reproduce in 8 loaded runs"

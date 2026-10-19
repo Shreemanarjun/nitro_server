@@ -259,8 +259,10 @@ jobs:
             echo "=== coverage.sh run $i (NITRO_RESET_DIAG, under load) ==="
             if ! NITRO_RESET_DIAG=1 bash tool/coverage.sh >"run_$i.log" 2>&1; then
               echo "### REPRODUCED on run $i"
-              echo "--- last 150 RDIAG lines (stall = last stage before a time gap) ---"
-              grep RDIAG "run_$i.log" | tail -150
+              echo "--- emitter lifecycle (resolve / addEmitter / removeEmitter, full) ---"
+              grep -E "RDIAG resolve|addEmitter|removeEmitter" "run_$i.log"
+              echo "--- last 200 lifecycle lines (stall = last stage before a time gap) ---"
+              grep RDIAG "run_$i.log" | tail -200
               echo "--- failure context ---"
               grep -E "stragglers|PEM cert|TimeoutException|Error:|[0-9]+ tests" "run_$i.log" | tail -40
               hit=1

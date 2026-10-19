@@ -449,12 +449,16 @@ void UvReactor::addEmitter(Emitter* e) {
   for (Emitter* x : emitters_)
     if (x == e) return;
   emitters_.push_back(e);
+  rdiag("addEmitter engine=%p emitter=%p count=%zu", (void*)this, (void*)e,
+        emitters_.size());
 }
 
 void UvReactor::removeEmitter(Emitter* e) {
   std::lock_guard<std::mutex> lk(emitterMutex_);
   emitters_.erase(std::remove(emitters_.begin(), emitters_.end(), e),
                   emitters_.end());
+  rdiag("removeEmitter engine=%p emitter=%p count=%zu", (void*)this, (void*)e,
+        emitters_.size());
 }
 
 size_t UvReactor::emitterCountForTesting() {
@@ -1305,9 +1309,10 @@ void UvReactor::processConn(Conn* c) {
       }
     }
     Emitter* em = nextEmitter();
-    rdiag("dispatch req=%lld conn=%lld loop=%d port=%d emitter=%p count=%zu path=%s",
+    rdiag("dispatch req=%lld conn=%lld loop=%d port=%d engine=%p emitter=%p "
+          "count=%zu path=%s",
           (long long)reqId, (long long)c->id, loopIdx, (int)boundPort_.load(),
-          (void*)em, emitterCountForTesting(), path.c_str());
+          (void*)this, (void*)em, emitterCountForTesting(), path.c_str());
     if (em) {
       const bool hasBody = clen > 0;
       // Head first (bodyComplete=false when a body follows), then the body as

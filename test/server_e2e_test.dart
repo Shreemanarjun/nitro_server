@@ -279,48 +279,53 @@ void main() {
       expect(NitroServerNative.engine.supportsTls(), isTrue);
     }, skip: skipReason);
 
-    test('serves HTTPS with a PEM cert over a real TLS socket', () async {
-      server = await NitroServer.bind(
-        const ServerConfig(
-          tls: TlsConfig(certPem: testCertPem, keyPem: testKeyPem),
-        ),
-      );
-      await server!.get('/secure', (_) => ResponseContext.text('over tls'));
-      await server!.post('/echo', (r) async => ResponseContext.bytes(r.body));
+    test(
+      'serves HTTPS with a PEM cert over a real TLS socket',
+      () async {
+        server = await NitroServer.bind(
+          const ServerConfig(
+            tls: TlsConfig(certPem: testCertPem, keyPem: testKeyPem),
+          ),
+        );
+        await server!.get('/secure', (_) => ResponseContext.text('over tls'));
+        await server!.post('/echo', (r) async => ResponseContext.bytes(r.body));
 
-      // Bound every TLS step: on a loaded x86 CI runner the handshake/read can
-      // stall; without these a stalled attempt burns the whole 30s test budget
-      // (×3 under retry) instead of failing fast and letting a retry get a
-      // fresh connection. Local/normal runs finish in milliseconds.
-      const step = Duration(seconds: 20);
-      final client = HttpClient()
-        ..connectionTimeout = step
-        ..badCertificateCallback = (cert, host, port) => true;
-      final get = await client.getUrl(
-        Uri.parse('https://127.0.0.1:${server!.port}/secure'),
-      );
-      final getRes = await get.close().timeout(step);
-      expect(getRes.statusCode, 200);
-      expect(
-        await getRes.transform(utf8.decoder).join().timeout(step),
-        'over tls',
-      );
+        // Bound every TLS step: on a loaded x86 CI runner the handshake/read can
+        // stall; without these a stalled attempt burns the whole 30s test budget
+        // (×3 under retry) instead of failing fast and letting a retry get a
+        // fresh connection. Local/normal runs finish in milliseconds.
+        const step = Duration(seconds: 20);
+        final client = HttpClient()
+          ..connectionTimeout = step
+          ..badCertificateCallback = (cert, host, port) => true;
+        final get = await client.getUrl(
+          Uri.parse('https://127.0.0.1:${server!.port}/secure'),
+        );
+        final getRes = await get.close().timeout(step);
+        expect(getRes.statusCode, 200);
+        expect(
+          await getRes.transform(utf8.decoder).join().timeout(step),
+          'over tls',
+        );
 
-      final post = await client.postUrl(
-        Uri.parse('https://127.0.0.1:${server!.port}/echo'),
-      );
-      post.add(utf8.encode('ping'));
-      final postRes = await post.close().timeout(step);
-      expect(
-        await postRes.transform(utf8.decoder).join().timeout(step),
-        'ping',
-      );
-      client.close(force: true);
-      // ponytail: residual x86-Linux-CI flake — native TLS handshake/read can
-      // stall on a loaded runner (unreproducible on Apple Silicon). Give it
-      // more attempts than the global retry:2; a true fix needs x86 ground
-      // truth in the reactor read path.
-    }, skip: skipReason, retry: 5);
+        final post = await client.postUrl(
+          Uri.parse('https://127.0.0.1:${server!.port}/echo'),
+        );
+        post.add(utf8.encode('ping'));
+        final postRes = await post.close().timeout(step);
+        expect(
+          await postRes.transform(utf8.decoder).join().timeout(step),
+          'ping',
+        );
+        client.close(force: true);
+        // ponytail: residual x86-Linux-CI flake — native TLS handshake/read can
+        // stall on a loaded runner (unreproducible on Apple Silicon). Give it
+        // more attempts than the global retry:2; a true fix needs x86 ground
+        // truth in the reactor read path.
+      },
+      skip: skipReason,
+      retry: 5,
+    );
 
     test('reloadTls hot-swaps the certificate on a live server', () async {
       server = await NitroServer.bind(

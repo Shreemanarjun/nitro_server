@@ -45,6 +45,33 @@ void main() {
       expect(String.fromCharCodes(response.body), 'got /');
     });
 
+    test('every answer carries the default x-server header; handler wins',
+        () async {
+      await addEcho('/def');
+      runner.addRoute(
+        HttpMethod.get,
+        '',
+        '/custom',
+        null,
+        (_) async => ResponseContext.text('hi', headers: {'x-server': 'Mine'}),
+      );
+      await Future<void>.delayed(Duration.zero);
+      final def = await driveRequest(
+        fake,
+        requestId: 10,
+        path: '/def',
+        routePattern: '/def',
+      );
+      expect(def.headers['x-server'], 'Nitro Dart Server');
+      final custom = await driveRequest(
+        fake,
+        requestId: 11,
+        path: '/custom',
+        routePattern: '/custom',
+      );
+      expect(custom.headers['x-server'], 'Mine');
+    });
+
     test('a body is reassembled across chunks before dispatch', () async {
       RequestContext? seen;
       runner.addRoute(HttpMethod.post, '', '/upload', null, (request) async {

@@ -76,6 +76,14 @@ class Http2Session final : public ProtocolSession {
   bool wantRead() const override;   // nghttp2_session_want_read
   bool wantWrite() const override;  // nghttp2_session_want_write
 
+  /// True while any request stream is still open — emitted to a handler but not
+  /// yet fully answered. The reactor must not tear a connection down in this
+  /// window: between a request completing and its async respond() landing,
+  /// nghttp2 can transiently report neither want-read nor want-write, and
+  /// closing then drops the in-flight response (seen as an h2c reset under load
+  /// on a fast peer). Streams are erased in onStreamClose, after END_STREAM.
+  bool hasOpenStreams() const { return !streams_.empty(); }
+
  private:
   struct Stream {
     int64_t requestId = 0;

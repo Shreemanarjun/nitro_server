@@ -998,7 +998,14 @@ bool UvReactor::feedH2(Conn* c) {
   // for a close that never comes (h2spec "expected connection closed"). A
   // healthy keep-alive h2 connection always still wants to read, so this never
   // closes one mid-serve. feed() already pumped any GOAWAY out before this.
-  const bool done = !c->h2->wantRead() && !c->h2->wantWrite();
+  // "Done" = the session wants neither read nor write AND has no request
+  // stream still awaiting its answer. The last clause matters: between a
+  // request completing and its async respond() landing, nghttp2 (notably 1.59)
+  // can momentarily report neither want-read nor want-write; without the guard
+  // the reactor tears the connection down in that window and the in-flight
+  // response is lost (an h2c reset a fast peer sees before any bytes).
+  const bool done = !c->h2->wantRead() && !c->h2->wantWrite() &&
+                    !c->h2->hasOpenStreams();
   if ((fatal || done) && !c->closing) {
     c->closing = true;
     if (!uv_is_closing((uv_handle_t*)&c->handle))

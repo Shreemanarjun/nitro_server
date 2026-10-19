@@ -11,6 +11,7 @@ import '../internal/instance_keys.dart';
 import '../internal/native_attach.dart';
 import '../internal/server_runner.dart';
 import 'context.dart';
+import 'controller.dart';
 import 'event.dart';
 import 'http_method.dart';
 import 'metrics.dart';
@@ -369,6 +370,24 @@ class NitroServer with RouteRegistrar<NitroServer> {
   /// A path-prefixed view of this server: `server.group('/api').get(...)`
   /// registers `/api/...`. Groups nest; middleware stays server-global.
   RouteGroup group(String prefix) => RouteGroup(server: this, prefix: prefix);
+
+  /// Mounts a [Controller] — a class that groups related routes behind a
+  /// shared prefix and middleware (the Spring `@RestController` idea, without
+  /// annotations or codegen). Scopes a [group] to the controller's `prefix`,
+  /// applies its `middleware`, then runs [Controller.register]. Returns `this`,
+  /// so mounts chain: `await (await server.mount(a)).mount(b)`.
+  ///
+  /// ```dart
+  /// await server.mount(UserController(db));
+  /// ```
+  Future<NitroServer> mount(Controller controller) async {
+    final scoped = group(controller.prefix);
+    for (final m in controller.middleware) {
+      await scoped.use(m);
+    }
+    await controller.register(scoped);
+    return this;
+  }
 
   /// Overrides the answer for unmatched routes (default: empty 404). May be
   /// sync or async; a throwing fallback degrades to the default.

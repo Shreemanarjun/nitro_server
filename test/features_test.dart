@@ -807,4 +807,66 @@ void main() {
       );
     });
   });
+
+  // Regression: a header-stamping middleware (cors) rebuilt the response and
+  // dropped the body for streaming / SSE / file answers (and set-cookies), so
+  // they went out empty (Content-Length: 0). copyWith must carry them through.
+  group('CORS / copyWith preserve body-bearing answers (regression)', () {
+    RequestContext getReq() => RequestContext(
+      method: HttpMethod.get,
+      customMethod: '',
+      path: '/',
+      query: '',
+      queryParameters: const {},
+      headers: const {},
+      params: const {},
+      routePattern: '/',
+      body: Uint8List(0),
+    );
+
+    test('copyWith carries stream, buffer, file range and cookies', () {
+      final s = Stream<Uint8List>.value(Uint8List.fromList([1, 2, 3]));
+      final streamed = ResponseContext.stream(
+        s,
+        status: 206,
+        bufferSize: 64,
+      ).copyWith(headers: {'x': 'y'});
+      expect(streamed.status, 206);
+      expect(streamed.headers['x'], 'y');
+      expect(streamed.bodyStream, same(s));
+      expect(streamed.streamBufferSize, 64);
+
+      final filed = ResponseContext.file('/tmp/x', offset: 10, length: 5)
+          .withCookie(const SetCookie('a', 'b'))
+          .copyWith(status: 200);
+      expect(filed.filePath, '/tmp/x');
+      expect(filed.fileOffset, 10);
+      expect(filed.fileLength, 5);
+      expect(filed.cookies.map((c) => c.name), contains('a'));
+    });
+
+    test('cors() keeps a streaming answer streaming', () async {
+      final s = Stream<Uint8List>.value(Uint8List.fromList([1]));
+      final out = await cors()(
+        getReq(),
+        (_) async => ResponseContext.stream(s, contentType: 'text/plain'),
+      );
+      expect(out.isStream, isTrue, reason: 'bodyStream must survive CORS');
+      expect(out.bodyStream, same(s));
+      expect(out.headers['access-control-allow-origin'], '*');
+      expect(out.headers['content-type'], 'text/plain');
+    });
+
+    test('cors() keeps a file answer and its set-cookies', () async {
+      final out = await cors()(
+        getReq(),
+        (_) async => ResponseContext.file(
+          '/tmp/x',
+        ).withCookie(const SetCookie('s', '1')),
+      );
+      expect(out.isFile, isTrue);
+      expect(out.filePath, '/tmp/x');
+      expect(out.cookies.map((c) => c.name), contains('s'));
+    });
+  });
 }

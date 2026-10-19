@@ -892,6 +892,11 @@ class ServerRunner {
   /// this path, so a custom error page may stream too.
   void _deliver(int requestId, ResponseContext response) {
     _record(requestId, response.status);
+    // Default server identity on every answer (stream/file/one-shot alike);
+    // a handler- or middleware-set `x-server` wins. copyWith keeps the body.
+    response = response.copyWith(
+      headers: {'x-server': 'Nitro Dart Server', ...response.headers},
+    );
     // Dispatch-to-answer time, emitted as `Server-Timing`. Computed once here
     // (the pending entry is still live) and reused by whichever answer path
     // runs. -1 when timing is off or the request is already gone.

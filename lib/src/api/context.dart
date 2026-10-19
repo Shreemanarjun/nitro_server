@@ -556,6 +556,26 @@ class ResponseContext {
     cookies: cookies,
   );
 
+  /// A copy with [status] and/or [headers] replaced, carrying over every
+  /// body-bearing field — the one-shot [body], the [bodyStream] and its
+  /// [streamBufferSize], the [filePath] and its range — plus [cookies].
+  /// Middleware that only augments headers (CORS, security headers) MUST use
+  /// this: rebuilding via the constructor and copying just `body` silently
+  /// drops a streaming, SSE or file answer (and any set-cookies), so the
+  /// response goes out empty. See [withHeader] for a single header.
+  ResponseContext copyWith({int? status, Map<String, String>? headers}) =>
+      ResponseContext(
+        status: status ?? this.status,
+        headers: headers ?? this.headers,
+        body: body,
+        bodyStream: bodyStream,
+        streamBufferSize: streamBufferSize,
+        filePath: filePath,
+        fileOffset: fileOffset,
+        fileLength: fileLength,
+        cookies: cookies,
+      );
+
   /// True when this answer is a file ([filePath] != null).
   bool get isFile => filePath != null;
 

@@ -4,6 +4,7 @@ library;
 export 'src/api/brotli.dart'
     show brotliAvailable, brotliCompress, brotliDecompress;
 export 'src/api/context.dart';
+export 'src/api/controller.dart';
 export 'src/api/event.dart';
 export 'src/api/exceptions.dart';
 export 'src/api/http_method.dart';

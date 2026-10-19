@@ -186,11 +186,9 @@ Middleware cors({
       return ResponseContext(status: 204, headers: policy);
     }
     final response = await next(request);
-    return ResponseContext(
-      status: response.status,
-      headers: {...policy, ...response.headers},
-      body: response.body,
-    );
+    // copyWith (not a fresh ResponseContext) so a streaming / SSE / file
+    // answer keeps its body and any set-cookies; handler headers win.
+    return response.copyWith(headers: {...policy, ...response.headers});
   };
 }
 

@@ -1304,10 +1304,11 @@ void UvReactor::processConn(Conn* c) {
         c->hasDeadline = true;
       }
     }
-    rdiag("dispatch req=%lld conn=%lld loop=%d port=%d path=%s",
+    Emitter* em = nextEmitter();
+    rdiag("dispatch req=%lld conn=%lld loop=%d port=%d emitter=%p count=%zu path=%s",
           (long long)reqId, (long long)c->id, loopIdx, (int)boundPort_.load(),
-          path.c_str());
-    if (Emitter* em = nextEmitter()) {
+          (void*)em, emitterCountForTesting(), path.c_str());
+    if (em) {
       const bool hasBody = clen > 0;
       // Head first (bodyComplete=false when a body follows), then the body as
       // one chunk, then the end marker — the runner accumulates until end,

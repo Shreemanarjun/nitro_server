@@ -104,9 +104,17 @@ clients exercise.
    `emitHead` to the HEADERS frame (`bodyComplete=false`) and emit per
    `on_data_chunk_recv`, `emitBodyEnd` on the last DATA.
 3. **Streaming responses.** A handler's `startStream`/chunks over h2 are buffered
-   and sent as one DATA body (`H2StreamAccum`); large/SSE responses want a real
-   per-frame `nghttp2` data provider fed from the chunk stream, with
-   `WINDOW_UPDATE` back-pressure driving `pump()` from `onWrite`.
+   and sent as one DATA body (`H2StreamAccum`). Now bounded + hardened: the
+   buffer is capped at `maxBodyBytes` (an indefinite/oversized stream answers
+   `503` instead of growing without bound — OOM-safe, and valid since no bytes
+   are on the wire yet); a **HEAD** stream answers headers-only immediately
+   rather than buffering a discarded body; and an h2 connection with open
+   streams is never idle-reaped mid-request (it carries no `c->busy`). The
+   remaining follow-up is *true* incremental delivery: a per-frame `nghttp2`
+   data provider (deferred read + `nghttp2_session_resume_data`) fed from the
+   chunk stream, with `WINDOW_UPDATE` back-pressure driving `pump()` from
+   `onWrite` — so large/SSE responses stream byte-for-byte instead of
+   buffer-then-flush.
 4. **Static & WebSocket routes over h2.** `emitComplete` dispatches a matched
    `staticResponse` to Dart rather than serving it in-engine, and an h2 request
    to a WebSocket route is dispatched rather than refused (h2 has no HTTP/1.1
@@ -116,6 +124,15 @@ clients exercise.
 6. **Adaptive dispatch within a connection.** An `Http2Session` binds one
    `Emitter` (isolate) for its lifetime; per-request `nextEmitter()` would spread
    a single busy h2 connection's streams across isolates.
+7. **Client-disconnect handler cancel.** `onCloseConn` now drops a closing
+   connection's in-flight `reqLoc_`/`h2StreamAccum_` entries (no engine-side
+   leak when a client disconnects mid-stream, h1 and h2 alike). The remaining
+   follow-up is telling the Dart runner to cancel the handler's outbound stream
+   subscription so an indefinite source (`Stream.periodic` SSE) stops producing
+   — that needs a `ClientDisconnect` server-event kind carrying the request id
+   (a `RawServerEventKind` addition → bridge regen) which `_onEvent` handles by
+   `_outbound.remove(id)?.cancel()`. Until then a disconnected indefinite stream
+   keeps running in Dart (the engine no-ops its writes; no leak, but wasted CPU).
 
 ## What makes it fit
 

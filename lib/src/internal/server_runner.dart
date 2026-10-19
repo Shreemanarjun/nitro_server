@@ -792,9 +792,18 @@ class ServerRunner {
 
   void _onEvent(RawServerEvent event) {
     if (_closed) return;
+    final kind = ServerEventKind.values[event.kind];
+    if (kind == ServerEventKind.clientDisconnect) {
+      // The client went away mid-request. Cancel the handler's outbound stream
+      // subscription so an indefinite source (e.g. an SSE `Stream.periodic`)
+      // stops producing into a dead connection, and release the request. A
+      // one-shot handler has already finished; this is the streaming case.
+      _outbound.remove(event.requestId)?.cancel();
+      _complete(event.requestId);
+    }
     _events.add(
       ServerEvent(
-        kind: ServerEventKind.values[event.kind],
+        kind: kind,
         requestId: event.requestId,
         message: event.message,
       ),

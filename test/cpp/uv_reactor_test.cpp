@@ -2124,6 +2124,55 @@ TEST(UvReactorTest, ChunkedStreamFramesBodyExactly) {
   server->stop();
 }
 
+TEST(UvReactorTest, RouteTimeoutBoundsTimeToFirstByteOnlyForStreams) {
+  // Regression: the route timeout bounds time-to-first-byte only. Once the
+  // stream head is sent (startStream), a slow body that outlives the timeout
+  // must still complete — the sweep must not splice a 408 into it.
+  RecordingEmitter emitter([](Method, const std::string&, const std::string&) {
+    return std::make_pair(200, "unused");
+  });
+  auto server = std::make_shared<UvReactor>();
+  server->setEmitter(&emitter);
+  EXPECT_EQ(server->registerRoute(Method::Get, "", "/slowstream", 150).kind,
+            ErrorKind::None);
+  ServerConfig cfg;
+  cfg.port = 0;
+  server->configure(cfg);
+  ASSERT_EQ((int64_t)server->start().kind, (int64_t)ErrorKind::None);
+  const int64_t port = server->boundPort();
+
+  std::string res;
+  std::thread client([&] {
+    const int fd = connectTo((int)port);
+    if (fd < 0) return;
+    sendStr(fd,
+            "GET /slowstream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    res = readAll(fd);
+    close(fd);
+  });
+
+  int64_t id = 0;
+  for (int i = 0; i < 1000 && id == 0; i++) {
+    auto seen = emitter.seen();
+    if (!seen.empty()) id = seen[0].requestId;
+    if (id == 0) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_NE(id, 0);
+  server->startStream(id, 200, {{"Content-Type", "text/plain"}});
+  // Send the body well after the 150ms route timeout would have fired. TTFB
+  // was met at startStream, so no 408 is spliced in and the stream completes.
+  std::this_thread::sleep_for(std::chrono::milliseconds(350));
+  const char* body = "late";
+  server->sendStreamChunk(id, (const uint8_t*)body, 4, true);
+  client.join();
+
+  EXPECT_EQ(statusOf(res), 200);  // completed, not 408
+  EXPECT_EQ(dechunk(bodyOf(res)), "late");
+  for (const auto& e : emitter.events())
+    EXPECT_NE(std::get<0>(e), (int64_t)ServerEventKind::HandlerTimeout);
+  server->stop();
+}
+
 TEST(UvReactorTest, StreamSurvivesForKeepAlive) {
   RecordingEmitter emitter([](Method, const std::string&, const std::string&) {
     return std::make_pair(200, "unused");

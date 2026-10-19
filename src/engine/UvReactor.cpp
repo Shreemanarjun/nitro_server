@@ -792,6 +792,36 @@ void UvReactor::onCloseConn(uv_handle_t* h) {
         self->wsConnLoop_.erase(c->id);
       }
       self->pending_.dropPayloads(c->id);  // free un-acked WS message payloads
+    } else {
+      // A connection closing with in-flight request state — a long streaming
+      // response, an h2 stream, or a handler yet to answer — must not strand
+      // its reqLoc_ / h2 accumulator entries: a client that disconnects
+      // mid-stream would otherwise leak them until the reactor is destroyed
+      // (an h1 stream's id leaves reqIdInFlight once startStream opens, and an
+      // h2 conn carries several stream ids, so scan by connId).
+      // ponytail: O(reqLoc_) per close; add a connId->ids index if
+      // streaming-connection churn ever makes this hot.
+      std::vector<int64_t> dropped;
+      {
+        std::lock_guard<std::mutex> lk(self->reqMutex_);
+        for (auto it = self->reqLoc_.begin(); it != self->reqLoc_.end();) {
+          if (it->second.connId == c->id) {
+            dropped.push_back(it->first);
+#ifdef NITRO_SERVER_HTTP2
+            self->h2StreamAccum_.erase(it->first);
+#endif
+            it = self->reqLoc_.erase(it);
+          } else {
+            ++it;
+          }
+        }
+      }
+      // Tell the Dart runner each in-flight request's client is gone so it
+      // cancels the handler's outbound stream subscription — an indefinite
+      // source (an SSE `Stream.periodic`) would otherwise produce forever.
+      // Broadcast outside reqMutex_ (broadcastEvent fans out to the emitters).
+      for (const int64_t rid : dropped)
+        self->broadcastEvent(ServerEventKind::ClientDisconnect, rid, "");
     }
   }
 #ifdef NITRO_SERVER_TLS
@@ -989,6 +1019,7 @@ void UvReactor::createH2Session(Conn* c) {
 bool UvReactor::feedH2(Conn* c) {
   bool fatal = false;
   if (!c->buf.empty()) {
+    c->lastActive = Clock::now();  // h2 inbound resets the idle timer (as h1)
     if (!c->h2->feed((const uint8_t*)c->buf.data(), c->buf.size())) fatal = true;
     c->buf.clear();
   }
@@ -1273,6 +1304,11 @@ void UvReactor::processConn(Conn* c) {
 void UvReactor::writeAnswer(Conn* c, std::string bytes, bool keepAlive,
                             bool finish) {
   c->busy = true;
+  // The route timeout bounds time-to-first-byte only (see ResponseContext docs):
+  // once any answer byte is on the way — a full response, or a streamed head —
+  // the handler has responded, so the sweep must not later splice a 408 into a
+  // long streaming body. Clearing on the first write makes this TTFB-only.
+  c->hasDeadline = false;
   std::string* payload;
 #ifdef NITRO_SERVER_TLS
   if (c->ssl) {
@@ -1424,8 +1460,32 @@ void UvReactor::startStream(int64_t id, int64_t status,
   ReqLoc loc;
   if (!lookupReq(id, loc, /*erase=*/false)) return;
 #ifdef NITRO_SERVER_HTTP2
-  if (loc.isH2) {  // buffer the streamed response; flush on the terminal chunk
-    std::lock_guard<std::mutex> lk(reqMutex_);
+  if (loc.isH2) {
+    if (loc.isHead) {
+      // HEAD: no body will stream, so answer headers-only now and release the
+      // request (later sendStreamChunk calls then no-op) instead of buffering a
+      // body the h2 session would only discard. Mirrors the HTTP/1.1 HEAD path,
+      // and routes through onAsync like respond()'s h2 branch.
+      {
+        std::lock_guard<std::mutex> lk(reqMutex_);
+        reqLoc_.erase(id);
+      }
+      completions_.fetch_add(1, std::memory_order_release);
+      Loop* lp = loops_[loc.loopIdx].get();
+      Loop::Pending p;
+      p.connId = loc.connId;
+      p.isH2 = true;
+      p.h2ReqId = id;
+      p.h2Status = (int)status;
+      p.h2Headers = headers;
+      {
+        std::lock_guard<std::mutex> lk(lp->qMutex);
+        lp->queue.push_back(std::move(p));
+      }
+      uv_async_send(&lp->async);
+      return;
+    }
+    std::lock_guard<std::mutex> lk(reqMutex_);  // buffer; flush on terminal chunk
     h2StreamAccum_[id] = H2StreamAccum{(int)status, headers, {}};
     return;
   }
@@ -1476,17 +1536,37 @@ void UvReactor::sendStreamChunk(int64_t id, const uint8_t* chunk, size_t n,
       std::lock_guard<std::mutex> lk(reqMutex_);
       auto it = h2StreamAccum_.find(id);
       if (it == h2StreamAccum_.end()) return;  // no startStream / already flushed
-      if (n > 0) it->second.body.append((const char*)chunk, n);
-      if (last) {
+      const int64_t cap = cfg_.maxBodyBytes;
+      if (cap > 0 && (int64_t)it->second.body.size() + (int64_t)n > cap) {
+        // The buffered h2 response would exceed the body cap. An indefinite or
+        // oversized stream must not grow the accumulator without bound (OOM).
+        // Nothing has gone out yet — h2 streamed responses are flushed whole on
+        // the terminal chunk — so discard the buffer and answer 503 instead.
+        // ponytail: true incremental h2 DATA framing (nghttp2 deferred data
+        // provider + resume) would actually stream these; buffering is the
+        // documented simplification and this only bounds its worst case.
         p.connId = loc.connId;
         p.isH2 = true;
         p.h2ReqId = id;
-        p.h2Status = it->second.status;
-        p.h2Headers = std::move(it->second.headers);
-        p.bytes = std::move(it->second.body);
+        p.h2Status = 503;
+        p.h2Headers = {{"content-type", "text/plain; charset=utf-8"}};
+        p.bytes = "response exceeded the server buffer cap";
         h2StreamAccum_.erase(it);
         reqLoc_.erase(id);
         flush = true;
+      } else {
+        if (n > 0) it->second.body.append((const char*)chunk, n);
+        if (last) {
+          p.connId = loc.connId;
+          p.isH2 = true;
+          p.h2ReqId = id;
+          p.h2Status = it->second.status;
+          p.h2Headers = std::move(it->second.headers);
+          p.bytes = std::move(it->second.body);
+          h2StreamAccum_.erase(it);
+          reqLoc_.erase(id);
+          flush = true;
+        }
       }
     }
     if (flush) {
@@ -1643,6 +1723,14 @@ void UvReactor::onSweep(uv_timer_t* timer) {
       if (c->hasDeadline && now >= c->reqDeadline && c->reqIdInFlight >= 0)
         timedOut.push_back(c->id);
     } else {
+#ifdef NITRO_SERVER_HTTP2
+      // An h2 connection serving one or more streams is actively busy even
+      // though it never sets c->busy (that flag is the HTTP/1.1 one-request-
+      // at-a-time gate). Don't idle-reap it mid-request — otherwise a stream
+      // that outlives keepAliveTimeout, or a server stream to a quiet client,
+      // is killed underneath the handler.
+      if (c->h2 && c->h2->hasOpenStreams()) continue;
+#endif
       const int64_t idleMs =
           (c->served == 0 && self->cfg_.headerTimeoutMs > 0)
               ? self->cfg_.headerTimeoutMs

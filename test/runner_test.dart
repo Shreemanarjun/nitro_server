@@ -2,6 +2,7 @@
 // Covers: head-only dispatch, body reassembly, early (pre-head) chunks,
 // terminal body errors, unknown-route 404, handler throws → 500,
 // per-chunk ack accounting, event re-broadcast, register failure mapping.
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:nitro_server/nitro_server.dart';
@@ -94,6 +95,50 @@ void main() {
       expect(res.headers['x-custom'], 'v');
       expect(res.headers.containsKey('X-Custom'), isFalse);
     });
+
+    test(
+      'a clientDisconnect event cancels a streaming handler subscription',
+      () async {
+        // A disconnected client must stop a still-producing stream source (an
+        // indefinite SSE feed) — else the handler runs forever into a dead conn.
+        final cancelled = Completer<void>();
+        late Timer timer;
+        late final StreamController<Uint8List> ctrl;
+        ctrl = StreamController<Uint8List>(
+          onListen: () => timer = Timer.periodic(
+            const Duration(milliseconds: 10),
+            (_) => ctrl.add(Uint8List.fromList([1])),
+          ),
+          onCancel: () {
+            timer.cancel();
+            if (!cancelled.isCompleted) cancelled.complete();
+          },
+        );
+        runner.addRoute(
+          HttpMethod.get,
+          '',
+          '/sse',
+          null,
+          (_) async => ResponseContext.stream(ctrl.stream),
+        );
+        await Future<void>.delayed(Duration.zero);
+
+        fake.heads.add(
+          fakeHead(requestId: 77, path: '/sse', routePattern: '/sse'),
+        );
+        await Future<void>.delayed(
+          const Duration(milliseconds: 30),
+        ); // open stream
+
+        // Client vanished: the engine broadcasts clientDisconnect (kind 5).
+        fake.events.add(const RawServerEvent(kind: 5, requestId: 77));
+        await cancelled.future.timeout(const Duration(seconds: 2));
+        expect(
+          cancelled.isCompleted,
+          isTrue,
+        ); // source subscription was cancelled
+      },
+    );
 
     test('a body is reassembled across chunks before dispatch', () async {
       RequestContext? seen;

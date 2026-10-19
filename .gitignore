@@ -39,3 +39,12 @@ crash-*
 leak-*
 timeout-*
 oom-*
+
+# Agent skill packs installed locally via `npx skills`/`skillfish` (developer
+# tooling, not part of this package). Each installer drops a skills/ tree and a
+# lockfile into the repo root; keep them out of version control.
+/.agents/
+/agent/
+/.claude/skills/
+/.commandcode/skills/
+/skills-lock.json

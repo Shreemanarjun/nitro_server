@@ -58,6 +58,11 @@ enum class ServerEventKind : int64_t {
   HandlerTimeout = 2,
   ClientError = 3,
   Notice = 4,
+  // A connection with an in-flight request closed (client disconnect): the
+  // `requestId` names the dropped request so the Dart runner cancels its
+  // outbound stream subscription. Crosses as an int64 (RawServerEvent.kind is
+  // int), so the public Dart `ServerEventKind` must keep the same index 5.
+  ClientDisconnect = 5,
 };
 
 struct Header {

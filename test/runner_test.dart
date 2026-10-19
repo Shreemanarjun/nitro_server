@@ -45,31 +45,54 @@ void main() {
       expect(String.fromCharCodes(response.body), 'got /');
     });
 
-    test('every answer carries the default x-server header; handler wins',
-        () async {
-      await addEcho('/def');
+    test(
+      'every answer carries the default x-server header; handler wins',
+      () async {
+        await addEcho('/def');
+        runner.addRoute(
+          HttpMethod.get,
+          '',
+          '/custom',
+          null,
+          (_) async =>
+              ResponseContext.text('hi', headers: {'x-server': 'Mine'}),
+        );
+        await Future<void>.delayed(Duration.zero);
+        final def = await driveRequest(
+          fake,
+          requestId: 10,
+          path: '/def',
+          routePattern: '/def',
+        );
+        expect(def.headers['x-server'], 'Nitro Dart Server');
+        final custom = await driveRequest(
+          fake,
+          requestId: 11,
+          path: '/custom',
+          routePattern: '/custom',
+        );
+        expect(custom.headers['x-server'], 'Mine');
+      },
+    );
+
+    test('response header names are lowercased on the wire', () async {
       runner.addRoute(
         HttpMethod.get,
         '',
-        '/custom',
+        '/mixed',
         null,
-        (_) async => ResponseContext.text('hi', headers: {'x-server': 'Mine'}),
+        (_) async => ResponseContext.text('hi').withHeader('X-Custom', 'v'),
       );
       await Future<void>.delayed(Duration.zero);
-      final def = await driveRequest(
+      final res = await driveRequest(
         fake,
-        requestId: 10,
-        path: '/def',
-        routePattern: '/def',
+        requestId: 12,
+        path: '/mixed',
+        routePattern: '/mixed',
       );
-      expect(def.headers['x-server'], 'Nitro Dart Server');
-      final custom = await driveRequest(
-        fake,
-        requestId: 11,
-        path: '/custom',
-        routePattern: '/custom',
-      );
-      expect(custom.headers['x-server'], 'Mine');
+      // HTTP/2 requires lowercase names (nghttp2 RSTs otherwise); normalize once.
+      expect(res.headers['x-custom'], 'v');
+      expect(res.headers.containsKey('X-Custom'), isFalse);
     });
 
     test('a body is reassembled across chunks before dispatch', () async {

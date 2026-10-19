@@ -1,8 +1,13 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:nitro_server/nitro_server.dart';
+import 'package:nitro_server/src/internal/server_runner.dart';
+import 'package:nitro_server/src/nitro_server.native.dart';
 import 'package:nitro_server/testing.dart';
 import 'package:test/test.dart';
+
+import 'support/fakes.dart';
 
 void main() {
   late NitroTestClient client;
@@ -60,5 +65,78 @@ void main() {
     // onClose -> gs.cancel() ran; triggering now is a harmless no-op close.
     await gs.trigger();
     expect(gs.isShuttingDown, isTrue);
+  });
+
+  group('runner', () {
+    late FakeNitroServerNative fake;
+    late ServerRunner runner;
+
+    setUp(() {
+      fake = FakeNitroServerNative();
+      runner = ServerRunner(fake);
+    });
+
+    tearDown(() async {
+      await runner.close();
+      await fake.close();
+    });
+
+    Future<void> addGet(String pattern, [RequestHandler? handler]) async {
+      runner.addRoute(
+        HttpMethod.get,
+        '',
+        pattern,
+        null,
+        handler ?? (_) async => const ResponseContext(),
+      );
+      await Future<void>.delayed(Duration.zero);
+    }
+
+    group('lifecycle edges', () {
+      test('close is idempotent', () async {
+        await addGet('/');
+        await runner.close();
+        await runner.close();
+        expect(fake.stopCalls, 1);
+      });
+
+      test('all event kinds map without throwing', () async {
+        final kinds = <ServerEventKind>[];
+        final sub = runner.events.listen((e) => kinds.add(e.kind));
+        runner.addRoute(HttpMethod.get, '', '/', null, (_) async {
+          return const ResponseContext();
+        });
+        for (var i = 0; i < ServerEventKind.values.length; i++) {
+          fake.events.add(RawServerEvent(kind: i, message: 'm$i'));
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 30));
+        expect(kinds, ServerEventKind.values);
+        await sub.cancel();
+      });
+
+      test('a late answer after close is dropped, never sent', () async {
+        final gate = Completer<ResponseContext>();
+        runner.addRoute(HttpMethod.get, '', '/slow', null, (_) => gate.future);
+        await Future<void>.delayed(Duration.zero);
+
+        fake.heads.add(
+          fakeHead(requestId: 400, path: '/slow', routePattern: '/slow'),
+        );
+        // Wait until dispatch parks on the handler future…
+        for (
+          var i = 0;
+          i < 200 && !runner.pendingIdsForTesting.contains(400);
+          i++
+        ) {
+          await Future<void>.delayed(const Duration(milliseconds: 5));
+        }
+        expect(runner.pendingIdsForTesting, contains(400));
+        await runner.close();
+        gate.complete(const ResponseContext());
+        await Future<void>.delayed(const Duration(milliseconds: 30));
+        // The engine never saw a response for the reaped request.
+        expect(fake.responded.where((r) => r.requestId == 400), isEmpty);
+      });
+    });
   });
 }

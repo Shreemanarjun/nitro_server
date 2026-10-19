@@ -892,10 +892,17 @@ class ServerRunner {
   /// this path, so a custom error page may stream too.
   void _deliver(int requestId, ResponseContext response) {
     _record(requestId, response.status);
-    // Default server identity on every answer (stream/file/one-shot alike);
-    // a handler- or middleware-set `x-server` wins. copyWith keeps the body.
+    // Normalize response header names to lowercase (HTTP/1.1 is case-
+    // insensitive; HTTP/2 REQUIRES lowercase — nghttp2 RSTs a mixed-case name,
+    // and a mixed-case duplicate would otherwise survive on the wire), and
+    // stamp the default server identity (a handler/middleware `x-server` wins).
+    // One place covers the one-shot, stream and file answer paths. copyWith
+    // keeps the body.
     response = response.copyWith(
-      headers: {'x-server': 'Nitro Dart Server', ...response.headers},
+      headers: {
+        'x-server': 'Nitro Dart Server',
+        for (final e in response.headers.entries) e.key.toLowerCase(): e.value,
+      },
     );
     // Dispatch-to-answer time, emitted as `Server-Timing`. Computed once here
     // (the pending entry is still live) and reused by whichever answer path

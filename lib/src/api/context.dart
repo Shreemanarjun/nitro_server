@@ -363,9 +363,12 @@ class RequestContext {
     return out;
   }
 
-  /// Headers by lowercase name, unpacked on first access.
-  late final Map<String, List<String>> headers =
-      _headers ?? unpackHeaders(_packedHeaders!);
+  /// Headers by lowercase name, unpacked on first access. A map passed to the
+  /// plain constructor is lowercased here too, so [header] finds mixed-case
+  /// keys (the `.packed` path already lowercases via [unpackHeaders]).
+  late final Map<String, List<String>> headers = _headers == null
+      ? unpackHeaders(_packedHeaders!)
+      : {for (final e in _headers.entries) e.key.toLowerCase(): e.value};
   final Map<String, String> params;
   final String routePattern;
 
@@ -857,15 +860,24 @@ class SseEvent {
   /// per line of [data], terminated by a blank line.
   String encode() {
     final b = StringBuffer();
-    if (event != null) b.write('event: $event\n');
-    if (id != null) b.write('id: $id\n');
+    // Strip CR/LF from the single-line fields: an embedded newline would inject
+    // extra SSE fields or end the event early (field injection). `data` is
+    // split per line below, so it is safe — split on every SSE line terminator
+    // (\r\n, \r, \n), not just \n.
+    final ev = event?.replaceAll(_crlf, '');
+    final eid = id?.replaceAll(_crlf, '');
+    if (ev != null) b.write('event: $ev\n');
+    if (eid != null) b.write('id: $eid\n');
     if (retry != null) b.write('retry: ${retry!.inMilliseconds}\n');
-    for (final line in data.split('\n')) {
+    for (final line in data.split(_sseLineBreak)) {
       b.write('data: $line\n');
     }
     b.write('\n');
     return b.toString();
   }
+
+  static final _crlf = RegExp(r'[\r\n]');
+  static final _sseLineBreak = RegExp(r'\r\n|\r|\n');
 }
 
 /// Answers one request. Sync or async: a handler returning a

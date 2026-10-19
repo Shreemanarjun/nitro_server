@@ -111,8 +111,10 @@ Middleware requestId({
     final incoming = request.header(name) ?? request.header('x-correlation-id');
     final id = (incoming != null && incoming.isNotEmpty) ? incoming : gen();
     final response = await next(request);
-    // Handler-set value wins; otherwise stamp ours.
-    return response.headers.containsKey(name)
+    // Handler-set value wins (any casing); otherwise stamp ours. Case-
+    // insensitive so a handler's `X-Request-Id` isn't duplicated under
+    // `x-request-id`.
+    return _headerValue(response.headers, name) != null
         ? response
         : response.withHeader(name, id);
   };
@@ -181,8 +183,12 @@ Middleware cors({
       'access-control-max-age': '${maxAge.inSeconds}',
   };
   return (request, next) async {
-    if (request.method == HttpMethod.options) {
-      // Preflight: the policy IS the answer; the route never runs.
+    // A CORS preflight is an OPTIONS carrying Access-Control-Request-Method;
+    // answer only those inline. A plain OPTIONS (a user-registered route, or a
+    // non-CORS probe) must fall through to `next` — else cors() shadows every
+    // OPTIONS/all route on the server.
+    if (request.method == HttpMethod.options &&
+        request.header('access-control-request-method') != null) {
       return ResponseContext(status: 204, headers: policy);
     }
     final response = await next(request);
@@ -281,6 +287,7 @@ ResponseContext _reencoded(
   status: response.status,
   headers: {...headers, 'content-encoding': coding, 'vary': 'accept-encoding'},
   body: body,
+  cookies: response.cookies, // else compression drops the handler's set-cookies
 );
 
 /// True when [accept] (an `Accept-Encoding` value) lists [coding] as a coding

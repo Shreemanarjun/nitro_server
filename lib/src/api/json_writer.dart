@@ -476,6 +476,46 @@ final class JsonWriter implements Finalizable {
     _n.freeBuf(_w);
   }
 
+  // ── Pooling (hot response path) ────────────────────────────────────────────
+  // A per-isolate free-list so `ResponseContext.jsonWriter` REUSES a native
+  // writer buffer across requests instead of jwNew/jwFree-ing one per request.
+  // Allocating + freeing a native buffer per request churned the native
+  // allocator and inflated RSS under sustained load — the memory was freed but
+  // the allocator kept the pages, so resident memory climbed into the GBs on
+  // large-response routes (/work, /echo) and only receded once the churn
+  // stopped. The pool bounds LIVE writers to the peak concurrency; a burst
+  // beyond [_poolMax] disposes the extras instead of growing unbounded. Statics
+  // are per-isolate, so there is no cross-isolate sharing to race on, and a
+  // checked-out writer is off the list (exclusively owned by its response)
+  // until [release].
+  static final List<JsonWriter> _pool = <JsonWriter>[];
+  static const int _poolMax = 256;
+  bool _pooled = false; // in the free-list — guards a double [release]
+
+  /// Checks out a cleared writer from the per-isolate pool (or makes one). Pair
+  /// with [release] once the response bytes have been read by the engine.
+  static JsonWriter checkout() {
+    if (_pool.isEmpty) return JsonWriter();
+    final w = _pool.removeLast();
+    w._pooled = false;
+    return w;
+  }
+
+  /// Returns this writer to the pool for reuse (clearing it first), or disposes
+  /// it when the pool is full. Idempotent; the caller must not use the writer
+  /// afterward. A no-op if already pooled (so a stray double-release can't alias
+  /// one writer to two responses) or disposed.
+  void release() {
+    if (_disposed || _pooled) return;
+    if (_pool.length < _poolMax) {
+      reset();
+      _pooled = true;
+      _pool.add(this);
+    } else {
+      dispose();
+    }
+  }
+
   // Copies [s]'s UTF-8 bytes into a reused native scratch buffer and returns
   // (pointer, length): the FFI calls take a native pointer, and Dart lists
   // have no stable one without a copy.

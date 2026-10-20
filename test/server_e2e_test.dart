@@ -245,6 +245,15 @@ Future<void> _afterSetup(NitroServer server) async {
   await server.get('/after', (_) async => ResponseContext.text('after'));
 }
 
+// Top-level (sendable) work for the Isolate.run offload tests below: a CPU-ish
+// job a handler can hand to a worker isolate, returning either a Map/List
+// (encoded by ResponseContext.jsonBody) or a pre-encoded jsonString (forwarded
+// by ResponseContext.json).
+List<Map<String, Object?>> _reportData() => [
+  for (var i = 0; i < 3; i++) {'id': i, 'v': i * 2},
+];
+String _reportJson() => jsonEncode(_reportData());
+
 void main() {
   final libraryPath = _locateLibrary();
   final skipReason = libraryPath == null
@@ -575,15 +584,19 @@ void main() {
       expect((await _get(server!.port, '/who')).status, 200);
     }, skip: skipReason);
 
-    test('isolates: 0 without a setup stays single-isolate (no throw)', () async {
-      // Auto is setup-gated: handler closures can't cross isolates, so a
-      // zero-config server (no setup) can't fan out — it binds as one isolate
-      // rather than failing.
-      server = await NitroServer.bind(const ServerConfig(isolates: 0));
-      expect(server!.isolates, 1);
-      await server!.get('/ping', (_) => ResponseContext.text('ok'));
-      expect((await _get(server!.port, '/ping')).status, 200);
-    }, skip: skipReason);
+    test(
+      'isolates: 0 without a setup stays single-isolate (no throw)',
+      () async {
+        // Auto is setup-gated: handler closures can't cross isolates, so a
+        // zero-config server (no setup) can't fan out — it binds as one isolate
+        // rather than failing.
+        server = await NitroServer.bind(const ServerConfig(isolates: 0));
+        expect(server!.isolates, 1);
+        await server!.get('/ping', (_) => ResponseContext.text('ok'));
+        expect((await _get(server!.port, '/ping')).status, 200);
+      },
+      skip: skipReason,
+    );
 
     test('bindWith forwards its arguments and setup', () async {
       server = await NitroServer.bindWith(
@@ -671,6 +684,41 @@ void main() {
         ),
       );
     }, skip: skipReason);
+
+    test(
+      'jsonBody serializes a Map/List built in a top-level Isolate.run',
+      () async {
+        // The handler offloads the work to a one-shot worker isolate (the
+        // function is top-level, hence sendable) and answers the returned Map/List
+        // with the native JsonWriter via jsonBody — the ergonomic CPU-offload path.
+        server = await NitroServer.bind();
+        await server!.get(
+          '/rep',
+          (_) async => ResponseContext.jsonBody(await Isolate.run(_reportData)),
+        );
+        final res = await _get(server!.port, '/rep');
+        expect(res.status, 200);
+        expect(res.body, jsonEncode(_reportData()));
+      },
+      skip: skipReason,
+    );
+
+    test(
+      'ResponseContext.json forwards a jsonString from a top-level Isolate.run',
+      () async {
+        // The worker isolate returns a pre-encoded jsonString; the handler
+        // forwards it verbatim (no re-encode) as application/json.
+        server = await NitroServer.bind();
+        await server!.get(
+          '/repj',
+          (_) async => ResponseContext.json(await Isolate.run(_reportJson)),
+        );
+        final res = await _get(server!.port, '/repj');
+        expect(res.status, 200);
+        expect(res.body, jsonEncode(_reportData()));
+      },
+      skip: skipReason,
+    );
 
     test(
       'close(drain:) finishes accepted work and refuses new connections',

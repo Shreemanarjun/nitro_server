@@ -118,3 +118,19 @@ per request (socket I/O + parse + engine dominate). `@Native`'s value is
 packaging (self-contained code asset, no cmake for consumers), not speed. Re-run
 `benchmark/blackbox/run.sh --frameworks "nitro-native nitro-dylib"` before
 re-litigating.
+
+## Memory under load (what the `mem MB` column means)
+
+The report's peak RSS is the resident memory of the server process tree under
+load. nitro's is higher than Go's (compact) and lower than Node's (cluster), and
+on **large-response routes** it was ~GBs under a burst — investigated and found
+to be **GC/allocator growth, not a leak**: RSS plateaus, the GC reclaims it even
+*during* load, and it returns to baseline at idle; capping both Dart generations
+didn't move it, so the driver was **native allocator churn** from a fresh
+`JsonWriter` (native buffer `jwNew`/`jwFree`) *per request*. Fixed with a
+per-isolate **writer pool** (`JsonWriter.checkout()/release()`, wired through
+`ResponseContext.jsonWriter`) that reuses buffers instead of alloc/free per
+request — `/work` peak RSS dropped ~6× (≈1485→253 MB per isolate). CPU-bound
+handlers should also encode **inline** (no intermediate `List<Map>` per request);
+the `/work` handler does. `/echo` (body echo) is a separate path not covered by
+the writer pool. See [[cpu-bound-perf-levers]] in memory.

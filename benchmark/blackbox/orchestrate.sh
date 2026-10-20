@@ -179,20 +179,37 @@ EQUAL=[r for r in routes if r!="/static"]   # /static is nitro engine fast-path
 def table(title, rts, note=""):
     L=[f"## {title}", ""]
     if note: L+=[note, ""]
-    L.append("| route | framework | req/s | p50 | p90 | p95 | p99 | p50:p99 | mem MB |")
-    L.append("|---|---|--:|--:|--:|--:|--:|--:|--:|")
+    L.append("| route | framework | req/s | p50 | p90 | p95 | p99 | p50:p99 |")
+    L.append("|---|---|--:|--:|--:|--:|--:|--:|")
     for rt in rts:
         # best req/s across frameworks for this route (to mark the winner)
         best=max((med(f,rt,"rps") or 0) for f in fws)
         for f in fws:
-            rps=med(f,rt,"rps");
+            rps=med(f,rt,"rps")
             if rps is None:
-                L.append(f"| {rt} | {f} | — | — | — | — | — | — | — |"); continue
-            p50=med(f,rt,"p50_ms"); p99=med(f,rt,"p99_ms"); mem=med(f,rt,"rss_mb")
+                L.append(f"| {rt} | {f} | — | — | — | — | — | — |"); continue
+            p50=med(f,rt,"p50_ms"); p99=med(f,rt,"p99_ms")
             ratio=(p99/p50) if (p50 and p99 and p50>0) else None
             win="**" if rps==best and best>0 else ""
-            L.append(f"| {rt} | {f} | {win}{rps:.0f}{win} | {p50:.2f} | {med(f,rt,'p90_ms'):.2f} | {med(f,rt,'p95_ms'):.2f} | {p99:.2f} | {ratio:.1f}× | {mem:.0f} |")
-        L.append("| | | | | | | | | |")
+            L.append(f"| {rt} | {f} | {win}{rps:.0f}{win} | {p50:.2f} | {med(f,rt,'p90_ms'):.2f} | {med(f,rt,'p95_ms'):.2f} | {p99:.2f} | {ratio:.1f}× |")
+        L.append("| | | | | | | | |")
+    return "\n".join(L)
+
+# Peak RSS per framework = the workload high-water (median of per-rep maxima).
+# NOT a per-route column: all routes share one server instance per rep, so a
+# per-route sample is the running high-water, not that route's own footprint.
+def mem_table():
+    L=["## Peak memory (RSS MB — whole-workload high-water per framework)",
+       "", "Server process tree, median of per-rep peaks. Per-route memory is "
+       "not isolated (routes share one server per rep), so it is one number per "
+       "framework, not a column.", "", "| framework | peak RSS MB |", "|---|--:|"]
+    for f in fws:
+        per_rep={}
+        for r in rows:
+            if r["framework"]==f and r["rss_mb"] not in ("NA",""):
+                per_rep[r["rep"]]=max(per_rep.get(r["rep"],0.0), float(r["rss_mb"]))
+        peak=st.median(list(per_rep.values())) if per_rep else None
+        L.append(f"| {f} | {peak:.0f} |" if peak is not None else f"| {f} | — |")
     return "\n".join(L)
 
 doc=[ "# Blackbox cross-framework benchmark", "",
@@ -205,6 +222,7 @@ doc=[ "# Blackbox cross-framework benchmark", "",
             "nitro answers `/static` from the engine (`getStatic`, no handler/FFI); the other "
             "frameworks run a handler returning the same bytes. Illustrates nitro's cached-response "
             "path, not an apples-to-apples comparison."),
+      "", mem_table(),
       "", "## Response validation (rep 1)", "",
       "Body-byte length per route must agree across frameworks (equal bytes = fair). Mismatches flagged.",
       "", "| route | agree? | bytes (by framework) |", "|---|---|---|" ]

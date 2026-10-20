@@ -530,10 +530,11 @@ class _Helper {
         // mutable state (a List, a controller, `this`) can't. The routes the
         // `setup` registers may themselves be closures: they are built fresh
         // inside each isolate, so only `setup` must be sendable.
+        //
+        // A non-sendable setup throws on the FIRST spawn (the same object is
+        // sent to every isolate), so no helper is ever live here — nothing to
+        // close but this iteration's `replies` port.
         replies.close();
-        for (final helper in helpers) {
-          await helper.close();
-        }
         throw ArgumentError(
           'nitro_server: `setup` must be sendable across isolates for a '
           'multi-isolate server (isolates > 1 or auto `isolates: 0`) — use a '

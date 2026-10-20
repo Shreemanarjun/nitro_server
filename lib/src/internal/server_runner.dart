@@ -1034,9 +1034,12 @@ class ServerRunner {
       // The request was already answered (timeout won) or the server went
       // away mid-flight. Exactly-once is the engine's job; Dart never retries.
     } finally {
-      // The writer's native buffer was read synchronously by respond; free it
-      // now (the NativeFinalizer is only the never-answered safety net).
-      writer?.dispose();
+      // The writer's native buffer was read synchronously by respond; return it
+      // to the per-isolate pool for reuse now (reset + recycled, so the next
+      // request does not jwNew/jwFree a fresh native buffer — that per-request
+      // churn was what inflated RSS under load). The NativeFinalizer is only the
+      // never-answered safety net.
+      writer?.release();
     }
   }
 

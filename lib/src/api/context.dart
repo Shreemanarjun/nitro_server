@@ -693,11 +693,11 @@ class ResponseContext {
     int status = 200,
     Map<String, String> headers = const {},
   }) {
-    final w = JsonWriter();
+    final w = JsonWriter.checkout();
     try {
       build(w);
     } catch (_) {
-      w.dispose();
+      w.release();
       rethrow;
     }
     // Hand the live writer to the runner (win ③): the answerer sends its native

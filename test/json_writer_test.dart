@@ -367,6 +367,63 @@ void main() {
       expect(ctx.headers['x-test'], 'yes');
       expect(ctx.bodyBytes, utf8.encode('1'));
     });
+
+    test(
+      'checkout/release pools and reuses a writer; double-release no-ops',
+      () {
+        final a = JsonWriter.checkout();
+        a.release(); // -> pool (LIFO)
+        final b = JsonWriter.checkout();
+        expect(identical(a, b), isTrue); // reused the just-released writer
+        b.release();
+        b.release(); // double-release: guarded no-op
+        final c = JsonWriter.checkout();
+        expect(identical(c, b), isTrue); // b was pooled exactly once
+        final d = JsonWriter.checkout();
+        expect(identical(d, b), isFalse); // not double-pooled
+        c.release();
+        d.release();
+      },
+    );
+
+    test('release disposes past the pool cap (bounded, keeps working)', () {
+      // Release more than the cap so the overflow branch (dispose, not pool)
+      // runs; the pool stays bounded and checkout still works afterward.
+      final ws = [for (var i = 0; i < 260; i++) JsonWriter.checkout()];
+      for (final w in ws) {
+        w.release();
+      }
+      final w = JsonWriter.checkout()
+        ..beginArray()
+        ..writeInt(1)
+        ..endArray();
+      expect(w.byteLength, 3); // "[1]"
+      w.release();
+    });
+
+    test('non-ASCII + control-char strings escape byte-identically', () {
+      // é routes keys through the UTF-8 marshal and values through the escaped
+      // UTF-8 marshal; the control chars exercise every \-escape (incl. \b, \f).
+      const s = 'héllo\b\f\n\r\t"\\\u0001';
+      final ctx = ResponseContext.jsonWriter(
+        (w) => w
+          ..beginObject()
+          ..key('kéy')
+          ..writeString(s)
+          ..endObject(),
+      );
+      expect(utf8.decode(ctx.bodyBytes), jsonEncode({'kéy': s}));
+    });
+
+    test('jsonWriter build error releases the writer and rethrows', () {
+      expect(
+        () => ResponseContext.jsonWriter((w) {
+          w.beginObject();
+          throw StateError('boom');
+        }),
+        throwsStateError,
+      );
+    });
   }, skip: libPath == null ? 'native library not built' : null);
 }
 

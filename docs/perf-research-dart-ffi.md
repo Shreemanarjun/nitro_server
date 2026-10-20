@@ -43,7 +43,7 @@ per request." Everything below is about that.
 - **A faster JSON codec** (encode or a native/simdjson decoder): serialization is
   ~1–2 µs for a normal body, dwarfed by the 4.5 µs crossing; and a native decoder
   loses to the VM's in-heap `jsonDecode` because materializing Dart objects
-  across FFI is the same wall. See `benchmark-results.md`; not the lever.
+  across FFI is the same wall. See the blackbox harness; not the lever.
 
 ## Levers that CAN raise it, ranked
 

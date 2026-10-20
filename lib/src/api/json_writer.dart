@@ -477,17 +477,12 @@ final class JsonWriter implements Finalizable {
   }
 
   // ── Pooling (hot response path) ────────────────────────────────────────────
-  // A per-isolate free-list so `ResponseContext.jsonWriter` REUSES a native
-  // writer buffer across requests instead of jwNew/jwFree-ing one per request.
-  // Allocating + freeing a native buffer per request churned the native
-  // allocator and inflated RSS under sustained load — the memory was freed but
-  // the allocator kept the pages, so resident memory climbed into the GBs on
-  // large-response routes (/work, /echo) and only receded once the churn
-  // stopped. The pool bounds LIVE writers to the peak concurrency; a burst
-  // beyond [_poolMax] disposes the extras instead of growing unbounded. Statics
-  // are per-isolate, so there is no cross-isolate sharing to race on, and a
-  // checked-out writer is off the list (exclusively owned by its response)
-  // until [release].
+  // Per-isolate free-list so `ResponseContext.jsonWriter` reuses a native writer
+  // buffer across requests. A fresh jwNew/jwFree per request churned the native
+  // allocator (it kept the freed pages), climbing RSS into the GBs under
+  // sustained large-response load. The pool caps LIVE writers at [_poolMax];
+  // a burst past it disposes the extras. Statics are per-isolate (no race), and
+  // a checked-out writer is off the list until [release].
   static final List<JsonWriter> _pool = <JsonWriter>[];
   static const int _poolMax = 256;
   bool _pooled = false; // in the free-list — guards a double [release]
@@ -594,7 +589,8 @@ final class JsonWriter implements Finalizable {
       if (c < 0x20 || c == 0x22 || c == 0x5c) {
         j = _escapeByte(out, j, c);
       } else {
-        out[j++] = c; // >= 0x80 UTF-8 bytes copy as-is (JSON does not escape them)
+        out[j++] =
+            c; // >= 0x80 UTF-8 bytes copy as-is (JSON does not escape them)
       }
     }
     out[j++] = 0x22;

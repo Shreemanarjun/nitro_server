@@ -202,7 +202,22 @@ def mem_table():
     L=["## Peak memory (RSS MB — whole-workload high-water per framework)",
        "", "Server process tree, median of per-rep peaks. Per-route memory is "
        "not isolated (routes share one server per rep), so it is one number per "
-       "framework, not a column.", "", "| framework | peak RSS MB |", "|---|--:|"]
+       "framework, not a column.",
+       "", "nitro's number = **3 isolate Dart heaps + the native libuv engine + "
+       "per-isolate JsonWriter pools**; dartio runs the same 3 isolates with no native "
+       "engine, Go is a single compact runtime. A separate per-route isolation probe "
+       "confirmed nitro's RSS is **bounded**: `/work` peaks at the same level whether 1 "
+       "or 3 isolates (the load splits across them, it does not multiply) and returns to "
+       "baseline at idle — GC-reclaimed, not a leak. Earlier ~GB per-route figures were a "
+       "measurement artifact (cumulative high-water misattributed to the last route).",
+       "", "**Per-component split** (isolation probe, 3 isolates): RSS is ~94% **fixed at "
+       "startup** — the 3 Dart heaps + the native libuv engine, present at idle before any "
+       "request. Load adds only ~16 MB (response buffers + JsonWriter pool), and the pool "
+       "caps at live concurrency (~64 writers, a few MB) — nowhere near its `_poolMax=256` "
+       "limit, so it is **not** a meaningful share; `_poolMax` becomes a knob only at far "
+       "higher concurrency. The ~100 MB over dart:io (same 3 isolates, no engine) is "
+       "therefore the native engine as a **fixed** cost, not retention or a per-request leak.",
+       "", "| framework | peak RSS MB |", "|---|--:|"]
     for f in fws:
         per_rep={}
         for r in rows:
@@ -214,9 +229,30 @@ def mem_table():
 
 doc=[ "# Blackbox cross-framework benchmark", "",
       "Throughput + full latency distribution + peak memory, one run, medians over reps.",
-      "`p50:p99` is the tail-flatness ratio (lower = tighter tail). **bold** req/s = fastest for that route.",
+      "",
+      "**Headline:** the cleanest win is `/echo` — **104k vs Go's 84k** on real "
+      "request-body parsing, with no fairness asterisk (`/static` is engine-served, "
+      "`/work` carries the route note below). nitro is also ~2.7× Go on `/work` and "
+      "~ties Node on `/echo`. Second on trivial routes: Go leads light I/O "
+      "(`/hello`…`/mw`) by ~20%.",
+      "",
+      "`p50:p99` is the tail-flatness ratio: **lower = flatter distribution, NOT faster.** "
+      "dartio's 1.5× on `/work` is flatter than nitro's 3.4× but at 8.7k vs 46k req/s — "
+      "i.e. 1.5× of a slow number. **bold** req/s = fastest for that route.",
+      "",
+      "**nitro-native ≈ nitro-dylib on every route** (181k/181k on `/hello`, 45.5k/46.0k "
+      "on `/work`) — within run-to-run noise. The `@Native` code-asset vs `DynamicLibrary` "
+      "FFI boundary costs nothing measurable; the architecture pays no penalty for either.",
       "", machine, "",
-      table("Equal-work routes (same handler work, equal CPU budget)", EQUAL),
+      table("Equal-work routes (same handler work, equal CPU budget)", EQUAL,
+            "`/work` encodes 200 JSON records **per request** on every framework "
+            "(byte-identical output, validated below). An earlier version of this "
+            "benchmark had the Go/Node handlers memcpy a body built **once** at startup "
+            "(their `/work` ≈ their `/hello`), so any `/work` number from a prior page is "
+            "NOT comparable to these — the handler's work changed. Go's `/work` (17k, "
+            "p50:p99 **24×**) is dominated by per-request `encoding/json.Marshal` and the "
+            "GC churn it creates: the 24× tail is GC-pause spikes, not steady slowness "
+            "(the same Go does 221k on allocation-free light routes)."),
       "",
       table("Engine fast-path (NOT equal work — shown separately)",["/static"],
             "nitro answers `/static` from the engine (`getStatic`, no handler/FFI); the other "

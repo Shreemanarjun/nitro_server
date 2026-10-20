@@ -107,6 +107,6 @@ a nitro backend.
   `ServerConfig.isolates` (e.g. to `Platform.numberOfProcessors`); the engine's
   adaptive dispatch then fans out only when it helps. If you do, register the
   observability/OpenAPI routes inside `setup` so every isolate serves them. See
-  [`benchmark-production.md`](benchmark-production.md).
+  [`../benchmark/BENCHMARKING.md`](../benchmark/BENCHMARKING.md).
 - Scale horizontally by running more replicas behind the platform's load
   balancer; nitro is lean (~30 MB RSS under load) so replicas are cheap.

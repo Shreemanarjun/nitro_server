@@ -162,10 +162,10 @@ Additional measurements (`--quick --raw`, 32 connections):
 | `/work`, 4 isolates | 10,929 | 11,298 | 3,058 |
 | `/file` | 24,627 | 11,827 | 10,865 |
 
-**Engine-served fast path (`getStatic`) and the Go/Node comparison** (a fast C
-client via `wrk`, TechEmpower-style) live in
-[`../docs/benchmark-results.md`](../docs/benchmark-results.md) — the single home
-for the cross-framework results and the engine-path throughput analysis.
+**Engine-served fast path (`getStatic`) and the Go/Node comparison** live in the
+reproducible blackbox harness ([`blackbox/`](blackbox/), run `blackbox/run.sh`) —
+the single home for cross-framework results; methodology in
+[`BENCHMARKING.md`](BENCHMARKING.md).
 
 WebSocket echo (keep-alive, one message per round trip; shelf has no
 WebSocket):

@@ -303,8 +303,10 @@ final class JsonWriter implements Finalizable {
 
   /// Writes a string value. UTF-8 and JSON-escaped.
   void writeString(String value) {
-    final (ptr, n) = _marshal(value);
-    _n.stringFn(_w, ptr, n);
+    // Win ②: escape+encode in one Dart pass, then memcpy via jw_raw — the
+    // native side no longer re-scans every byte to escape (jw_string).
+    final (ptr, n) = _marshalEscaped(value);
+    _n.rawFn(_w, ptr, n);
   }
 
   void writeBool(bool value) => _n.boolFn(_w, value ? 1 : 0);
@@ -452,6 +454,14 @@ final class JsonWriter implements Finalizable {
     return Uint8List.fromList(_n.bytes(_w).asTypedList(n));
   }
 
+  /// The native buffer pointer + byte length, for answering straight from the
+  /// writer (win ③) — the engine reads these synchronously in `respond`,
+  /// skipping [toBytes]'s writer→Dart copy and the answerer's stage copy. Valid
+  /// until the next [reset]/[dispose]; the caller must not dispose the writer
+  /// before the (synchronous) respond returns.
+  Pointer<Uint8> get nativeBufferPointer => _n.bytes(_w).cast();
+  int get byteLength => _n.len(_w);
+
   /// Releases native memory. Idempotent; the writer must not be used after.
   void dispose() {
     if (_disposed) return;
@@ -469,14 +479,112 @@ final class JsonWriter implements Finalizable {
   // Copies [s]'s UTF-8 bytes into a reused native scratch buffer and returns
   // (pointer, length): the FFI calls take a native pointer, and Dart lists
   // have no stable one without a copy.
+  // ASCII fast path: 1 byte per code unit, written straight into the native
+  // scratch — no intermediate Dart list and no second copy (~3-4x faster than
+  // utf8.encode + setAll for ASCII, the common case for JSON keys/values). The
+  // first non-ASCII code unit falls back to full UTF-8; bytes are identical
+  // either way. (The native key/string/raw fns escape + append, so _marshal
+  // only has to land the UTF-8 bytes in the scratch.)
   (Pointer<Uint8>, int) _marshal(String s) {
-    final bytes = utf8.encode(s);
-    if (bytes.length > _scratchCap) {
-      if (_scratch != nullptr) _n.freeBuf(_scratch.cast());
-      _scratch = _n.alloc(bytes.length);
-      _scratchCap = bytes.length;
+    final n = s.length;
+    if (n > _scratchCap) _growScratch(n);
+    if (n != 0) {
+      final out = _scratch.asTypedList(_scratchCap);
+      for (var i = 0; i < n; i++) {
+        final c = s.codeUnitAt(i);
+        if (c >= 0x80) return _marshalUtf8(s);
+        out[i] = c;
+      }
     }
+    return (_scratch, n);
+  }
+
+  (Pointer<Uint8>, int) _marshalUtf8(String s) {
+    final bytes = utf8.encode(s);
+    if (bytes.length > _scratchCap) _growScratch(bytes.length);
     if (bytes.isNotEmpty) _scratch.asTypedList(bytes.length).setAll(0, bytes);
     return (_scratch, bytes.length);
+  }
+
+  void _growScratch(int need) {
+    if (_scratch != nullptr) _n.freeBuf(_scratch.cast());
+    _scratch = _n.alloc(need);
+    _scratchCap = need;
+  }
+
+  static const _hexDigits = '0123456789abcdef';
+
+  // Win ②: escape + UTF-8-encode [s] into the scratch as a complete JSON string
+  // token `"<escaped>"` in one Dart pass, so the native side only has to memcpy
+  // it in (`jw_raw`) instead of re-scanning every byte to escape (`jw_string`
+  // -> writeEscaped). One scalar pass over the data instead of two. ASCII fast
+  // path copies a byte per code unit; the first non-ASCII unit re-does it via
+  // UTF-8. Bytes are identical to the native escaper either way.
+  (Pointer<Uint8>, int) _marshalEscaped(String s) {
+    final n = s.length;
+    // ponytail: worst case every char -> \u00XX (6B) + 2 quotes; transient and
+    // reused, grown only when a longer string arrives. Swap for a per-char
+    // grow-check if scratch memory on huge strings ever matters.
+    final cap = n * 6 + 2;
+    if (cap > _scratchCap) _growScratch(cap);
+    final out = _scratch.asTypedList(_scratchCap);
+    var j = 0;
+    out[j++] = 0x22; // "
+    for (var i = 0; i < n; i++) {
+      final c = s.codeUnitAt(i);
+      if (c >= 0x80) return _marshalEscapedUtf8(s);
+      if (c < 0x20 || c == 0x22 || c == 0x5c) {
+        j = _escapeByte(out, j, c);
+      } else {
+        out[j++] = c;
+      }
+    }
+    out[j++] = 0x22; // "
+    return (_scratch, j);
+  }
+
+  (Pointer<Uint8>, int) _marshalEscapedUtf8(String s) {
+    final bytes = utf8.encode(s);
+    final cap = bytes.length * 6 + 2;
+    if (cap > _scratchCap) _growScratch(cap);
+    final out = _scratch.asTypedList(_scratchCap);
+    var j = 0;
+    out[j++] = 0x22;
+    for (final c in bytes) {
+      if (c < 0x20 || c == 0x22 || c == 0x5c) {
+        j = _escapeByte(out, j, c);
+      } else {
+        out[j++] = c; // >= 0x80 UTF-8 bytes copy as-is (JSON does not escape them)
+      }
+    }
+    out[j++] = 0x22;
+    return (_scratch, j);
+  }
+
+  int _escapeByte(Uint8List out, int j, int c) {
+    out[j++] = 0x5c; // backslash
+    switch (c) {
+      case 0x22:
+        out[j++] = 0x22;
+      case 0x5c:
+        out[j++] = 0x5c;
+      case 0x08:
+        out[j++] = 0x62; // \b
+      case 0x0c:
+        out[j++] = 0x66; // \f
+      case 0x0a:
+        out[j++] = 0x6e; // \n
+      case 0x0d:
+        out[j++] = 0x72; // \r
+      case 0x09:
+        out[j++] = 0x74; // \t
+      default: // other control chars < 0x20 -> \u00XX
+        out[j++] = 0x75; // u
+        out[j++] = 0x30; // 0
+        out[j++] = 0x30; // 0
+        out[j++] = _hexDigits.codeUnitAt(c >> 4);
+        out[j++] = _hexDigits.codeUnitAt(c & 0xf);
+    }
+    return j;
   }
 }

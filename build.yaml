@@ -21,5 +21,7 @@ targets:
         - "**/ephemeral/**"
     builders:
       nitro_generator:
+        options:
+          native_assets: true
         generate_for:
           - lib/src/**.native.dart

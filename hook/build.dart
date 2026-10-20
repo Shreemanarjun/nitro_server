@@ -38,7 +38,7 @@ void main(List<String> args) async {
       output.assets.code.add(
         CodeAsset(
           package: 'nitro_server',
-          name: _libFileName(os),
+          name: 'nitro_server',
           linkMode: DynamicLoadingBundled(),
           file: lib.uri,
         ),

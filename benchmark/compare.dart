@@ -390,8 +390,14 @@ Future<HttpServer> _startShelfServer() async {
 
 /// Route registration for nitro as a setup function: with `--isolates N`
 /// it runs once per isolate, so it captures only the values it needs.
-ServerSetup _nitroSetup(bool batchEvents) {
-  return (server) async {
+// Top-level (sendable) setup so a multi-isolate server can send it to every
+// isolate (see ServerConfig.isolates). A top-level/static function is always
+// sendable; this one captures nothing. It reads the top-level [_batchEvents]
+// only for /events, which the blackbox harness does not bench, and the headline
+// in-process run is single-isolate (the global is read directly) — so the
+// per-isolate value is never observed in a measured case.
+Future<void> _nitroSetup(NitroServer server) async {
+  {
     // One pass-through middleware, like the other sides. Handlers return
     // their response directly: nothing here awaits, and the dart:io and
     // shelf handlers do their work synchronously too.
@@ -433,14 +439,18 @@ ServerSetup _nitroSetup(bool batchEvents) {
     final vB = JsonToken('b');
     await server.get(
       '/work',
+      // Encode the 200 records INLINE from the index — no intermediate
+      // List<Map> is built per request. Go and Node encode inline too (a loop
+      // over 0..199), so this is the equal-work shape; building 200 Dart maps
+      // per request (the old form) was extra allocation unique to this side and
+      // the main driver of heap growth under load. Byte-identical output.
       (_) => ResponseContext.jsonWriter((w) {
         w.beginArray();
-        for (final row in _workData()) {
-          final m = row as Map<String, Object?>;
+        for (var i = 0; i < 200; i++) {
           w
             ..beginObject()
             ..keyToken(kId)
-            ..writeInt(m['id'] as int)
+            ..writeInt(i)
             ..keyToken(kName)
             ..writeStringToken(vName)
             ..keyToken(kTags)
@@ -449,7 +459,7 @@ ServerSetup _nitroSetup(bool batchEvents) {
             ..writeStringToken(vB)
             ..endArray()
             ..keyToken(kScore)
-            ..writeDouble(m['score'] as double)
+            ..writeDouble(i * 1.5)
             ..endObject();
         }
         w.endArray();
@@ -461,7 +471,7 @@ ServerSetup _nitroSetup(bool batchEvents) {
       (_) => ResponseContext.stream(
         Stream.fromIterable(_eventChunks),
         headers: {'content-type': 'text/event-stream'},
-        bufferSize: batchEvents ? 4096 : 0,
+        bufferSize: _batchEvents ? 4096 : 0,
       ),
     );
     await server.post(
@@ -477,7 +487,7 @@ ServerSetup _nitroSetup(bool batchEvents) {
         }
       }
     });
-  };
+  }
 }
 
 /// Builds and starts the Go net/http side (compare_go_server.go) as a child
@@ -598,7 +608,7 @@ Future<NitroServer> _startNitroServer() async {
           workerThreads: _workers,
           isolates: _isolates,
         );
-  return NitroServer.bind(config, _nitroSetup(_batchEvents));
+  return NitroServer.bind(config, _nitroSetup);
 }
 
 // ── Driver (identical for every server) ──────────────────────────────────────
@@ -714,7 +724,94 @@ Map<String, double> _summarize(List<int> samplesUs) {
       sorted[(sorted.length * p).clamp(0, sorted.length - 1).toInt()]
           .toDouble();
   final mean = sorted.reduce((a, b) => a + b) / sorted.length;
-  return {'mean': mean, 'p50': pct(0.5), 'p99': pct(0.99)};
+  return {
+    'mean': mean,
+    'p50': pct(0.5),
+    'p90': pct(0.9),
+    'p95': pct(0.95),
+    'p99': pct(0.99),
+  };
+}
+
+/// Per-case summary across all [rounds]: load latency p50/p90/p95/p99 (median
+/// of the rounds), median throughput (req/s), and throughput loss vs the
+/// fastest server for that case (the leader is 0%; the rest show how far below
+/// it they run). Load mode only — the close-mode rows carry no req/s.
+void _printSummary(List<Map<String, Object?>> cases, int rounds) {
+  final load = cases.where((c) => c['req_per_s'] != null).toList();
+  if (load.isEmpty) return;
+
+  double median(List<double> xs) {
+    if (xs.isEmpty) return 0;
+    final s = [...xs]..sort();
+    final m = s.length ~/ 2;
+    return s.length.isOdd ? s[m] : (s[m - 1] + s[m]) / 2;
+  }
+
+  const sides = ['dart:io', 'shelf', 'nitro', 'go', 'node'];
+  // Labels are space-padded for column alignment ("shelf   /hello"), so strip
+  // the leading server token AND all the padding that follows it.
+  String opOf(String label) {
+    final side = sides.firstWhere(
+      (s) => label.startsWith('$s '),
+      orElse: () => '',
+    );
+    return (side.isEmpty ? label : label.substring(side.length)).trimLeft();
+  }
+
+  double metric(String label, String key) => median([
+    for (final c in load)
+      if (c['case'] == label && c[key] != null) (c[key] as num).toDouble(),
+  ]);
+
+  String sideOf(String label) => sides.firstWhere(
+    (s) => label.startsWith('$s '),
+    orElse: () => label.trimLeft().split(' ').first,
+  );
+
+  // Map each case (op) to its servers' actual (padded) labels, in first-seen
+  // order, so the printed rows match the real labels regardless of padding.
+  final opOrder = <String>[];
+  final labelFor = <String, Map<String, String>>{};
+  for (final c in load) {
+    final label = c['case'] as String;
+    final op = opOf(label);
+    if (!opOrder.contains(op)) opOrder.add(op);
+    (labelFor[op] ??= {})[sideOf(label)] = label;
+  }
+  final bestRps = {
+    for (final op in opOrder)
+      op: labelFor[op]!.values
+          .map((l) => metric(l, 'req_per_s'))
+          .reduce((a, b) => a > b ? a : b),
+  };
+
+  print('');
+  print(
+    '=== SUMMARY (median of $rounds rounds, load latency µs; '
+    'loss = req/s below the fastest server for that case) ===',
+  );
+  print('| case | server | p50 | p90 | p95 | p99 | req/s | loss% |');
+  print('| ---- | ------ | --- | --- | --- | --- | ----- | ----- |');
+  for (final op in opOrder) {
+    for (final side in sides) {
+      final label = labelFor[op]?[side];
+      if (label == null) continue;
+      final rps = metric(label, 'req_per_s');
+      final best = bestRps[op]!;
+      final loss = best > 0 ? (best - rps) / best * 100 : 0.0;
+      print(
+        '| $op | $side | '
+        '${metric(label, 'load_p50_us').toStringAsFixed(0)} | '
+        '${metric(label, 'load_p90_us').toStringAsFixed(0)} | '
+        '${metric(label, 'load_p95_us').toStringAsFixed(0)} | '
+        '${metric(label, 'load_p99_us').toStringAsFixed(0)} | '
+        '${rps.toStringAsFixed(0)} | '
+        '${loss.toStringAsFixed(1)} |',
+      );
+    }
+  }
+  print('');
 }
 
 /// One benchmark case driven by `package:benchmark_harness`.
@@ -1223,6 +1320,8 @@ Future<({String row, Map<String, Object?> json})> _phase(
       'seq_p50_us': lat['p50'],
       'seq_p99_us': lat['p99'],
       'load_p50_us': under['p50'],
+      'load_p90_us': under['p90'],
+      'load_p95_us': under['p95'],
       'load_p99_us': under['p99'],
       'req_per_s': double.parse(rps.toStringAsFixed(1)),
       'n': seq.samplesUs.length,
@@ -1272,6 +1371,51 @@ Future<void> main(List<String> args) async {
   // `NITRO_SERVER_DYLIB` or `--dylib <path>` overrides the search when the
   // compiled exe runs from a different working directory.
   final loadedFrom = loadNitroServerNative(path: _flagStr(args, '--dylib'));
+
+  // Blackbox serve mode (benchmark/blackbox/): bind ONE framework's server and
+  // block, so an EXTERNAL load generator can hit it as an opaque HTTP server on
+  // the printed port. Reuses the exact route handlers below — byte-identical to
+  // the in-process comparison, so no contract drift. Go/Node run their own
+  // standalone servers (compare_go_server.go / compare_node_server.js).
+  final serve = _flagStr(args, '--serve');
+  if (serve != null) {
+    final int servedPort;
+    switch (serve) {
+      case 'nitro':
+        servedPort = (await _startNitroServer()).port;
+      case 'dartio':
+        // dart:io scales with `shared: true` isolates (SO_REUSEPORT), the same
+        // equal-CPU budget as nitro's isolates / Go's GOMAXPROCS, so /work is a
+        // fair multi-core comparison.
+        {
+          final shared = _isolates != 1;
+          final s = await _startDartServer(shared: shared);
+          if (shared) {
+            await _spawnSharedDartServers(
+              s.port,
+              (_isolates == 0 ? Platform.numberOfProcessors ~/ 2 : _isolates) -
+                  1,
+            );
+          }
+          servedPort = s.port;
+        }
+      case 'shelf':
+        // shelf_io is single-isolate (its common deployment); its /work is a
+        // one-core figure by design — stated in the config table.
+        servedPort = (await _startShelfServer()).port;
+      default:
+        stderr.writeln(
+          'unknown --serve framework: $serve (nitro|dartio|shelf)',
+        );
+        exit(2);
+    }
+    stdout.writeln(
+      'SERVING $serve on $servedPort (native library: $loadedFrom)',
+    );
+    await Completer<void>().future; // serve until the process is killed
+    return;
+  }
+
   final jsonPath = _flagStr(args, '--json');
   final mode = _vmMode();
   print(
@@ -1359,10 +1503,12 @@ Future<void> main(List<String> args) async {
         keepAlive: _keepAlive,
       );
       print(result.row);
-      if (round == rounds - 1) jsonCases.add(result.json);
+      jsonCases.add({...result.json, 'round': round});
     }
     print('');
   }
+
+  _printSummary(jsonCases, rounds);
 
   if (jsonPath != null) {
     File(jsonPath).writeAsStringSync(

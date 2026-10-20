@@ -432,6 +432,34 @@ void main() {
     );
 
     test(
+      'a JsonWriter response is sent straight from the writer buffer (win ③)',
+      () async {
+        // ResponseContext.jsonWriter keeps the native writer alive and the
+        // runner answers from its buffer (no toBytes copy); the body must
+        // still arrive byte-identical, and a payload past the fast buffer must
+        // grow correctly.
+        server = await NitroServer.bind();
+        final big = 'x' * 70000;
+        await server!.get('/jw', (_) async {
+          return ResponseContext.jsonWriter((w) {
+            w
+              ..beginObject()
+              ..key('ok')
+              ..writeBool(true)
+              ..key('big')
+              ..writeString(big)
+              ..endObject();
+          });
+        });
+        final res = await _get(server!.port, '/jw');
+        expect(res.status, 200);
+        expect(res.headers.value('content-type'), contains('application/json'));
+        expect(res.body, '{"ok":true,"big":"$big"}');
+      },
+      skip: skipReason,
+    );
+
+    test(
       'isolates: 2 spawns a helper; adaptive dispatch concentrates light load',
       () async {
         server = await NitroServer.bind(
@@ -538,13 +566,23 @@ void main() {
       expect((await _get(server!.port, '/who')).status, 200);
     }, skip: skipReason);
 
-    test('isolates: 0 picks a size from the CPU count', () async {
+    test('isolates: 0 with a setup auto-scales to the core count', () async {
       server = await NitroServer.bind(
         const ServerConfig(isolates: 0),
         _whoSetup,
       );
-      expect(server!.isolates, (Platform.numberOfProcessors ~/ 2).clamp(1, 8));
+      expect(server!.isolates, Platform.numberOfProcessors.clamp(1, 32));
       expect((await _get(server!.port, '/who')).status, 200);
+    }, skip: skipReason);
+
+    test('isolates: 0 without a setup stays single-isolate (no throw)', () async {
+      // Auto is setup-gated: handler closures can't cross isolates, so a
+      // zero-config server (no setup) can't fan out — it binds as one isolate
+      // rather than failing.
+      server = await NitroServer.bind(const ServerConfig(isolates: 0));
+      expect(server!.isolates, 1);
+      await server!.get('/ping', (_) => ResponseContext.text('ok'));
+      expect((await _get(server!.port, '/ping')).status, 200);
     }, skip: skipReason);
 
     test('bindWith forwards its arguments and setup', () async {
@@ -608,6 +646,29 @@ void main() {
       await expectLater(
         NitroServer.bind(const ServerConfig(isolates: 2)),
         throwsArgumentError,
+      );
+    }, skip: skipReason);
+
+    test('a capturing-closure setup fails with actionable guidance', () async {
+      // A multi-isolate setup must be sendable to each isolate; a closure that
+      // captures non-sendable state can't cross. The capture is a ReceivePort
+      // (non-sendable under both the JIT `dart test` runs on and the AOT the
+      // server ships as) so the guard fires portably — a plain List capture is
+      // rejected under AOT but JIT can serialize it into the boot message.
+      final captured = ReceivePort();
+      addTearDown(captured.close);
+      await expectLater(
+        NitroServer.bind(const ServerConfig(isolates: 2), (s) async {
+          captured.sendPort; // captures a ReceivePort -> non-sendable closure
+          await s.get('/x', (_) => ResponseContext.text('ok'));
+        }),
+        throwsA(
+          isA<ArgumentError>().having(
+            (e) => e.message.toString(),
+            'message',
+            contains('top-level or static function'),
+          ),
+        ),
       );
     }, skip: skipReason);
 

@@ -18,6 +18,7 @@ library;
 
 import 'package:nitro/nitro.dart';
 
+import '../api/json_writer.dart';
 import '../nitro_server.native.dart';
 
 typedef _RespondNative =
@@ -152,6 +153,32 @@ final class FastCalls {
       _headers,
       _body,
       body.length,
+      _err,
+    );
+    _check();
+  }
+
+  /// Answers [requestId] straight from a [JsonWriter]'s native buffer — no
+  /// `toBytes()` copy (writer→Dart) and no `_stageBody` copy (Dart→native); the
+  /// engine reads the writer buffer synchronously (win ③). The caller keeps the
+  /// writer alive across this call and disposes it afterwards.
+  void respondFromWriter(
+    int requestId,
+    int status,
+    Map<String, String> headers,
+    JsonWriter writer, [
+    List<String> setCookies = const [],
+    int timingUs = -1,
+  ]) {
+    if (_disposed) return;
+    _encodeHeaders(headers, setCookies, timingUs);
+    _respond(
+      _instanceId,
+      requestId,
+      status,
+      _headers,
+      writer.nativeBufferPointer,
+      writer.byteLength,
       _err,
     );
     _check();

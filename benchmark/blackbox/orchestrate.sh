@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+# In-container blackbox orchestrator — ONE run emits every number (machine
+# header, per-framework config, response validation, throughput, p50/p90/p95/p99,
+# p50:p99 ratio, and peak memory). Each framework is an OPAQUE HTTP server; the
+# external load generator (oha) hits it over loopback on DISJOINT pinned cores.
+# Fairness/repro rules (see benchmark/BENCHMARKING.md):
+#   * server and oha on DISJOINT pinned cores (taskset) — never contend.
+#   * EQUAL CPU budget: every framework gets SRV_N cores for handler work
+#     (nitro isolates / Go GOMAXPROCS / Node workers / dart:io shared isolates;
+#     shelf is single-isolate by design — stated in the config table).
+#   * ONE framework at a time (no noisy neighbours), warm up before measuring.
+#   * frameworks INTERLEAVED across reps; per-(framework,route) value is the
+#     MEDIAN over reps (cancels the ~10-15% machine drift).
+#   * responses VALIDATED (status + content-type + body length), not just counted.
+# Env (set by run.sh): SRV_CORES, CLI_CORES, REPS, DURATION, CONNECTIONS, OUT.
+set -uo pipefail
+cd /app
+
+SRV_CORES="${SRV_CORES:-0-1}"
+CLI_CORES="${CLI_CORES:-2-3}"
+REPS="${REPS:-5}"
+DURATION="${DURATION:-10s}"
+CONNECTIONS="${CONNECTIONS:-64}"
+OUT="${OUT:-/out}"
+mkdir -p "$OUT/raw"
+
+# Equal per-framework CPU budget (cores for handler work). Dart's
+# numberOfProcessors reports the VM not the cpuset, so `isolates: 0` auto can't
+# see the pin inside a container — we pass an explicit count to every side.
+SRV_N=$(echo "$SRV_CORES" | awk -F- '{print ($2==""?1:$2-$1+1)}')
+
+export DYLD_LIBRARY_PATH="/opt/homebrew/lib:${DYLD_LIBRARY_PATH:-}" # harmless on Linux
+
+# framework -> launch command (each prints a line containing its port). dartio +
+# shelf carry no nitro FFI, so they ride the _dylib binary. nitro-native is the
+# dart-build-cli bundle. Every CPU-scaling side is given SRV_N cores.
+declare -A LAUNCH=(
+  [nitro-native]="build/native_cli/bundle/bin/compare --keep-alive --isolates $SRV_N --serve nitro"
+  [nitro-dylib]="env NITRO_SERVER_DYLIB=/app/build/lib/libnitro_server.so ./compare_dylib --keep-alive --isolates $SRV_N --serve nitro"
+  [dartio]="./compare_dylib --keep-alive --isolates $SRV_N --serve dartio"
+  [shelf]="./compare_dylib --keep-alive --serve shelf"
+  [go]="env GOMAXPROCS=$SRV_N ./compare_go_server"
+  [node]="env NODE_PROCS=$SRV_N node benchmark/compare_node_server.js"
+)
+# Config disclosure for the report.
+declare -A CONFIG=(
+  [nitro-native]="@Native code asset; isolates=$SRV_N (engine fans CPU work across them)"
+  [nitro-dylib]="DynamicLibrary; isolates=$SRV_N (engine fans CPU work across them)"
+  [dartio]="dart:io HttpServer; shared isolates=$SRV_N (SO_REUSEPORT)"
+  [shelf]="shelf_io.serve; single isolate (framework default)"
+  [go]="net/http; GOMAXPROCS=$SRV_N"
+  [node]="http + cluster; NODE_PROCS=$SRV_N workers"
+)
+FRAMEWORKS="${FRAMEWORKS:-nitro-native nitro-dylib go node dartio shelf}"
+
+# route -> oha args. SSE(/events) + WS are EXCLUDED (oha measures req/resp, not
+# open streams). /static is EQUAL-WORK only for the handler sides; nitro answers
+# it from the engine (getStatic) — the report shows it in a separate fast-path
+# section, not the equal-work table.
+declare -A ROUTE=(
+  [/hello]="" [/json]="" [/static]="" ["/q?a=1&b=two"]="" [/users/42]=""
+  [/files/x]="" [/mw]="" [/work]="" ["/echo|POST|4096"]="-m POST -D /app/benchmark/blackbox/echo4k.bin"
+)
+ROUTES="${ROUTES:-/hello /json /static /q?a=1&b=two /users/42 /files/x /mw /work /echo|POST|4096}"
+
+# ── machine + config disclosure ───────────────────────────────────────────────
+{
+  echo "## Machine"
+  echo "- generator: oha $(oha --version 2>/dev/null | awk '{print $2}') — run IN-container, pinned to cores $CLI_CORES (disjoint from the server's $SRV_CORES)"
+  echo "- container: $(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-linux}") on $(uname -m); VM cores visible=$(nproc)"
+  echo "- server cores=$SRV_CORES ($SRV_N), client cores=$CLI_CORES; memory cap=$( (awk '/MemTotal/{printf "%.1f GiB", $2/1048576}' /proc/meminfo) )"
+  echo "- load: $CONNECTIONS connections, ${DURATION}/route, $REPS reps interleaved, keep-alive; median reported"
+  echo "- host: docker --cpuset-cpus pin inside colima VM (Apple Silicon). For a cross-machine matrix, rerun run.sh on each host."
+  echo ""
+  echo "## Per-framework configuration (equal CPU budget = $SRV_N cores)"
+  for fw in $FRAMEWORKS; do echo "- **$fw**: ${CONFIG[$fw]}"; done
+} > "$OUT/machine.md"
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+descendants() { local p=$1; echo "$p"; local c; for c in $(pgrep -P "$p" 2>/dev/null); do descendants "$c"; done; }
+rss_mb() { # total resident KB of the process tree -> MB
+  local total=0 p r
+  for p in $(descendants "$1"); do
+    r=$(awk '/^VmRSS:/{print $2}' "/proc/$p/status" 2>/dev/null)
+    total=$((total + ${r:-0}))
+  done
+  awk "BEGIN{printf \"%.1f\", $total/1024}"
+}
+
+start_server() { # $1=framework -> echoes "pid port"
+  local fw="$1" log; log="$OUT/raw/$fw.serverlog"
+  taskset -c "$SRV_CORES" bash -c "${LAUNCH[$fw]}" > "$log" 2>&1 &
+  local pid=$! port=""
+  local i
+  for i in $(seq 1 100); do
+    port=$(grep -oE "(SERVING .* on|LISTENING) [0-9]+" "$log" 2>/dev/null | grep -oE "[0-9]+" | tail -1)
+    [ -n "$port" ] && break
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.25
+  done
+  echo "$pid $port"
+}
+
+oha_json() { # $1=url, rest=extra -> "p50 p90 p95 p99 rps" (ms, req/s)
+  local url="$1"; shift
+  taskset -c "$CLI_CORES" oha -c "$CONNECTIONS" -z "$DURATION" --no-tui --output-format json "$@" "$url" 2>/dev/null \
+    | python3 -c '
+import sys,json
+try:
+    d=json.load(sys.stdin); p=d["latencyPercentiles"]; f=lambda k:round(p[k]*1000,3)
+    print(f("p50"),f("p90"),f("p95"),f("p99"),round(d["summary"]["requestsPerSec"],1))
+except Exception: print("NA NA NA NA NA")'
+}
+
+validate() { # $1=fw $2=port -> append rows to validation.csv (status, content-type, body bytes)
+  local fw="$1" port="$2" rspec path m hdrs status ctype len
+  for rspec in $ROUTES; do
+    path="${rspec%%|*}"
+    if [[ "$rspec" == *"|POST|"* ]]; then
+      hdrs=$(curl -s -m5 -D - -o /tmp/vb -X POST --data-binary @/app/benchmark/blackbox/echo4k.bin "http://127.0.0.1:$port$path")
+    else
+      hdrs=$(curl -s -m5 -D - -o /tmp/vb "http://127.0.0.1:$port$path")
+    fi
+    status=$(echo "$hdrs" | awk 'NR==1{print $2}')
+    ctype=$(echo "$hdrs" | awk -F': ' 'tolower($1)=="content-type"{gsub(/\r/,"",$2);print $2}' | head -1)
+    len=$(wc -c < /tmp/vb | tr -d ' ')
+    echo "$fw,$rspec,${status:-ERR},${ctype:-none},$len" >> "$OUT/raw/validation.csv"
+  done
+}
+
+# ── measure ───────────────────────────────────────────────────────────────────
+echo "blackbox: frameworks=[$FRAMEWORKS] reps=$REPS dur=$DURATION conns=$CONNECTIONS srv=$SRV_CORES cli=$CLI_CORES" | tee "$OUT/run.log"
+echo "rep,framework,route,p50_ms,p90_ms,p95_ms,p99_ms,rps,rss_mb" > "$OUT/raw/samples.csv"
+echo "framework,route,status,content_type,body_bytes" > "$OUT/raw/validation.csv"
+
+for rep in $(seq 1 "$REPS"); do
+  for fw in $FRAMEWORKS; do
+    read -r pid port < <(start_server "$fw")
+    if [ -z "$port" ]; then echo "rep$rep $fw: FAILED TO START" | tee -a "$OUT/run.log"; kill -9 "$pid" 2>/dev/null; continue; fi
+    taskset -c "$CLI_CORES" oha -c "$CONNECTIONS" -z 3s --no-tui "http://127.0.0.1:$port/hello" >/dev/null 2>&1 # warmup
+    [ "$rep" = "1" ] && validate "$fw" "$port"   # response validation once
+    for rspec in $ROUTES; do
+      path="${rspec%%|*}"
+      read -r p50 p90 p95 p99 rps < <(oha_json "http://127.0.0.1:$port$path" ${ROUTE[$rspec]})
+      rss=$(rss_mb "$pid")   # resident memory of the server process tree, under load
+      echo "$rep,$fw,$rspec,$p50,$p90,$p95,$p99,$rps,$rss" >> "$OUT/raw/samples.csv"
+    done
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; sleep 1
+  done
+  echo "rep $rep done" | tee -a "$OUT/run.log"
+done
+
+# ── report ────────────────────────────────────────────────────────────────────
+python3 - "$OUT" <<'PY'
+import sys, csv, statistics as st
+from collections import defaultdict, OrderedDict
+out=sys.argv[1]
+rows=list(csv.DictReader(open(out+"/raw/samples.csv")))
+val=list(csv.DictReader(open(out+"/raw/validation.csv")))
+machine=open(out+"/machine.md").read()
+
+num=defaultdict(lambda: defaultdict(list))
+fws=[]; routes=[]
+for r in rows:
+    for k in ("p50_ms","p90_ms","p95_ms","p99_ms","rps","rss_mb"):
+        if r[k] not in ("NA",""):
+            try: num[(r["framework"],r["route"])][k].append(float(r[k]))
+            except ValueError: pass
+    if r["framework"] not in fws: fws.append(r["framework"])
+    if r["route"] not in routes: routes.append(r["route"])
+def med(fw,rt,k):
+    v=num[(fw,rt)][k]; return st.median(v) if v else None
+
+# cross-framework body-length agreement per route (equal-bytes validation)
+blen=defaultdict(dict)
+for v in val: blen[v["route"]][v["framework"]]=v["body_bytes"]
+
+EQUAL=[r for r in routes if r!="/static"]   # /static is nitro engine fast-path
+def table(title, rts, note=""):
+    L=[f"## {title}", ""]
+    if note: L+=[note, ""]
+    L.append("| route | framework | req/s | p50 | p90 | p95 | p99 | p50:p99 | mem MB |")
+    L.append("|---|---|--:|--:|--:|--:|--:|--:|--:|")
+    for rt in rts:
+        # best req/s across frameworks for this route (to mark the winner)
+        best=max((med(f,rt,"rps") or 0) for f in fws)
+        for f in fws:
+            rps=med(f,rt,"rps");
+            if rps is None:
+                L.append(f"| {rt} | {f} | — | — | — | — | — | — | — |"); continue
+            p50=med(f,rt,"p50_ms"); p99=med(f,rt,"p99_ms"); mem=med(f,rt,"rss_mb")
+            ratio=(p99/p50) if (p50 and p99 and p50>0) else None
+            win="**" if rps==best and best>0 else ""
+            L.append(f"| {rt} | {f} | {win}{rps:.0f}{win} | {p50:.2f} | {med(f,rt,'p90_ms'):.2f} | {med(f,rt,'p95_ms'):.2f} | {p99:.2f} | {ratio:.1f}× | {mem:.0f} |")
+        L.append("| | | | | | | | | |")
+    return "\n".join(L)
+
+doc=[ "# Blackbox cross-framework benchmark", "",
+      "Throughput + full latency distribution + peak memory, one run, medians over reps.",
+      "`p50:p99` is the tail-flatness ratio (lower = tighter tail). **bold** req/s = fastest for that route.",
+      "", machine, "",
+      table("Equal-work routes (same handler work, equal CPU budget)", EQUAL),
+      "",
+      table("Engine fast-path (NOT equal work — shown separately)",["/static"],
+            "nitro answers `/static` from the engine (`getStatic`, no handler/FFI); the other "
+            "frameworks run a handler returning the same bytes. Illustrates nitro's cached-response "
+            "path, not an apples-to-apples comparison."),
+      "", "## Response validation (rep 1)", "",
+      "Body-byte length per route must agree across frameworks (equal bytes = fair). Mismatches flagged.",
+      "", "| route | agree? | bytes (by framework) |", "|---|---|---|" ]
+for rt in routes:
+    bl=blen.get(rt,{}); vals=set(bl.values())
+    agree="✅" if len(vals)<=1 else "⚠️ MISMATCH"
+    doc.append(f"| {rt} | {agree} | " + ", ".join(f"{f}={bl.get(f,'—')}" for f in fws) + " |")
+# status check
+bad=[v for v in val if v["status"]!="200"]
+doc+=["", f"All sampled responses returned HTTP 200." if not bad else
+      "⚠️ non-200 responses: " + ", ".join(f"{v['framework']}{v['route']}={v['status']}" for v in bad)]
+open(out+"/report.md","w").write("\n".join(doc)+"\n")
+print("\n".join(doc))
+PY
+echo "blackbox: wrote $OUT/report.md (+ raw/samples.csv, raw/validation.csv, machine.md)"

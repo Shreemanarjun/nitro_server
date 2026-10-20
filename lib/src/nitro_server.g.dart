@@ -144,26 +144,29 @@ extension RawWsMessageExt on RawWsMessage {
 /// field buffers remain owned by the native implementation and must
 /// stay valid until this proxy is released by the finalizer or
 /// [toDartAndRelease].
+@Native<Void Function(Pointer<Void>)>(
+  symbol: 'nitro_server_release_RawBodyChunk',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external void _nitro_server_release_RawBodyChunkPtr(Pointer<Void> _p);
+
 final class RawBodyChunkProxy extends RawBodyChunk implements Finalizable {
   final Pointer<RawBodyChunkFfi> _native;
 
   static NativeFinalizer? _finalizer;
   static void Function(Pointer<Void>)? _releaseFn;
 
-  /// Binds the generated release symbol from [dylib].
+  /// Binds the generated release symbol.
   /// Must be called once — typically in the impl class constructor.
   /// Idempotent: subsequent calls are a no-op.
-  static void _init(DynamicLibrary dylib) {
+  static void _init() {
     _finalizer ??= NativeFinalizer(
-      dylib.lookup<NativeFunction<Void Function(Pointer<Void>)>>(
-        'nitro_server_release_RawBodyChunk',
-      ),
+      Native.addressOf<NativeFunction<Void Function(Pointer<Void>)>>(
+        _nitro_server_release_RawBodyChunkPtr,
+      ).cast(),
     );
-    _releaseFn ??= dylib
-        .lookupFunction<
-          Void Function(Pointer<Void>),
-          void Function(Pointer<Void>)
-        >('nitro_server_release_RawBodyChunk');
+    _releaseFn ??= _nitro_server_release_RawBodyChunkPtr;
   }
 
   /// Takes ownership of [native]. Super fields are zeroed and never read;
@@ -218,26 +221,29 @@ final class RawBodyChunkProxy extends RawBodyChunk implements Finalizable {
 /// field buffers remain owned by the native implementation and must
 /// stay valid until this proxy is released by the finalizer or
 /// [toDartAndRelease].
+@Native<Void Function(Pointer<Void>)>(
+  symbol: 'nitro_server_release_RawWsMessage',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external void _nitro_server_release_RawWsMessagePtr(Pointer<Void> _p);
+
 final class RawWsMessageProxy extends RawWsMessage implements Finalizable {
   final Pointer<RawWsMessageFfi> _native;
 
   static NativeFinalizer? _finalizer;
   static void Function(Pointer<Void>)? _releaseFn;
 
-  /// Binds the generated release symbol from [dylib].
+  /// Binds the generated release symbol.
   /// Must be called once — typically in the impl class constructor.
   /// Idempotent: subsequent calls are a no-op.
-  static void _init(DynamicLibrary dylib) {
+  static void _init() {
     _finalizer ??= NativeFinalizer(
-      dylib.lookup<NativeFunction<Void Function(Pointer<Void>)>>(
-        'nitro_server_release_RawWsMessage',
-      ),
+      Native.addressOf<NativeFunction<Void Function(Pointer<Void>)>>(
+        _nitro_server_release_RawWsMessagePtr,
+      ).cast(),
     );
-    _releaseFn ??= dylib
-        .lookupFunction<
-          Void Function(Pointer<Void>),
-          void Function(Pointer<Void>)
-        >('nitro_server_release_RawWsMessage');
+    _releaseFn ??= _nitro_server_release_RawWsMessagePtr;
   }
 
   /// Takes ownership of [native]. Super fields are zeroed and never read;
@@ -538,10 +544,390 @@ extension RawServerEventRecordExt on RawServerEvent {
   }
 }
 
-class _NitroServerNativeImpl extends NitroServerNative {
-  final DynamicLibrary _dylib;
-  static final _instances = <String, WeakReference<_NitroServerNativeImpl>>{};
+// Native-assets code asset symbols (built by hook/build.dart) — resolved
+// statically via @Native, which is what makes this work on Android.
+@Native<Void Function(Pointer<Void>)>(
+  symbol: 'nitro_server_nitro_free',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external void _nitroFreePtr(Pointer<Void> _p);
+@Native<Pointer<Void> Function(IntPtr)>(
+  symbol: 'nitro_server_nitro_alloc',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external Pointer<Void> _nitroAllocPtr(int _n);
+@Native<Uint32 Function()>(
+  symbol: 'nitro_server_nitro_abi_version',
+  assetId: 'package:nitro_server/nitro_server',
+)
+external int _nitroAbiVersionPtr();
+@Native<Pointer<Utf8> Function()>(
+  symbol: 'nitro_server_nitro_bridge_checksum',
+  assetId: 'package:nitro_server/nitro_server',
+)
+external Pointer<Utf8> _nitroBridgeChecksumPtr();
+@Native<Int64 Function(Pointer<Utf8>)>(
+  symbol: 'nitro_server_create_instance',
+  assetId: 'package:nitro_server/nitro_server',
+)
+external int _createInstancePtr(Pointer<Utf8> _key);
+@Native<Void Function(Int64)>(
+  symbol: 'nitro_server_destroy_instance',
+  assetId: 'package:nitro_server/nitro_server',
+)
+external void _destroyInstancePtr(int _id);
+@Native<Void Function(Pointer<Void>)>(
+  symbol: 'nitro_server_release_typed_data_return',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external void _releaseTypedDataReturnPtr(Pointer<Void> _p);
+@Native<Pointer<Utf8> Function(Int64, Pointer<NitroErrorFfi>)>(
+  symbol: 'nitro_server_engine_version',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external Pointer<Utf8> _engineVersionPtr(int _a0, Pointer<NitroErrorFfi> _a1);
+@Native<Bool Function(Int64, Pointer<NitroErrorFfi>)>(
+  symbol: 'nitro_server_supports_tls',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external bool _supportsTlsPtr(int _a0, Pointer<NitroErrorFfi> _a1);
+@Native<Void Function(Int64, Pointer<NitroErrorFfi>)>(
+  symbol: 'nitro_server_reset_native',
+  assetId: 'package:nitro_server/nitro_server',
+)
+external void _resetNativePtr(int _a0, Pointer<NitroErrorFfi> _a1);
+@Native<Bool Function(Int64, Pointer<NitroErrorFfi>)>(
+  symbol: 'nitro_server_supports_brotli',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external bool _supportsBrotliPtr(int _a0, Pointer<NitroErrorFfi> _a1);
+@Native<
+  Pointer<Uint8> Function(
+    Int64,
+    Pointer<Uint8>,
+    Size,
+    Int64,
+    Pointer<NitroErrorFfi>,
+  )
+>(
+  symbol: 'nitro_server_brotli_encode',
+  assetId: 'package:nitro_server/nitro_server',
+)
+external Pointer<Uint8> _brotliEncodePtr(
+  int _a0,
+  Pointer<Uint8> _a1,
+  int _a2,
+  int _a3,
+  Pointer<NitroErrorFfi> _a4,
+);
+@Native<
+  Pointer<Uint8> Function(Int64, Pointer<Uint8>, Size, Pointer<NitroErrorFfi>)
+>(
+  symbol: 'nitro_server_brotli_decode',
+  assetId: 'package:nitro_server/nitro_server',
+)
+external Pointer<Uint8> _brotliDecodePtr(
+  int _a0,
+  Pointer<Uint8> _a1,
+  int _a2,
+  Pointer<NitroErrorFfi> _a3,
+);
+@Native<Void Function(Int64, Pointer<Uint8>, Pointer<NitroErrorFfi>)>(
+  symbol: 'nitro_server_configure_server',
+  assetId: 'package:nitro_server/nitro_server',
+)
+external void _configureServerPtr(
+  int _a0,
+  Pointer<Uint8> _a1,
+  Pointer<NitroErrorFfi> _a2,
+);
+@Native<Bool Function(Int64, Pointer<Uint8>, Pointer<NitroErrorFfi>)>(
+  symbol: 'nitro_server_reload_tls',
+  assetId: 'package:nitro_server/nitro_server',
+)
+external bool _reloadTlsPtr(
+  int _a0,
+  Pointer<Uint8> _a1,
+  Pointer<NitroErrorFfi> _a2,
+);
+@Native<Pointer<Uint8> Function(Int64, Pointer<Uint8>, Pointer<NitroErrorFfi>)>(
+  symbol: 'nitro_server_register_route',
+  assetId: 'package:nitro_server/nitro_server',
+)
+external Pointer<Uint8> _registerRoutePtr(
+  int _a0,
+  Pointer<Uint8> _a1,
+  Pointer<NitroErrorFfi> _a2,
+);
+@Native<
+  Pointer<Uint8> Function(
+    Int64,
+    Pointer<Utf8>,
+    Pointer<Utf8>,
+    Pointer<NitroErrorFfi>,
+  )
+>(
+  symbol: 'nitro_server_unregister_route',
+  assetId: 'package:nitro_server/nitro_server',
+)
+external Pointer<Uint8> _unregisterRoutePtr(
+  int _a0,
+  Pointer<Utf8> _a1,
+  Pointer<Utf8> _a2,
+  Pointer<NitroErrorFfi> _a3,
+);
+@Native<
+  Pointer<Uint8> Function(
+    Int64,
+    Pointer<Utf8>,
+    Pointer<Utf8>,
+    Int64,
+    Pointer<Uint8>,
+    Pointer<Uint8>,
+    Size,
+    Pointer<NitroErrorFfi>,
+  )
+>(
+  symbol: 'nitro_server_register_static_route',
+  assetId: 'package:nitro_server/nitro_server',
+)
+external Pointer<Uint8> _registerStaticRoutePtr(
+  int _a0,
+  Pointer<Utf8> _a1,
+  Pointer<Utf8> _a2,
+  int _a3,
+  Pointer<Uint8> _a4,
+  Pointer<Uint8> _a5,
+  int _a6,
+  Pointer<NitroErrorFfi> _a7,
+);
+@Native<Pointer<Uint8> Function(Int64, Pointer<NitroErrorFfi>)>(
+  symbol: 'nitro_server_start',
+  assetId: 'package:nitro_server/nitro_server',
+)
+external Pointer<Uint8> _startPtr(int _a0, Pointer<NitroErrorFfi> _a1);
+@Native<Void Function(Int64, Pointer<NitroErrorFfi>)>(
+  symbol: 'nitro_server_stop',
+  assetId: 'package:nitro_server/nitro_server',
+)
+external void _stopPtr(int _a0, Pointer<NitroErrorFfi> _a1);
+@Native<Void Function(Int64, Pointer<NitroErrorFfi>)>(
+  symbol: 'nitro_server_begin_drain',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external void _beginDrainPtr(int _a0, Pointer<NitroErrorFfi> _a1);
+@Native<Int64 Function(Int64, Pointer<NitroErrorFfi>)>(
+  symbol: 'nitro_server_in_flight_requests',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external int _inFlightRequestsPtr(int _a0, Pointer<NitroErrorFfi> _a1);
+@Native<Int64 Function(Int64, Pointer<NitroErrorFfi>)>(
+  symbol: 'nitro_server_live_connections',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external int _liveConnectionsPtr(int _a0, Pointer<NitroErrorFfi> _a1);
+@Native<
+  Void Function(
+    Int64,
+    Int64,
+    Int64,
+    Pointer<Uint8>,
+    Pointer<Utf8>,
+    Int64,
+    Int64,
+    Pointer<NitroErrorFfi>,
+  )
+>(
+  symbol: 'nitro_server_respond_file',
+  assetId: 'package:nitro_server/nitro_server',
+)
+external void _respondFilePtr(
+  int _a0,
+  int _a1,
+  int _a2,
+  Pointer<Uint8> _a3,
+  Pointer<Utf8> _a4,
+  int _a5,
+  int _a6,
+  Pointer<NitroErrorFfi> _a7,
+);
+@Native<
+  Void Function(
+    Int64,
+    Int64,
+    Int64,
+    Pointer<Uint8>,
+    Pointer<Uint8>,
+    Size,
+    Pointer<NitroErrorFfi>,
+  )
+>(
+  symbol: 'nitro_server_respond',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external void _respondPtr(
+  int _a0,
+  int _a1,
+  int _a2,
+  Pointer<Uint8> _a3,
+  Pointer<Uint8> _a4,
+  int _a5,
+  Pointer<NitroErrorFfi> _a6,
+);
+@Native<Void Function(Int64, Int64, Int64, Pointer<NitroErrorFfi>)>(
+  symbol: 'nitro_server_ack_body',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external void _ackBodyPtr(
+  int _a0,
+  int _a1,
+  int _a2,
+  Pointer<NitroErrorFfi> _a3,
+);
+@Native<
+  Void Function(Int64, Int64, Int64, Pointer<Uint8>, Pointer<NitroErrorFfi>)
+>(
+  symbol: 'nitro_server_start_stream',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external void _startStreamPtr(
+  int _a0,
+  int _a1,
+  int _a2,
+  Pointer<Uint8> _a3,
+  Pointer<NitroErrorFfi> _a4,
+);
+@Native<
+  Void Function(
+    Int64,
+    Int64,
+    Pointer<Uint8>,
+    Size,
+    Bool,
+    Pointer<NitroErrorFfi>,
+  )
+>(
+  symbol: 'nitro_server_send_stream_chunk',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external void _sendStreamChunkPtr(
+  int _a0,
+  int _a1,
+  Pointer<Uint8> _a2,
+  int _a3,
+  bool _a4,
+  Pointer<NitroErrorFfi> _a5,
+);
+@Native<
+  Int64 Function(
+    Int64,
+    Int64,
+    Pointer<Uint8>,
+    Size,
+    Bool,
+    Bool,
+    Pointer<NitroErrorFfi>,
+  )
+>(
+  symbol: 'nitro_server_ws_send',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external int _wsSendPtr(
+  int _a0,
+  int _a1,
+  Pointer<Uint8> _a2,
+  int _a3,
+  bool _a4,
+  bool _a5,
+  Pointer<NitroErrorFfi> _a6,
+);
+@Native<Void Function(Int64, Int64, Int64, Pointer<NitroErrorFfi>)>(
+  symbol: 'nitro_server_ws_close',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external void _wsClosePtr(
+  int _a0,
+  int _a1,
+  int _a2,
+  Pointer<NitroErrorFfi> _a3,
+);
+@Native<IntPtr Function(Pointer<Void>)>(
+  symbol: 'nitro_server_init_dart_api_dl',
+  assetId: 'package:nitro_server/nitro_server',
+)
+external int _initDartApiDlPtr(Pointer<Void> _data);
+@Native<Void Function(Int64)>(
+  symbol: 'nitro_server_nitro_ack',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external void _nitroAckPtr(int _p);
+@Native<Void Function(Int64, Int64)>(
+  symbol: 'nitro_server_register_incoming_requests_stream',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external void _registerIncomingRequestsPtr(int _id, int _port);
+@Native<Void Function(Int64)>(
+  symbol: 'nitro_server_release_incoming_requests_stream',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external void _releaseIncomingRequestsPtr(int _port);
+@Native<Void Function(Int64, Int64)>(
+  symbol: 'nitro_server_register_body_chunks_stream',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external void _registerBodyChunksPtr(int _id, int _port);
+@Native<Void Function(Int64)>(
+  symbol: 'nitro_server_release_body_chunks_stream',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external void _releaseBodyChunksPtr(int _port);
+@Native<Void Function(Int64, Int64)>(
+  symbol: 'nitro_server_register_server_events_stream',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external void _registerServerEventsPtr(int _id, int _port);
+@Native<Void Function(Int64)>(
+  symbol: 'nitro_server_release_server_events_stream',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external void _releaseServerEventsPtr(int _port);
+@Native<Void Function(Int64, Int64)>(
+  symbol: 'nitro_server_register_ws_messages_stream',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external void _registerWsMessagesPtr(int _id, int _port);
+@Native<Void Function(Int64)>(
+  symbol: 'nitro_server_release_ws_messages_stream',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external void _releaseWsMessagesPtr(int _port);
 
+class _NitroServerNativeImpl extends NitroServerNative {
+  static final _instances = <String, WeakReference<_NitroServerNativeImpl>>{};
   static final _instanceFinalizer =
       Finalizer<
         ({
@@ -553,7 +939,6 @@ class _NitroServerNativeImpl extends NitroServerNative {
       >((t) {
         try {
           t.destroy(t.id);
-          NitroRuntime.releaseLib('nitro_server');
           if (_instances[t.key]?.target == null) _instances.remove(t.key);
         } catch (_) {
         } finally {
@@ -563,44 +948,22 @@ class _NitroServerNativeImpl extends NitroServerNative {
   final String _instanceKey;
   late final int _instanceId;
   final Pointer<NitroErrorFfi> _nitroErr = calloc<NitroErrorFfi>();
-  late final Pointer<NativeFinalizerFunction> _typedDataReturnFinalizer = _dylib
-      .lookup<NativeFinalizerFunction>('nitro_server_release_typed_data_return')
-      .cast();
-  late final void Function(Pointer<Void>) _nitroFreePtr = _dylib
-      .lookupFunction<
-        Void Function(Pointer<Void>),
-        void Function(Pointer<Void>)
-      >('nitro_server_nitro_free', isLeaf: true);
   void _nitroFree(Pointer<NativeType> ptr) => _nitroFreePtr(ptr.cast());
-  late final Pointer<NativeFinalizerFunction> _nitroFreeFinalizer = _dylib
-      .lookup<NativeFinalizerFunction>('nitro_server_nitro_free')
-      .cast();
-  late final Pointer<Void> Function(int) _nitroAllocPtr = _dylib
-      .lookupFunction<
-        Pointer<Void> Function(IntPtr),
-        Pointer<Void> Function(int)
-      >('nitro_server_nitro_alloc', isLeaf: true);
-  late final void Function(int) _nitroAckPtr = _dylib
-      .lookupFunction<Void Function(Int64), void Function(int)>(
-        'nitro_server_nitro_ack',
-        isLeaf: true,
-      );
+  // ignore: unused_field
   late final NitroNativeAllocator _nitroNativeAllocator = NitroNativeAllocator(
     _nitroAllocPtr,
     _nitroFreePtr,
   );
-
-  static DynamicLibrary _loadSupportedLibrary() {
-    return NitroRuntime.loadLibForTargets(
-      'nitro_server',
-      ios: true,
-      android: true,
-      macos: true,
-      windows: true,
-      linux: true,
-      web: false,
-    );
-  }
+  // ignore: unused_field
+  late final Pointer<NativeFinalizerFunction> _nitroFreeFinalizer =
+      Native.addressOf<NativeFunction<Void Function(Pointer<Void>)>>(
+        _nitroFreePtr,
+      ).cast();
+  // ignore: unused_field
+  late final Pointer<NativeFinalizerFunction> _typedDataReturnFinalizer =
+      Native.addressOf<NativeFunction<Void Function(Pointer<Void>)>>(
+        _releaseTypedDataReturnPtr,
+      ).cast();
 
   factory _NitroServerNativeImpl([String key = 'default']) {
     final cached = _instances[key]?.target;
@@ -608,8 +971,7 @@ class _NitroServerNativeImpl extends NitroServerNative {
     return _NitroServerNativeImpl._init(key);
   }
 
-  _NitroServerNativeImpl._init(this._instanceKey)
-    : _dylib = _loadSupportedLibrary() {
+  _NitroServerNativeImpl._init(this._instanceKey) {
     final initSw =
         NitroConfig.instance.effectiveLogLevel == NitroLogLevel.verbose
         ? (Stopwatch()..start())
@@ -618,44 +980,20 @@ class _NitroServerNativeImpl extends NitroServerNative {
       sizeOf<IntPtr>() >= 4,
       'nitro_server: unsupported pointer width ${sizeOf<IntPtr>()}B',
     );
-    final initFunc = _dylib
-        .lookupFunction<
-          IntPtr Function(Pointer<Void>),
-          int Function(Pointer<Void>)
-        >('nitro_server_init_dart_api_dl');
-    final initCode = initFunc(NativeApi.initializeApiDLData);
-    if (initCode != 0) {
+    final _initCode = _initDartApiDlPtr(NativeApi.initializeApiDLData);
+    if (_initCode != 0) {
       throw StateError(
-        'nitro_server: Dart API DL initialization failed with code $initCode.',
+        'nitro_server: Dart API DL initialization failed with code $_initCode.',
       );
     }
-    if (!_dylib.providesSymbol('nitro_server_nitro_abi_version')) {
-      throw StateError(
-        'nitro_server: missing nitro_server_nitro_abi_version — plugin must be rebuilt against the current Nitro version.',
-      );
-    }
-    NitroRuntime.checkAbiVersion(
-      'nitro_server',
-      () => _dylib.lookupFunction<Uint32 Function(), int Function()>(
-        'nitro_server_nitro_abi_version',
-      )(),
-    );
-    if (!_dylib.providesSymbol('nitro_server_nitro_bridge_checksum')) {
-      throw StateError(
-        'nitro_server: missing nitro_server_nitro_bridge_checksum — plugin must be rebuilt against the current Nitro version.',
-      );
-    }
+    NitroRuntime.checkAbiVersion('nitro_server', () => _nitroAbiVersionPtr());
     NitroRuntime.checkLinkChecksum(
       'nitro_server',
       'd6c2c98c678def88',
-      () => _dylib
-          .lookupFunction<Pointer<Utf8> Function(), Pointer<Utf8> Function()>(
-            'nitro_server_nitro_bridge_checksum',
-          )()
-          .toDartString(),
+      () => _nitroBridgeChecksumPtr().toDartString(),
     );
-    RawBodyChunkProxy._init(_dylib);
-    RawWsMessageProxy._init(_dylib);
+    RawBodyChunkProxy._init();
+    RawWsMessageProxy._init();
     final _keyPtr = _instanceKey.toNitroUtf8(allocator: calloc);
     try {
       _instanceId = _createInstancePtr(_keyPtr);
@@ -683,405 +1021,6 @@ class _NitroServerNativeImpl extends NitroServerNative {
     }
   }
 
-  late final int Function(Pointer<Utf8>) _createInstancePtr = _dylib
-      .lookupFunction<
-        Int64 Function(Pointer<Utf8>),
-        int Function(Pointer<Utf8>)
-      >('nitro_server_create_instance');
-  late final void Function(int) _destroyInstancePtr = _dylib
-      .lookupFunction<Void Function(Int64), void Function(int)>(
-        'nitro_server_destroy_instance',
-      );
-  late final Pointer<Utf8> Function(int, Pointer<NitroErrorFfi>)
-  _engineVersionPtr = _dylib
-      .lookup<
-        NativeFunction<Pointer<Utf8> Function(Int64, Pointer<NitroErrorFfi>)>
-      >('nitro_server_engine_version')
-      .asFunction<Pointer<Utf8> Function(int, Pointer<NitroErrorFfi>)>(
-        isLeaf: true,
-      );
-  late final bool Function(int, Pointer<NitroErrorFfi>) _supportsTlsPtr = _dylib
-      .lookup<NativeFunction<Bool Function(Int64, Pointer<NitroErrorFfi>)>>(
-        'nitro_server_supports_tls',
-      )
-      .asFunction<bool Function(int, Pointer<NitroErrorFfi>)>(isLeaf: true);
-  late final void Function(int, Pointer<NitroErrorFfi>) _resetNativePtr = _dylib
-      .lookup<NativeFunction<Void Function(Int64, Pointer<NitroErrorFfi>)>>(
-        'nitro_server_reset_native',
-      )
-      .asFunction<void Function(int, Pointer<NitroErrorFfi>)>(isLeaf: true);
-  late final bool Function(int, Pointer<NitroErrorFfi>) _supportsBrotliPtr =
-      _dylib
-          .lookup<NativeFunction<Bool Function(Int64, Pointer<NitroErrorFfi>)>>(
-            'nitro_server_supports_brotli',
-          )
-          .asFunction<bool Function(int, Pointer<NitroErrorFfi>)>(isLeaf: true);
-  late final Pointer<Uint8> Function(
-    int,
-    Pointer<Uint8>,
-    int,
-    int,
-    Pointer<NitroErrorFfi>,
-  )
-  _brotliEncodePtr = _dylib
-      .lookupFunction<
-        Pointer<Uint8> Function(
-          Int64,
-          Pointer<Uint8>,
-          Size,
-          Int64,
-          Pointer<NitroErrorFfi>,
-        ),
-        Pointer<Uint8> Function(
-          int,
-          Pointer<Uint8>,
-          int,
-          int,
-          Pointer<NitroErrorFfi>,
-        )
-      >('nitro_server_brotli_encode');
-  late final Pointer<Uint8> Function(
-    int,
-    Pointer<Uint8>,
-    int,
-    Pointer<NitroErrorFfi>,
-  )
-  _brotliDecodePtr = _dylib
-      .lookupFunction<
-        Pointer<Uint8> Function(
-          Int64,
-          Pointer<Uint8>,
-          Size,
-          Pointer<NitroErrorFfi>,
-        ),
-        Pointer<Uint8> Function(
-          int,
-          Pointer<Uint8>,
-          int,
-          Pointer<NitroErrorFfi>,
-        )
-      >('nitro_server_brotli_decode');
-  late final void Function(int, Pointer<Uint8>, Pointer<NitroErrorFfi>)
-  _configureServerPtr = _dylib
-      .lookupFunction<
-        Void Function(Int64, Pointer<Uint8>, Pointer<NitroErrorFfi>),
-        void Function(int, Pointer<Uint8>, Pointer<NitroErrorFfi>)
-      >('nitro_server_configure_server');
-  late final bool Function(int, Pointer<Uint8>, Pointer<NitroErrorFfi>)
-  _reloadTlsPtr = _dylib
-      .lookupFunction<
-        Bool Function(Int64, Pointer<Uint8>, Pointer<NitroErrorFfi>),
-        bool Function(int, Pointer<Uint8>, Pointer<NitroErrorFfi>)
-      >('nitro_server_reload_tls');
-  late final Pointer<Uint8> Function(
-    int,
-    Pointer<Uint8>,
-    Pointer<NitroErrorFfi>,
-  )
-  _registerRoutePtr = _dylib
-      .lookupFunction<
-        Pointer<Uint8> Function(Int64, Pointer<Uint8>, Pointer<NitroErrorFfi>),
-        Pointer<Uint8> Function(int, Pointer<Uint8>, Pointer<NitroErrorFfi>)
-      >('nitro_server_register_route');
-  late final Pointer<Uint8> Function(
-    int,
-    Pointer<Utf8>,
-    Pointer<Utf8>,
-    Pointer<NitroErrorFfi>,
-  )
-  _unregisterRoutePtr = _dylib
-      .lookupFunction<
-        Pointer<Uint8> Function(
-          Int64,
-          Pointer<Utf8>,
-          Pointer<Utf8>,
-          Pointer<NitroErrorFfi>,
-        ),
-        Pointer<Uint8> Function(
-          int,
-          Pointer<Utf8>,
-          Pointer<Utf8>,
-          Pointer<NitroErrorFfi>,
-        )
-      >('nitro_server_unregister_route');
-  late final Pointer<Uint8> Function(
-    int,
-    Pointer<Utf8>,
-    Pointer<Utf8>,
-    int,
-    Pointer<Uint8>,
-    Pointer<Uint8>,
-    int,
-    Pointer<NitroErrorFfi>,
-  )
-  _registerStaticRoutePtr = _dylib
-      .lookupFunction<
-        Pointer<Uint8> Function(
-          Int64,
-          Pointer<Utf8>,
-          Pointer<Utf8>,
-          Int64,
-          Pointer<Uint8>,
-          Pointer<Uint8>,
-          Size,
-          Pointer<NitroErrorFfi>,
-        ),
-        Pointer<Uint8> Function(
-          int,
-          Pointer<Utf8>,
-          Pointer<Utf8>,
-          int,
-          Pointer<Uint8>,
-          Pointer<Uint8>,
-          int,
-          Pointer<NitroErrorFfi>,
-        )
-      >('nitro_server_register_static_route');
-  late final Pointer<Uint8> Function(int, Pointer<NitroErrorFfi>) _startPtr =
-      _dylib.lookupFunction<
-        Pointer<Uint8> Function(Int64, Pointer<NitroErrorFfi>),
-        Pointer<Uint8> Function(int, Pointer<NitroErrorFfi>)
-      >('nitro_server_start');
-  late final void Function(int, Pointer<NitroErrorFfi>) _stopPtr = _dylib
-      .lookup<NativeFunction<Void Function(Int64, Pointer<NitroErrorFfi>)>>(
-        'nitro_server_stop',
-      )
-      .asFunction<void Function(int, Pointer<NitroErrorFfi>)>(isLeaf: true);
-  late final void Function(int, Pointer<NitroErrorFfi>) _beginDrainPtr = _dylib
-      .lookup<NativeFunction<Void Function(Int64, Pointer<NitroErrorFfi>)>>(
-        'nitro_server_begin_drain',
-      )
-      .asFunction<void Function(int, Pointer<NitroErrorFfi>)>(isLeaf: true);
-  late final int Function(int, Pointer<NitroErrorFfi>)
-  _inFlightRequestsPtr = _dylib
-      .lookup<NativeFunction<Int64 Function(Int64, Pointer<NitroErrorFfi>)>>(
-        'nitro_server_in_flight_requests',
-      )
-      .asFunction<int Function(int, Pointer<NitroErrorFfi>)>(isLeaf: true);
-  late final int Function(int, Pointer<NitroErrorFfi>)
-  _liveConnectionsPtr = _dylib
-      .lookup<NativeFunction<Int64 Function(Int64, Pointer<NitroErrorFfi>)>>(
-        'nitro_server_live_connections',
-      )
-      .asFunction<int Function(int, Pointer<NitroErrorFfi>)>(isLeaf: true);
-  late final void Function(
-    int,
-    int,
-    int,
-    Pointer<Uint8>,
-    Pointer<Utf8>,
-    int,
-    int,
-    Pointer<NitroErrorFfi>,
-  )
-  _respondFilePtr = _dylib
-      .lookupFunction<
-        Void Function(
-          Int64,
-          Int64,
-          Int64,
-          Pointer<Uint8>,
-          Pointer<Utf8>,
-          Int64,
-          Int64,
-          Pointer<NitroErrorFfi>,
-        ),
-        void Function(
-          int,
-          int,
-          int,
-          Pointer<Uint8>,
-          Pointer<Utf8>,
-          int,
-          int,
-          Pointer<NitroErrorFfi>,
-        )
-      >('nitro_server_respond_file');
-  late final void Function(
-    int,
-    int,
-    int,
-    Pointer<Uint8>,
-    Pointer<Uint8>,
-    int,
-    Pointer<NitroErrorFfi>,
-  )
-  _respondPtr = _dylib
-      .lookup<
-        NativeFunction<
-          Void Function(
-            Int64,
-            Int64,
-            Int64,
-            Pointer<Uint8>,
-            Pointer<Uint8>,
-            Size,
-            Pointer<NitroErrorFfi>,
-          )
-        >
-      >('nitro_server_respond')
-      .asFunction<
-        void Function(
-          int,
-          int,
-          int,
-          Pointer<Uint8>,
-          Pointer<Uint8>,
-          int,
-          Pointer<NitroErrorFfi>,
-        )
-      >(isLeaf: true);
-  late final void Function(int, int, int, Pointer<NitroErrorFfi>) _ackBodyPtr =
-      _dylib
-          .lookup<
-            NativeFunction<
-              Void Function(Int64, Int64, Int64, Pointer<NitroErrorFfi>)
-            >
-          >('nitro_server_ack_body')
-          .asFunction<void Function(int, int, int, Pointer<NitroErrorFfi>)>(
-            isLeaf: true,
-          );
-  late final void Function(
-    int,
-    int,
-    int,
-    Pointer<Uint8>,
-    Pointer<NitroErrorFfi>,
-  )
-  _startStreamPtr = _dylib
-      .lookup<
-        NativeFunction<
-          Void Function(
-            Int64,
-            Int64,
-            Int64,
-            Pointer<Uint8>,
-            Pointer<NitroErrorFfi>,
-          )
-        >
-      >('nitro_server_start_stream')
-      .asFunction<
-        void Function(int, int, int, Pointer<Uint8>, Pointer<NitroErrorFfi>)
-      >(isLeaf: true);
-  late final void Function(
-    int,
-    int,
-    Pointer<Uint8>,
-    int,
-    bool,
-    Pointer<NitroErrorFfi>,
-  )
-  _sendStreamChunkPtr = _dylib
-      .lookup<
-        NativeFunction<
-          Void Function(
-            Int64,
-            Int64,
-            Pointer<Uint8>,
-            Size,
-            Bool,
-            Pointer<NitroErrorFfi>,
-          )
-        >
-      >('nitro_server_send_stream_chunk')
-      .asFunction<
-        void Function(
-          int,
-          int,
-          Pointer<Uint8>,
-          int,
-          bool,
-          Pointer<NitroErrorFfi>,
-        )
-      >(isLeaf: true);
-  late final int Function(
-    int,
-    int,
-    Pointer<Uint8>,
-    int,
-    bool,
-    bool,
-    Pointer<NitroErrorFfi>,
-  )
-  _wsSendPtr = _dylib
-      .lookup<
-        NativeFunction<
-          Int64 Function(
-            Int64,
-            Int64,
-            Pointer<Uint8>,
-            Size,
-            Bool,
-            Bool,
-            Pointer<NitroErrorFfi>,
-          )
-        >
-      >('nitro_server_ws_send')
-      .asFunction<
-        int Function(
-          int,
-          int,
-          Pointer<Uint8>,
-          int,
-          bool,
-          bool,
-          Pointer<NitroErrorFfi>,
-        )
-      >(isLeaf: true);
-  late final void Function(int, int, int, Pointer<NitroErrorFfi>) _wsClosePtr =
-      _dylib
-          .lookup<
-            NativeFunction<
-              Void Function(Int64, Int64, Int64, Pointer<NitroErrorFfi>)
-            >
-          >('nitro_server_ws_close')
-          .asFunction<void Function(int, int, int, Pointer<NitroErrorFfi>)>(
-            isLeaf: true,
-          );
-  late final void Function(int, int) _registerIncomingRequestsPtr = _dylib
-      .lookupFunction<Void Function(Int64, Int64), void Function(int, int)>(
-        'nitro_server_register_incoming_requests_stream',
-      );
-  late final void Function(int) _releaseIncomingRequestsPtr = _dylib
-      .lookupFunction<Void Function(Int64), void Function(int)>(
-        'nitro_server_release_incoming_requests_stream',
-      );
-  late final void Function(int, int) _registerBodyChunksPtr = _dylib
-      .lookupFunction<Void Function(Int64, Int64), void Function(int, int)>(
-        'nitro_server_register_body_chunks_stream',
-      );
-  late final void Function(int) _releaseBodyChunksPtr = _dylib
-      .lookupFunction<Void Function(Int64), void Function(int)>(
-        'nitro_server_release_body_chunks_stream',
-      );
-  late final void Function(int, int) _registerServerEventsPtr = _dylib
-      .lookupFunction<Void Function(Int64, Int64), void Function(int, int)>(
-        'nitro_server_register_server_events_stream',
-      );
-  late final void Function(int) _releaseServerEventsPtr = _dylib
-      .lookupFunction<Void Function(Int64), void Function(int)>(
-        'nitro_server_release_server_events_stream',
-      );
-  late final void Function(int, int) _registerWsMessagesPtr = _dylib
-      .lookupFunction<Void Function(Int64, Int64), void Function(int, int)>(
-        'nitro_server_register_ws_messages_stream',
-      );
-  late final void Function(int) _releaseWsMessagesPtr = _dylib
-      .lookupFunction<Void Function(Int64), void Function(int)>(
-        'nitro_server_release_ws_messages_stream',
-      );
-  // ignore: unused_field
-  late final Pointer<NitroErrorFfi> Function() _getErrorPtr = _dylib
-      .lookupFunction<
-        Pointer<NitroErrorFfi> Function(),
-        Pointer<NitroErrorFfi> Function()
-      >('nitro_server_get_error');
-  // ignore: unused_field
-  late final void Function() _clearErrorPtr = _dylib
-      .lookupFunction<Void Function(), void Function()>(
-        'nitro_server_clear_error',
-      );
-
   @override
   void dispose() {
     if (isDisposed) return;
@@ -1093,15 +1032,13 @@ class _NitroServerNativeImpl extends NitroServerNative {
       );
     }
     _destroyInstancePtr(_instanceId);
-    NitroRuntime.releaseLib('nitro_server');
     _instances.remove(_instanceKey);
     NitroInstanceRegistry.unregister(_instanceId, this);
-    calloc.free(_nitroErr); // S8: free pre-allocated error slot
-    super.dispose(); // sets isDisposed = true, calls onDestroy()
+    calloc.free(_nitroErr);
+    super.dispose();
     NitroRuntime.logLifecycle('dispose(nitro_server)', 'disposed');
   }
 
-  /// Opaque reference to this native impl — pass to other plugins via AnyNativeObject.
   AnyNativeObject get asAnyNativeObject => AnyNativeObject(_instanceId);
 
   @override
@@ -1515,7 +1452,7 @@ class _NitroServerNativeImpl extends NitroServerNative {
             (w, e) => e.writeFields(w),
             arena,
           ),
-          body.toPointer(arena),
+          body.address,
           body.length,
           _nitroErr,
         );
@@ -1581,29 +1518,22 @@ class _NitroServerNativeImpl extends NitroServerNative {
   @override
   void sendStreamChunk(int requestId, Uint8List chunk, bool last) {
     checkDisposed();
-    final t0 = NitroRuntime.syncStart('sendStreamChunk');
-    try {
-      withArena((arena) {
-        _sendStreamChunkPtr(
-          _instanceId,
-          requestId,
-          chunk.toPointer(arena),
-          chunk.length,
-          last,
-          _nitroErr,
-        );
-        assert(() {
-          NitroRuntime.throwIfOutParamError(
-            _nitroErr,
-            nativeFree: _nitroFree,
-            methodName: 'sendStreamChunk',
-          );
-          return true;
-        }());
-      });
-    } finally {
-      NitroRuntime.syncEnd(t0, 'sendStreamChunk');
-    }
+    _sendStreamChunkPtr(
+      _instanceId,
+      requestId,
+      chunk.address,
+      chunk.length,
+      last,
+      _nitroErr,
+    );
+    assert(() {
+      NitroRuntime.throwIfOutParamError(
+        _nitroErr,
+        nativeFree: _nitroFree,
+        methodName: 'sendStreamChunk',
+      );
+      return true;
+    }());
   }
 
   @override
@@ -1614,31 +1544,24 @@ class _NitroServerNativeImpl extends NitroServerNative {
     bool compressed,
   ) {
     checkDisposed();
-    final t0 = NitroRuntime.syncStart('wsSend');
-    try {
-      return withArena((arena) {
-        final res = _wsSendPtr(
-          _instanceId,
-          connectionId,
-          payload.toPointer(arena),
-          payload.length,
-          binary,
-          compressed,
-          _nitroErr,
-        );
-        assert(() {
-          NitroRuntime.throwIfOutParamError(
-            _nitroErr,
-            nativeFree: _nitroFree,
-            methodName: 'wsSend',
-          );
-          return true;
-        }());
-        return res;
-      });
-    } finally {
-      NitroRuntime.syncEnd(t0, 'wsSend');
-    }
+    final res = _wsSendPtr(
+      _instanceId,
+      connectionId,
+      payload.address,
+      payload.length,
+      binary,
+      compressed,
+      _nitroErr,
+    );
+    assert(() {
+      NitroRuntime.throwIfOutParamError(
+        _nitroErr,
+        nativeFree: _nitroFree,
+        methodName: 'wsSend',
+      );
+      return true;
+    }());
+    return res;
   }
 
   @override

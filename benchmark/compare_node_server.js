@@ -38,7 +38,6 @@ function buildWork() {
   }
   return Buffer.from(s + ']');
 }
-const workBody = buildWork();
 
 const fileBody = Buffer.alloc(64 * 1024);
 for (let i = 0; i < fileBody.length; i++) fileBody[i] = (i * 31) & 0xff;
@@ -122,7 +121,11 @@ function handler(req, res) {
     return writeBytes(res, helloBody, 'text/plain');
   }
   if (path === '/json') return writeBytes(res, jsonBody, 'application/json');
-  if (path === '/work') return writeBytes(res, workBody, 'application/json');
+  // Encode the 200 records PER REQUEST (not a precomputed body) so /work
+  // measures real CPU, equal to the Dart sides. buildWork is byte-identical to
+  // Dart's jsonEncode (JSON.stringify can't reproduce Dart's "N.0" float format
+  // that the equal-bytes check requires).
+  if (path === '/work') return writeBytes(res, buildWork(), 'application/json');
   if (path === '/file') return writeBytes(res, fileBody, 'application/octet-stream');
   res.statusCode = 404;
   res.end('not found');

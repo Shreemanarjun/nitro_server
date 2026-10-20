@@ -76,6 +76,15 @@ List<String> nitroServerLibraryCandidates({
     // `<bundle>/lib/` beside `<bundle>/bin/<exe>` — so the build hook's
     // prebuilt is found at run time (see hook/build.dart).
     '$exeDir/../lib/$name',
+    // Native-assets (@Native) under `dart run`/`dart test`: the runtime stages
+    // the code asset the build hook declared here. It MUST outrank `build/lib`
+    // below — in @Native mode both exist, and the generated @Native bindings
+    // resolve against THIS staged image. Opening `build/lib` instead would map
+    // a second copy of the engine with its own global state (reactor, mutexes),
+    // so requests land on one copy while the Dart port wiring lives in the
+    // other and teardown aborts on a cross-image mutex lock. In plain `_dylib`
+    // mode this path is absent and the search falls through to `build/lib`.
+    '.dart_tool/lib/$name',
     // cmake outputs relative to the working directory (dev / `dart run`).
     'build/lib/$name',
     'build/$name',

@@ -13,7 +13,10 @@ linux/
 windows/
 example/
 test/
-benchmark/
+# benchmark/ sources ARE needed in-container (compare.dart, the Go/Node servers,
+# the blackbox harness + vendored nitro); exclude only generated outputs.
+benchmark/docker/out/
+benchmark/blackbox/out/
 docs/
 .git/
 .github/

@@ -63,22 +63,36 @@ class NitroServer with RouteRegistrar<NitroServer> {
   /// Binds [config.host]:[config.port] and starts accepting. A config port of
   /// 0 asks the OS for a free port — read it back from [port].
   ///
-  /// [setup] registers routes before the first request can arrive; it is
-  /// required when [ServerConfig.isolates] is not 1, because every isolate
-  /// behind the server must register the same handlers (see [ServerSetup]).
+  /// [setup] registers routes before the first request can arrive. It is
+  /// required for a multi-isolate server (an explicit [ServerConfig.isolates]
+  /// above 1), because every isolate must register the same handlers (see
+  /// [ServerSetup]). It also unlocks auto: `isolates: 0` scales to the core
+  /// count when a [setup] is present, and stays single-isolate without one.
   static Future<NitroServer> bind([
     ServerConfig config = const ServerConfig(),
     ServerSetup? setup,
   ]) async {
     _ensureNativeLoaded();
-    final isolates = config.isolates == 0 ? _autoIsolates() : config.isolates;
-    if (isolates > 1 && setup == null) {
-      throw ArgumentError.value(
-        config.isolates,
-        'isolates',
-        'a multi-isolate server needs a `setup` function: routes must be '
-            'registered in every isolate',
-      );
+    // Auto (`isolates: 0`): scale to the machine so the engine can fan a
+    // CPU-bound handler across cores — but ONLY when a `setup` is given, since
+    // every isolate must re-register the routes (handler closures can't cross
+    // isolates; that is a Dart constraint, not a nitro one). Without a `setup`
+    // auto resolves to a single isolate so a zero-config server still binds
+    // instead of throwing. An EXPLICIT `isolates > 1` without a `setup` is a
+    // caller mistake and still throws.
+    final int isolates;
+    if (config.isolates == 0) {
+      isolates = setup == null ? 1 : _autoIsolates();
+    } else {
+      isolates = config.isolates;
+      if (isolates > 1 && setup == null) {
+        throw ArgumentError.value(
+          config.isolates,
+          'isolates',
+          'a multi-isolate server needs a `setup` function: routes must be '
+              'registered in every isolate',
+        );
+      }
     }
     final key = serverKey(Ids.nextServer());
     final runner = ServerRunner(attachedNative(key));
@@ -123,9 +137,14 @@ class NitroServer with RouteRegistrar<NitroServer> {
     }
   }
 
-  /// Auto size for [ServerConfig.isolates] == 0: half the cores, so the
-  /// native workers and the client side keep the rest, clamped to 1–8.
-  static int _autoIsolates() => (Platform.numberOfProcessors ~/ 2).clamp(1, 8);
+  /// Auto size for [ServerConfig.isolates] == 0 (with a `setup`): the full core
+  /// count, so a CPU-bound handler can fan out across every core — nitro's own
+  /// guidance is "set it to the core count and let the engine decide", and the
+  /// engine keeps light handlers on one isolate, so extra isolates are headroom,
+  /// not a tax (see [ServerConfig.isolates]). Capped at 32 to stay sane on very
+  /// large boxes. Note: inside a cgroup/cpuset-limited container this reports
+  /// the host CPU count, not the quota — pin an explicit `isolates` there.
+  static int _autoIsolates() => Platform.numberOfProcessors.clamp(1, 32);
 
   /// [bind] with named-argument sugar over a default [ServerConfig]:
   ///
@@ -489,19 +508,39 @@ class _Helper {
       final replies = ReceivePort();
       // Uncaught errors in the helper (a throwing `setup`) land on the same
       // port, so a failure surfaces here instead of hanging `bind`.
-      await Isolate.spawn(
-        _helperMain,
-        _HelperBoot(
-          key,
-          dylibPath,
-          setup,
-          replies.sendPort,
-          wsCompression,
-          responseTiming,
-        ),
-        debugName: 'nitro_server:$key:${i + 1}',
-        onError: replies.sendPort,
-      );
+      try {
+        await Isolate.spawn(
+          _helperMain,
+          _HelperBoot(
+            key,
+            dylibPath,
+            setup,
+            replies.sendPort,
+            wsCompression,
+            responseTiming,
+          ),
+          debugName: 'nitro_server:$key:${i + 1}',
+          onError: replies.sendPort,
+        );
+      } on ArgumentError catch (e) {
+        // The only non-sendable thing in the boot message is `setup`: a
+        // multi-isolate `setup` must be SENDABLE to each isolate. A top-level
+        // or static function always is — prefer that. A closure crosses only
+        // if it captures nothing mutable/non-sendable; one capturing local
+        // mutable state (a List, a controller, `this`) can't. The routes the
+        // `setup` registers may themselves be closures: they are built fresh
+        // inside each isolate, so only `setup` must be sendable.
+        replies.close();
+        for (final helper in helpers) {
+          await helper.close();
+        }
+        throw ArgumentError(
+          'nitro_server: `setup` must be sendable across isolates for a '
+          'multi-isolate server (isolates > 1 or auto `isolates: 0`) — use a '
+          'top-level or static function (a closure works only if it captures '
+          'nothing mutable). Underlying error: ${e.message}',
+        );
+      }
       final queue = StreamIterator<Object?>(replies);
       // The first message is the control port, sent once routes are
       // registered and streams subscribed — the engine may deal to this

@@ -110,7 +110,6 @@ func main() {
 	batch := flag.Bool("batch-events", false, "coalesce SSE events into one write")
 	flag.Parse()
 
-	work := workBody()
 	file := fileBytes()
 	var eventChunks [][]byte
 	var eventsAll []byte
@@ -150,7 +149,12 @@ func main() {
 		case p == "/json":
 			writeBytes(w, jsonBody, "application/json")
 		case p == "/work":
-			writeBytes(w, work, "application/json")
+			// Encode the 200 records PER REQUEST (not a precomputed body) so
+			// /work measures real CPU, equal to the Dart sides. workBody builds
+			// byte-identical output to Dart's jsonEncode (json.Marshal can't
+			// reproduce Dart's "N.0" float format, which the equal-bytes check
+			// requires).
+			writeBytes(w, workBody(), "application/json")
 		case p == "/file":
 			writeBytes(w, file, "application/octet-stream")
 		default:

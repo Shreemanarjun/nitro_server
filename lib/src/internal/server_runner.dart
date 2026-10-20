@@ -200,6 +200,14 @@ class ServerRunner {
   /// Every WebSocket connection id ever opened (test seam backing).
   final _wsOpened = <int>{};
 
+  /// Cumulative ack count per WebSocket connection id. The engine's `ackBody`
+  /// second argument is an absolute cumulative sequence (it frees every tracked
+  /// payload with seq < ackedUpTo), so a long-lived socket must ack a
+  /// monotonically rising count — a constant 1 frees only the first frame and
+  /// leaks every inbound buffer thereafter until the connection closes. Mirrors
+  /// the HTTP [_acked] counter; dropped when the session closes.
+  final _wsAcked = <int, int>{};
+
   /// Frames that reached [_onWsMessage] before their session opened. The open
   /// event ([_dispatchWs]) and message events ([_onWsMessage]) ride separate
   /// bridge streams with no cross-ordering — the same property that lets HTTP
@@ -641,6 +649,7 @@ class ServerRunner {
     }
     _wsSessions.clear();
     _wsEarly.clear();
+    _wsAcked.clear();
     await _heads?.cancel();
     await _chunks?.cancel();
     await _serverEvents?.cancel();
@@ -990,9 +999,21 @@ class ServerRunner {
 
   void _answer(int requestId, ResponseContext response, int timingUs) {
     if (_closed) return;
+    final writer = response.bodyWriterOrNull;
     try {
       final fast = _fast;
-      if (fast != null) {
+      if (fast != null && writer != null) {
+        // Win ③: send the writer's native buffer straight to the engine — no
+        // toBytes() copy, no stage copy.
+        fast.respondFromWriter(
+          requestId,
+          response.status,
+          response.headers,
+          writer,
+          _setCookies(response),
+          timingUs,
+        );
+      } else if (fast != null) {
         fast.respond(
           requestId,
           response.status,
@@ -1012,6 +1033,10 @@ class ServerRunner {
     } catch (_) {
       // The request was already answered (timeout won) or the server went
       // away mid-flight. Exactly-once is the engine's job; Dart never retries.
+    } finally {
+      // The writer's native buffer was read synchronously by respond; free it
+      // now (the NativeFinalizer is only the never-answered safety net).
+      writer?.dispose();
     }
   }
 
@@ -1188,6 +1213,7 @@ class ServerRunner {
       selectWsProtocol(handshake.header('sec-websocket-protocol'), protocols),
       () {
         _wsSessions.remove(connectionId);
+        _wsAcked.remove(connectionId);
       },
     );
     _wsSessions[connectionId] = session;
@@ -1212,8 +1238,14 @@ class ServerRunner {
     // Copy FIRST then ack immediately: WS payloads have no _complete path
     // so deferred acks would leak native memory.
     final copy = Uint8List.fromList(message.payload);
-    _native.ackBody(message.connectionId, 1);
     final id = message.connectionId;
+    // Cumulative ack: the engine frees payloads with seq < ackedUpTo, and it
+    // assigns each inbound frame a rising per-connection seq, so the ack count
+    // must rise too. A constant 1 freed only the first frame and leaked the
+    // rest for the life of the socket.
+    final acked = (_wsAcked[id] ?? 0) + 1;
+    _wsAcked[id] = acked;
+    _native.ackBody(id, acked);
     final session = _wsSessions[id];
     if (session == null) {
       // No session yet. Either the frame beat its open across the bridge —

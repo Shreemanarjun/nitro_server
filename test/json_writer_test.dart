@@ -352,7 +352,9 @@ void main() {
       });
       expect(ctx.status, 200);
       expect(ctx.headers['content-type'], contains('application/json'));
-      expect(ctx.body, utf8.encode('{"a":1}'));
+      // body is null (the writer lives in bodyWriter — win ③, no eager copy);
+      // bodyBytes is the bytes on the wire.
+      expect(ctx.bodyBytes, utf8.encode('{"a":1}'));
     });
 
     test('ResponseContext.jsonWriter honours status and headers', () {
@@ -363,7 +365,7 @@ void main() {
       );
       expect(ctx.status, 201);
       expect(ctx.headers['x-test'], 'yes');
-      expect(ctx.body, utf8.encode('1'));
+      expect(ctx.bodyBytes, utf8.encode('1'));
     });
   }, skip: libPath == null ? 'native library not built' : null);
 }

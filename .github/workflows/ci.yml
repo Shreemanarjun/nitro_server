@@ -30,6 +30,12 @@ jobs:
       - run: ./build/lib/nitro_server_tests/nitro_server_engine_tests
       - run: bash tool/coverage.sh
       - run: bash tool/cpp_coverage.sh 90
+      # Production crash gate: drive every @Native native-free path (streams, WS,
+      # @zeroCopy returns, concurrency, multi-isolate, bind/close) under aggressive
+      # allocator diagnostics and assert a single engine image — guards the
+      # two-copies split-brain that regressed the native-assets migration.
+      - name: Crash gate (@Native free paths under malloc diagnostics)
+        run: bash tool/crash_stress.sh 20
       - run: mkdir -p build/benchmark && dart compile exe benchmark/compare.dart -o build/benchmark/compare
       - run: ./build/benchmark/compare --quick --keep-alive --raw --only /hello
 

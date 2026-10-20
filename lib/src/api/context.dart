@@ -112,9 +112,15 @@ class ServerConfig {
   final int workerThreads;
 
   /// Isolates available to run handlers. `1` (default) runs every handler on
-  /// the calling isolate; `0` picks from the CPU count (half the cores, 1–8).
-  /// Above 1, routes must be registered by the `setup` passed to
-  /// [NitroServer.bind], which runs once per isolate.
+  /// the calling isolate; `0` is auto — it scales to the core count when a
+  /// `setup` is passed to [NitroServer.bind] (so a CPU-bound handler can fan
+  /// out across cores), and stays at 1 without one (so a zero-config server
+  /// still binds rather than failing). Above 1, routes are registered by that
+  /// `setup`, which must be **sendable** to each isolate — use a top-level or
+  /// static function (always sendable); a closure works only if it captures
+  /// nothing mutable. The handlers the `setup` registers may be closures: they
+  /// are built fresh inside each isolate when the `setup` runs there, so only
+  /// the `setup` itself must be sendable.
   ///
   /// The engine deals requests across only as many of these isolates as help:
   /// it keeps light handlers on one (it already does the I/O on every core) and
@@ -482,6 +488,7 @@ class ResponseContext {
     this.status = 200,
     this.headers = const {},
     this.body,
+    this.bodyWriter,
     this.bodyStream,
     this.streamBufferSize = 0,
     this.filePath,
@@ -491,10 +498,11 @@ class ResponseContext {
   }) : assert(status >= 100 && status <= 599, 'status out of range: $status'),
        assert(
          (body == null ? 0 : 1) +
+                 (bodyWriter == null ? 0 : 1) +
                  (bodyStream == null ? 0 : 1) +
                  (filePath == null ? 0 : 1) <=
              1,
-         'body, bodyStream and filePath are mutually exclusive',
+         'body, bodyWriter, bodyStream and filePath are mutually exclusive',
        ),
        assert(streamBufferSize >= 0, 'streamBufferSize < 0: $streamBufferSize'),
        assert(fileOffset >= 0, 'fileOffset < 0: $fileOffset');
@@ -502,6 +510,21 @@ class ResponseContext {
   final int status;
   final Map<String, String> headers;
   final Uint8List? body;
+
+  /// A [JsonWriter] whose native buffer IS the response body (win ③): the
+  /// answerer sends it straight from native memory, and the runner disposes it
+  /// after the (synchronous) respond — no `toBytes()` copy. Mutually exclusive
+  /// with [body]/[bodyStream]/[filePath]. Falls back to [toBytes] on the slow
+  /// (generated) answer path via [bodyBytes].
+  ///
+  /// Typed `Object?`, not `JsonWriter?`: a `Finalizable`-typed field in this
+  /// const-constructor class trips a CFE incremental-compile bug (a spurious
+  /// "const constructor can't have a body" surfaces across test files). Read it
+  /// back with [bodyWriterOrNull].
+  final Object? bodyWriter;
+
+  /// The [bodyWriter] as a [JsonWriter] (see that field for why it is `Object?`).
+  JsonWriter? get bodyWriterOrNull => bodyWriter as JsonWriter?;
 
   /// Cookies to set, each sent as its own `set-cookie` header (a header
   /// map cannot hold several).
@@ -579,6 +602,7 @@ class ResponseContext {
         status: status ?? this.status,
         headers: headers ?? this.headers,
         body: body,
+        bodyWriter: bodyWriter,
         bodyStream: bodyStream,
         streamBufferSize: streamBufferSize,
         filePath: filePath,
@@ -672,17 +696,21 @@ class ResponseContext {
     final w = JsonWriter();
     try {
       build(w);
-      return ResponseContext(
-        status: status,
-        headers: {
-          'content-type': 'application/json; charset=utf-8',
-          ...headers,
-        },
-        body: w.toBytes(),
-      );
-    } finally {
+    } catch (_) {
       w.dispose();
+      rethrow;
     }
+    // Hand the live writer to the runner (win ③): the answerer sends its native
+    // buffer straight to the engine and disposes it after respond — no toBytes()
+    // copy. The NativeFinalizer frees it if the response is never answered.
+    return ResponseContext(
+      status: status,
+      headers: {
+        'content-type': 'application/json; charset=utf-8',
+        ...headers,
+      },
+      bodyWriter: w,
+    );
   }
 
   /// Encodes any JSON-encodable [data] (maps, lists, nested values) and
@@ -859,8 +887,10 @@ class ResponseContext {
   }
 
   /// The bytes placed on the wire (empty for a null body). The empty body is
-  /// one shared instance — treat it as immutable.
-  Uint8List get bodyBytes => body ?? _emptyBody;
+  /// one shared instance — treat it as immutable. A [bodyWriter] is copied out
+  /// here only for the slow (generated) answer path; the fast answerer reads
+  /// the writer's native buffer directly (win ③).
+  Uint8List get bodyBytes => body ?? bodyWriterOrNull?.toBytes() ?? _emptyBody;
 
   static final Uint8List _emptyBody = Uint8List(0);
 }

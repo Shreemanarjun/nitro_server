@@ -1,5 +1,5 @@
 nitro_server compare benchmark
-date:    Mon Oct 19 16:23:11 IST 2026
+date:    Mon Oct 19 22:37:46 IST 2026
 machine: Darwin arm64, 8 logical CPUs
 config:  --keep-alive  (Go GOMAXPROCS = all cores)
 
@@ -13,273 +13,344 @@ Sequential latency via package:benchmark_harness (AsyncBenchmarkBase, ~2 s per c
 
 | case | seq p50 µs | seq p99 µs | load p50 µs | load p99 µs | req/s @64 |
 | ---- | ---------- | ---------- | ----------- | ----------- | --- |
-dart:io /hello(RunTime): 92.2170 us. (n=21688)
-| dart:io /hello | 76 | 263 | 1963 | 2619 | 31634 |
-shelf   /hello(RunTime): 97.9715 us. (n=20415)
-| shelf   /hello | 88 | 223 | 2835 | 3583 | 22021 |
-nitro   /hello(RunTime): 97.0065 us. (n=20618)
-| nitro   /hello | 83 | 173 | 837 | 1751 | 69860 |
-go      /hello(RunTime): 77.1579 us. (n=25921)
-| go      /hello | 75 | 128 | 831 | 1889 | 70224 |
-node    /hello(RunTime): 73.4985 us. (n=27212)
-| node    /hello | 70 | 107 | 834 | 2519 | 65805 |
-dart:io /json(RunTime): 71.4813 us. (n=27980)
-| dart:io /json | 68 | 106 | 1968 | 2584 | 31645 |
-shelf   /json(RunTime): 88.2396 us. (n=22666)
-| shelf   /json | 84 | 140 | 2776 | 3361 | 22619 |
-nitro   /json(RunTime): 82.8563 us. (n=24139)
-| nitro   /json | 80 | 119 | 797 | 1502 | 74844 |
-go      /json(RunTime): 74.6423 us. (n=26795)
-| go      /json | 73 | 108 | 826 | 1976 | 70067 |
-node    /json(RunTime): 73.5960 us. (n=27176)
-| node    /json | 70 | 105 | 824 | 1937 | 69903 |
-dart:io /users/:id(RunTime): 73.6582 us. (n=27153)
-| dart:io /users/:id | 69 | 124 | 1971 | 2597 | 31593 |
-shelf   /users/:id(RunTime): 86.6743 us. (n=23075)
-| shelf   /users/:id | 83 | 128 | 2916 | 6313 | 20569 |
-nitro   /users/:id(RunTime): 88.1730 us. (n=22684)
-| nitro   /users/:id | 84 | 150 | 852 | 2798 | 62327 |
-go      /users/:id(RunTime): 81.3975 us. (n=24571)
-| go      /users/:id | 78 | 153 | 843 | 2155 | 67816 |
-node    /users/:id(RunTime): 79.1576 us. (n=25267)
-| node    /users/:id | 74 | 145 | 839 | 2229 | 67702 |
-dart:io /files/*(RunTime): 82.6419 us. (n=24202)
-| dart:io /files/* | 72 | 158 | 2012 | 3316 | 30210 |
-shelf   /files/*(RunTime): 92.8778 us. (n=21535)
-| shelf   /files/* | 86 | 164 | 2846 | 3590 | 21907 |
-nitro   /files/*(RunTime): 92.4962 us. (n=21623)
-| nitro   /files/* | 84 | 164 | 810 | 1540 | 73523 |
-go      /files/*(RunTime): 79.1219 us. (n=25278)
-| go      /files/* | 77 | 132 | 842 | 1944 | 69276 |
-node    /files/*(RunTime): 75.3195 us. (n=26554)
-| node    /files/* | 72 | 115 | 846 | 2067 | 67544 |
-dart:io /q?a=1&b=two(RunTime): 79.0077 us. (n=25314)
-| dart:io /q?a=1&b=two | 73 | 142 | 2067 | 2670 | 30142 |
-shelf   /q?a=1&b=two(RunTime): 91.1295 us. (n=21947)
-| shelf   /q?a=1&b=two | 86 | 147 | 2903 | 3622 | 21610 |
-nitro   /q?a=1&b=two(RunTime): 88.5154 us. (n=22595)
-| nitro   /q?a=1&b=two | 84 | 150 | 822 | 1646 | 71829 |
-go      /q?a=1&b=two(RunTime): 77.3753 us. (n=25849)
-| go      /q?a=1&b=two | 76 | 118 | 851 | 2120 | 67908 |
-node    /q?a=1&b=two(RunTime): 82.3799 us. (n=24278)
-| node    /q?a=1&b=two | 72 | 122 | 844 | 2291 | 66865 |
-dart:io /mw(RunTime): 76.2508 us. (n=26230)
-| dart:io /mw | 71 | 138 | 1951 | 2540 | 31985 |
-shelf   /mw(RunTime): 86.2047 us. (n=23201)
-| shelf   /mw | 82 | 126 | 2772 | 3393 | 22663 |
-nitro   /mw(RunTime): 88.3667 us. (n=22634)
-| nitro   /mw | 84 | 156 | 824 | 1685 | 71597 |
-go      /mw(RunTime): 76.8825 us. (n=26014)
-| go      /mw | 76 | 116 | 825 | 1878 | 70739 |
-node    /mw(RunTime): 72.9775 us. (n=27406)
-| node    /mw | 70 | 103 | 810 | 1864 | 71493 |
-dart:io /static(RunTime): 72.6115 us. (n=27544)
-| dart:io /static | 69 | 115 | 1963 | 2538 | 31888 |
-shelf   /static(RunTime): 86.2263 us. (n=23195)
-| shelf   /static | 83 | 124 | 2769 | 3364 | 22732 |
-nitro   /static(RunTime): 56.1082 us. (n=35646)
-| nitro   /static | 53 | 84 | 725 | 1285 | 83614 |
-go      /static(RunTime): 75.9435 us. (n=26336)
-| go      /static | 75 | 110 | 828 | 1958 | 70557 |
-node    /static(RunTime): 74.1444 us. (n=26975)
-| node    /static | 71 | 105 | 811 | 1837 | 71851 |
-dart:io /work(RunTime): 345.1489 us. (n=5795)
-| dart:io /work | 338 | 443 | 16361 | 16878 | 3906 |
-shelf   /work(RunTime): 372.8939 us. (n=5364)
-| shelf   /work | 359 | 460 | 17109 | 17647 | 3736 |
-nitro   /work(RunTime): 160.7983 us. (n=12438)
-| nitro   /work | 143 | 217 | 4766 | 5305 | 13251 |
-go      /work(RunTime): 91.4386 us. (n=21873)
-| go      /work | 77 | 113 | 1149 | 2483 | 51373 |
-node    /work(RunTime): 85.9427 us. (n=23272)
-| node    /work | 71 | 105 | 1083 | 2119 | 54267 |
-dart:io /file(RunTime): 243.8951 us. (n=8201)
-| dart:io /file | 171 | 281 | 5969 | 6646 | 10721 |
-shelf   /file(RunTime): 258.8263 us. (n=7728)
-| shelf   /file | 185 | 305 | 6622 | 7619 | 9646 |
-nitro   /file(RunTime): 194.8543 us. (n=10265)
-| nitro   /file | 122 | 215 | 2418 | 3189 | 25507 |
-go      /file(RunTime): 162.1067 us. (n=12338)
-| go      /file | 93 | 143 | 2423 | 3821 | 26217 |
-node    /file(RunTime): 157.0922 us. (n=12732)
-| node    /file | 88 | 148 | 2351 | 3298 | 26194 |
-dart:io POST /echo 4k(RunTime): 93.3105 us. (n=21435)
-| dart:io POST /echo 4k | 89 | 141 | 2433 | 3079 | 25830 |
-shelf   POST /echo 4k(RunTime): 105.9223 us. (n=18882)
-| shelf   POST /echo 4k | 102 | 153 | 3270 | 3916 | 19620 |
-nitro   POST /echo 4k(RunTime): 102.2463 us. (n=19561)
-| nitro   POST /echo 4k | 98 | 152 | 1124 | 2238 | 51974 |
-go      POST /echo 4k(RunTime): 92.6985 us. (n=21576)
-| go      POST /echo 4k | 90 | 150 | 1199 | 2953 | 48954 |
-node    POST /echo 4k(RunTime): 90.7678 us. (n=22035)
-| node    POST /echo 4k | 87 | 128 | 1120 | 2711 | 50883 |
-dart:io POST /echo 1m(RunTime): 3787.0340 us. (n=529)
-| dart:io POST /echo 1m | 3434 | 6228 | 117940 | 133973 | 617 |
-shelf   POST /echo 1m(RunTime): 3473.6146 us. (n=576)
-| shelf   POST /echo 1m | 2963 | 5838 | 89719 | 109258 | 814 |
-nitro   POST /echo 1m(RunTime): 3664.2930 us. (n=546)
-| nitro   POST /echo 1m | 3003 | 5896 | 74518 | 119355 | 909 |
-go      POST /echo 1m(RunTime): 2976.7604 us. (n=672)
-| go      POST /echo 1m | 2648 | 5217 | 61347 | 98967 | 1151 |
-node    POST /echo 1m(RunTime): 2838.7035 us. (n=705)
-| node    POST /echo 1m | 2549 | 4860 | 60564 | 115841 | 1168 |
-dart:io GET /events(RunTime): 102.9817 us. (n=19422)
-| dart:io GET /events | 100 | 149 | 3322 | 3839 | 18951 |
-shelf   GET /events(RunTime): 97.1460 us. (n=20588)
-| shelf   GET /events | 93 | 149 | 3105 | 3690 | 20298 |
-nitro   GET /events(RunTime): 86.2240 us. (n=23196)
-| nitro   GET /events | 83 | 129 | 5274 | 6548 | 12075 |
-go      GET /events(RunTime): 123.0534 us. (n=16254)
-| go      GET /events | 117 | 192 | 1931 | 12789 | 25292 |
-node    GET /events(RunTime): 89.9131 us. (n=22244)
-| node    GET /events | 86 | 126 | 974 | 2525 | 58768 |
-dart:io WS /ws 128B(RunTime): 55.7742 us. (n=35859)
-| dart:io WS /ws 128B | 53 | 89 | 1557 | 2396 | 41359 |
-nitro   WS /ws 128B(RunTime): 64.7357 us. (n=30895)
-| nitro   WS /ws 128B | 61 | 99 | 706 | 1949 | 86163 |
-dart:io WS /ws 4k(RunTime): 62.2702 us. (n=32119)
-| dart:io WS /ws 4k | 55 | 93 | 1652 | 2223 | 38665 |
-nitro   WS /ws 4k(RunTime): 72.4890 us. (n=27591)
-| nitro   WS /ws 4k | 66 | 103 | 1106 | 1824 | 56124 |
-dart:io WS /ws 4k deflate(RunTime): 103.5949 us. (n=19306)
-| dart:io WS /ws 4k deflate | 99 | 159 | 3227 | 3853 | 19515 |
-nitro   WS /ws 4k deflate(RunTime): 114.5498 us. (n=17460)
-| nitro   WS /ws 4k deflate | 108 | 293 | 2954 | 5066 | 21572 |
+dart:io /hello(RunTime): 104.9094 us. (n=19065)
+| dart:io /hello | 86 | 346 | 2014 | 2866 | 30599 |
+shelf   /hello(RunTime): 103.1495 us. (n=19390)
+| shelf   /hello | 92 | 236 | 2891 | 3885 | 21490 |
+nitro   /hello(RunTime): 89.5818 us. (n=22326)
+| nitro   /hello | 84 | 169 | 830 | 1673 | 71461 |
+go      /hello(RunTime): 79.8157 us. (n=25058)
+| go      /hello | 78 | 134 | 836 | 3267 | 63520 |
+node    /hello(RunTime): 87.5641 us. (n=22841)
+| node    /hello | 76 | 179 | 831 | 5066 | 57383 |
+dart:io /json(RunTime): 76.2786 us. (n=26220)
+| dart:io /json | 71 | 131 | 1983 | 2619 | 31415 |
+shelf   /json(RunTime): 90.8077 us. (n=22025)
+| shelf   /json | 86 | 145 | 2811 | 3459 | 22294 |
+nitro   /json(RunTime): 81.0674 us. (n=24671)
+| nitro   /json | 79 | 137 | 827 | 1609 | 71896 |
+go      /json(RunTime): 81.6990 us. (n=24481)
+| go      /json | 78 | 150 | 871 | 2895 | 63311 |
+node    /json(RunTime): 74.7445 us. (n=26758)
+| node    /json | 72 | 112 | 819 | 2630 | 67217 |
+dart:io /users/:id(RunTime): 74.6341 us. (n=26798)
+| dart:io /users/:id | 70 | 125 | 1983 | 2761 | 31255 |
+shelf   /users/:id(RunTime): 89.7932 us. (n=22274)
+| shelf   /users/:id | 85 | 142 | 2866 | 3960 | 21731 |
+nitro   /users/:id(RunTime): 86.3729 us. (n=23156)
+| nitro   /users/:id | 83 | 140 | 832 | 1771 | 70243 |
+go      /users/:id(RunTime): 78.2143 us. (n=25571)
+| go      /users/:id | 77 | 121 | 867 | 2109 | 66748 |
+node    /users/:id(RunTime): 76.1211 us. (n=26274)
+| node    /users/:id | 73 | 113 | 834 | 2083 | 68668 |
+dart:io /files/*(RunTime): 74.5849 us. (n=26816)
+| dart:io /files/* | 70 | 121 | 2013 | 2718 | 30857 |
+shelf   /files/*(RunTime): 91.0777 us. (n=21960)
+| shelf   /files/* | 86 | 145 | 2889 | 3569 | 21704 |
+nitro   /files/*(RunTime): 85.2485 us. (n=23462)
+| nitro   /files/* | 82 | 130 | 830 | 1671 | 70926 |
+go      /files/*(RunTime): 80.8558 us. (n=24736)
+| go      /files/* | 77 | 130 | 794 | 2157 | 71097 |
+node    /files/*(RunTime): 74.7468 us. (n=26758)
+| node    /files/* | 72 | 112 | 802 | 2521 | 68553 |
+dart:io /q?a=1&b=two(RunTime): 76.8989 us. (n=26009)
+| dart:io /q?a=1&b=two | 72 | 123 | 2088 | 2698 | 29849 |
+shelf   /q?a=1&b=two(RunTime): 91.1897 us. (n=21933)
+| shelf   /q?a=1&b=two | 86 | 145 | 2941 | 3597 | 21346 |
+nitro   /q?a=1&b=two(RunTime): 101.4400 us. (n=19717)
+| nitro   /q?a=1&b=two | 87 | 254 | 820 | 1636 | 72002 |
+go      /q?a=1&b=two(RunTime): 76.6788 us. (n=26083)
+| go      /q?a=1&b=two | 75 | 118 | 843 | 2310 | 66981 |
+node    /q?a=1&b=two(RunTime): 76.5991 us. (n=26111)
+| node    /q?a=1&b=two | 73 | 118 | 839 | 2739 | 65669 |
+dart:io /mw(RunTime): 74.4395 us. (n=26868)
+| dart:io /mw | 70 | 119 | 1997 | 2656 | 31212 |
+shelf   /mw(RunTime): 90.6757 us. (n=22057)
+| shelf   /mw | 85 | 147 | 2800 | 3452 | 22428 |
+nitro   /mw(RunTime): 85.5959 us. (n=23366)
+| nitro   /mw | 82 | 131 | 823 | 1687 | 71613 |
+go      /mw(RunTime): 81.0425 us. (n=24679)
+| go      /mw | 78 | 142 | 821 | 2344 | 67897 |
+node    /mw(RunTime): 75.5328 us. (n=26479)
+| node    /mw | 72 | 112 | 820 | 2318 | 68344 |
+dart:io /static(RunTime): 74.5168 us. (n=26840)
+| dart:io /static | 70 | 119 | 1989 | 2575 | 31362 |
+shelf   /static(RunTime): 91.4139 us. (n=21879)
+| shelf   /static | 86 | 149 | 2835 | 3613 | 22084 |
+nitro   /static(RunTime): 57.9091 us. (n=34537)
+| nitro   /static | 54 | 94 | 737 | 1443 | 78250 |
+go      /static(RunTime): 77.4579 us. (n=25821)
+| go      /static | 76 | 119 | 870 | 2122 | 66626 |
+node    /static(RunTime): 75.1912 us. (n=26599)
+| node    /static | 72 | 111 | 819 | 2197 | 69021 |
+dart:io /work(RunTime): 362.9817 us. (n=5510)
+| dart:io /work | 350 | 473 | 16348 | 17172 | 3906 |
+shelf   /work(RunTime): 367.5209 us. (n=5442)
+| shelf   /work | 355 | 477 | 17218 | 23842 | 3696 |
+nitro   /work(RunTime): 167.2315 us. (n=11960)
+| nitro   /work | 147 | 245 | 4916 | 5565 | 12899 |
+go      /work(RunTime): 92.1742 us. (n=21699)
+| go      /work | 77 | 120 | 1139 | 2690 | 51375 |
+node    /work(RunTime): 90.6682 us. (n=22059)
+| node    /work | 74 | 130 | 1103 | 2346 | 52696 |
+dart:io /file(RunTime): 256.2061 us. (n=7807)
+| dart:io /file | 178 | 311 | 6045 | 6733 | 10545 |
+shelf   /file(RunTime): 266.8139 us. (n=7496)
+| shelf   /file | 192 | 317 | 6733 | 8250 | 9386 |
+nitro   /file(RunTime): 201.4372 us. (n=9929)
+| nitro   /file | 123 | 235 | 2463 | 3563 | 24852 |
+go      /file(RunTime): 166.7486 us. (n=11995)
+| go      /file | 96 | 163 | 2497 | 4653 | 24857 |
+node    /file(RunTime): 165.4451 us. (n=12089)
+| node    /file | 94 | 172 | 2376 | 3938 | 25486 |
+dart:io POST /echo 4k(RunTime): 96.7282 us. (n=20677)
+| dart:io POST /echo 4k | 92 | 163 | 2506 | 3306 | 25072 |
+shelf   POST /echo 4k(RunTime): 109.5547 us. (n=18256)
+| shelf   POST /echo 4k | 104 | 165 | 3385 | 4090 | 19117 |
+nitro   POST /echo 4k(RunTime): 107.9656 us. (n=18525)
+| nitro   POST /echo 4k | 101 | 176 | 1156 | 2533 | 49991 |
+go      POST /echo 4k(RunTime): 95.3772 us. (n=20970)
+| go      POST /echo 4k | 92 | 165 | 1221 | 3046 | 47673 |
+node    POST /echo 4k(RunTime): 94.5989 us. (n=21142)
+| node    POST /echo 4k | 89 | 143 | 1149 | 3344 | 48368 |
+dart:io POST /echo 1m(RunTime): 3912.7734 us. (n=512)
+| dart:io POST /echo 1m | 3479 | 6316 | 121453 | 146736 | 586 |
+shelf   POST /echo 1m(RunTime): 4305.3978 us. (n=465)
+| shelf   POST /echo 1m | 3666 | 12873 | 174342 | 224495 | 428 |
+nitro   POST /echo 1m(RunTime): 5869.7331 us. (n=341)
+| nitro   POST /echo 1m | 5391 | 14429 | 112368 | 199058 | 590 |
+go      POST /echo 1m(RunTime): 4709.2988 us. (n=425)
+| go      POST /echo 1m | 4008 | 12980 | 100436 | 181121 | 683 |
+node    POST /echo 1m(RunTime): 4101.2623 us. (n=488)
+| node    POST /echo 1m | 3420 | 11243 | 103876 | 202767 | 663 |
+dart:io GET /events(RunTime): 233.7820 us. (n=8555)
+| dart:io GET /events | 128 | 2085 | 3900 | 10421 | 14099 |
+shelf   GET /events(RunTime): 227.6305 us. (n=8788)
+| shelf   GET /events | 123 | 1869 | 3739 | 10174 | 14451 |
+nitro   GET /events(RunTime): 246.0853 us. (n=8128)
+| nitro   GET /events | 116 | 2455 | 5923 | 12963 | 10150 |
+go      GET /events(RunTime): 277.0506 us. (n=7219)
+| go      GET /events | 143 | 2184 | 2317 | 22212 | 18527 |
+node    GET /events(RunTime): 211.9407 us. (n=9437)
+| node    GET /events | 109 | 1826 | 1320 | 14724 | 29352 |
+dart:io WS /ws 128B(RunTime): 57.8525 us. (n=34571)
+| dart:io WS /ws 128B | 54 | 98 | 1575 | 2491 | 40810 |
+nitro   WS /ws 128B(RunTime): 67.3045 us. (n=29716)
+| nitro   WS /ws 128B | 62 | 141 | 711 | 1888 | 84944 |
+dart:io WS /ws 4k(RunTime): 64.6956 us. (n=30914)
+| dart:io WS /ws 4k | 57 | 102 | 1680 | 2279 | 37974 |
+nitro   WS /ws 4k(RunTime): 75.8508 us. (n=26368)
+| nitro   WS /ws 4k | 68 | 116 | 1114 | 1866 | 54465 |
+dart:io WS /ws 4k deflate(RunTime): 108.0582 us. (n=18509)
+| dart:io WS /ws 4k deflate | 102 | 166 | 3280 | 3910 | 19217 |
+nitro   WS /ws 4k deflate(RunTime): 119.5149 us. (n=16735)
+| nitro   WS /ws 4k deflate | 111 | 311 | 2975 | 5433 | 21168 |
 
 | case | seq p50 µs | seq p99 µs | load p50 µs | load p99 µs | req/s @64 |
 | ---- | ---------- | ---------- | ----------- | ----------- | --- |
-dart:io /hello(RunTime): 74.3836 us. (n=26888)
-| dart:io /hello | 71 | 113 | 2003 | 2584 | 31239 |
-shelf   /hello(RunTime): 88.4624 us. (n=22609)
-| shelf   /hello | 84 | 132 | 2803 | 3421 | 22418 |
-nitro   /hello(RunTime): 84.0908 us. (n=23784)
-| nitro   /hello | 82 | 117 | 809 | 1516 | 74100 |
-go      /hello(RunTime): 76.5505 us. (n=26127)
-| go      /hello | 75 | 109 | 830 | 1893 | 70271 |
-node    /hello(RunTime): 74.6166 us. (n=26804)
-| node    /hello | 71 | 109 | 822 | 1946 | 70179 |
-dart:io /json(RunTime): 73.3306 us. (n=27274)
-| dart:io /json | 70 | 109 | 2006 | 2605 | 31172 |
-shelf   /json(RunTime): 88.2336 us. (n=22668)
-| shelf   /json | 84 | 129 | 2809 | 3427 | 22402 |
-nitro   /json(RunTime): 85.4354 us. (n=23410)
-| nitro   /json | 82 | 119 | 807 | 1510 | 74241 |
-go      /json(RunTime): 77.0525 us. (n=25957)
-| go      /json | 76 | 110 | 840 | 1895 | 70035 |
-node    /json(RunTime): 73.9114 us. (n=27060)
-| node    /json | 71 | 103 | 819 | 1878 | 70550 |
-dart:io /users/:id(RunTime): 73.8825 us. (n=27070)
-| dart:io /users/:id | 71 | 111 | 2012 | 2628 | 31023 |
-shelf   /users/:id(RunTime): 89.5770 us. (n=22328)
-| shelf   /users/:id | 85 | 138 | 2859 | 3480 | 21967 |
-nitro   /users/:id(RunTime): 84.5115 us. (n=23666)
-| nitro   /users/:id | 82 | 120 | 812 | 1554 | 73648 |
-go      /users/:id(RunTime): 79.5949 us. (n=25128)
-| go      /users/:id | 77 | 131 | 840 | 1905 | 69698 |
-node    /users/:id(RunTime): 75.7754 us. (n=26394)
-| node    /users/:id | 72 | 113 | 852 | 2112 | 67253 |
-dart:io /files/*(RunTime): 76.4016 us. (n=26178)
-| dart:io /files/* | 72 | 127 | 2023 | 2659 | 30888 |
-shelf   /files/*(RunTime): 92.9523 us. (n=21517)
-| shelf   /files/* | 87 | 154 | 2923 | 3645 | 21484 |
-nitro   /files/*(RunTime): 93.3944 us. (n=21415)
-| nitro   /files/* | 86 | 157 | 833 | 1591 | 71689 |
-go      /files/*(RunTime): 83.2954 us. (n=24011)
-| go      /files/* | 80 | 149 | 836 | 2102 | 68976 |
-node    /files/*(RunTime): 75.4854 us. (n=26496)
-| node    /files/* | 72 | 111 | 824 | 1837 | 70556 |
-dart:io /q?a=1&b=two(RunTime): 75.8808 us. (n=26358)
-| dart:io /q?a=1&b=two | 72 | 114 | 2110 | 2716 | 29665 |
-shelf   /q?a=1&b=two(RunTime): 90.0460 us. (n=22211)
-| shelf   /q?a=1&b=two | 86 | 134 | 2899 | 3518 | 21674 |
-nitro   /q?a=1&b=two(RunTime): 85.0231 us. (n=23524)
-| nitro   /q?a=1&b=two | 83 | 119 | 814 | 1566 | 73275 |
-go      /q?a=1&b=two(RunTime): 77.5279 us. (n=25798)
-| go      /q?a=1&b=two | 76 | 111 | 843 | 1897 | 69649 |
-node    /q?a=1&b=two(RunTime): 74.9832 us. (n=26673)
-| node    /q?a=1&b=two | 72 | 107 | 830 | 1917 | 69634 |
-dart:io /mw(RunTime): 73.3101 us. (n=27282)
-| dart:io /mw | 70 | 108 | 1998 | 2590 | 31338 |
-shelf   /mw(RunTime): 88.3747 us. (n=22632)
-| shelf   /mw | 84 | 133 | 2802 | 3387 | 22460 |
-nitro   /mw(RunTime): 84.3250 us. (n=23718)
-| nitro   /mw | 82 | 119 | 805 | 1491 | 74388 |
-go      /mw(RunTime): 76.9360 us. (n=25996)
-| go      /mw | 76 | 112 | 824 | 1877 | 70962 |
-node    /mw(RunTime): 74.2373 us. (n=26941)
-| node    /mw | 71 | 105 | 809 | 1804 | 71617 |
-dart:io /static(RunTime): 74.0503 us. (n=27009)
-| dart:io /static | 70 | 113 | 2012 | 2591 | 31107 |
-shelf   /static(RunTime): 87.6762 us. (n=22812)
-| shelf   /static | 84 | 127 | 2839 | 3456 | 22161 |
-nitro   /static(RunTime): 57.0557 us. (n=35054)
-| nitro   /static | 53 | 86 | 725 | 1323 | 83143 |
-go      /static(RunTime): 76.2758 us. (n=26221)
-| go      /static | 75 | 109 | 833 | 1838 | 70707 |
-node    /static(RunTime): 74.2198 us. (n=26948)
-| node    /static | 71 | 104 | 868 | 2341 | 65109 |
-dart:io /work(RunTime): 343.7920 us. (n=5818)
-| dart:io /work | 337 | 459 | 16430 | 17058 | 3888 |
-shelf   /work(RunTime): 378.9242 us. (n=5279)
-| shelf   /work | 361 | 466 | 17131 | 17645 | 3732 |
-nitro   /work(RunTime): 162.0647 us. (n=12341)
-| nitro   /work | 144 | 217 | 4809 | 5348 | 13125 |
-go      /work(RunTime): 90.5776 us. (n=22081)
-| go      /work | 76 | 115 | 1145 | 2451 | 52168 |
-node    /work(RunTime): 88.1300 us. (n=22694)
-| node    /work | 74 | 108 | 1109 | 2392 | 52217 |
-dart:io /file(RunTime): 243.6289 us. (n=8210)
-| dart:io /file | 173 | 284 | 5971 | 6539 | 10741 |
-shelf   /file(RunTime): 257.8989 us. (n=7755)
-| shelf   /file | 187 | 299 | 6693 | 7550 | 9548 |
-nitro   /file(RunTime): 190.6568 us. (n=10491)
-| nitro   /file | 120 | 213 | 2436 | 3230 | 25346 |
-go      /file(RunTime): 163.4417 us. (n=12237)
-| go      /file | 94 | 139 | 2467 | 4417 | 25523 |
-node    /file(RunTime): 162.3392 us. (n=12320)
-| node    /file | 94 | 150 | 2381 | 3530 | 25738 |
-dart:io POST /echo 4k(RunTime): 93.5902 us. (n=21370)
-| dart:io POST /echo 4k | 90 | 135 | 2526 | 3239 | 25287 |
-shelf   POST /echo 4k(RunTime): 106.7897 us. (n=18729)
-| shelf   POST /echo 4k | 103 | 152 | 3295 | 3972 | 19373 |
-nitro   POST /echo 4k(RunTime): 102.1322 us. (n=19583)
-| nitro   POST /echo 4k | 98 | 152 | 1127 | 2240 | 51858 |
-go      POST /echo 4k(RunTime): 93.6284 us. (n=21362)
-| go      POST /echo 4k | 91 | 152 | 1208 | 2952 | 48519 |
-node    POST /echo 4k(RunTime): 94.0166 us. (n=21273)
-| node    POST /echo 4k | 90 | 132 | 1135 | 2741 | 50848 |
-dart:io POST /echo 1m(RunTime): 3740.1178 us. (n=535)
-| dart:io POST /echo 1m | 3463 | 6118 | 118101 | 147580 | 599 |
-shelf   POST /echo 1m(RunTime): 3405.8690 us. (n=588)
-| shelf   POST /echo 1m | 2935 | 5560 | 91770 | 108621 | 798 |
-nitro   POST /echo 1m(RunTime): 3600.5306 us. (n=556)
-| nitro   POST /echo 1m | 3032 | 5985 | 71714 | 105994 | 968 |
-go      POST /echo 1m(RunTime): 2996.0629 us. (n=668)
-| go      POST /echo 1m | 2674 | 5497 | 62087 | 110746 | 1153 |
-node    POST /echo 1m(RunTime): 2859.2357 us. (n=700)
-| node    POST /echo 1m | 2551 | 4986 | 61623 | 108839 | 1156 |
-dart:io GET /events(RunTime): 105.3045 us. (n=18993)
-| dart:io GET /events | 102 | 160 | 3367 | 3912 | 18658 |
-shelf   GET /events(RunTime): 106.2862 us. (n=18818)
-| shelf   GET /events | 102 | 156 | 3091 | 3696 | 20363 |
-nitro   GET /events(RunTime): 89.1510 us. (n=22434)
-| nitro   GET /events | 86 | 129 | 5635 | 6595 | 11410 |
-go      GET /events(RunTime): 122.1439 us. (n=16375)
-| go      GET /events | 116 | 191 | 1988 | 11234 | 25455 |
-node    GET /events(RunTime): 90.8277 us. (n=22020)
-| node    GET /events | 88 | 124 | 1051 | 2824 | 54553 |
-dart:io WS /ws 128B(RunTime): 55.6456 us. (n=35942)
-| dart:io WS /ws 128B | 53 | 91 | 1567 | 2333 | 42040 |
-nitro   WS /ws 128B(RunTime): 64.1871 us. (n=31159)
-| nitro   WS /ws 128B | 61 | 94 | 707 | 1948 | 87200 |
-dart:io WS /ws 4k(RunTime): 62.2288 us. (n=32140)
-| dart:io WS /ws 4k | 55 | 93 | 1643 | 2209 | 38945 |
-nitro   WS /ws 4k(RunTime): 73.4665 us. (n=27224)
-| nitro   WS /ws 4k | 66 | 107 | 1104 | 1815 | 56968 |
-dart:io WS /ws 4k deflate(RunTime): 103.4369 us. (n=19336)
-| dart:io WS /ws 4k deflate | 99 | 159 | 3264 | 3892 | 19617 |
-nitro   WS /ws 4k deflate(RunTime): 114.7928 us. (n=17423)
-| nitro   WS /ws 4k deflate | 108 | 296 | 2970 | 5179 | 21524 |
+dart:io /hello(RunTime): 76.7977 us. (n=26043)
+| dart:io /hello | 72 | 126 | 2046 | 2714 | 30459 |
+shelf   /hello(RunTime): 91.6551 us. (n=21821)
+| shelf   /hello | 86 | 145 | 2877 | 3518 | 21849 |
+nitro   /hello(RunTime): 86.4381 us. (n=23138)
+| nitro   /hello | 83 | 132 | 831 | 1694 | 70828 |
+go      /hello(RunTime): 78.2646 us. (n=25555)
+| go      /hello | 77 | 119 | 859 | 2014 | 67986 |
+node    /hello(RunTime): 77.1974 us. (n=25908)
+| node    /hello | 74 | 116 | 837 | 2316 | 67059 |
+dart:io /json(RunTime): 75.3912 us. (n=26529)
+| dart:io /json | 71 | 120 | 2046 | 2667 | 30535 |
+shelf   /json(RunTime): 90.8312 us. (n=22019)
+| shelf   /json | 86 | 142 | 2879 | 3511 | 21857 |
+nitro   /json(RunTime): 86.4779 us. (n=23128)
+| nitro   /json | 83 | 134 | 829 | 1661 | 71241 |
+go      /json(RunTime): 78.5982 us. (n=25446)
+| go      /json | 77 | 125 | 858 | 2027 | 67923 |
+node    /json(RunTime): 75.7105 us. (n=26417)
+| node    /json | 72 | 109 | 853 | 2254 | 66518 |
+dart:io /users/:id(RunTime): 75.9693 us. (n=26327)
+| dart:io /users/:id | 72 | 123 | 2048 | 2643 | 30565 |
+shelf   /users/:id(RunTime): 91.3736 us. (n=21889)
+| shelf   /users/:id | 86 | 143 | 2911 | 3527 | 21626 |
+nitro   /users/:id(RunTime): 87.3641 us. (n=22894)
+| nitro   /users/:id | 84 | 134 | 835 | 1754 | 70191 |
+go      /users/:id(RunTime): 78.5646 us. (n=25457)
+| go      /users/:id | 77 | 125 | 849 | 1987 | 68816 |
+node    /users/:id(RunTime): 76.5925 us. (n=26113)
+| node    /users/:id | 73 | 118 | 883 | 3454 | 60420 |
+dart:io /files/*(RunTime): 75.8889 us. (n=26355)
+| dart:io /files/* | 72 | 122 | 2060 | 2662 | 30370 |
+shelf   /files/*(RunTime): 93.2600 us. (n=21446)
+| shelf   /files/* | 87 | 156 | 2942 | 3957 | 21274 |
+nitro   /files/*(RunTime): 86.2873 us. (n=23179)
+| nitro   /files/* | 83 | 133 | 825 | 1646 | 71797 |
+go      /files/*(RunTime): 78.5111 us. (n=25475)
+| go      /files/* | 77 | 119 | 848 | 2124 | 67986 |
+node    /files/*(RunTime): 76.2811 us. (n=26219)
+| node    /files/* | 73 | 112 | 844 | 2327 | 66836 |
+dart:io /q?a=1&b=two(RunTime): 77.9359 us. (n=25663)
+| dart:io /q?a=1&b=two | 74 | 122 | 2144 | 2774 | 29207 |
+shelf   /q?a=1&b=two(RunTime): 93.7328 us. (n=21338)
+| shelf   /q?a=1&b=two | 88 | 148 | 2946 | 3583 | 21355 |
+nitro   /q?a=1&b=two(RunTime): 87.5612 us. (n=22842)
+| nitro   /q?a=1&b=two | 84 | 134 | 834 | 1670 | 70802 |
+go      /q?a=1&b=two(RunTime): 78.5664 us. (n=25457)
+| go      /q?a=1&b=two | 77 | 120 | 861 | 2023 | 67753 |
+node    /q?a=1&b=two(RunTime): 76.9257 us. (n=26000)
+| node    /q?a=1&b=two | 74 | 111 | 873 | 2607 | 63742 |
+dart:io /mw(RunTime): 87.5970 us. (n=22832)
+| dart:io /mw | 80 | 183 | 2041 | 3327 | 29821 |
+shelf   /mw(RunTime): 94.7510 us. (n=21108)
+| shelf   /mw | 89 | 155 | 2879 | 3518 | 21867 |
+nitro   /mw(RunTime): 86.1260 us. (n=23222)
+| nitro   /mw | 83 | 132 | 839 | 1655 | 71223 |
+go      /mw(RunTime): 82.7678 us. (n=24164)
+| go      /mw | 80 | 142 | 876 | 2346 | 63873 |
+node    /mw(RunTime): 77.4626 us. (n=25819)
+| node    /mw | 74 | 123 | 861 | 2577 | 64703 |
+dart:io /static(RunTime): 77.4663 us. (n=25818)
+| dart:io /static | 72 | 129 | 2044 | 2657 | 30630 |
+shelf   /static(RunTime): 95.8689 us. (n=20862)
+| shelf   /static | 89 | 160 | 2901 | 3564 | 21735 |
+nitro   /static(RunTime): 59.7521 us. (n=33472)
+| nitro   /static | 55 | 99 | 736 | 1328 | 81865 |
+go      /static(RunTime): 81.6620 us. (n=24492)
+| go      /static | 79 | 134 | 860 | 2278 | 66439 |
+node    /static(RunTime): 82.0198 us. (n=24385)
+| node    /static | 78 | 133 | 910 | 2890 | 60904 |
+dart:io /work(RunTime): 366.4907 us. (n=5458)
+| dart:io /work | 347 | 509 | 16428 | 17361 | 3882 |
+shelf   /work(RunTime): 370.3412 us. (n=5401)
+| shelf   /work | 361 | 502 | 17291 | 18132 | 3691 |
+nitro   /work(RunTime): 169.4276 us. (n=11805)
+| nitro   /work | 149 | 250 | 4927 | 5724 | 12808 |
+go      /work(RunTime): 95.4707 us. (n=20949)
+| go      /work | 80 | 145 | 1191 | 2797 | 49370 |
+node    /work(RunTime): 95.2171 us. (n=21005)
+| node    /work | 78 | 145 | 1152 | 3023 | 49065 |
+dart:io /file(RunTime): 260.5599 us. (n=7676)
+| dart:io /file | 183 | 332 | 6220 | 7929 | 10154 |
+shelf   /file(RunTime): 280.9896 us. (n=7118)
+| shelf   /file | 198 | 358 | 6943 | 8018 | 9129 |
+nitro   /file(RunTime): 209.0233 us. (n=9569)
+| nitro   /file | 129 | 242 | 2541 | 4004 | 23933 |
+go      /file(RunTime): 170.2501 us. (n=11748)
+| go      /file | 99 | 176 | 2508 | 5003 | 24351 |
+node    /file(RunTime): 176.8189 us. (n=11324)
+| node    /file | 101 | 219 | 2515 | 6450 | 22450 |
+dart:io POST /echo 4k(RunTime): 122.1481 us. (n=16374)
+| dart:io POST /echo 4k | 108 | 272 | 2509 | 3270 | 24935 |
+shelf   POST /echo 4k(RunTime): 112.1031 us. (n=17841)
+| shelf   POST /echo 4k | 106 | 185 | 3414 | 4375 | 18758 |
+nitro   POST /echo 4k(RunTime): 115.0036 us. (n=17391)
+| nitro   POST /echo 4k | 106 | 212 | 1145 | 2626 | 50127 |
+go      POST /echo 4k(RunTime): 99.0734 us. (n=20188)
+| go      POST /echo 4k | 93 | 180 | 1204 | 4175 | 44672 |
+node    POST /echo 4k(RunTime): 98.7264 us. (n=20259)
+| node    POST /echo 4k | 92 | 171 | 1115 | 4552 | 46116 |
+dart:io POST /echo 1m(RunTime): 3894.8580 us. (n=514)
+| dart:io POST /echo 1m | 3571 | 6968 | 132552 | 150379 | 554 |
+shelf   POST /echo 1m(RunTime): 3707.7296 us. (n=540)
+| shelf   POST /echo 1m | 3096 | 7172 | 93451 | 113224 | 748 |
+nitro   POST /echo 1m(RunTime): 3767.2806 us. (n=531)
+| nitro   POST /echo 1m | 3120 | 6399 | 74522 | 128023 | 900 |
+go      POST /echo 1m(RunTime): 3145.5236 us. (n=636)
+| go      POST /echo 1m | 2822 | 5800 | 65090 | 108068 | 1089 |
+node    POST /echo 1m(RunTime): 3087.5756 us. (n=648)
+| node    POST /echo 1m | 2678 | 6297 | 65350 | 122542 | 1059 |
+dart:io GET /events(RunTime): 123.5528 us. (n=16188)
+| dart:io GET /events | 119 | 203 | 3624 | 4508 | 17516 |
+shelf   GET /events(RunTime): 110.4305 us. (n=18111)
+| shelf   GET /events | 104 | 190 | 3253 | 4116 | 19289 |
+nitro   GET /events(RunTime): 109.4326 us. (n=18277)
+| nitro   GET /events | 107 | 172 | 5756 | 7271 | 11142 |
+go      GET /events(RunTime): 127.9511 us. (n=15631)
+| go      GET /events | 121 | 218 | 1965 | 14111 | 24207 |
+node    GET /events(RunTime): 96.7596 us. (n=20670)
+| node    GET /events | 93 | 145 | 1089 | 3514 | 51264 |
+dart:io WS /ws 128B(RunTime): 59.1070 us. (n=33837)
+| dart:io WS /ws 128B | 55 | 106 | 1579 | 2478 | 40928 |
+nitro   WS /ws 128B(RunTime): 69.8033 us. (n=28652)
+| nitro   WS /ws 128B | 64 | 130 | 718 | 1977 | 85108 |
+dart:io WS /ws 4k(RunTime): 66.1750 us. (n=30223)
+| dart:io WS /ws 4k | 58 | 111 | 1700 | 2336 | 37548 |
+nitro   WS /ws 4k(RunTime): 77.8426 us. (n=25693)
+| nitro   WS /ws 4k | 69 | 128 | 1112 | 1829 | 56222 |
+dart:io WS /ws 4k deflate(RunTime): 112.2195 us. (n=17823)
+| dart:io WS /ws 4k deflate | 103 | 179 | 3349 | 4055 | 19038 |
+nitro   WS /ws 4k deflate(RunTime): 122.9133 us. (n=16272)
+| nitro   WS /ws 4k deflate | 112 | 333 | 2986 | 5568 | 21271 |
+
+
+=== SUMMARY (median of 2 rounds, load latency µs; loss = req/s below the fastest server for that case) ===
+| case | server | p50 | p90 | p95 | p99 | req/s | loss% |
+| ---- | ------ | --- | --- | --- | --- | ----- | ----- |
+| /hello | dart:io | 2030 | 2401 | 2503 | 2790 | 30529 | 57.1 |
+| /hello | shelf | 2884 | 3274 | 3397 | 3702 | 21670 | 69.5 |
+| /hello | nitro | 831 | 1213 | 1358 | 1684 | 71145 | 0.0 |
+| /hello | go | 848 | 1500 | 1779 | 2641 | 65753 | 7.6 |
+| /hello | node | 834 | 1676 | 2110 | 3691 | 62221 | 12.5 |
+| /json | dart:io | 2015 | 2374 | 2481 | 2643 | 30975 | 56.7 |
+| /json | shelf | 2845 | 3207 | 3303 | 3485 | 22076 | 69.2 |
+| /json | nitro | 828 | 1196 | 1332 | 1635 | 71568 | 0.0 |
+| /json | go | 865 | 1482 | 1721 | 2461 | 65618 | 8.3 |
+| /json | node | 836 | 1477 | 1721 | 2442 | 66868 | 6.6 |
+| /users/:id | dart:io | 2016 | 2367 | 2480 | 2702 | 30910 | 56.0 |
+| /users/:id | shelf | 2889 | 3261 | 3377 | 3744 | 21678 | 69.1 |
+| /users/:id | nitro | 834 | 1242 | 1396 | 1763 | 70217 | 0.0 |
+| /users/:id | go | 858 | 1412 | 1609 | 2048 | 67782 | 3.5 |
+| /users/:id | node | 859 | 1538 | 1821 | 2769 | 64544 | 8.1 |
+| /files/* | dart:io | 2037 | 2400 | 2513 | 2690 | 30614 | 57.1 |
+| /files/* | shelf | 2916 | 3312 | 3423 | 3763 | 21489 | 69.9 |
+| /files/* | nitro | 828 | 1211 | 1347 | 1659 | 71361 | 0.0 |
+| /files/* | go | 821 | 1404 | 1629 | 2141 | 69542 | 2.5 |
+| /files/* | node | 823 | 1473 | 1723 | 2424 | 67695 | 5.1 |
+| /q?a=1&b=two | dart:io | 2116 | 2472 | 2578 | 2736 | 29528 | 58.6 |
+| /q?a=1&b=two | shelf | 2944 | 3308 | 3414 | 3590 | 21351 | 70.1 |
+| /q?a=1&b=two | nitro | 827 | 1209 | 1344 | 1653 | 71402 | 0.0 |
+| /q?a=1&b=two | go | 852 | 1432 | 1647 | 2167 | 67367 | 5.7 |
+| /q?a=1&b=two | node | 856 | 1520 | 1766 | 2673 | 64705 | 9.4 |
+| /mw | dart:io | 2019 | 2392 | 2518 | 2992 | 30517 | 57.3 |
+| /mw | shelf | 2840 | 3205 | 3302 | 3485 | 22148 | 69.0 |
+| /mw | nitro | 831 | 1205 | 1347 | 1671 | 71418 | 0.0 |
+| /mw | go | 849 | 1459 | 1698 | 2345 | 65885 | 7.7 |
+| /mw | node | 841 | 1488 | 1738 | 2448 | 66523 | 6.9 |
+| /static | dart:io | 2017 | 2366 | 2473 | 2616 | 30996 | 61.3 |
+| /static | shelf | 2868 | 3239 | 3347 | 3589 | 21910 | 72.6 |
+| /static | nitro | 737 | 1026 | 1150 | 1386 | 80058 | 0.0 |
+| /static | go | 865 | 1469 | 1686 | 2200 | 66532 | 16.9 |
+| /static | node | 865 | 1524 | 1777 | 2544 | 64963 | 18.9 |
+| /work | dart:io | 16388 | 16690 | 16826 | 17267 | 3894 | 92.3 |
+| /work | shelf | 17255 | 17603 | 17760 | 20987 | 3694 | 92.7 |
+| /work | nitro | 4922 | 5250 | 5349 | 5645 | 12853 | 74.7 |
+| /work | go | 1165 | 1846 | 2107 | 2744 | 50373 | 1.0 |
+| /work | node | 1128 | 1788 | 2047 | 2685 | 50881 | 0.0 |
+| /file | dart:io | 6133 | 6610 | 6773 | 7331 | 10349 | 57.9 |
+| /file | shelf | 6838 | 7367 | 7615 | 8134 | 9257 | 62.4 |
+| /file | nitro | 2502 | 3015 | 3222 | 3784 | 24393 | 0.9 |
+| /file | go | 2503 | 3348 | 3746 | 4828 | 24604 | 0.0 |
+| /file | node | 2446 | 3317 | 3774 | 5194 | 23968 | 2.6 |
+| POST /echo 4k | dart:io | 2508 | 2957 | 3060 | 3288 | 25004 | 50.1 |
+| POST /echo 4k | shelf | 3400 | 3864 | 3980 | 4233 | 18938 | 62.2 |
+| POST /echo 4k | nitro | 1151 | 1756 | 1964 | 2580 | 50059 | 0.0 |
+| POST /echo 4k | go | 1213 | 2248 | 2630 | 3611 | 46173 | 7.8 |
+| POST /echo 4k | node | 1132 | 2115 | 2581 | 3948 | 47242 | 5.6 |
+| POST /echo 1m | dart:io | 127003 | 138814 | 141530 | 148558 | 570 | 35.7 |
+| POST /echo 1m | shelf | 133897 | 155020 | 159833 | 168860 | 588 | 33.7 |
+| POST /echo 1m | nitro | 93445 | 123637 | 134806 | 163541 | 745 | 16.0 |
+| POST /echo 1m | go | 82763 | 109351 | 118481 | 144595 | 886 | 0.0 |
+| POST /echo 1m | node | 84613 | 116704 | 127199 | 162655 | 861 | 2.9 |
+| GET /events | dart:io | 3762 | 5493 | 6137 | 7465 | 15808 | 60.8 |
+| GET /events | shelf | 3496 | 5367 | 5930 | 7145 | 16870 | 58.1 |
+| GET /events | nitro | 5840 | 7171 | 8057 | 10117 | 10646 | 73.6 |
+| GET /events | go | 2141 | 5905 | 8415 | 18162 | 21367 | 47.0 |
+| GET /events | node | 1205 | 3257 | 4523 | 9119 | 40308 | 0.0 |
+| WS /ws 128B | dart:io | 1577 | 1757 | 1847 | 2485 | 40869 | 51.9 |
+| WS /ws 128B | nitro | 715 | 893 | 975 | 1933 | 85026 | 0.0 |
+| WS /ws 4k | dart:io | 1690 | 1889 | 2047 | 2308 | 37761 | 31.8 |
+| WS /ws 4k | nitro | 1113 | 1392 | 1515 | 1848 | 55344 | 0.0 |
+| WS /ws 4k deflate | dart:io | 3315 | 3663 | 3785 | 3983 | 19127 | 9.9 |
+| WS /ws 4k deflate | nitro | 2981 | 3379 | 3572 | 5501 | 21220 | 0.0 |
 
 Load: 64 connections / 4 client isolates, 3 s per case. Sequential: harness ~2 s per case, one connection.
 
@@ -293,272 +364,343 @@ Sequential latency via package:benchmark_harness (AsyncBenchmarkBase, ~2 s per c
 
 | case | seq p50 µs | seq p99 µs | load p50 µs | load p99 µs | req/s @64 |
 | ---- | ---------- | ---------- | ----------- | ----------- | --- |
-dart:io /hello(RunTime): 69.3602 us. (n=28835)
-| dart:io /hello | 66 | 115 | 2071 | 2364 | 31790 |
-shelf   /hello(RunTime): 81.2155 us. (n=24626)
-| shelf   /hello | 78 | 129 | 2756 | 3047 | 23617 |
-nitro   /hello(RunTime): 79.6528 us. (n=25109)
-| nitro   /hello | 77 | 112 | 870 | 1582 | 68317 |
-go      /hello(RunTime): 73.0673 us. (n=27373)
-| go      /hello | 72 | 111 | 877 | 1999 | 67232 |
-node    /hello(RunTime): 72.0046 us. (n=27777)
-| node    /hello | 69 | 106 | 918 | 2272 | 63174 |
-dart:io /json(RunTime): 68.3484 us. (n=29262)
-| dart:io /json | 65 | 111 | 2070 | 2349 | 31879 |
-shelf   /json(RunTime): 81.3723 us. (n=24579)
-| shelf   /json | 78 | 132 | 2759 | 3054 | 23573 |
-nitro   /json(RunTime): 80.8127 us. (n=24749)
-| nitro   /json | 78 | 118 | 870 | 1569 | 68400 |
-go      /json(RunTime): 72.8826 us. (n=27442)
-| go      /json | 72 | 108 | 893 | 1994 | 66049 |
-node    /json(RunTime): 72.1377 us. (n=27725)
-| node    /json | 69 | 106 | 883 | 2064 | 66366 |
-dart:io /users/:id(RunTime): 68.7286 us. (n=29101)
-| dart:io /users/:id | 66 | 113 | 2084 | 2372 | 31591 |
-shelf   /users/:id(RunTime): 82.0413 us. (n=24379)
-| shelf   /users/:id | 78 | 130 | 2667 | 3260 | 23755 |
-nitro   /users/:id(RunTime): 80.5674 us. (n=24824)
-| nitro   /users/:id | 78 | 113 | 806 | 1502 | 74792 |
-go      /users/:id(RunTime): 72.6706 us. (n=27522)
-| go      /users/:id | 71 | 109 | 782 | 1890 | 73755 |
-node    /users/:id(RunTime): 71.9071 us. (n=27814)
-| node    /users/:id | 69 | 100 | 790 | 1892 | 72613 |
-dart:io /files/*(RunTime): 69.4995 us. (n=28778)
-| dart:io /files/* | 66 | 105 | 1894 | 2477 | 32985 |
-shelf   /files/*(RunTime): 82.6194 us. (n=24208)
-| shelf   /files/* | 79 | 121 | 2613 | 3197 | 24046 |
-nitro   /files/*(RunTime): 80.3736 us. (n=24884)
-| nitro   /files/* | 78 | 112 | 791 | 1481 | 76131 |
-go      /files/*(RunTime): 78.6468 us. (n=25431)
-| go      /files/* | 71 | 112 | 779 | 1861 | 73954 |
-node    /files/*(RunTime): 72.0605 us. (n=27755)
-| node    /files/* | 69 | 101 | 776 | 1832 | 74194 |
-dart:io /q?a=1&b=two(RunTime): 71.0221 us. (n=28161)
-| dart:io /q?a=1&b=two | 68 | 109 | 1961 | 2543 | 31902 |
-shelf   /q?a=1&b=two(RunTime): 83.7941 us. (n=23869)
-| shelf   /q?a=1&b=two | 80 | 121 | 2661 | 3283 | 23597 |
-nitro   /q?a=1&b=two(RunTime): 81.3513 us. (n=24585)
-| nitro   /q?a=1&b=two | 79 | 116 | 788 | 1496 | 76254 |
-go      /q?a=1&b=two(RunTime): 73.3867 us. (n=27253)
-| go      /q?a=1&b=two | 72 | 108 | 781 | 1842 | 74207 |
-node    /q?a=1&b=two(RunTime): 73.8262 us. (n=27091)
-| node    /q?a=1&b=two | 71 | 103 | 804 | 2132 | 70311 |
-dart:io /mw(RunTime): 70.9504 us. (n=28189)
-| dart:io /mw | 67 | 116 | 1907 | 2615 | 32684 |
-shelf   /mw(RunTime): 88.9039 us. (n=22497)
-| shelf   /mw | 82 | 154 | 2581 | 3305 | 23655 |
-nitro   /mw(RunTime): 86.9578 us. (n=23000)
-| nitro   /mw | 82 | 151 | 800 | 1548 | 74955 |
-go      /mw(RunTime): 73.4464 us. (n=27231)
-| go      /mw | 72 | 107 | 778 | 1880 | 74232 |
-node    /mw(RunTime): 71.4779 us. (n=27981)
-| node    /mw | 69 | 98 | 755 | 1783 | 75815 |
-dart:io /static(RunTime): 69.1867 us. (n=28908)
-| dart:io /static | 66 | 103 | 1880 | 2480 | 33208 |
-shelf   /static(RunTime): 81.9394 us. (n=24409)
-| shelf   /static | 79 | 116 | 2553 | 3194 | 24565 |
-nitro   /static(RunTime): 53.7280 us. (n=37225)
-| nitro   /static | 51 | 83 | 684 | 1281 | 87690 |
-go      /static(RunTime): 73.2402 us. (n=27308)
-| go      /static | 72 | 105 | 790 | 1879 | 73344 |
-node    /static(RunTime): 72.3130 us. (n=27658)
-| node    /static | 69 | 104 | 771 | 1784 | 75240 |
-dart:io /work(RunTime): 404.2474 us. (n=4948)
-| dart:io /work | 369 | 451 | 18195 | 18677 | 3511 |
-shelf   /work(RunTime): 438.1225 us. (n=4565)
-| shelf   /work | 388 | 529 | 18831 | 19776 | 3389 |
-nitro   /work(RunTime): 190.5129 us. (n=10499)
-| nitro   /work | 147 | 231 | 4909 | 5509 | 12809 |
-go      /work(RunTime): 117.2368 us. (n=17060)
-| go      /work | 75 | 125 | 1466 | 2925 | 40738 |
-node    /work(RunTime): 123.9510 us. (n=16136)
-| node    /work | 75 | 146 | 1439 | 2926 | 40372 |
-dart:io /file(RunTime): 402.1737 us. (n=4973)
-| dart:io /file | 191 | 354 | 5902 | 8554 | 10264 |
-shelf   /file(RunTime): 422.6250 us. (n=4733)
-| shelf   /file | 210 | 381 | 6228 | 7564 | 9927 |
-nitro   /file(RunTime): 351.2726 us. (n=5694)
-| nitro   /file | 160 | 266 | 4281 | 5017 | 14211 |
-go      /file(RunTime): 305.4973 us. (n=6547)
-| go      /file | 113 | 164 | 4328 | 5934 | 13910 |
-node    /file(RunTime): 327.6704 us. (n=6104)
-| node    /file | 118 | 261 | 4351 | 5675 | 13808 |
-dart:io POST /echo 4k(RunTime): 141.2881 us. (n=14156)
-| dart:io POST /echo 4k | 135 | 218 | 2409 | 5847 | 24616 |
-shelf   POST /echo 4k(RunTime): 161.6068 us. (n=12376)
-| shelf   POST /echo 4k | 152 | 270 | 2962 | 3756 | 21102 |
-nitro   POST /echo 4k(RunTime): 155.9930 us. (n=12822)
-| nitro   POST /echo 4k | 146 | 255 | 1931 | 3868 | 30558 |
-go      POST /echo 4k(RunTime): 145.8991 us. (n=13709)
-| go      POST /echo 4k | 138 | 233 | 1978 | 4664 | 29822 |
-node    POST /echo 4k(RunTime): 148.7709 us. (n=13444)
-| node    POST /echo 4k | 141 | 231 | 1909 | 5040 | 29868 |
-dart:io POST /echo 1m(RunTime): 14902.9407 us. (n=135)
-| dart:io POST /echo 1m | 14841 | 15756 | 285856 | 473257 | 237 |
-shelf   POST /echo 1m(RunTime): 14678.7445 us. (n=137)
-| shelf   POST /echo 1m | 14634 | 15724 | 254617 | 474883 | 257 |
-nitro   POST /echo 1m(RunTime): 14945.6567 us. (n=134)
-| nitro   POST /echo 1m | 14907 | 15674 | 260211 | 448076 | 259 |
-go      POST /echo 1m(RunTime): 14392.7482 us. (n=139)
-| go      POST /echo 1m | 14314 | 15681 | 247885 | 739817 | 258 |
-node    POST /echo 1m(RunTime): 14248.6383 us. (n=141)
-| node    POST /echo 1m | 14184 | 14937 | 258062 | 498441 | 258 |
-dart:io GET /events(RunTime): 105.2418 us. (n=19004)
-| dart:io GET /events | 101 | 180 | 3353 | 6797 | 17925 |
-shelf   GET /events(RunTime): 95.4544 us. (n=20953)
-| shelf   GET /events | 90 | 167 | 2903 | 3735 | 21546 |
-nitro   GET /events(RunTime): 92.1405 us. (n=21706)
-| nitro   GET /events | 84 | 167 | 5558 | 9012 | 11192 |
-go      GET /events(RunTime): 121.8821 us. (n=16410)
-| go      GET /events | 116 | 191 | 1844 | 12415 | 25800 |
-node    GET /events(RunTime): 98.4929 us. (n=20307)
-| node    GET /events | 91 | 172 | 1000 | 4848 | 51239 |
-dart:io WS /ws 128B(RunTime): 53.5065 us. (n=37379)
-| dart:io WS /ws 128B | 51 | 83 | 1502 | 2544 | 41697 |
-nitro   WS /ws 128B(RunTime): 64.6022 us. (n=30959)
-| nitro   WS /ws 128B | 60 | 124 | 717 | 1827 | 84493 |
-dart:io WS /ws 4k(RunTime): 73.5323 us. (n=27199)
-| dart:io WS /ws 4k | 54 | 115 | 1538 | 2106 | 40722 |
-nitro   WS /ws 4k(RunTime): 91.5818 us. (n=21839)
-| nitro   WS /ws 4k | 68 | 172 | 1069 | 1801 | 57439 |
-dart:io WS /ws 4k deflate(RunTime): 101.8316 us. (n=19641)
-| dart:io WS /ws 4k deflate | 98 | 152 | 3162 | 3986 | 19865 |
-nitro   WS /ws 4k deflate(RunTime): 119.3474 us. (n=16758)
-| nitro   WS /ws 4k deflate | 110 | 302 | 2872 | 4127 | 22209 |
+dart:io /hello(RunTime): 75.7049 us. (n=26419)
+| dart:io /hello | 70 | 144 | 2063 | 2439 | 31808 |
+shelf   /hello(RunTime): 88.5787 us. (n=22579)
+| shelf   /hello | 83 | 156 | 2783 | 3108 | 23364 |
+nitro   /hello(RunTime): 84.8175 us. (n=23581)
+| nitro   /hello | 80 | 141 | 887 | 1713 | 67318 |
+go      /hello(RunTime): 77.0457 us. (n=25959)
+| go      /hello | 75 | 133 | 884 | 2200 | 65860 |
+node    /hello(RunTime): 74.8363 us. (n=26725)
+| node    /hello | 72 | 123 | 932 | 3230 | 59680 |
+dart:io /json(RunTime): 72.9858 us. (n=27403)
+| dart:io /json | 68 | 128 | 2067 | 2457 | 31746 |
+shelf   /json(RunTime): 86.8364 us. (n=23032)
+| shelf   /json | 81 | 155 | 2826 | 4810 | 21986 |
+nitro   /json(RunTime): 84.1800 us. (n=23759)
+| nitro   /json | 80 | 136 | 878 | 1744 | 67484 |
+go      /json(RunTime): 80.7940 us. (n=24755)
+| go      /json | 78 | 147 | 927 | 2551 | 61761 |
+node    /json(RunTime): 79.4454 us. (n=25175)
+| node    /json | 74 | 138 | 952 | 3126 | 58934 |
+dart:io /users/:id(RunTime): 78.8621 us. (n=25361)
+| dart:io /users/:id | 71 | 154 | 2093 | 2620 | 30949 |
+shelf   /users/:id(RunTime): 94.2001 us. (n=21232)
+| shelf   /users/:id | 86 | 174 | 2859 | 3427 | 22423 |
+nitro   /users/:id(RunTime): 83.4487 us. (n=23967)
+| nitro   /users/:id | 80 | 137 | 917 | 1802 | 66143 |
+go      /users/:id(RunTime): 76.4286 us. (n=26169)
+| go      /users/:id | 74 | 125 | 885 | 2157 | 65881 |
+node    /users/:id(RunTime): 74.5665 us. (n=26822)
+| node    /users/:id | 71 | 118 | 893 | 2513 | 63675 |
+dart:io /files/*(RunTime): 74.8796 us. (n=26710)
+| dart:io /files/* | 70 | 136 | 2077 | 2490 | 31585 |
+shelf   /files/*(RunTime): 90.2741 us. (n=22155)
+| shelf   /files/* | 83 | 157 | 2884 | 3301 | 22442 |
+nitro   /files/*(RunTime): 85.6236 us. (n=23359)
+| nitro   /files/* | 81 | 145 | 888 | 1759 | 67469 |
+go      /files/*(RunTime): 76.4951 us. (n=26146)
+| go      /files/* | 74 | 128 | 907 | 2238 | 64393 |
+node    /files/*(RunTime): 74.7921 us. (n=26742)
+| node    /files/* | 72 | 120 | 895 | 2230 | 64922 |
+dart:io /q?a=1&b=two(RunTime): 74.5119 us. (n=26842)
+| dart:io /q?a=1&b=two | 70 | 131 | 2139 | 2498 | 30686 |
+shelf   /q?a=1&b=two(RunTime): 88.0575 us. (n=22713)
+| shelf   /q?a=1&b=two | 83 | 150 | 2895 | 3288 | 22358 |
+nitro   /q?a=1&b=two(RunTime): 84.1716 us. (n=23762)
+| nitro   /q?a=1&b=two | 80 | 137 | 895 | 1782 | 66952 |
+go      /q?a=1&b=two(RunTime): 77.5542 us. (n=25789)
+| go      /q?a=1&b=two | 75 | 131 | 911 | 2424 | 63498 |
+node    /q?a=1&b=two(RunTime): 78.1751 us. (n=25584)
+| node    /q?a=1&b=two | 74 | 132 | 924 | 2631 | 61401 |
+dart:io /mw(RunTime): 72.7987 us. (n=27473)
+| dart:io /mw | 68 | 131 | 2059 | 2438 | 31957 |
+shelf   /mw(RunTime): 88.3124 us. (n=22647)
+| shelf   /mw | 82 | 154 | 2806 | 3286 | 23054 |
+nitro   /mw(RunTime): 85.4195 us. (n=23414)
+| nitro   /mw | 81 | 143 | 875 | 1717 | 68182 |
+go      /mw(RunTime): 79.5001 us. (n=25158)
+| go      /mw | 76 | 140 | 900 | 2224 | 64852 |
+node    /mw(RunTime): 74.8298 us. (n=26728)
+| node    /mw | 71 | 119 | 869 | 2464 | 65488 |
+dart:io /static(RunTime): 75.5433 us. (n=26475)
+| dart:io /static | 70 | 140 | 2074 | 2519 | 31418 |
+shelf   /static(RunTime): 89.2082 us. (n=22420)
+| shelf   /static | 83 | 164 | 2678 | 3292 | 23623 |
+nitro   /static(RunTime): 57.5983 us. (n=34724)
+| nitro   /static | 53 | 102 | 679 | 1416 | 86569 |
+go      /static(RunTime): 76.6033 us. (n=26109)
+| go      /static | 74 | 123 | 794 | 2033 | 71647 |
+node    /static(RunTime): 77.1135 us. (n=25936)
+| node    /static | 73 | 123 | 785 | 2264 | 70475 |
+dart:io /work(RunTime): 415.8852 us. (n=4810)
+| dart:io /work | 377 | 492 | 18141 | 19143 | 3518 |
+shelf   /work(RunTime): 442.9092 us. (n=4516)
+| shelf   /work | 396 | 524 | 18820 | 36773 | 3347 |
+nitro   /work(RunTime): 192.5028 us. (n=10390)
+| nitro   /work | 148 | 245 | 4897 | 5498 | 12854 |
+go      /work(RunTime): 115.2217 us. (n=17358)
+| go      /work | 76 | 130 | 1434 | 3158 | 40778 |
+node    /work(RunTime): 113.5454 us. (n=17615)
+| node    /work | 73 | 128 | 1387 | 3009 | 41269 |
+dart:io /file(RunTime): 383.4617 us. (n=5216)
+| dart:io /file | 193 | 340 | 5899 | 8690 | 10267 |
+shelf   /file(RunTime): 393.2556 us. (n=5086)
+| shelf   /file | 206 | 339 | 6591 | 8541 | 9309 |
+nitro   /file(RunTime): 349.2969 us. (n=5726)
+| nitro   /file | 173 | 289 | 4115 | 5879 | 14516 |
+go      /file(RunTime): 294.5813 us. (n=6790)
+| go      /file | 112 | 193 | 4149 | 7526 | 14042 |
+node    /file(RunTime): 301.3610 us. (n=6637)
+| node    /file | 120 | 214 | 4087 | 5529 | 14710 |
+dart:io POST /echo 4k(RunTime): 142.1269 us. (n=14073)
+| dart:io POST /echo 4k | 136 | 213 | 2248 | 3093 | 27481 |
+shelf   POST /echo 4k(RunTime): 154.0196 us. (n=12986)
+| shelf   POST /echo 4k | 148 | 227 | 2990 | 3808 | 20884 |
+nitro   POST /echo 4k(RunTime): 151.5675 us. (n=13196)
+| nitro   POST /echo 4k | 145 | 231 | 1789 | 3070 | 33390 |
+go      POST /echo 4k(RunTime): 139.5551 us. (n=14332)
+| go      POST /echo 4k | 135 | 220 | 1860 | 5238 | 30090 |
+node    POST /echo 4k(RunTime): 146.6625 us. (n=13637)
+| node    POST /echo 4k | 138 | 244 | 2089 | 17020 | 20473 |
+dart:io POST /echo 1m(RunTime): 16159.1613 us. (n=124)
+| dart:io POST /echo 1m | 15530 | 24568 | 287387 | 544418 | 236 |
+shelf   POST /echo 1m(RunTime): 14910.9407 us. (n=135)
+| shelf   POST /echo 1m | 14874 | 15807 | 278857 | 504600 | 242 |
+nitro   POST /echo 1m(RunTime): 15960.2540 us. (n=126)
+| nitro   POST /echo 1m | 15239 | 41331 | 270404 | 553481 | 247 |
+go      POST /echo 1m(RunTime): 14666.8759 us. (n=137)
+| go      POST /echo 1m | 14547 | 16378 | 260242 | 834468 | 254 |
+node    POST /echo 1m(RunTime): 14558.9783 us. (n=138)
+| node    POST /echo 1m | 14406 | 17720 | 291461 | 468698 | 235 |
+dart:io GET /events(RunTime): 118.2186 us. (n=16918)
+| dart:io GET /events | 103 | 312 | 3314 | 7414 | 17863 |
+shelf   GET /events(RunTime): 110.1961 us. (n=18150)
+| shelf   GET /events | 95 | 233 | 2949 | 4151 | 21007 |
+nitro   GET /events(RunTime): 88.8359 us. (n=22514)
+| nitro   GET /events | 83 | 154 | 5472 | 6707 | 11773 |
+go      GET /events(RunTime): 127.9351 us. (n=15633)
+| go      GET /events | 120 | 213 | 1972 | 14687 | 24277 |
+node    GET /events(RunTime): 90.2946 us. (n=22150)
+| node    GET /events | 86 | 138 | 945 | 4341 | 53796 |
+dart:io WS /ws 128B(RunTime): 57.8012 us. (n=34602)
+| dart:io WS /ws 128B | 53 | 106 | 1464 | 2349 | 43944 |
+nitro   WS /ws 128B(RunTime): 66.2892 us. (n=30171)
+| nitro   WS /ws 128B | 61 | 117 | 796 | 4632 | 61158 |
+dart:io WS /ws 4k(RunTime): 74.1992 us. (n=26955)
+| dart:io WS /ws 4k | 55 | 112 | 1521 | 2129 | 41024 |
+nitro   WS /ws 4k(RunTime): 84.3750 us. (n=23704)
+| nitro   WS /ws 4k | 66 | 126 | 1097 | 2038 | 54863 |
+dart:io WS /ws 4k deflate(RunTime): 108.8624 us. (n=18372)
+| dart:io WS /ws 4k deflate | 102 | 169 | 3142 | 4196 | 19763 |
+nitro   WS /ws 4k deflate(RunTime): 139.5128 us. (n=14336)
+| nitro   WS /ws 4k deflate | 115 | 476 | 2894 | 4834 | 21768 |
 
 | case | seq p50 µs | seq p99 µs | load p50 µs | load p99 µs | req/s @64 |
 | ---- | ---------- | ---------- | ----------- | ----------- | --- |
-dart:io /hello(RunTime): 74.2753 us. (n=26927)
-| dart:io /hello | 69 | 129 | 1893 | 2556 | 32888 |
-shelf   /hello(RunTime): 88.6659 us. (n=22557)
-| shelf   /hello | 83 | 146 | 2564 | 3206 | 24413 |
-nitro   /hello(RunTime): 80.9129 us. (n=24718)
-| nitro   /hello | 78 | 111 | 794 | 1539 | 75510 |
-go      /hello(RunTime): 77.2552 us. (n=25889)
-| go      /hello | 75 | 124 | 800 | 2635 | 65891 |
-node    /hello(RunTime): 77.9319 us. (n=25664)
-| node    /hello | 74 | 133 | 792 | 2867 | 66846 |
-dart:io /json(RunTime): 69.1066 us. (n=28941)
-| dart:io /json | 66 | 105 | 1886 | 2596 | 32901 |
-shelf   /json(RunTime): 96.9373 us. (n=20632)
-| shelf   /json | 85 | 198 | 2586 | 3281 | 24207 |
-nitro   /json(RunTime): 81.4004 us. (n=24570)
-| nitro   /json | 78 | 118 | 792 | 1552 | 75259 |
-go      /json(RunTime): 74.2293 us. (n=26944)
-| go      /json | 72 | 108 | 788 | 1852 | 73671 |
-node    /json(RunTime): 73.9800 us. (n=27035)
-| node    /json | 69 | 100 | 771 | 1928 | 73527 |
-dart:io /users/:id(RunTime): 68.9013 us. (n=29028)
-| dart:io /users/:id | 66 | 104 | 1891 | 2516 | 32946 |
-shelf   /users/:id(RunTime): 82.4386 us. (n=24261)
-| shelf   /users/:id | 79 | 121 | 2589 | 3218 | 24196 |
-nitro   /users/:id(RunTime): 80.6845 us. (n=24788)
-| nitro   /users/:id | 78 | 112 | 795 | 1519 | 75602 |
-go      /users/:id(RunTime): 73.4163 us. (n=27242)
-| go      /users/:id | 72 | 107 | 768 | 1907 | 74622 |
-node    /users/:id(RunTime): 72.5606 us. (n=27564)
-| node    /users/:id | 70 | 101 | 775 | 1962 | 73479 |
-dart:io /files/*(RunTime): 69.4215 us. (n=28810)
-| dart:io /files/* | 67 | 102 | 1884 | 2503 | 33037 |
-shelf   /files/*(RunTime): 83.1090 us. (n=24065)
-| shelf   /files/* | 80 | 120 | 2622 | 3224 | 23936 |
-nitro   /files/*(RunTime): 80.5622 us. (n=24826)
-| nitro   /files/* | 78 | 113 | 786 | 1497 | 76508 |
-go      /files/*(RunTime): 74.4421 us. (n=26867)
-| go      /files/* | 73 | 111 | 784 | 2004 | 73040 |
-node    /files/*(RunTime): 72.2103 us. (n=27697)
-| node    /files/* | 69 | 101 | 771 | 1891 | 74114 |
-dart:io /q?a=1&b=two(RunTime): 70.9575 us. (n=28186)
-| dart:io /q?a=1&b=two | 68 | 108 | 1949 | 2581 | 31965 |
-shelf   /q?a=1&b=two(RunTime): 83.6577 us. (n=23907)
-| shelf   /q?a=1&b=two | 80 | 121 | 2635 | 3258 | 23770 |
-nitro   /q?a=1&b=two(RunTime): 81.6398 us. (n=24498)
-| nitro   /q?a=1&b=two | 79 | 117 | 785 | 1534 | 76236 |
-go      /q?a=1&b=two(RunTime): 74.0810 us. (n=26998)
-| go      /q?a=1&b=two | 73 | 108 | 786 | 1922 | 73336 |
-node    /q?a=1&b=two(RunTime): 73.4990 us. (n=27212)
-| node    /q?a=1&b=two | 71 | 102 | 776 | 1948 | 73206 |
-dart:io /mw(RunTime): 68.9549 us. (n=29005)
-| dart:io /mw | 66 | 101 | 1875 | 2518 | 33231 |
-shelf   /mw(RunTime): 82.7069 us. (n=24182)
-| shelf   /mw | 79 | 123 | 2589 | 3568 | 21934 |
-nitro   /mw(RunTime): 82.0603 us. (n=24373)
-| nitro   /mw | 79 | 128 | 789 | 1524 | 75985 |
-go      /mw(RunTime): 73.3286 us. (n=27275)
-| go      /mw | 72 | 108 | 777 | 1883 | 74464 |
-node    /mw(RunTime): 71.8004 us. (n=27856)
-| node    /mw | 69 | 98 | 764 | 1883 | 74505 |
-dart:io /static(RunTime): 69.3923 us. (n=28822)
-| dart:io /static | 66 | 105 | 1878 | 2482 | 33214 |
-shelf   /static(RunTime): 81.7376 us. (n=24469)
-| shelf   /static | 78 | 118 | 2557 | 3208 | 24483 |
-nitro   /static(RunTime): 53.7184 us. (n=37232)
-| nitro   /static | 51 | 82 | 683 | 1300 | 87743 |
-go      /static(RunTime): 73.2883 us. (n=27290)
-| go      /static | 72 | 106 | 781 | 1890 | 73900 |
-node    /static(RunTime): 72.4997 us. (n=27587)
-| node    /static | 70 | 102 | 810 | 2269 | 68837 |
-dart:io /work(RunTime): 398.8997 us. (n=5014)
-| dart:io /work | 366 | 481 | 18214 | 18636 | 3510 |
-shelf   /work(RunTime): 426.3069 us. (n=4692)
-| shelf   /work | 384 | 508 | 18899 | 32207 | 3346 |
-nitro   /work(RunTime): 183.5147 us. (n=10899)
-| nitro   /work | 142 | 215 | 4875 | 5435 | 12846 |
-go      /work(RunTime): 114.8907 us. (n=17408)
-| go      /work | 74 | 115 | 1472 | 2892 | 40725 |
-node    /work(RunTime): 108.7868 us. (n=18385)
-| node    /work | 69 | 110 | 1397 | 2497 | 41857 |
-dart:io /file(RunTime): 383.2405 us. (n=5219)
-| dart:io /file | 185 | 295 | 5592 | 6655 | 11127 |
-shelf   /file(RunTime): 396.0881 us. (n=5050)
-| shelf   /file | 200 | 322 | 6341 | 7231 | 9864 |
-nitro   /file(RunTime): 345.4304 us. (n=5790)
-| nitro   /file | 143 | 246 | 4331 | 5045 | 14081 |
-go      /file(RunTime): 305.9530 us. (n=6537)
-| go      /file | 113 | 157 | 4317 | 5644 | 14014 |
-node    /file(RunTime): 311.1023 us. (n=6429)
-| node    /file | 120 | 190 | 4302 | 5048 | 14182 |
-dart:io POST /echo 4k(RunTime): 133.1532 us. (n=15021)
-| dart:io POST /echo 4k | 129 | 174 | 2229 | 2992 | 27679 |
-shelf   POST /echo 4k(RunTime): 148.0264 us. (n=13512)
-| shelf   POST /echo 4k | 144 | 198 | 2915 | 3583 | 21418 |
-nitro   POST /echo 4k(RunTime): 140.0942 us. (n=14277)
-| nitro   POST /echo 4k | 135 | 192 | 1787 | 2785 | 33935 |
-go      POST /echo 4k(RunTime): 134.9828 us. (n=14817)
-| go      POST /echo 4k | 133 | 189 | 1778 | 3598 | 33872 |
-node    POST /echo 4k(RunTime): 135.7897 us. (n=14729)
-| node    POST /echo 4k | 132 | 176 | 1733 | 3253 | 34337 |
-dart:io POST /echo 1m(RunTime): 14775.8676 us. (n=136)
-| dart:io POST /echo 1m | 14757 | 15562 | 276369 | 528523 | 250 |
-shelf   POST /echo 1m(RunTime): 14512.1232 us. (n=138)
-| shelf   POST /echo 1m | 14468 | 15044 | 247301 | 482522 | 256 |
-nitro   POST /echo 1m(RunTime): 14768.8603 us. (n=136)
-| nitro   POST /echo 1m | 14765 | 15263 | 275911 | 388725 | 256 |
-go      POST /echo 1m(RunTime): 14197.7801 us. (n=141)
-| go      POST /echo 1m | 14129 | 15273 | 251381 | 592460 | 265 |
-node    POST /echo 1m(RunTime): 14167.6620 us. (n=142)
-| node    POST /echo 1m | 14163 | 14778 | 255490 | 474579 | 265 |
-dart:io GET /events(RunTime): 97.6190 us. (n=20488)
-| dart:io GET /events | 95 | 142 | 3185 | 3785 | 19590 |
-shelf   GET /events(RunTime): 89.1886 us. (n=22425)
-| shelf   GET /events | 86 | 125 | 2837 | 3490 | 22049 |
-nitro   GET /events(RunTime): 82.7048 us. (n=24183)
-| nitro   GET /events | 80 | 124 | 4941 | 6262 | 12851 |
-go      GET /events(RunTime): 119.6686 us. (n=16713)
-| go      GET /events | 114 | 188 | 1936 | 12481 | 25489 |
-node    GET /events(RunTime): 88.0279 us. (n=22721)
-| node    GET /events | 86 | 121 | 934 | 2886 | 59863 |
-dart:io WS /ws 128B(RunTime): 53.2088 us. (n=37588)
-| dart:io WS /ws 128B | 51 | 82 | 1489 | 2274 | 43714 |
-nitro   WS /ws 128B(RunTime): 62.1823 us. (n=32164)
-| nitro   WS /ws 128B | 59 | 95 | 706 | 2013 | 87467 |
-dart:io WS /ws 4k(RunTime): 69.0754 us. (n=28954)
-| dart:io WS /ws 4k | 52 | 85 | 1533 | 2102 | 40852 |
-nitro   WS /ws 4k(RunTime): 80.9595 us. (n=24704)
-| nitro   WS /ws 4k | 64 | 102 | 1078 | 1842 | 57007 |
-dart:io WS /ws 4k deflate(RunTime): 101.8951 us. (n=19629)
-| dart:io WS /ws 4k deflate | 98 | 154 | 3132 | 3736 | 20166 |
-nitro   WS /ws 4k deflate(RunTime): 113.6789 us. (n=17594)
-| nitro   WS /ws 4k deflate | 107 | 291 | 2842 | 3892 | 22639 |
+dart:io /hello(RunTime): 78.2163 us. (n=25571)
+| dart:io /hello | 72 | 146 | 1900 | 2655 | 32443 |
+shelf   /hello(RunTime): 93.6849 us. (n=21349)
+| shelf   /hello | 86 | 182 | 2657 | 3662 | 23287 |
+nitro   /hello(RunTime): 86.6046 us. (n=23094)
+| nitro   /hello | 81 | 147 | 780 | 1585 | 75954 |
+go      /hello(RunTime): 77.3860 us. (n=25845)
+| go      /hello | 75 | 131 | 787 | 2263 | 70347 |
+node    /hello(RunTime): 75.2128 us. (n=26592)
+| node    /hello | 72 | 120 | 776 | 2409 | 69238 |
+dart:io /json(RunTime): 73.5937 us. (n=27177)
+| dart:io /json | 69 | 125 | 1883 | 2584 | 32999 |
+shelf   /json(RunTime): 87.1135 us. (n=22959)
+| shelf   /json | 81 | 144 | 2621 | 3297 | 23922 |
+nitro   /json(RunTime): 85.0703 us. (n=23510)
+| nitro   /json | 81 | 136 | 774 | 1635 | 75539 |
+go      /json(RunTime): 78.5207 us. (n=25472)
+| go      /json | 76 | 131 | 786 | 2260 | 70433 |
+node    /json(RunTime): 75.4158 us. (n=26520)
+| node    /json | 72 | 116 | 779 | 2580 | 68928 |
+dart:io /users/:id(RunTime): 78.9255 us. (n=25341)
+| dart:io /users/:id | 73 | 162 | 1870 | 2530 | 33238 |
+shelf   /users/:id(RunTime): 87.2155 us. (n=22932)
+| shelf   /users/:id | 82 | 140 | 2652 | 3351 | 23626 |
+nitro   /users/:id(RunTime): 85.9107 us. (n=23280)
+| nitro   /users/:id | 81 | 147 | 800 | 1605 | 74531 |
+go      /users/:id(RunTime): 78.3353 us. (n=25532)
+| go      /users/:id | 76 | 128 | 793 | 2291 | 70314 |
+node    /users/:id(RunTime): 75.9456 us. (n=26335)
+| node    /users/:id | 72 | 123 | 804 | 2382 | 69077 |
+dart:io /files/*(RunTime): 73.7664 us. (n=27113)
+| dart:io /files/* | 69 | 126 | 1895 | 2597 | 32793 |
+shelf   /files/*(RunTime): 89.1919 us. (n=22424)
+| shelf   /files/* | 83 | 153 | 2656 | 3340 | 23597 |
+nitro   /files/*(RunTime): 85.1777 us. (n=23481)
+| nitro   /files/* | 81 | 141 | 773 | 1648 | 75450 |
+go      /files/*(RunTime): 77.8111 us. (n=25704)
+| go      /files/* | 76 | 126 | 792 | 2164 | 70808 |
+node    /files/*(RunTime): 75.8669 us. (n=26362)
+| node    /files/* | 73 | 119 | 793 | 2372 | 69447 |
+dart:io /q?a=1&b=two(RunTime): 75.2503 us. (n=26578)
+| dart:io /q?a=1&b=two | 70 | 131 | 1964 | 2678 | 31599 |
+shelf   /q?a=1&b=two(RunTime): 89.7957 us. (n=22273)
+| shelf   /q?a=1&b=two | 84 | 155 | 2713 | 3390 | 23161 |
+nitro   /q?a=1&b=two(RunTime): 86.1230 us. (n=23223)
+| nitro   /q?a=1&b=two | 82 | 144 | 772 | 1602 | 76005 |
+go      /q?a=1&b=two(RunTime): 77.9383 us. (n=25662)
+| go      /q?a=1&b=two | 76 | 127 | 785 | 2185 | 71099 |
+node    /q?a=1&b=two(RunTime): 76.8711 us. (n=26018)
+| node    /q?a=1&b=two | 73 | 120 | 788 | 2308 | 70149 |
+dart:io /mw(RunTime): 73.3349 us. (n=27273)
+| dart:io /mw | 69 | 124 | 1869 | 2541 | 33253 |
+shelf   /mw(RunTime): 87.3599 us. (n=22895)
+| shelf   /mw | 81 | 149 | 2593 | 3258 | 24126 |
+nitro   /mw(RunTime): 84.8444 us. (n=23573)
+| nitro   /mw | 81 | 138 | 782 | 1700 | 74408 |
+go      /mw(RunTime): 76.7270 us. (n=26067)
+| go      /mw | 75 | 125 | 773 | 2113 | 72445 |
+node    /mw(RunTime): 75.2459 us. (n=26580)
+| node    /mw | 72 | 118 | 790 | 2268 | 70092 |
+dart:io /static(RunTime): 74.6207 us. (n=26803)
+| dart:io /static | 69 | 132 | 1882 | 2762 | 32742 |
+shelf   /static(RunTime): 94.1909 us. (n=21234)
+| shelf   /static | 85 | 189 | 2613 | 3304 | 23932 |
+nitro   /static(RunTime): 58.0407 us. (n=34459)
+| nitro   /static | 53 | 103 | 676 | 1505 | 85684 |
+go      /static(RunTime): 77.9842 us. (n=25647)
+| go      /static | 76 | 127 | 756 | 2260 | 72184 |
+node    /static(RunTime): 77.2595 us. (n=25887)
+| node    /static | 74 | 127 | 887 | 3473 | 59867 |
+dart:io /work(RunTime): 413.1657 us. (n=4841)
+| dart:io /work | 374 | 508 | 18122 | 19256 | 3521 |
+shelf   /work(RunTime): 426.4023 us. (n=4691)
+| shelf   /work | 386 | 530 | 18807 | 28814 | 3371 |
+nitro   /work(RunTime): 191.2510 us. (n=10458)
+| nitro   /work | 147 | 247 | 4934 | 5601 | 12762 |
+go      /work(RunTime): 115.5639 us. (n=17307)
+| go      /work | 76 | 131 | 1411 | 2968 | 41241 |
+node    /work(RunTime): 113.5190 us. (n=17619)
+| node    /work | 74 | 129 | 1414 | 3342 | 39856 |
+dart:io /file(RunTime): 383.5256 us. (n=5215)
+| dart:io /file | 195 | 320 | 5676 | 7725 | 10858 |
+shelf   /file(RunTime): 397.1819 us. (n=5036)
+| shelf   /file | 205 | 350 | 6484 | 8253 | 9541 |
+nitro   /file(RunTime): 358.3623 us. (n=5584)
+| nitro   /file | 173 | 361 | 4128 | 6323 | 14512 |
+go      /file(RunTime): 294.4722 us. (n=6792)
+| go      /file | 108 | 205 | 4243 | 7199 | 14222 |
+node    /file(RunTime): 305.9095 us. (n=6538)
+| node    /file | 122 | 213 | 4144 | 5870 | 14421 |
+dart:io POST /echo 4k(RunTime): 142.6437 us. (n=14021)
+| dart:io POST /echo 4k | 135 | 212 | 2262 | 3499 | 27138 |
+shelf   POST /echo 4k(RunTime): 159.5605 us. (n=12535)
+| shelf   POST /echo 4k | 150 | 295 | 2960 | 3772 | 21030 |
+nitro   POST /echo 4k(RunTime): 150.9728 us. (n=13248)
+| nitro   POST /echo 4k | 144 | 229 | 1787 | 3081 | 32937 |
+go      POST /echo 4k(RunTime): 140.3294 us. (n=14253)
+| go      POST /echo 4k | 136 | 211 | 1768 | 4054 | 32945 |
+node    POST /echo 4k(RunTime): 141.2706 us. (n=14158)
+| node    POST /echo 4k | 135 | 207 | 1763 | 4148 | 32517 |
+dart:io POST /echo 1m(RunTime): 15112.6391 us. (n=133)
+| dart:io POST /echo 1m | 15074 | 15930 | 298023 | 515751 | 242 |
+shelf   POST /echo 1m(RunTime): 14931.0000 us. (n=134)
+| shelf   POST /echo 1m | 14888 | 16335 | 268784 | 459684 | 251 |
+nitro   POST /echo 1m(RunTime): 15151.8409 us. (n=132)
+| nitro   POST /echo 1m | 15125 | 15705 | 274938 | 554881 | 254 |
+go      POST /echo 1m(RunTime): 14419.8993 us. (n=139)
+| go      POST /echo 1m | 14379 | 15075 | 258624 | 544762 | 260 |
+node    POST /echo 1m(RunTime): 14592.0797 us. (n=138)
+| node    POST /echo 1m | 14452 | 16508 | 257865 | 618442 | 260 |
+dart:io GET /events(RunTime): 104.1135 us. (n=19210)
+| dart:io GET /events | 100 | 175 | 3210 | 3869 | 19519 |
+shelf   GET /events(RunTime): 96.4838 us. (n=20729)
+| shelf   GET /events | 91 | 166 | 2934 | 3866 | 21139 |
+nitro   GET /events(RunTime): 100.6337 us. (n=19875)
+| nitro   GET /events | 86 | 295 | 5640 | 10243 | 11148 |
+go      GET /events(RunTime): 124.2462 us. (n=16098)
+| go      GET /events | 118 | 203 | 1920 | 13710 | 25120 |
+node    GET /events(RunTime): 94.4942 us. (n=21166)
+| node    GET /events | 90 | 150 | 1023 | 5489 | 49370 |
+dart:io WS /ws 128B(RunTime): 57.1534 us. (n=34994)
+| dart:io WS /ws 128B | 53 | 103 | 1458 | 2547 | 42631 |
+nitro   WS /ws 128B(RunTime): 66.0265 us. (n=30292)
+| nitro   WS /ws 128B | 61 | 118 | 721 | 1983 | 84856 |
+dart:io WS /ws 4k(RunTime): 73.6208 us. (n=27167)
+| dart:io WS /ws 4k | 55 | 110 | 1510 | 2110 | 41293 |
+nitro   WS /ws 4k(RunTime): 84.7961 us. (n=23586)
+| nitro   WS /ws 4k | 67 | 128 | 1085 | 1882 | 55909 |
+dart:io WS /ws 4k deflate(RunTime): 109.6446 us. (n=18241)
+| dart:io WS /ws 4k deflate | 102 | 176 | 3132 | 3873 | 20102 |
+nitro   WS /ws 4k deflate(RunTime): 120.2723 us. (n=16630)
+| nitro   WS /ws 4k deflate | 111 | 314 | 2869 | 4122 | 22347 |
+
+
+=== SUMMARY (median of 2 rounds, load latency µs; loss = req/s below the fastest server for that case) ===
+| case | server | p50 | p90 | p95 | p99 | req/s | loss% |
+| ---- | ------ | --- | --- | --- | --- | ----- | ----- |
+| /hello | dart:io | 1982 | 2284 | 2375 | 2547 | 32125 | 55.2 |
+| /hello | shelf | 2720 | 3020 | 3109 | 3385 | 23326 | 67.4 |
+| /hello | nitro | 834 | 1233 | 1363 | 1649 | 71636 | 0.0 |
+| /hello | go | 836 | 1469 | 1692 | 2232 | 68104 | 4.9 |
+| /hello | node | 854 | 1588 | 1874 | 2820 | 64459 | 10.0 |
+| /json | dart:io | 1975 | 2271 | 2354 | 2521 | 32372 | 54.7 |
+| /json | shelf | 2724 | 3091 | 3399 | 4054 | 22954 | 67.9 |
+| /json | nitro | 826 | 1250 | 1390 | 1690 | 71511 | 0.0 |
+| /json | go | 857 | 1537 | 1791 | 2406 | 66097 | 7.6 |
+| /json | node | 866 | 1626 | 1924 | 2853 | 63931 | 10.6 |
+| /users/:id | dart:io | 1982 | 2296 | 2386 | 2575 | 32093 | 54.4 |
+| /users/:id | shelf | 2756 | 3068 | 3164 | 3389 | 23025 | 67.3 |
+| /users/:id | nitro | 859 | 1257 | 1400 | 1704 | 70337 | 0.0 |
+| /users/:id | go | 839 | 1476 | 1697 | 2224 | 68097 | 3.2 |
+| /users/:id | node | 849 | 1515 | 1756 | 2448 | 66376 | 5.6 |
+| /files/* | dart:io | 1986 | 2287 | 2374 | 2544 | 32189 | 55.0 |
+| /files/* | shelf | 2770 | 3074 | 3160 | 3321 | 23019 | 67.8 |
+| /files/* | nitro | 831 | 1261 | 1404 | 1704 | 71460 | 0.0 |
+| /files/* | go | 850 | 1477 | 1696 | 2201 | 67601 | 5.4 |
+| /files/* | node | 844 | 1495 | 1716 | 2301 | 67185 | 6.0 |
+| /q?a=1&b=two | dart:io | 2052 | 2359 | 2441 | 2588 | 31143 | 56.4 |
+| /q?a=1&b=two | shelf | 2804 | 3087 | 3174 | 3339 | 22760 | 68.2 |
+| /q?a=1&b=two | nitro | 834 | 1250 | 1386 | 1692 | 71478 | 0.0 |
+| /q?a=1&b=two | go | 848 | 1514 | 1743 | 2305 | 67298 | 5.8 |
+| /q?a=1&b=two | node | 856 | 1525 | 1763 | 2470 | 65775 | 8.0 |
+| /mw | dart:io | 1964 | 2260 | 2341 | 2490 | 32605 | 54.3 |
+| /mw | shelf | 2700 | 3010 | 3095 | 3272 | 23590 | 66.9 |
+| /mw | nitro | 829 | 1264 | 1405 | 1709 | 71295 | 0.0 |
+| /mw | go | 837 | 1467 | 1683 | 2169 | 68649 | 3.7 |
+| /mw | node | 830 | 1475 | 1701 | 2366 | 67790 | 4.9 |
+| /static | dart:io | 1978 | 2296 | 2385 | 2641 | 32080 | 62.8 |
+| /static | shelf | 2646 | 3008 | 3108 | 3298 | 23778 | 72.4 |
+| /static | nitro | 678 | 1034 | 1171 | 1461 | 86127 | 0.0 |
+| /static | go | 775 | 1402 | 1620 | 2147 | 71915 | 16.5 |
+| /static | node | 836 | 1597 | 1898 | 2869 | 65171 | 24.3 |
+| /work | dart:io | 18132 | 18432 | 18560 | 19200 | 3519 | 91.4 |
+| /work | shelf | 18814 | 19167 | 19389 | 32794 | 3359 | 91.8 |
+| /work | nitro | 4916 | 5282 | 5364 | 5550 | 12808 | 68.8 |
+| /work | go | 1423 | 2120 | 2389 | 3063 | 41010 | 0.0 |
+| /work | node | 1401 | 2098 | 2396 | 3176 | 40563 | 1.1 |
+| /file | dart:io | 5788 | 6850 | 7202 | 8208 | 10562 | 27.5 |
+| /file | shelf | 6538 | 7360 | 7647 | 8397 | 9425 | 35.3 |
+| /file | nitro | 4122 | 4688 | 4941 | 6101 | 14514 | 0.4 |
+| /file | go | 4196 | 5239 | 5775 | 7363 | 14132 | 3.0 |
+| /file | node | 4116 | 4770 | 5040 | 5700 | 14566 | 0.0 |
+| POST /echo 4k | dart:io | 2255 | 2768 | 2902 | 3296 | 27309 | 17.7 |
+| POST /echo 4k | shelf | 2975 | 3478 | 3584 | 3790 | 20957 | 36.8 |
+| POST /echo 4k | nitro | 1788 | 2405 | 2592 | 3076 | 33164 | 0.0 |
+| POST /echo 4k | go | 1814 | 2954 | 3476 | 4646 | 31517 | 5.0 |
+| POST /echo 4k | node | 1926 | 4159 | 5781 | 10584 | 26495 | 20.1 |
+| POST /echo 1m | dart:io | 292705 | 385327 | 419498 | 530085 | 239 | 7.0 |
+| POST /echo 1m | shelf | 273821 | 379089 | 406040 | 482142 | 246 | 4.2 |
+| POST /echo 1m | nitro | 272671 | 353410 | 383995 | 554181 | 251 | 2.6 |
+| POST /echo 1m | go | 259433 | 336919 | 378156 | 689615 | 257 | 0.0 |
+| POST /echo 1m | node | 274663 | 375033 | 411242 | 543570 | 247 | 3.8 |
+| GET /events | dart:io | 3262 | 3741 | 3999 | 5642 | 18691 | 63.8 |
+| GET /events | shelf | 2942 | 3388 | 3512 | 4009 | 21073 | 59.1 |
+| GET /events | nitro | 5556 | 6234 | 6489 | 8475 | 11460 | 77.8 |
+| GET /events | go | 1946 | 4898 | 6680 | 14199 | 24699 | 52.1 |
+| GET /events | node | 984 | 2068 | 2636 | 4915 | 51583 | 0.0 |
+| WS /ws 128B | dart:io | 1461 | 1618 | 1682 | 2448 | 43287 | 40.7 |
+| WS /ws 128B | nitro | 759 | 1249 | 1602 | 3308 | 73007 | 0.0 |
+| WS /ws 4k | dart:io | 1516 | 1697 | 1866 | 2120 | 41158 | 25.7 |
+| WS /ws 4k | nitro | 1091 | 1389 | 1551 | 1960 | 55386 | 0.0 |
+| WS /ws 4k deflate | dart:io | 3137 | 3508 | 3638 | 4035 | 19932 | 9.6 |
+| WS /ws 4k deflate | nitro | 2882 | 3290 | 3466 | 4478 | 22057 | 0.0 |
 
 Load: 64 connections / 4 client isolates, 3 s per case. Sequential: harness ~2 s per case, one connection.

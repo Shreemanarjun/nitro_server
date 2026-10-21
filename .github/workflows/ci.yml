@@ -36,8 +36,11 @@ jobs:
       # two-copies split-brain that regressed the native-assets migration.
       - name: Crash gate (@Native free paths under malloc diagnostics)
         run: bash tool/crash_stress.sh 20
-      - run: mkdir -p build/benchmark && dart compile exe benchmark/compare.dart -o build/benchmark/compare
-      - run: ./build/benchmark/compare --quick --keep-alive --raw --only /hello
+      # `dart build cli`, not `dart compile exe`: only the former runs the build
+      # hook, so the @Native bridge gets its engine asset (bundle/lib/). compile
+      # exe only appears to work on macOS (process-wide dlopen) and fails on Linux.
+      - run: dart build cli -t benchmark/compare.dart -o build/benchmark
+      - run: ./build/benchmark/bundle/bin/compare --quick --keep-alive --raw --only /hello
 
   sanitize:
     strategy:
@@ -132,12 +135,15 @@ jobs:
       - run: flutter pub get
       - run: cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release
       - run: cmake --build build/lib --parallel
-      - run: mkdir -p build/benchmark && dart compile exe benchmark/compare.dart -o build/benchmark/compare
+      # `dart build cli`, not `dart compile exe`: only the former runs the build
+      # hook, so the @Native bridge gets its engine asset (bundle/lib/). compile
+      # exe only appears to work on macOS (process-wide dlopen) and fails on Linux.
+      - run: dart build cli -t benchmark/compare.dart -o build/benchmark
       # Keep-alive: the headline, hardware-neutral comparison (throughput + tail
       # latency, every route, every framework). Captured to a table + JSON.
       - name: Cross-framework comparison (keep-alive)
         run: |
-          ./build/benchmark/compare --keep-alive \
+          ./build/benchmark/bundle/bin/compare --keep-alive \
             --json build/benchmark/results-${{ matrix.os }}.json \
             | tee build/benchmark/table-${{ matrix.os }}.md
       # Render the comparison onto the run's Summary page so anyone can read it

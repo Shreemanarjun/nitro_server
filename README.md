@@ -145,13 +145,16 @@ No Visual Studio at all? Install the *Desktop development with C++* workload
 | `serve` | run `bin/server.dart`, JIT + hot reload (VM service) |
 | `serve <entry>` | run a different entrypoint |
 | `serve --aot` | compile, then run (prod-like) |
-| `build` | AOT exe → `build/server` |
-| `build --jit` | JIT snapshot |
+| `build` | AOT bundle via `dart build cli` → `build/<name>/bundle/bin/<name>` (engine in `bundle/lib/`) |
+| `build --jit` | kernel snapshot → `build/<name>.dill` (run: `dart build/<name>.dill`) |
 | `build -o <path>` | custom output path |
 | `build --bundle-deps` | AOT exe + native deps copied beside it, load paths rewritten (self-contained) |
 
-`serve` wraps `dart run --enable-vm-service`; `build` wraps
-`dart compile exe`/`jit-snapshot`. Run those directly if you prefer.
+`serve` wraps `dart run --enable-vm-service`; `build` wraps `dart build cli`
+(AOT bundle) or `dart compile kernel` (`--jit`). **Do not `dart compile exe`** a
+nitro_server program: it skips the build hook, so the `@Native` bridge has no
+engine asset — it only appears to work on macOS (process-wide `dlopen`) and fails
+on Linux/Windows. `dart build cli` is the equivalent that bundles the engine.
 
 ## Build and run
 
@@ -160,8 +163,8 @@ No Visual Studio at all? Install the *Desktop development with C++* workload
 dart run nitro_server:nitro serve
 
 # production — AOT
-dart run nitro_server:nitro build      # -> build/server (engine lib copied beside it)
-./build/server                         # runs from any working directory
+dart run nitro_server:nitro build      # -> build/server/bundle/bin/server (+ bundle/lib/libnitro_server.*)
+./build/server/bundle/bin/server       # runs from any working directory
 
 # self-contained — no system libs on the target host
 dart run nitro_server:nitro build --bundle-deps
@@ -171,8 +174,8 @@ docker build -t myapp .
 docker run -p 8080:8080 myapp
 ```
 
-AOT has no hot reload. Keep the `.dylib`/`.so`/`.dll` beside a moved binary, or
-use `--bundle-deps`. Deploy recipes (Fly.io, Render, Railway, Cloud Run,
+AOT has no hot reload. Move the whole `bundle/` directory (the engine lives in
+`bundle/lib/`); `--bundle-deps` adds the system deps there too. Deploy recipes (Fly.io, Render, Railway, Cloud Run,
 Kubernetes, Netlify): [`doc/deployment.md`](doc/deployment.md).
 
 ## How it works

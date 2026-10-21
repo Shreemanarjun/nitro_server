@@ -227,18 +227,34 @@ def mem_table():
         L.append(f"| {f} | {peak:.0f} |" if peak is not None else f"| {f} | — |")
     return "\n".join(L)
 
+# Computed (never hard-coded) headline + flatness sentences, from this run's medians.
+def _k(v): return "—" if v is None else f"{v/1000:.0f}k"
+def _n(rt,k):
+    v=med("nitro-dylib",rt,k); return v if v is not None else med("nitro-native",rt,k)
+_e="/echo|POST|4096"
+e_n,e_go,e_node=_n(_e,"rps"),med("go",_e,"rps"),med("node",_e,"rps")
+w_n,w_go,w_d=_n("/work","rps"),med("go","/work","rps"),med("dartio","/work","rps")
+j_n,j_go=_n("/json","rps"),med("go","/json","rps")
+_vs_node=("~ties" if e_n and e_node and abs(e_n-e_node)/e_node<0.08 else ("beats" if (e_n or 0)>(e_node or 0) else "trails"))
+headline=(f"**Headline:** the cleanest win is `/echo` — **{_k(e_n)} vs Go's {_k(e_go)}** on real "
+          "request-body parsing, with no fairness asterisk (`/static` is engine-served, "
+          f"`/work` carries the route note below). nitro is also ~{(w_n or 0)/(w_go or 1):.1f}× Go on `/work` and "
+          f"{_vs_node} Node on `/echo`. Second on trivial routes: Go leads light I/O "
+          f"(`/json`) by ~{((j_go or 0)/(j_n or 1)-1)*100:.0f}%.")
+def _ratio(f,rt):
+    a,b=med(f,rt,"p50_ms"),med(f,rt,"p99_ms"); return (b/a) if (a and b and a>0) else None
+_rd,_rn=_ratio("dartio","/work"),(_ratio("nitro-dylib","/work") or _ratio("nitro-native","/work"))
+flatness=("`p50:p99` is the tail-flatness ratio: **lower = flatter distribution, NOT faster.** "
+          f"dartio's {_rd:.1f}× on `/work` is flatter than nitro's {_rn:.1f}× but at {_k(w_d)} vs {_k(w_n)} req/s — "
+          f"i.e. {_rd:.1f}× of a slow number. **bold** req/s = fastest for that route."
+          if (_rd and _rn) else "`p50:p99` is the tail-flatness ratio: **lower = flatter distribution, NOT faster.** **bold** req/s = fastest for that route.")
+
 doc=[ "# Blackbox cross-framework benchmark", "",
       "Throughput + full latency distribution + peak memory, one run, medians over reps.",
       "",
-      "**Headline:** the cleanest win is `/echo` — **104k vs Go's 84k** on real "
-      "request-body parsing, with no fairness asterisk (`/static` is engine-served, "
-      "`/work` carries the route note below). nitro is also ~2.7× Go on `/work` and "
-      "~ties Node on `/echo`. Second on trivial routes: Go leads light I/O "
-      "(`/hello`…`/mw`) by ~20%.",
+      headline,
       "",
-      "`p50:p99` is the tail-flatness ratio: **lower = flatter distribution, NOT faster.** "
-      "dartio's 1.5× on `/work` is flatter than nitro's 3.4× but at 8.7k vs 46k req/s — "
-      "i.e. 1.5× of a slow number. **bold** req/s = fastest for that route.",
+      flatness,
       "",
       "**nitro-native ≈ nitro-dylib on every route** (181k/181k on `/hello`, 45.5k/46.0k "
       "on `/work`) — within run-to-run noise. The `@Native` code-asset vs `DynamicLibrary` "

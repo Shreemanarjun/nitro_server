@@ -23,20 +23,17 @@ import 'package:nitro_server/src/internal/instance_keys.dart';
 import 'package:nitro_server/src/internal/native_attach.dart';
 import 'package:test/test.dart';
 
+/// The same search the runtime uses (`nitroServerLibraryCandidates`): under
+/// `dart test` the build hook stages the @Native code asset at
+/// `.dart_tool/lib/`, which outranks the cmake `build/lib` copy. Opening
+/// `build/lib` here instead would map a SECOND engine image — and when this
+/// suite is the first in the process to touch native, Nitro's
+/// `DynamicLibrary.process()` lookups bind to that copy while the @Native
+/// dispatch wiring lives in the staged one: requests are accepted but never
+/// answered (408s), depending purely on suite order.
 String? _locateLibrary() {
-  final override = Platform.environment['NITRO_SERVER_DYLIB'];
-  if (override != null && File(override).existsSync()) return override;
-  final names = <String>[
-    if (Platform.isMacOS) 'libnitro_server.dylib',
-    if (Platform.isLinux) 'libnitro_server.so',
-    if (Platform.isWindows) 'nitro_server.dll',
-  ];
-  const roots = <String>['build/lib', 'build'];
-  for (final root in roots) {
-    for (final name in names) {
-      final candidate = File('$root/$name');
-      if (candidate.existsSync()) return candidate.absolute.path;
-    }
+  for (final candidate in nitroServerLibraryCandidates()) {
+    if (File(candidate).existsSync()) return File(candidate).absolute.path;
   }
   return null;
 }

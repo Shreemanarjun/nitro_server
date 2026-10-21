@@ -824,13 +824,13 @@ Reproducible blackbox harness: each framework an opaque HTTP server, `oha` at 64
 keep-alive connections, **equal CPU budget (3 server cores each)**, load
 generator on disjoint cores, medians of interleaved reps, **responses
 byte-validated identical across frameworks**; Linux container on Apple Silicon,
-measured 2026-10-20. The `nitro` column is the `_dylib` build; `@Native` is
-within noise on every route. Run it: `benchmark/blackbox/run.sh`; methodology in
+measured 2026-10-21 on the published nitro 0.8.0. The `nitro` column is the
+`_dylib` build; `@Native` is within noise on every route. Run it: `benchmark/blackbox/run.sh`; methodology in
 [`benchmark/BENCHMARKING.md`](benchmark/BENCHMARKING.md).
 
 **Headline:** fastest where there is real per-request work — `/echo` (beats Go,
-~ties Node), `/work` (~2.7× Go), and the engine `/static` fast-path. Second on
-trivial I/O: Go leads `/hello`…`/mw` by ~24%.
+~ties Node), `/work` (~2.8× Go), and the engine `/static` fast-path. Second on
+trivial I/O: Go leads `/hello`…`/mw` by ~20%.
 
 ### Setup (equal CPU budget = 3 cores each)
 
@@ -846,10 +846,10 @@ trivial I/O: Go leads `/hello`…`/mw` by ~24%.
 
 | route | nitro | go | node | dart:io | shelf |
 |-------|------:|---:|-----:|--------:|------:|
-| `/json` (light I/O)¹ | 173k | **215k** | 143k | 84k | 64k |
-| `/work` (encode 200 JSON records)² | 44k | 16k | **52k** | 8.4k | 9.0k |
-| `/echo` (4 KB body) | 100k | 79k | **107k** | 63k | 53k |
-| `/static` (engine fast-path)³ | **445k** | 218k | 142k | 87k | 64k |
+| `/json` (light I/O)¹ | 174k | **208k** | 134k | 78k | 62k |
+| `/work` (encode 200 JSON records)² | 44k | 16k | **53k** | 8.5k | 8.2k |
+| `/echo` (4 KB body) | 102k | 73k | **106k** | 61k | 51k |
+| `/static` (engine fast-path)³ | **442k** | 215k | 132k | 75k | 66k |
 
 ¹ `/hello`, `/q`, `/users`, `/files`, `/mw` track `/json` within ~5%.
 ² per-request encode on every framework (equal work).
@@ -860,21 +860,21 @@ handler returning the same bytes — not apples-to-apples.
 
 | framework | p50 | p90 | p99 | p50:p99 |
 |-----------|----:|----:|----:|--------:|
-| node | 1.14 | 1.60 | **3.84** | 3.4× |
-| nitro | 1.24 | 2.61 | 4.16 | 3.4× |
-| shelf | 7.12 | 8.34 | 10.79 | 1.5× |
-| dart:io | 7.43 | 8.75 | 11.36 | 1.5× |
-| go | 0.96 | 11.02 | 22.15 | 23× |
+| node | 1.11 | 1.53 | **3.60** | 3.2× |
+| nitro | 1.21 | 2.61 | 4.14 | 3.4× |
+| dart:io | 7.31 | 8.93 | 10.89 | 1.5× |
+| shelf | 7.80 | 9.05 | 13.84 | 1.8× |
+| go | 0.97 | 11.28 | 22.55 | 23× |
 
-`p50:p99` is flatness, not speed (dart:io's and shelf's 1.5× is 1.5× of a slow
-number — 8–9k req/s vs nitro's 44k). Go's 23× is per-request-`Marshal` GC-pause
+`p50:p99` is flatness, not speed (dart:io's and shelf's 1.5–1.8× is flatness of a
+slow number — ~8k req/s vs nitro's 44k). Go's 23× is per-request-`Marshal` GC-pause
 spikes, not steady slowness.
 
 ### Peak memory (RSS, whole-workload high-water; **bold** = lowest)
 
 | framework | nitro | go | node | dart:io | shelf |
 |-----------|------:|---:|-----:|--------:|------:|
-| peak RSS | 151 MB | **12 MB** | 394 MB | 51 MB | 58 MB |
+| peak RSS | 154 MB | **12 MB** | 395 MB | 51 MB | 51 MB |
 
 nitro = 3 isolate Dart heaps + the native libuv engine (~fixed at startup; load
 adds only ~16 MB — the JsonWriter pool bounds per-request churn). A light-route

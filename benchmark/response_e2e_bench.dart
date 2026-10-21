@@ -65,9 +65,11 @@ Future<void> main() async {
     await _seq(client, url, 500); // warm
     final usPer = await _seq(client, url, 3000);
     final rps = await _conc(client, url, 20000, 64);
-    print('jsonWriter ${size.toString().padLeft(6)} B body: '
-        'seq ${usPer.toStringAsFixed(1).padLeft(6)} µs/req   '
-        'conc(64) ${rps.toStringAsFixed(0).padLeft(7)} req/s');
+    print(
+      'jsonWriter ${size.toString().padLeft(6)} B body: '
+      'seq ${usPer.toStringAsFixed(1).padLeft(6)} µs/req   '
+      'conc(64) ${rps.toStringAsFixed(0).padLeft(7)} req/s',
+    );
     client.close(force: true);
   }
   await server.close();

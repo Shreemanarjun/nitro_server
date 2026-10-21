@@ -12,9 +12,7 @@
 # Dart base: nitro is Dart-only, so pub resolves without the Flutter SDK. We
 # only strip nitro_server's own `flutter:` ENV constraint (it exists solely to
 # publish the ffiPlugin platforms block; the Dart code is Flutter-free). The
-# nitro* packages are UNPUBLISHED (local overrides) so run.sh vendors them into
-# benchmark/blackbox/_vendor and this image repoints the overrides there — drop
-# both seds once nitro ships to pub.dev.
+# nitro* packages resolve from pub.dev like any other dependency.
 #
 # Build context is the repo ROOT (run.sh handles it):
 #   docker build -f benchmark/blackbox/Dockerfile -t nitro-blackbox .

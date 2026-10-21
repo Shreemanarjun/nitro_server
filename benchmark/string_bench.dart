@@ -119,17 +119,31 @@ void main() {
   final b = _run(iters, () => utf8.encode(jsonEncode(rows)));
 
   double mbps(int ns) => size / (ns / 1e9) / 1e6;
-  print('payload: $size bytes, 20 objects × 6 fields  (JsonWriter==jsonEncode bytes: $identical)');
+  print(
+    'payload: $size bytes, 20 objects × 6 fields  (JsonWriter==jsonEncode bytes: $identical)',
+  );
   print('--------------------------------------------------------------');
-  print('A JsonWriter build only        ${a.toString().padLeft(6)} ns  ${mbps(a).toStringAsFixed(0).padLeft(6)} MB/s');
-  print('A JsonWriter build + toBytes()  ${aFull.toString().padLeft(5)} ns  ${mbps(aFull).toStringAsFixed(0).padLeft(6)} MB/s');
-  print('B jsonEncode + utf8.encode      ${b.toString().padLeft(5)} ns  ${mbps(b).toStringAsFixed(0).padLeft(6)} MB/s');
-  print('  → JsonWriter(+toBytes) is ${(b / aFull).toStringAsFixed(2)}x the dart:convert baseline');
-  print('  → toBytes() copy (win ③ removes it) costs ${aFull - a} ns at $size bytes');
+  print(
+    'A JsonWriter build only        ${a.toString().padLeft(6)} ns  ${mbps(a).toStringAsFixed(0).padLeft(6)} MB/s',
+  );
+  print(
+    'A JsonWriter build + toBytes()  ${aFull.toString().padLeft(5)} ns  ${mbps(aFull).toStringAsFixed(0).padLeft(6)} MB/s',
+  );
+  print(
+    'B jsonEncode + utf8.encode      ${b.toString().padLeft(5)} ns  ${mbps(b).toStringAsFixed(0).padLeft(6)} MB/s',
+  );
+  print(
+    '  → JsonWriter(+toBytes) is ${(b / aFull).toStringAsFixed(2)}x the dart:convert baseline',
+  );
+  print(
+    '  → toBytes() copy (win ③ removes it) costs ${aFull - a} ns at $size bytes',
+  );
 
   // B2. String-value-heavy payload — isolates writeString (win ②: escape+encode
   // in one Dart pass + jw_raw memcpy, vs encode + native jw_string escape-scan).
-  final strs = [for (var i = 0; i < 50; i++) 'the quick brown fox #$i jumps over'];
+  final strs = [
+    for (var i = 0; i < 50; i++) 'the quick brown fox #$i jumps over',
+  ];
   final kV = JsonToken('v');
   void buildStr() {
     w.reset();
@@ -151,7 +165,9 @@ void main() {
     w.toBytes();
   });
   print('');
-  print('win ② — string-heavy ($strSize B, 50 string values): writeString build+toBytes = $sNs ns  (${(strSize / (sNs / 1e9) / 1e6).toStringAsFixed(0)} MB/s)');
+  print(
+    'win ② — string-heavy ($strSize B, 50 string values): writeString build+toBytes = $sNs ns  (${(strSize / (sNs / 1e9) / 1e6).toStringAsFixed(0)} MB/s)',
+  );
 
   // Decode direction: utf8.decode vs the ASCII fast-path across sizes.
   print('');
@@ -160,12 +176,16 @@ void main() {
     final bytes = Uint8List.fromList(List.generate(n, (i) => 0x61 + i % 26));
     final u = _run(100000, () => utf8.decode(bytes));
     final f = _run(100000, () => decodeFast(bytes));
-    print('  ${n.toString().padLeft(5)} B: utf8.decode ${u.toString().padLeft(4)} ns  fast ${f.toString().padLeft(4)} ns  → ${(u / f).toStringAsFixed(2)}x');
+    print(
+      '  ${n.toString().padLeft(5)} B: utf8.decode ${u.toString().padLeft(4)} ns  fast ${f.toString().padLeft(4)} ns  → ${(u / f).toStringAsFixed(2)}x',
+    );
   }
 
   // C. The win-③ copy across response sizes: toBytes() = writer→Dart copy.
   print('');
-  print('win ③ — per-response toBytes() copy that respond-from-writer removes:');
+  print(
+    'win ③ — per-response toBytes() copy that respond-from-writer removes:',
+  );
   for (final n in [256, 4096, 65536]) {
     final big = 'x' * n;
     w.reset();
@@ -174,6 +194,8 @@ void main() {
     w.writeString(big);
     w.endObject();
     final tb = _run(n <= 4096 ? 50000 : 10000, w.toBytes);
-    print('  ${n.toString().padLeft(6)} B response: toBytes() = ${tb.toString().padLeft(5)} ns  (${(n / (tb / 1e9) / 1e6).toStringAsFixed(0)} MB/s copied, avoidable)');
+    print(
+      '  ${n.toString().padLeft(6)} B response: toBytes() = ${tb.toString().padLeft(5)} ns  (${(n / (tb / 1e9) / 1e6).toStringAsFixed(0)} MB/s copied, avoidable)',
+    );
   }
 }

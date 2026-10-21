@@ -175,18 +175,18 @@ packages:
     dependency: transitive
     description:
       name: nitro
-      sha256: "5b66645b1b0f703d6ff226c3ce78e2ffad6f4731b2272cfe0ebcc9b506cb538e"
+      sha256: "5b9f519b261bf0659513bb8b0000983a0b8cbedefba84d06318f72b78ba484d9"
       url: "https://pub.dev"
     source: hosted
-    version: "0.7.12"
+    version: "0.8.0"
   nitro_annotations:
     dependency: transitive
     description:
       name: nitro_annotations
-      sha256: "8e637b3b9704351bb937dd335b238e130c8ff7e33d1579a8c7d3024b3b29a757"
+      sha256: "2c958c7359df46cc3495e647ef4dae9777a718b3a6d7379ca49cd597b3e25596"
       url: "https://pub.dev"
     source: hosted
-    version: "0.7.12"
+    version: "0.8.0"
   nitro_server:
     dependency: "direct main"
     description:
@@ -202,14 +202,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.9.1"
-  plugin_platform_interface:
-    dependency: transitive
-    description:
-      name: plugin_platform_interface
-      sha256: "4820fbfdb9478b1ebae27888254d445073732dae3d6ea81f0b7e06d5dedc3f02"
-      url: "https://pub.dev"
-    source: hosted
-    version: "2.1.8"
   pub_semver:
     dependency: transitive
     description:

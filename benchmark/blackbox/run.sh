@@ -32,25 +32,6 @@ lo="${CPUS%-*}"; hi="${CPUS#*-}"; n=$((hi - lo + 1))
 if [ "$n" -lt 2 ]; then echo "need >=2 cores in --cpus (got $CPUS)"; exit 2; fi
 half=$((n / 2)); SRV="$lo-$((lo + half - 1))"; CLI="$((lo + half))-$hi"
 
-# Vendor the UNPUBLISHED local nitro packages into the build context so the
-# image is self-contained + reproducible. Delete this block once nitro ships.
-VEND="benchmark/blackbox/_vendor"
-NE="../../flutter_package/nitro_ecosystem/packages"
-if [ -d "$NE/nitro" ]; then
-  rm -rf "$VEND"; mkdir -p "$VEND"
-  for p in nitro nitro_generator nitro_annotations; do
-    # /example is each package's Flutter demo app — not needed to build the
-    # server, and it imports package:flutter, which this Dart-only vendor copy
-    # cannot resolve (an IDE analyzing the workspace would flag it).
-    # --delete-excluded evicts anything a previous copy brought in.
-    rsync -a --delete --delete-excluded --exclude .dart_tool --exclude build \
-      --exclude /example "$NE/$p/" "$VEND/$p/"
-  done
-  echo "vendored local nitro into $VEND"
-else
-  echo "WARN: local nitro ($NE) not found — image will use pub.dev nitro (may lack @Native)"
-fi
-
 echo "building nitro-blackbox image…"
 docker build -f benchmark/blackbox/Dockerfile -t nitro-blackbox .
 

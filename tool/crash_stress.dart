@@ -24,9 +24,9 @@ Future<void> _setup(NitroServer s) async {
   await s.get(
     '/stream',
     (_) => ResponseContext.stream(
-      Stream.fromIterable(
-        [for (var i = 0; i < 16; i++) Uint8List.fromList('chunk$i '.codeUnits)],
-      ),
+      Stream.fromIterable([
+        for (var i = 0; i < 16; i++) Uint8List.fromList('chunk$i '.codeUnits),
+      ]),
     ),
   );
   await s.get(
@@ -62,7 +62,9 @@ Future<void> main(List<String> args) async {
   );
   final port = server.port;
   final base = 'http://127.0.0.1:$port';
-  stderr.writeln('[crash_stress] up on $port isolates=$isolates rounds=$rounds');
+  stderr.writeln(
+    '[crash_stress] up on $port isolates=$isolates rounds=$rounds',
+  );
 
   final keep = HttpClient(); // reuses connections (keep-alive)
   Future<void> get(String p, {Map<String, String> headers = const {}}) async {

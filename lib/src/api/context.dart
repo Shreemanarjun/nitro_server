@@ -705,10 +705,7 @@ class ResponseContext {
     // copy. The NativeFinalizer frees it if the response is never answered.
     return ResponseContext(
       status: status,
-      headers: {
-        'content-type': 'application/json; charset=utf-8',
-        ...headers,
-      },
+      headers: {'content-type': 'application/json; charset=utf-8', ...headers},
       bodyWriter: w,
     );
   }

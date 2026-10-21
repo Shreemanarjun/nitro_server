@@ -17,9 +17,7 @@ analyzer:
     - test/cpp/**
     # Generated bridge code is not hand-maintained.
     - lib/src/**.g.dart
-    # Blackbox benchmark inputs/outputs: a vendored copy of the nitro monorepo
-    # (its own packages, not ours) and generated reports — never analyzed here.
-    - benchmark/blackbox/_vendor/**
+    # Blackbox benchmark outputs (generated reports), never analyzed here.
     - benchmark/blackbox/out/**
 
 linter:

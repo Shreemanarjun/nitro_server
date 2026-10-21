@@ -244,32 +244,35 @@ void main() {
         expect(fake.wsClosed.single, (601, 1000));
       });
 
-      test('inbound frames ack cumulatively so native payloads are freed', () async {
-        // Regression: the engine's ackBody second argument is an absolute
-        // cumulative sequence — it frees tracked payloads with seq < count.
-        // A constant 1 frees only the first frame and leaks every inbound
-        // buffer after it for the life of the socket. Each frame must ack a
-        // rising count.
-        final done = Completer<void>();
-        var seen = 0;
-        await openSession(
-          610,
-          handler: (session) async {
-            await for (final _ in session.messages) {
-              if (++seen == 3) done.complete();
-            }
-          },
-        );
-        inject(610, 1, Uint8List.fromList('a'.codeUnits));
-        inject(610, 1, Uint8List.fromList('bb'.codeUnits));
-        inject(610, 1, Uint8List.fromList('ccc'.codeUnits));
-        await done.future.timeout(const Duration(seconds: 5));
-        final counts = fake.acked
-            .where((a) => a.$1 == 610)
-            .map((a) => a.$2)
-            .toList();
-        expect(counts, [1, 2, 3], reason: 'cumulative ack, not constant 1');
-      });
+      test(
+        'inbound frames ack cumulatively so native payloads are freed',
+        () async {
+          // Regression: the engine's ackBody second argument is an absolute
+          // cumulative sequence — it frees tracked payloads with seq < count.
+          // A constant 1 frees only the first frame and leaks every inbound
+          // buffer after it for the life of the socket. Each frame must ack a
+          // rising count.
+          final done = Completer<void>();
+          var seen = 0;
+          await openSession(
+            610,
+            handler: (session) async {
+              await for (final _ in session.messages) {
+                if (++seen == 3) done.complete();
+              }
+            },
+          );
+          inject(610, 1, Uint8List.fromList('a'.codeUnits));
+          inject(610, 1, Uint8List.fromList('bb'.codeUnits));
+          inject(610, 1, Uint8List.fromList('ccc'.codeUnits));
+          await done.future.timeout(const Duration(seconds: 5));
+          final counts = fake.acked
+              .where((a) => a.$1 == 610)
+              .map((a) => a.$2)
+              .toList();
+          expect(counts, [1, 2, 3], reason: 'cumulative ack, not constant 1');
+        },
+      );
 
       test(
         'frames that beat the open are parked and replayed in order',

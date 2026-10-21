@@ -43,9 +43,11 @@ just the number — is what makes a result real. Follow this for every perf clai
 
 8. **Equal CPU budget.** Every framework gets the SAME number of cores for
    handler work (`SRV_N` = the server half of the cpuset): nitro `--isolates N`,
-   Go `GOMAXPROCS=N`, Node `NODE_PROCS=N`, dart:io `shared` isolates = N. The one
-   exception is shelf (single-isolate by design) — stated in the config table.
-   Without this, `/work` (CPU-bound) is a core-count artifact, not a comparison.
+   Go `GOMAXPROCS=N`, Node `NODE_PROCS=N`, dart:io AND shelf `shared` isolates
+   = N (shelf is dart:io underneath — `shelf_io.serve(shared: true)` scales the
+   same way; it is NOT exempt). Without this, `/work` (CPU-bound) is a
+   core-count artifact, not a comparison — running one framework on fewer cores
+   than the rest silently voids the "equal budget" claim for its whole column.
 
 9. **Validate responses, don't just count them.** The harness curls every route
    once and records status + content-type + body-byte length, then asserts the

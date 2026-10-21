@@ -6,8 +6,8 @@
 # Fairness/repro rules (see benchmark/BENCHMARKING.md):
 #   * server and oha on DISJOINT pinned cores (taskset) — never contend.
 #   * EQUAL CPU budget: every framework gets SRV_N cores for handler work
-#     (nitro isolates / Go GOMAXPROCS / Node workers / dart:io shared isolates;
-#     shelf is single-isolate by design — stated in the config table).
+#     (nitro isolates / Go GOMAXPROCS / Node workers / dart:io + shelf shared
+#     isolates via SO_REUSEPORT).
 #   * ONE framework at a time (no noisy neighbours), warm up before measuring.
 #   * frameworks INTERLEAVED across reps; per-(framework,route) value is the
 #     MEDIAN over reps (cancels the ~10-15% machine drift).
@@ -38,7 +38,7 @@ declare -A LAUNCH=(
   [nitro-native]="build/native_cli/bundle/bin/compare --keep-alive --isolates $SRV_N --serve nitro"
   [nitro-dylib]="env NITRO_SERVER_DYLIB=/app/build/lib/libnitro_server.so ./compare_dylib --keep-alive --isolates $SRV_N --serve nitro"
   [dartio]="./compare_dylib --keep-alive --isolates $SRV_N --serve dartio"
-  [shelf]="./compare_dylib --keep-alive --serve shelf"
+  [shelf]="./compare_dylib --keep-alive --isolates $SRV_N --serve shelf"
   [go]="env GOMAXPROCS=$SRV_N ./compare_go_server"
   [node]="env NODE_PROCS=$SRV_N node benchmark/compare_node_server.js"
 )
@@ -47,7 +47,7 @@ declare -A CONFIG=(
   [nitro-native]="@Native code asset; isolates=$SRV_N (engine fans CPU work across them)"
   [nitro-dylib]="DynamicLibrary; isolates=$SRV_N (engine fans CPU work across them)"
   [dartio]="dart:io HttpServer; shared isolates=$SRV_N (SO_REUSEPORT)"
-  [shelf]="shelf_io.serve; single isolate (framework default)"
+  [shelf]="shelf_io.serve; shared isolates=$SRV_N (SO_REUSEPORT, dart:io underneath)"
   [go]="net/http; GOMAXPROCS=$SRV_N"
   [node]="http + cluster; NODE_PROCS=$SRV_N workers"
 )

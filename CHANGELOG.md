@@ -15,7 +15,12 @@ optional **HTTP/2** (`-DNITRO_SERVER_HTTP2=ON` + nghttp2) served live over TLS
 (136/145 h2spec, ASan/TSan-clean); draining answers the backlog `503` not a drop.
 
 **Routing & handlers** — trie routing (`:param`, `*`, custom verbs, `group`),
-per-route `timeout`/`maxBodyBytes`/`middleware`/`streamBody`; `RequestContext`
+per-route `timeout`/`maxBodyBytes`/`middleware`/`streamBody`; WebSocket routes
+take `middleware:` too (`ws(..., middleware: [bearerAuth(...)])`, also on
+`group.ws` with the group's `use` list prepended) — the chain gates the
+handshake before the handler, and because the engine has already upgraded, a
+rejection closes the socket with `4000 + status` (4401/4403) or 1008 instead of
+an HTTP status; `RequestContext`
 (`params`, `query`/`queryParamAll`, `headers`, `cookies`, `body`/`bodyStream`,
 `clientIp`, `jsonMap`/`jsonAs<T>`/`multipart`); `ResponseContext`
 (text/json/bytes/stream/file/redirect/cookies, RFC 7807 `problem`, SSE via

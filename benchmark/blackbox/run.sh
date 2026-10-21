@@ -39,7 +39,12 @@ NE="../../flutter_package/nitro_ecosystem/packages"
 if [ -d "$NE/nitro" ]; then
   rm -rf "$VEND"; mkdir -p "$VEND"
   for p in nitro nitro_generator nitro_annotations; do
-    rsync -a --delete --exclude .dart_tool --exclude build "$NE/$p/" "$VEND/$p/"
+    # /example is each package's Flutter demo app — not needed to build the
+    # server, and it imports package:flutter, which this Dart-only vendor copy
+    # cannot resolve (an IDE analyzing the workspace would flag it).
+    # --delete-excluded evicts anything a previous copy brought in.
+    rsync -a --delete --delete-excluded --exclude .dart_tool --exclude build \
+      --exclude /example "$NE/$p/" "$VEND/$p/"
   done
   echo "vendored local nitro into $VEND"
 else

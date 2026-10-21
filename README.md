@@ -1,6 +1,6 @@
 # nitro_server
 
-Production HTTP/1.1 + WebSocket server for Dart and Flutter. A native,
+Production HTTP/1.1 + HTTP/2 + WebSocket server for Dart and Flutter. A native,
 multithreaded C++ engine (libuv, via [Nitro](https://pub.dev/packages/nitro)
 FFI) accepts, parses, routes and writes on every CPU core; handlers run on the
 Dart isolate. Client counterpart:
@@ -22,18 +22,44 @@ Future<void> main() async {
 > complete entrypoint with every route type, OpenAPI + Swagger UI, `/metrics` +
 > live dashboard, graceful drain and hot reload; reads `HOST`/`PORT` from the env.
 
+## Contents
+
+- [Features](#features)
+- [Installation](#installation)
+- [Commands (nitro CLI)](#commands-nitro-cli)
+- [Build and run](#build-and-run)
+- [How it works](#how-it-works)
+- [Routes](#routes) — Express-style · class-based controllers · engine-served
+- [Request](#request) — params, query, headers, cookies, body · multipart · streaming
+- [Response](#response) — types · cookies & headers · SSE · problem+json · native JSON
+- [WebSocket](#websocket)
+- [Middleware](#middleware) — built-in · custom · shared rate-limit store · JSON validation
+- [Configuration (ServerConfig)](#configuration-serverconfig) — table · from env · TLS
+- [Production](#production) — observability · OpenAPI · shutdown · events · banner
+- [Testing](#testing)
+- [Hot reload](#hot-reload)
+- [Native library loading](#native-library-loading)
+- [Exceptions](#exceptions)
+- [Platforms and limitations](#platforms-and-limitations)
+- [Performance](#performance)
+- [Developing](#developing)
+
 ## Features
 
-- HTTP/1.1 (keep-alive, pipelining, `Expect: 100-continue`, chunked uploads) and
-  RFC 6455 WebSocket, both in the native engine. HTTP/2 when built in.
-- Trie routing: `:param`, trailing `*`, custom verbs, prefixed groups.
-- Middleware: CORS, gzip/brotli compression, access log, rate limit,
-  bearer/API-key/basic auth.
-- Streaming and file responses (`sendfile`), static file serving, multipart.
-- Observability: Prometheus `/metrics`, `/healthz`, `/readyz`, live dashboard.
-- OpenAPI 3.1 + Swagger UI generated from the routes.
-- `Server-Timing` header per answer; graceful drain; transactional hot reload.
-- Typed public API (no `dynamic`); in-memory test client.
+- HTTP/1.1 (keep-alive, pipelining, `Expect: 100-continue`, chunked uploads),
+  HTTP/2 (ALPN `h2` + h2c, runtime-selectable) and RFC 6455 WebSocket, all in
+  the native engine. Engine-served static responses (no handler, no FFI).
+- Trie routing: `:param`, trailing `*`, custom verbs, prefixed groups, class-based
+  controllers.
+- Responses: text/JSON/HTML/bytes/redirect/file (`sendfile`)/stream, Server-Sent
+  Events, RFC 7807 problem+json, a native zero-copy JSON writer.
+- Middleware: CORS, gzip/brotli, access log, request IDs, rate limit (pluggable
+  store), bearer/API-key/basic auth, JSON-schema body validation, static files.
+- Observability: Prometheus `/metrics`, `/healthz`, `/readyz`, live dashboard,
+  server event stream. OpenAPI 3.1 + Swagger UI generated from the routes.
+- `Server-Timing` per answer; graceful drain; transactional hot reload; TLS with
+  zero-downtime cert rotation.
+- Typed public API (no `dynamic`); in-memory test client (HTTP + WebSocket).
 
 ## Installation
 
@@ -77,7 +103,39 @@ Minimal build (HTTP/1.1 + WebSocket, no TLS/brotli/h2) needs only libuv.
 Detection order: `pkg-config` → CMake config → Homebrew prefix; override with
 `-DOPENSSL_ROOT_DIR=…` or `PKG_CONFIG_PATH`.
 
-## Commands — the `nitro` CLI
+### Enabling TLS, brotli, gzip, HTTP/2
+
+Prebuilt engines ship with **all of these on**; this matters only when building
+from source. Nothing is a `-D` switch except HTTP/2 and static linking:
+
+| feature | build time | runtime |
+|---------|------------|---------|
+| **TLS / HTTPS** | auto — `find_package(OpenSSL)` found → compiled in (`-DOPENSSL_ROOT_DIR=…` to point at one). There is no `NITRO_SERVER_TLS` option | `ServerConfig(tls: TlsConfig(...))`; `bind` throws `ServerTlsException` if the engine lacks it |
+| **brotli** | auto — `pkg-config libbrotlienc` found → compiled in | `compress()` sends `br` when `brotliAvailable()` and the client accepts it; `brotliQuality:` 0–11 (default 4) |
+| **gzip** | always (dart:io zlib) | `compress()` fallback; `level:` 1–9 (default 1 = fastest) |
+| **HTTP/2** | **`-DNITRO_SERVER_HTTP2=ON`** + nghttp2 — configure fails if nghttp2 is missing. Off by default from source; the build hook and prebuilts pass it | `ServerConfig(protocol:)` — `http2` (default: ALPN `h2` + h2c) or `http1` |
+| static deps | `-DNITRO_SERVER_STATIC_DEPS=ON` links libuv/OpenSSL/brotli/nghttp2 into the engine | — |
+
+Check a built engine from Dart with `brotliAvailable()`; TLS and the `protocol`
+cap surface as `bind` errors.
+
+**Windows.** Configure with the vcpkg toolchain and **let CMake pick the
+generator** — do not pass `-G "Visual Studio 17 2022"` unless that exact VS is
+installed, or configure fails with *could not find any instance of Visual
+Studio* (CI never hard-codes one):
+
+```powershell
+vcpkg install libuv openssl brotli nghttp2 --triplet x64-windows
+cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release -DNITRO_SERVER_HTTP2=ON `
+  -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+  -DVCPKG_TARGET_TRIPLET=x64-windows
+cmake --build build/lib --config Release --parallel
+```
+
+No Visual Studio at all? Install the *Desktop development with C++* workload
+(Build Tools suffice) or use `-G Ninja` with `ninja` on `PATH`.
+
+## Commands (nitro CLI)
 
 `dart run nitro_server:nitro <cmd>` (or `nitro <cmd>` after
 `dart pub global activate nitro_server`):
@@ -95,7 +153,7 @@ Detection order: `pkg-config` → CMake config → Homebrew prefix; override wit
 `serve` wraps `dart run --enable-vm-service`; `build` wraps
 `dart compile exe`/`jit-snapshot`. Run those directly if you prefer.
 
-## Build & run
+## Build and run
 
 ```sh
 # dev — hot reload on
@@ -127,121 +185,359 @@ spreads work across only as many `isolates` as raise throughput — so leave
 `isolates` at `1` for IO-bound work and raise it (or `isolates: 0`) for
 CPU-bound handlers.
 
+---
+
+Snippets below run inside a `setup(NitroServer server)` function or after
+`final server = await NitroServer.bind(const ServerConfig(port: 8080));`.
+Handlers may be sync or async (`FutureOr`); registration calls return a
+`Future` — `await` them. Imports used: `dart:convert`, `dart:io`,
+`dart:typed_data`, `package:nitro_server/nitro_server.dart`.
+
 ## Routes
+
+Two styles, same router — the fluent **Express-style** API, or a **`Controller`**
+class for larger apps. Mix freely.
+
+### Express-style (fluent)
 
 ```dart
 // Verbs + :param + trailing * capture
 await server.get('/users/:id', (r) => ResponseContext.text('user ${r.param('id')}'));
-await server.post('/upload/*', handleUpload, maxBodyBytes: 50 * 1024 * 1024);
+await server.post('/upload/*', (r) => ResponseContext.text('${r.body.length} bytes'),
+    maxBodyBytes: 50 * 1024 * 1024);
+await server.put('/items/:id', (r) => ResponseContext.jsonBody(r.jsonMap()));
+await server.delete('/items/:id', (r) => ResponseContext.text('', status: 204));
+await server.all('/ping', (_) => ResponseContext.text('pong')); // every method
 
-// Custom verb, per-route middleware
-await server.route(HttpMethod.custom, '/items', report, customMethod: 'REPORT');
-await server.get('/admin', dashboard, middleware: [requireAdmin]);
+// Custom verb, per-route middleware and timeout
+await server.route(HttpMethod.custom, '/items', (_) => ResponseContext.text('report'),
+    customMethod: 'REPORT');
+await server.get('/slow', (_) => ResponseContext.text('done'),
+    timeout: const Duration(seconds: 5)); // 408 past the deadline
 
-// Prefixed group with its own middleware
-final api = server.group('/api/v1')..use(cors());
-await api.get('/ping', (_) => ResponseContext.text('pong'));
-
-// Streaming, file, static
-await server.get('/stream', (_) => ResponseContext.stream(byteStream));
-await server.get('/download', (_) => ResponseContext.file('report.pdf'));
-await server.get('/static/*', staticFiles('public'));
-
-// WebSocket
-await server.ws('/chat', (session) async {
-  await for (final m in session.messages) {
-    session.sendText('echo: ${m is WsText ? m.text : '(binary)'}');
-  }
-}, protocols: ['chat.v1']);
+// Prefixed group with its own middleware (call `use` BEFORE registering routes)
+final api = server.group('/api/v1');
+await api.use(cors());
+await api.get('/ping', (_) => ResponseContext.text('pong')); // GET /api/v1/ping
+final v2 = api.group('/v2');                                  // nested: /api/v1/v2/...
 
 // Fallbacks
-server.notFoundHandler = (r) => ResponseContext.text('nope', status: 404);
-server.errorHandler = (e, r) => ResponseContext.text('oops', status: 500);
+server.notFoundHandler = (r) => ResponseContext.text('no ${r.path}', status: 404);
+server.errorHandler = (e, r) => ResponseContext.text('oops: $e', status: 500);
+
+// Remove a route on a live server
+await server.unroute(HttpMethod.get, '/slow');
 ```
 
-Precedence: static > param > wildcard; method-specific > `HttpMethod.all`; HEAD
-falls back to GET. A handler past its `timeout` → 408; a throwing handler → 500.
+### Class-based (controllers)
 
-## API
+Group related routes behind a shared prefix + middleware; handlers are methods
+that share the controller's fields (injected deps) — the nitro_server analogue
+of a Spring `@RestController`, with no annotations and no codegen (AOT-safe).
 
-<a id="api"></a>
+```dart
+import 'package:nitro_server/nitro_server.dart';
 
-**`RequestContext`** — `method`, `path`, `query`, `queryParameters`, `headers`,
-`cookies`, `params`, `body`, `bodyStream` (with `streamBody: true`), `clientIp`;
-`text()`, `jsonMap()`, `jsonList()`, `jsonAs<T>()`, `multipart()`, `header(n)`,
-`param(n)`, `queryParam(n)`.
+class UserController extends Controller {
+  UserController() : super(prefix: '/users', middleware: [cors()]);
+  final _users = <String, Object?>{'42': 'Ada'};
 
-**`ResponseContext`** — `text`, `json`, `jsonBody`, `jsonMap`, `jsonWriter`
-(native zero-copy encoder), `html`, `bytes`, `redirect`, `stream`, `file`;
-`.withCookie(SetCookie(...))`. Sync handlers answer without a `Future`.
+  @override
+  Future<void> register(RouteGroup on) async {
+    await on.get('/', (_) => ResponseContext.jsonBody(_users)); // GET  /users
+    await on.get('/:id', getOne); //                               GET  /users/:id
+    await on.post('/', create); //                                 POST /users
+  }
 
-**`WsSession`** — `messages` (`WsText` | `WsBinary`), `sendText`/`sendBytes`
-(return queued byte count, `-1` when closed), `bufferedBytes`, `compressed`,
-`close(code)`. Engine handles the RFC 6455 handshake, ping/pong, close codes,
-`permessage-deflate`, subprotocol selection.
+  ResponseContext getOne(RequestContext c) =>
+      ResponseContext.jsonBody({c.param('id'): _users[c.param('id')]});
+
+  ResponseContext create(RequestContext c) {
+    final body = c.jsonMap();
+    _users['${body['id']}'] = body['name'];
+    return ResponseContext.jsonBody(body, status: 201);
+  }
+}
+
+Future<void> main() async {
+  final server = await NitroServer.bind(const ServerConfig(port: 8080));
+  await server.mount(UserController()); // mounts chain: (await a).mount(b)
+  print('listening on ${server.uri}');
+}
+```
+
+### Engine-served static responses
+
+Answered by the native engine with no handler, no middleware and no FFI
+round-trip — the `/static` fast path in [Performance](#performance). Use it for
+health strings, version blobs, cached fragments.
+
+```dart
+await server.getStatic('/health', utf8.encode('ok'), contentType: 'text/plain');
+await server.staticRoute(HttpMethod.get, '/version', utf8.encode('{"v":"1.0.0"}'),
+    contentType: 'application/json', headers: {'cache-control': 'max-age=60'});
+```
+
+Precedence: static segment > `:param` > `*`; method-specific > `all`; HEAD falls
+back to GET. Middleware order: server-wide → group → per-route. A handler past
+its `timeout` → 408; a throwing handler → 500 (or your `errorHandler`).
+
+## Request
+
+### Reading the request
+
+```dart
+await server.post('/users/:id', (r) {
+  r.method; //                HttpMethod.post   (r.customMethod for custom verbs)
+  r.path; //                  '/users/42'       (r.routePattern = '/users/:id')
+  r.param('id'); //           '42'              (r.params)
+  r.queryParam('page'); //    ?page=2 → '2'     (r.queryParameters; r.queryParamAll / queryParametersAll for repeats)
+  r.header('x-request-id'); //first value, case-insensitive (r.headers: Map<String, List<String>>)
+  r.cookies['session']; //    parsed `cookie` header
+  r.clientIp; //              peer address ('' when unavailable)
+  r.body; //                  Uint8List
+  r.text(); //                UTF-8 string
+  final m = r.jsonMap(); //   Map<String, Object?>   — also r.jsonList(), r.json(), r.jsonAs<T>()
+  return ResponseContext.jsonBody({'id': r.param('id'), 'got': m});
+});
+```
+
+`jsonAs<T>()` decodes then checks `is T` — `T` is a JSON type the decoder yields
+(`Map<String, Object?>`, `List<Object?>`, `String`, `int`…), not a model class;
+a mismatch throws `FormatException`.
+
+### Multipart uploads
+
+```dart
+await server.post('/upload', (r) {
+  final parts = r.multipart(); // FormatException unless multipart/form-data
+  for (final p in parts) {
+    if (p.isFile) {
+      File('uploads/${p.filename}').writeAsBytesSync(p.bytes); // p.contentType
+    } else {
+      print('${p.name} = ${p.text()}');
+    }
+  }
+  return ResponseContext.jsonBody({'parts': parts.length});
+}, maxBodyBytes: 50 * 1024 * 1024);
+```
+
+### Streaming request bodies
+
+```dart
+await server.post('/ingest', (r) async {
+  var total = 0;
+  await for (final chunk in r.bodyStream!) {
+    total += chunk.length; // process as it arrives — nothing is buffered
+  }
+  return ResponseContext.text('received $total bytes');
+}, streamBody: true); // r.body is empty, r.bodyStream is set
+```
+
+## Response
+
+### Response types
+
+Return any of these from a handler; all take `status:` and `headers:`.
+
+```dart
+ResponseContext.text('hi'); //                                   text/plain; charset=utf-8
+ResponseContext.text('<b>hi</b>', contentType: 'text/html');
+ResponseContext.html('<h1>hi</h1>');
+ResponseContext.jsonBody({'ok': true, 'n': [1, 2]}); //          any JSON-encodable, single-pass UTF-8
+ResponseContext.jsonMap({'ok': true}); //                        Map only
+ResponseContext.json('{"pre":"encoded"}'); //                    an already-encoded string
+ResponseContext.bytes(Uint8List(0), contentType: 'image/png');
+ResponseContext.redirect('/login'); //                           302; status: 301/303/307/308
+ResponseContext.file('report.pdf', contentType: 'application/pdf'); // sendfile; offset:/length: for ranges
+ResponseContext.stream(Stream.value(Uint8List(0)), contentType: 'text/csv'); // chunked; bufferSize: 65536
+ResponseContext.text('created', status: 201, headers: {'location': '/items/7'});
+```
+
+### Cookies and headers
+
+```dart
+await server.get('/login', (_) => ResponseContext.text('ok')
+    .withCookie(SetCookie('session', 'abc123',
+        httpOnly: true, secure: true, sameSite: SameSite.lax,
+        maxAge: const Duration(days: 7), path: '/'))
+    .withHeader('cache-control', 'no-store'));
+```
+
+`copyWith(status:, headers:)` changes status/headers while keeping a stream,
+file or cookies intact — use it in middleware instead of rebuilding a response.
+
+### Server-Sent Events
+
+```dart
+await server.get('/events', (_) => ResponseContext.sse(
+  Stream.periodic(const Duration(seconds: 1),
+      (i) => SseEvent('tick $i', event: 'tick', id: '$i')).take(10),
+)); // text/event-stream, cache-control: no-cache
+```
+
+`SseEvent(data, {event, id, retry})`; `bufferSize:` batches writes.
+
+### Problem details (RFC 7807)
+
+```dart
+await server.post('/orders', (r) {
+  if (r.jsonMap()['email'] == null) {
+    return ResponseContext.problem(
+      title: 'Validation failed', status: 422, detail: 'email is required',
+      type: 'https://example.com/errors/validation', extensions: {'field': 'email'},
+    ); // application/problem+json
+  }
+  return ResponseContext.text('ok', status: 201);
+});
+```
+
+### Native JSON fast path
+
+Encodes straight into a pooled native buffer the engine writes from — no Dart
+`String`/`List` materialization. The `build` callback is synchronous.
+
+```dart
+final kId = JsonToken('id'), kName = JsonToken('name'); // interned keys, hoist once
+
+await server.get('/report', (_) => ResponseContext.jsonWriter((w) {
+  w..beginObject()..key('ok')..writeBool(true)..key('rows')..beginArray();
+  for (var i = 0; i < 3; i++) {
+    w..beginObject()..keyToken(kId)..writeInt(i)..keyToken(kName)..writeString('row $i')..endObject();
+  }
+  w..endArray()..endObject();
+}));
+```
+
+`writeInt/Double/Num/String/Bool/Null`, `writeValue(any)` walks a Map/List,
+`writeRaw(fragment)` splices pre-encoded JSON, `keyToken`/`writeStringToken` for
+interned strings. This is the path behind the `/work` numbers in
+[Performance](#performance).
+
+## WebSocket
+
+```dart
+await server.ws('/chat', (session) async {
+  print('subprotocol: ${session.protocol}'); // negotiated, or null
+  print('user: ${session.handshake.header('x-user')}'); // the upgrade request
+
+  await for (final m in session.messages) {
+    if (m is WsText) {
+      session.sendText('echo: ${m.text}'); // returns queued bytes: 0 = on the wire, -1 = closed
+    } else if (m is WsBinary) {
+      session.sendBytes(m.bytes);
+    }
+    if (session.bufferedBytes > 1 << 20) await session.close(1009); // slow consumer
+  }
+  // returning (or throwing) closes the session; session.closeCode = the peer's code
+}, protocols: ['chat.v1'], middleware: [bearerAuth((t) => t == 'secret')]); // gates the handshake
+```
+
+`WsSession`: `handshake` (the upgrade `RequestContext`), `messages`
+(`WsText` | `WsBinary`), `sendText`/`sendBytes`, `bufferedBytes`, `compressed`
+(`permessage-deflate` negotiated; frames ≥ 256 B compressed), `protocol`,
+`closeCode`, `close([code = 1000])`. The engine handles the RFC 6455 handshake,
+ping/pong and close codes. `group.ws(...)` takes the same `protocols:` and
+`middleware:` and prepends the group's `use` list.
+
+**Middleware on WebSocket routes.** Server-global middleware does not wrap WS
+handlers (the engine completes the upgrade before dispatch), so
+`ws(middleware: [...])` runs a chain against the handshake *before* your
+handler — reuse `bearerAuth`/`apiKeyAuth`/`basicAuth` or any custom middleware
+unchanged. The 101 is already on the wire, so a short-circuit cannot become an
+HTTP status: the socket closes with **`4000 + status`** (401 → 4401,
+403 → 4403 — the app range) or **1008** for a non-4xx, **1011** if the
+middleware throws, and the handler never runs. Read it client-side from the
+close code.
 
 ## Middleware
 
-```dart
-await server.use(accessLog());
-await server.use(cors(allowOrigin: 'https://example.com'));
-await server.use(compress());                 // gzip, or brotli if the engine has it
-await server.use(rateLimit(maxRequests: 100)); // 100/min per client
-await server.use(bearerAuth((t) => t == secret));
-```
-
-Available: `accessLog`, `cors`, `compress`, `rateLimit`, `bearerAuth`,
-`apiKeyAuth`, `basicAuth`, `staticFiles(dir)` (sendfile, etag, 304, byte ranges,
-index files, traversal-safe). Scope: server-wide (`server.use`, outermost
-first), per group, or per route (`middleware:`).
-
-> `rateLimit` counters are in-memory per isolate — on a multi-isolate server the
-> effective limit is `maxRequests × isolates`; pass a shared `RateLimitStore`
-> for a hard global cap. Keys on `X-Forwarded-For`/`X-Real-IP` or a custom
-> `keyExtractor`.
-
-## Observability
+### Built-in
 
 ```dart
-await serveObservability(server);
-// /healthz   liveness (200 while serving)
-// /readyz    readiness (503 once draining)
-// /metrics   Prometheus text (per-route counts, 5xx, p50/p90/p99)
-// /dashboard self-contained auto-refreshing HTML
+await server.use(accessLog()); //                      method · status · latency · path · ip  (json: true → JSON lines)
+await server.use(requestId()); //                      x-request-id in/out  (generator: () => ...)
+await server.use(cors(allowOrigin: 'https://example.com', allowCredentials: true));
+await server.use(compress(minBytes: 1024, level: 1, brotliQuality: 4)); // br if built in + accepted, else gzip
+await server.use(rateLimit(maxRequests: 100, window: const Duration(minutes: 1))); // 429 + Retry-After
+await server.use(bearerAuth((token) => token == 'secret', realm: 'api'));
+await server.use(apiKeyAuth((key) => key == 'k', headerName: 'x-api-key'));
+await server.use(basicAuth((user, pass) => user == 'admin' && pass == 'pw'));
+
+// Static files are a HANDLER on a wildcard route, not middleware:
+await server.get('/assets/*', staticFiles('web', maxAge: const Duration(hours: 1)));
+// sendfile · etag · 304 · byte ranges (206/416) · index.html · `..` traversal → 404
 ```
 
-Aggregates across every isolate. `prometheusFormat(m)` / `metricsJson(m)` are
-pure renderers; `await server.aggregatedMetrics()` = cross-isolate view,
-`server.metrics` = this isolate.
+Scope: server-wide (`server.use`, outermost first), per group (`group.use`,
+before registering its routes), per route (`middleware: [...]`, on HTTP routes
+and `ws()` alike), per controller. Verifier callbacks may be async.
 
-## OpenAPI 3.1 + Swagger UI
-
-Built from the registered routes. Typed helpers render body, query/header params
-and auth in Swagger "Try it out" — no raw OpenAPI maps.
+### Custom middleware
 
 ```dart
-final api = OpenApi(server, title: 'My API',
-  securitySchemes: {'bearer': bearerScheme(bearerFormat: 'JWT')});
+// Signature: FutureOr<ResponseContext> Function(RequestContext request, RequestHandler next)
+Middleware timing() => (request, next) async {
+  final sw = Stopwatch()..start();
+  final res = await next(request); // continue the chain; return early to short-circuit
+  return res.withHeader('x-elapsed-ms', '${sw.elapsedMilliseconds}');
+};
 
-await api.get('/search', search, doc: const OpenApiOperation(
-  summary: 'Search',
-  params: [OpenApiParam.query('q', required: true), OpenApiParam.header('X-Request-Id')],
-  responseExample: {'total': 0}));
+final Middleware requireAdmin = (request, next) => request.header('x-role') == 'admin'
+    ? next(request)
+    : ResponseContext.text('forbidden', status: 403);
 
-await api.post('/users', createUser, doc: const OpenApiOperation(
-  requestExample: {'name': 'Ada', 'email': 'ada@example.com'}));
-
-await api.serve(); // GET /openapi.json + Swagger UI at /docs
+await server.use(timing());
+await server.get('/admin', (_) => ResponseContext.text('hi'), middleware: [requireAdmin]);
 ```
 
-POST/PUT/PATCH always get a JSON `requestBody`. Auth schemes: `bearerScheme()`,
-`apiKeyScheme()`, `basicScheme()`. Raw
-`parameters`/`requestBody`/`responses`/`security` remain as escape hatches.
+### Shared rate-limit store
 
-## Configuration — `ServerConfig`
+The default `InMemoryRateLimitStore` is per isolate (effective limit =
+`maxRequests × isolates`). Implement `RateLimitStore` over Redis/etc. to share
+one counter across isolates and replicas:
 
-Pass to `bind`; register routes in a `setup` function (required when
-`isolates != 1`, so every isolate builds the same routes):
+```dart
+class CountingStore implements RateLimitStore { // swap the map for Redis INCR+EXPIRE
+  final _hits = <String, RateLimitHit>{};
+  @override
+  RateLimitHit hit(String key, Duration window) {
+    final now = DateTime.now();
+    final prev = _hits[key];
+    return _hits[key] = (prev == null || now.isAfter(prev.resetAt))
+        ? RateLimitHit(count: 1, resetAt: now.add(window))
+        : RateLimitHit(count: prev.count + 1, resetAt: prev.resetAt);
+  }
+}
+
+await server.use(rateLimit(
+  maxRequests: 100,
+  store: CountingStore(),
+  keyExtractor: (r) => r.header('x-api-key') ?? r.clientIp,
+  onLimit: (retryAfter) => ResponseContext.problem(title: 'Too many requests', status: 429),
+));
+```
+
+### JSON body validation
+
+```dart
+final userSchema = ApiSchema.object({
+  'name': ApiSchema.string(),
+  'email': ApiSchema.string(format: 'email'),
+  'age': ApiSchema.integer(nullable: true),
+}, required: ['name', 'email']);
+
+await server.post('/users', (r) => ResponseContext.jsonBody(r.jsonMap(), status: 201),
+    middleware: [validateJsonBody(userSchema)]); // 400 bad JSON · 422 schema failure (problem+json); body-bearing routes only, not streamBody
+```
+
+`ApiSchema.string/integer/number/boolean/object/array/ref`; `schema.validate(v)`
+returns the error list for manual use; `toJson()` is OpenAPI-compatible.
+
+## Configuration (ServerConfig)
+
+Pass to `bind` (positional); register routes in a `setup` function (required
+when `isolates != 1`, so every isolate builds the same routes):
 
 ```dart
 Future<void> setup(NitroServer server) async {
@@ -270,59 +566,234 @@ final server = await NitroServer.bind(
 | `tls` | none | `TlsConfig(certPem:, keyPem:)` or `certFile`/`keyFile`; throws `ServerTlsException` unless the engine was built with OpenSSL |
 | `protocol` | `HttpProtocol.http2` | highest HTTP version to negotiate: `http1` (1.1 only), `http2` (adds `h2` via ALPN/h2c, falls back to 1.1), `http3` (reserved). Caps at what the engine was built with |
 
-## Graceful shutdown
+`config.copyWith(...)` tweaks a config; `server.config` is the resolved one.
+
+### From the environment
 
 ```dart
-shutdownOnSignals(server, drain: const Duration(seconds: 15));
-// SIGTERM/SIGINT -> stop accepting, drain in-flight requests, then exit.
+final server = await NitroServer.bind(ServerConfig.fromEnv(Platform.environment), setup);
+// HOST PORT ISOLATES WORKER_THREADS MAX_BODY_BYTES MAX_CONNECTIONS MAX_CONNECTIONS_PER_IP
+// KEEP_ALIVE_TIMEOUT_MS DEFAULT_TIMEOUT_MS RESPONSE_TIMING WS_COMPRESSION HTTP_PROTOCOL
+```
+
+### TLS
+
+```dart
+final server = await NitroServer.bind(
+  const ServerConfig(port: 8443, tls: TlsConfig(certFile: 'cert.pem', keyFile: 'key.pem')), // or certPem:/keyPem:
+  setup,
+); // server.uri is https://…; h2 via ALPN when protocol is http2
+
+server.reloadTls(const TlsConfig(certFile: 'renewed.pem', keyFile: 'renewed.key')); // zero-downtime; returns false if unavailable
+```
+
+Needs the engine built with OpenSSL (prebuilts include it); otherwise `bind`
+throws `ServerTlsException`.
+
+## Production
+
+### Observability
+
+```dart
+var dbReady = false;
+await serveObservability(server,
+    ready: () => dbReady, //  /readyz 503 while false — REPLACES the default (ready until close()), so drain-awareness is yours
+    dashboardPath: null, //   drop the dashboard (default '/dashboard')
+    prefix: 'myapp'); //      metric name prefix
+// GET /healthz   liveness (200 while serving)
+// GET /readyz    readiness
+// GET /metrics   Prometheus text (per-route counts, 5xx, p50/p90/p99)
+// GET /dashboard self-contained auto-refreshing HTML (WebSocket-pushed)
+```
+
+Aggregates across every isolate. `prometheusFormat(m)` / `metricsJson(m)` are
+pure renderers; `await server.aggregatedMetrics()` = cross-isolate view,
+`server.metrics` = this isolate only.
+
+### OpenAPI 3.1 + Swagger UI
+
+Built from the registered routes. Typed helpers render body, query/header params
+and auth in Swagger "Try it out" — no raw OpenAPI maps.
+
+```dart
+await serveOpenApi(server, title: 'My API'); // zero-config: spec from routes, Swagger UI at /docs
+```
+
+```dart
+final api = OpenApi(server, title: 'My API',
+    securitySchemes: {'bearer': bearerScheme(bearerFormat: 'JWT')}); // lights up "Authorize"
+
+await api.get('/search', (r) => ResponseContext.jsonBody({'q': r.queryParam('q')}),
+    doc: const OpenApiOperation(
+      summary: 'Search',
+      params: [OpenApiParam.query('q', required: true), OpenApiParam.header('X-Request-Id')],
+      responseExample: {'total': 0},
+    ));
+
+await api.post('/users', (r) => ResponseContext.jsonBody(r.jsonMap(), status: 201),
+    doc: const OpenApiOperation(
+      requestExample: {'name': 'Ada', 'email': 'ada@example.com'}, // schema + editor inferred
+      successStatus: 201,
+      extraResponses: {'400': OpenApiResponse('Invalid body')},
+    ));
+
+await api.post('/upload', (r) => ResponseContext.jsonBody({'parts': r.multipart().length}),
+    doc: const OpenApiOperation(requestBodyDoc: OpenApiRequestBody.multipart(schema: {
+      'type': 'object', 'properties': {'file': {'type': 'string', 'format': 'binary'}},
+    })));
+
+await api.get('/me', (_) => ResponseContext.jsonBody({'ok': true}),
+    middleware: [bearerAuth((t) => t == 'secret')],
+    doc: const OpenApiOperation(requiresAuth: ['bearer'])); // padlock + credential sent
+
+await api.serve(); // GET /openapi.json + Swagger UI at /docs
+```
+
+Path params come from `:param`; `OpenApiParam.query/.header/.cookie`;
+`OpenApiRequestBody.json/.form/.multipart/.text/.binary`. POST/PUT/PATCH always
+get a JSON `requestBody`. Schemes: `bearerScheme()`, `apiKeyScheme()`,
+`basicScheme()`, `oauth2Scheme()`, `openIdConnectScheme()`. Raw
+`parameters`/`requestBody`/`responses`/`security` remain as escape hatches.
+
+### Graceful shutdown
+
+```dart
+final shutdown = shutdownOnSignals(server,
+    drain: const Duration(seconds: 15), onSignal: (s) => print('$s: draining'));
+// SIGTERM/SIGINT → stop accepting, drain in-flight requests, then exit.
+// shutdown.isShuttingDown · await shutdown.trigger() · await shutdown.cancel()
+
+await server.onClose; // keep main alive
+```
+
+Direct: `await server.close(drain: const Duration(seconds: 15))` — without
+`drain:` it closes immediately (parked requests get 503).
+
+### Server events
+
+```dart
+server.events.listen((e) => print('${e.kind.name} #${e.requestId}: ${e.message}'));
+// ServerEventKind: started, stopped, handlerTimeout, clientError, clientDisconnect, notice
+```
+
+### Startup banner
+
+```dart
+print(serverBanner(
+  title: 'my-api', version: '1.0.0', uri: server.uri,
+  isolates: server.isolates, pid: pid, routes: server.routes,
+  links: {'docs': '/docs', 'metrics': '/metrics'},
+  facts: ['hot reload off'], logo: nitroServerAsciiLogo,
+  color: stdout.supportsAnsiEscapes,
+));
 ```
 
 ## Testing
 
 `package:nitro_server/testing.dart` drives the real runner in memory — no
-sockets, no native library, real routing/middleware/error mapping:
+sockets, no native library, real routing/middleware/error mapping, HTTP and
+WebSocket. Import both libraries (`testing.dart` does not re-export the main one).
 
 ```dart
+import 'package:nitro_server/nitro_server.dart';
 import 'package:nitro_server/testing.dart';
+import 'package:test/test.dart';
 
-final client = await NitroTestClient.start();
-await client.server.get('/users/:id', (r) => ResponseContext.text('u${r.param('id')}'));
-final res = await client.get('/users/42');
-expect(res.status, 200);
-expect(res.text(), 'u42');
-await client.close();
+void main() {
+  test('routes and websocket', () async {
+    final client = await NitroTestClient.start();
+    final s = client.server; // register exactly as in production
+    await s.get('/users/:id', (r) => ResponseContext.text('u${r.param('id')}'));
+    await s.post('/echo', (r) => ResponseContext.jsonBody(r.jsonMap()));
+    await s.ws('/ws', (session) async {
+      await for (final m in session.messages) {
+        if (m is WsText) session.sendText('echo: ${m.text}');
+      }
+    });
+
+    expect((await client.get('/users/42')).text(), 'u42');
+
+    final posted = await client.post('/echo',
+        body: {'a': 1}, headers: {'content-type': 'application/json'}); // Map → JSON
+    expect(posted.status, 200);
+    expect(posted.json(), {'a': 1});
+
+    final ws = await client.ws('/ws');
+    ws.sendText('hi');
+    expect((await ws.messages.first).text, 'echo: hi');
+    await ws.close();
+
+    await client.close();
+  });
+}
 ```
+
+`client.request(HttpMethod.custom, '/x', customMethod: 'REPORT')` for custom
+verbs; `body:` accepts `String`, bytes or `Map`. Divergences: no sockets
+(`port` = 0), route timeouts and `maxBodyBytes` not enforced, `clientIp` = `''`.
 
 ## Hot reload
 
 ```dart
 import 'package:nitro_server/hot_reload.dart';
+import 'package:nitro_server/nitro_server.dart';
+
+Future<void> setup(NitroServer server) async {
+  await server.get('/hello', (_) => ResponseContext.text('hi'));
+}
 
 Future<void> main() async {
   final server = await NitroServer.bind(const ServerConfig(port: 8080), setup);
   try {
-    await enableHotReload(server); // re-runs `setup` after each hot reload
+    await enableHotReload(server, log: print); // watch: ['lib', 'bin'] to narrow; returns a HotReloader (.stop())
   } catch (_) {
     // AOT or no VM service: serve without reload.
   }
+  await server.onClose;
 }
 ```
 
 `server.reload([setup])` rebuilds the whole routing surface transactionally on
 the live socket (added/removed/changed routes, across every isolate, no dropped
-connections). Needs a VM service — works under `dart run --enable-vm-service`
-(JIT), throws under AOT (guard as above). `setup` must be a **top-level or
-static function** (hot reload cannot re-patch a stored closure); inline handlers
-are fine.
+connections). Needs `hotreloader` in `dev_dependencies` and a VM service —
+`dart run --enable-vm-service bin/server.dart` (JIT); throws under AOT, so guard
+as above. `setup` must be a **top-level or static function** (hot reload cannot
+re-patch a stored closure); inline handlers are fine.
 
-## Native library loading (Dart-only, no Flutter)
+## Native library loading
 
 `bind` opens the native library automatically — Flutter bundles it, a Dart CLI
-builds it with cmake. Search order: `NITRO_SERVER_DYLIB` → `build/lib/<name>` →
-`build/<name>`. For a custom path call `loadNitroServerNative(path: ...)`
-(idempotent) or `NitroServer.bindWith(dylibPath: ...)` before `bind`.
+builds it with cmake. Search order: explicit path → `NITRO_SERVER_DYLIB` →
+beside the executable (`lib/`, `../lib/`) → `.dart_tool/lib` → `build/lib` →
+`build/`.
 
-## Platforms & limitations
+```dart
+loadNitroServerNative(path: '/opt/libs/libnitro_server.so'); // idempotent; StateError lists searched paths
+// or
+final server = await NitroServer.bindWith(port: 8080, dylibPath: '/opt/libs/libnitro_server.so');
+```
+
+## Exceptions
+
+```dart
+try {
+  await NitroServer.bind(const ServerConfig(port: 80));
+} on ServerBindException catch (e) {
+  print('cannot bind: ${e.message}');
+} on ServerTlsException catch (e) {
+  print('TLS unavailable: ${e.message}');
+}
+```
+
+All extend `NitroServerException` (`message`): `ServerBindException`,
+`ServerTlsException`, `ServerAlreadyRunningException`,
+`ServerNotRunningException`, `RouteNotFoundException` (from `unroute`),
+`ServerBadRequestException`, `HandlerTimeoutException`,
+`ServerUnknownException`. Plain Dart errors elsewhere: `ArgumentError` (bad
+pattern/prefix, `isolates > 1` without `setup`), `StateError` (`reload` without a
+setup, missing dylib), `FormatException` (`json*()`, `multipart()`).
+
+## Platforms and limitations
 
 - **Platforms:** iOS (foreground only), Android (foreground service),
   macOS/Linux/Windows (unconstrained), Web (unsupported).
@@ -330,29 +801,81 @@ builds it with cmake. Search order: `NITRO_SERVER_DYLIB` → `build/lib/<name>` 
   when built `-DNITRO_SERVER_HTTP2=ON` (+ nghttp2); **HTTP/3** not implemented —
   terminate at a proxy. See [`docs/http2.md`](docs/http2.md),
   [`docs/http3.md`](docs/http3.md), [`docs/conformance.md`](docs/conformance.md).
-- **TLS/brotli are build-time** (OpenSSL/libbrotli, off by default); certificates
-  hot-reload via `server.reloadTls(...)`.
+- **TLS/brotli are build-time**: auto-enabled when OpenSSL/libbrotli are found at
+  engine build (prebuilts have both) — see
+  [Enabling TLS, brotli, gzip, HTTP/2](#enabling-tls-brotli-gzip-http2).
+  Certificates hot-reload via `server.reloadTls(...)`.
 - **Not serverless** — a persistent native process, for containers/VMs.
 - **State is process-wide** (one isolate by default); observability
-  auto-aggregates at `isolates > 1`, but see the `rateLimit` note above.
+  auto-aggregates at `isolates > 1`, but `metrics` and the default rate-limit
+  store are per isolate (see [shared store](#shared-rate-limit-store)).
+- **Server-global middleware does not wrap WebSocket routes** (the engine
+  upgrades first) — use `ws(middleware: [...])`, which gates the handshake and
+  maps a rejection to a close code (see [WebSocket](#websocket)).
 - `close(drain:)` answers connections accepted during drain with `503`; one still
   in the kernel backlog at final listener close may be reset.
 
 ## Performance
 
-8-core box, handler `/json`, `wrk`/`oha`:
-
-| metric | nitro | vs field |
-| --- | --- | --- |
-| throughput | ~115k req/s | 3rd (> dart:io, shelf) |
-| closed-loop p99 | 0.76 ms | best |
-| CPU efficiency | ~83k req/s per core | best (~2.4× Go) |
-| memory under load | ~30 MB RSS | lean tier; ~20× < Node |
-
-Full cross-framework comparison (throughput, p50–p99 latency, memory, AOT,
-response-validated fairness) is the reproducible blackbox harness — run
-`benchmark/blackbox/run.sh`; methodology in
+Reproducible blackbox harness: each framework an opaque HTTP server, `oha` at 64
+keep-alive connections, **equal CPU budget (3 server cores each)**, load
+generator on disjoint cores, medians of interleaved reps, **responses
+byte-validated identical across frameworks**; Linux container on Apple Silicon,
+measured 2026-10-20. The `nitro` column is the `_dylib` build; `@Native` is
+within noise on every route. Run it: `benchmark/blackbox/run.sh`; methodology in
 [`benchmark/BENCHMARKING.md`](benchmark/BENCHMARKING.md).
+
+**Headline:** fastest where there is real per-request work — `/echo` (beats Go,
+~ties Node), `/work` (~2.7× Go), and the engine `/static` fast-path. Second on
+trivial I/O: Go leads `/hello`…`/mw` by ~24%.
+
+### Setup (equal CPU budget = 3 cores each)
+
+| framework | configuration |
+|-----------|---------------|
+| **nitro** | `@Native` code asset **and** `DynamicLibrary` (both shown — within noise); `isolates: 3`, engine fans CPU work across them |
+| go | `net/http`; `GOMAXPROCS=3` |
+| node | `http` + `cluster`, 3 workers |
+| dart:io | `HttpServer`, 3 shared isolates (`SO_REUSEPORT`) |
+| shelf | `shelf_io.serve`, 3 shared isolates (`SO_REUSEPORT` — dart:io underneath) |
+
+### Throughput (req/s, median; **bold** = fastest per route)
+
+| route | nitro | go | node | dart:io | shelf |
+|-------|------:|---:|-----:|--------:|------:|
+| `/json` (light I/O)¹ | 173k | **215k** | 143k | 84k | 64k |
+| `/work` (encode 200 JSON records)² | 44k | 16k | **52k** | 8.4k | 9.0k |
+| `/echo` (4 KB body) | 100k | 79k | **107k** | 63k | 53k |
+| `/static` (engine fast-path)³ | **445k** | 218k | 142k | 87k | 64k |
+
+¹ `/hello`, `/q`, `/users`, `/files`, `/mw` track `/json` within ~5%.
+² per-request encode on every framework (equal work).
+³ nitro answers from the engine (`getStatic`, no handler/FFI); the others run a
+handler returning the same bytes — not apples-to-apples.
+
+### Tail latency — `/work` (ms, median; **bold** = best p99)
+
+| framework | p50 | p90 | p99 | p50:p99 |
+|-----------|----:|----:|----:|--------:|
+| node | 1.14 | 1.60 | **3.84** | 3.4× |
+| nitro | 1.24 | 2.61 | 4.16 | 3.4× |
+| shelf | 7.12 | 8.34 | 10.79 | 1.5× |
+| dart:io | 7.43 | 8.75 | 11.36 | 1.5× |
+| go | 0.96 | 11.02 | 22.15 | 23× |
+
+`p50:p99` is flatness, not speed (dart:io's and shelf's 1.5× is 1.5× of a slow
+number — 8–9k req/s vs nitro's 44k). Go's 23× is per-request-`Marshal` GC-pause
+spikes, not steady slowness.
+
+### Peak memory (RSS, whole-workload high-water; **bold** = lowest)
+
+| framework | nitro | go | node | dart:io | shelf |
+|-----------|------:|---:|-----:|--------:|------:|
+| peak RSS | 151 MB | **12 MB** | 394 MB | 51 MB | 58 MB |
+
+nitro = 3 isolate Dart heaps + the native libuv engine (~fixed at startup; load
+adds only ~16 MB — the JsonWriter pool bounds per-request churn). A light-route
+single-isolate server (the default) is ~30–50 MB.
 
 ## Developing
 

@@ -360,7 +360,10 @@ FutureOr<Response> Function(Request) _shelfMw(
   return (request) => inner(request);
 }
 
-Future<HttpServer> _startShelfServer() async {
+Future<HttpServer> _startShelfServer({
+  int port = 0,
+  bool shared = false,
+}) async {
   Future<Response> handler(Request request) async {
     if (request.method == 'POST' && request.url.path == 'echo') {
       final builder = BytesBuilder(copy: false);
@@ -382,10 +385,39 @@ Future<HttpServer> _startShelfServer() async {
   final server = await shelf_io.serve(
     pipeline,
     InternetAddress.loopbackIPv4,
-    0,
+    port,
+    shared: shared,
   );
   server.defaultResponseHeaders.clear();
   return server;
+}
+
+/// Extra shelf isolates sharing the port — shelf is `dart:io` underneath, so
+/// `shelf_io.serve(shared: true)` scales across isolates (SO_REUSEPORT) the
+/// same way the dart:io side does, giving shelf the same equal-CPU budget.
+Future<void> _spawnSharedShelfServers(int port, int count) async {
+  for (var i = 0; i < count; i++) {
+    final ready = ReceivePort();
+    await Isolate.spawn(_sharedShelfServerMain, (
+      port: port,
+      keepAlive: _keepAlive,
+      batchEvents: _batchEvents,
+      ready: ready.sendPort,
+    ), onError: ready.sendPort);
+    final first = await ready.first;
+    if (first != true) {
+      throw StateError('shelf shared isolate $i failed to bind: $first');
+    }
+  }
+}
+
+Future<void> _sharedShelfServerMain(
+  ({int port, bool keepAlive, bool batchEvents, SendPort ready}) args,
+) async {
+  _keepAlive = args.keepAlive;
+  _batchEvents = args.batchEvents;
+  await _startShelfServer(port: args.port, shared: true);
+  args.ready.send(true);
 }
 
 /// Route registration for nitro as a setup function: with `--isolates N`
@@ -1400,9 +1432,21 @@ Future<void> main(List<String> args) async {
           servedPort = s.port;
         }
       case 'shelf':
-        // shelf_io is single-isolate (its common deployment); its /work is a
-        // one-core figure by design — stated in the config table.
-        servedPort = (await _startShelfServer()).port;
+        // shelf is dart:io underneath; shelf_io.serve(shared: true) scales via
+        // SO_REUSEPORT the same way, so it gets the same equal-CPU budget as
+        // nitro's isolates / Go's GOMAXPROCS / the dart:io side.
+        {
+          final shared = _isolates != 1;
+          final s = await _startShelfServer(shared: shared);
+          if (shared) {
+            await _spawnSharedShelfServers(
+              s.port,
+              (_isolates == 0 ? Platform.numberOfProcessors ~/ 2 : _isolates) -
+                  1,
+            );
+          }
+          servedPort = s.port;
+        }
       default:
         stderr.writeln(
           'unknown --serve framework: $serve (nitro|dartio|shelf)',

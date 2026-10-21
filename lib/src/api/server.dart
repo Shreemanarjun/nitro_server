@@ -368,9 +368,14 @@ class NitroServer with RouteRegistrar<NitroServer> {
   ///
   /// A pattern holds either a WS or an HTTP route: registering one evicts
   /// the other (the engine keeps a single entry per method + pattern), and
-  /// [unroute] removes whichever stands. Global middleware does not wrap
-  /// WS handlers — the socket leaves HTTP mode before dispatch could run
-  /// it; see [WsHandler] for the auth pattern.
+  /// [unroute] removes whichever stands. Server-global middleware does not
+  /// wrap WS handlers — the engine completes the upgrade before dispatch —
+  /// so pass [middleware] (route-local, outermost first; a group's `use` list
+  /// prepends) to run a chain against the handshake before [handler]. Reuse
+  /// the HTTP middleware unchanged: because the 101 is already on the wire a
+  /// short-circuit such as `bearerAuth`'s 401 cannot become an HTTP status —
+  /// the socket closes with `4000 + status` (4401, 4403: the app range) or
+  /// 1008 for a non-4xx, and [handler] never runs. See [WsHandler].
   ///
   /// [protocols] lists accepted subprotocols in preference order: the
   /// handshake selects the first one the client offers (`Sec-WebSocket-
@@ -380,9 +385,10 @@ class NitroServer with RouteRegistrar<NitroServer> {
     String pattern,
     WsHandler handler, {
     List<String> protocols = const [],
+    List<Middleware>? middleware,
   }) async {
     _requirePattern(pattern);
-    _runner.addWsRoute(pattern, handler, protocols);
+    _runner.addWsRoute(pattern, handler, protocols, middleware ?? const []);
     return this;
   }
 

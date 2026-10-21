@@ -90,10 +90,21 @@ class RouteGroup with RouteRegistrar<RouteGroup> {
     return this;
   }
 
-  /// Registers a WebSocket route under the prefixed [pattern].
-  /// See [NitroServer.ws]. Returns `this`, so registrations chain.
-  Future<RouteGroup> ws(String pattern, WsHandler handler) async {
-    await server.ws('$_prefix$pattern', handler);
+  /// Registers a WebSocket route under the prefixed [pattern]; the group's
+  /// `use` list prepends [middleware]. See [NitroServer.ws]. Returns `this`,
+  /// so registrations chain.
+  Future<RouteGroup> ws(
+    String pattern,
+    WsHandler handler, {
+    List<String> protocols = const [],
+    List<Middleware>? middleware,
+  }) async {
+    await server.ws(
+      '$_prefix$pattern',
+      handler,
+      protocols: protocols,
+      middleware: [..._middleware, ...?middleware],
+    );
     return this;
   }
 

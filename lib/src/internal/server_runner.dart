@@ -192,7 +192,11 @@ class ServerRunner {
   /// WebSocket routes by pattern. Disjoint from [_routes] for GET: the
   /// engine holds a single entry per (method, pattern), so registering one
   /// side evicts the other here too (see [addRoute]/[addWsRoute]).
-  final _wsHandlers = <String, ({WsHandler handler, List<String> protocols})>{};
+  final _wsHandlers =
+      <
+        String,
+        ({WsHandler handler, List<String> protocols, HandlerComposer gate})
+      >{};
 
   /// Live WebSocket sessions by connection id.
   final _wsSessions = <int, _WsSessionImpl>{};
@@ -521,6 +525,7 @@ class ServerRunner {
     String pattern,
     WsHandler handler, [
     List<String> protocols = const [],
+    List<Middleware> middleware = const [],
   ]) {
     _ensureListening();
     final status = _native.registerRoute(
@@ -534,7 +539,11 @@ class ServerRunner {
     _routes['GET']?.remove(pattern);
     (_registered['GET'] ??= <String>{}).add(pattern);
     _reloadTouched?.add(_key('GET', pattern));
-    _wsHandlers[pattern] = (handler: handler, protocols: protocols);
+    _wsHandlers[pattern] = (
+      handler: handler,
+      protocols: protocols,
+      gate: _composeAll(middleware),
+    );
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -865,7 +874,7 @@ class ServerRunner {
     if (entry == null) {
       final ws = _wsHandlers[head.routePattern];
       if (ws != null) {
-        _dispatchWs(head.requestId, context, ws.handler, ws.protocols);
+        _dispatchWs(head.requestId, context, ws.handler, ws.protocols, ws.gate);
         return;
       }
       _guardedNotFound(context).then((response) {
@@ -1191,6 +1200,7 @@ class ServerRunner {
     RequestContext handshake,
     WsHandler handler,
     List<String> protocols,
+    HandlerComposer gate,
   ) {
     final offered =
         handshake
@@ -1219,8 +1229,43 @@ class ServerRunner {
     );
     _wsSessions[connectionId] = session;
     _wsOpened.add(connectionId);
-    // Replay any frames that beat the open (buffered in the stream controller
-    // until the handler subscribes), in arrival order, before live frames.
+    if (identical(gate, _identity)) {
+      _runWs(connectionId, session, handler);
+      return;
+    }
+    // Route middleware (`ws(middleware:)`) runs against the handshake before
+    // the handler, with [_wsAccept] as its terminal. The engine already sent
+    // the 101, so a short-circuit cannot become an HTTP status: it closes the
+    // socket instead — 4000+status for a 4xx (4401, 4403: the app range RFC
+    // 6455 reserves), 1008 (policy violation) for anything else, 1011 if the
+    // middleware throws — and the handler never runs.
+    Future<ResponseContext>.sync(() => gate(_wsAccept)(handshake)).then(
+      (verdict) {
+        final s = verdict.status;
+        if (s == _wsAccepted) {
+          _runWs(connectionId, session, handler);
+          return;
+        }
+        _wsEarly.remove(connectionId);
+        session._closeLocal(s >= 400 && s < 500 ? 4000 + s : 1008);
+      },
+      onError: (_) {
+        _wsEarly.remove(connectionId);
+        session._closeLocal(1011);
+      },
+    );
+  }
+
+  /// The WS middleware gate's terminal: reaching it means every middleware
+  /// called `next`, so the handshake is accepted.
+  static const int _wsAccepted = 101;
+  static ResponseContext _wsAccept(RequestContext _) =>
+      const ResponseContext(status: _wsAccepted);
+
+  /// Replays any frames that beat the open (buffered in the stream controller
+  /// until the handler subscribes), in arrival order, then runs [handler]:
+  /// returning closes 1000, throwing 1011.
+  void _runWs(int connectionId, _WsSessionImpl session, WsHandler handler) {
     final parked = _wsEarly.remove(connectionId);
     if (parked != null) {
       for (final m in parked) {

@@ -162,7 +162,7 @@ endfunction()
 # Opt in with -DNITRO_SERVER_HTTP2=ON. When requested AND nghttp2 is found,
 # links it and defines NITRO_SERVER_HTTP2=1 so the engine serves HTTP/2 (ALPN
 # `h2` over TLS, and h2c); otherwise the engine stays HTTP/1.1-only and never
-# advertises `h2` over ALPN. See docs/http2.md.
+# advertises `h2` over ALPN. See doc/http2.md.
 option(NITRO_SERVER_HTTP2 "Build with HTTP/2 (nghttp2)" OFF)
 function(nitro_server_attach_http2 target)
   if(NOT NITRO_SERVER_HTTP2)

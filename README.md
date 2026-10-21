@@ -173,7 +173,7 @@ docker run -p 8080:8080 myapp
 
 AOT has no hot reload. Keep the `.dylib`/`.so`/`.dll` beside a moved binary, or
 use `--bundle-deps`. Deploy recipes (Fly.io, Render, Railway, Cloud Run,
-Kubernetes, Netlify): [`docs/deployment.md`](docs/deployment.md).
+Kubernetes, Netlify): [`doc/deployment.md`](doc/deployment.md).
 
 ## How it works
 
@@ -799,8 +799,8 @@ setup, missing dylib), `FormatException` (`json*()`, `multipart()`).
   macOS/Linux/Windows (unconstrained), Web (unsupported).
 - **HTTP/2** on by default and runtime-selectable (`ServerConfig(protocol:)`)
   when built `-DNITRO_SERVER_HTTP2=ON` (+ nghttp2); **HTTP/3** not implemented —
-  terminate at a proxy. See [`docs/http2.md`](docs/http2.md),
-  [`docs/http3.md`](docs/http3.md), [`docs/conformance.md`](docs/conformance.md).
+  terminate at a proxy. See [`doc/http2.md`](doc/http2.md),
+  [`doc/http3.md`](doc/http3.md), [`doc/conformance.md`](doc/conformance.md).
 - **TLS/brotli are build-time**: auto-enabled when OpenSSL/libbrotli are found at
   engine build (prebuilts have both) — see
   [Enabling TLS, brotli, gzip, HTTP/2](#enabling-tls-brotli-gzip-http2).

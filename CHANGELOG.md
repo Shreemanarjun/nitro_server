@@ -47,7 +47,7 @@ and `ApiSchema` as the single source for docs **and** request validation.
 (`serve` JIT+hot-reload / `build` AOT or JIT snapshot, `--bundle-deps` for a
 portable native bundle); `serverBanner` startup banner; `ServerConfig.fromEnv`;
 a benchmark regression checker; Docker/Fly/Cloud-Run/Netlify deploy recipes
-(`docs/deployment.md`).
+(`doc/deployment.md`).
 
 **Quality** — 100% Dart line coverage, ≥90% C++ engine coverage, ThreadSanitizer
 + AddressSanitizer + libFuzzer in CI, and a reproducible cross-framework

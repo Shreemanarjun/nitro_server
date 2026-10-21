@@ -1,1 +1,1 @@
-../../../Classes/nitro_server.bridge.g.swift
+../../../../lib/src/generated/swift/nitro_server.bridge.g.swift

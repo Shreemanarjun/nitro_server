@@ -48,3 +48,9 @@ oom-*
 /.claude/skills/
 /.commandcode/skills/
 /skills-lock.json
+
+# Local `nitrogen link` artifacts: symlinks into the example app's ephemeral
+# Flutter SwiftPM package. Machine-specific and dangling until `flutter pub get`
+# runs in example/; never part of the published package (nitro tracks none).
+ios/FlutterFramework
+macos/FlutterFramework

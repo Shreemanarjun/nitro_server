@@ -1,6 +1,6 @@
 # Netlify hosts a STATIC frontend; nitro_server is a persistent native process,
 # so it runs on a container host (Fly.io / Render / Cloud Run — see
-# docs/deployment.md), NOT as a Netlify Function. This config serves your static
+# doc/deployment.md), NOT as a Netlify Function. This config serves your static
 # site and proxies API + WebSocket calls to the deployed backend.
 #
 # Replace the backend host below with your deployed nitro_server URL.

@@ -24,7 +24,9 @@ WORKDIR /app
 # Resolve dependencies on the pubspec layer. nitro_server is also a Flutter FFI
 # plugin, so its pubspec carries a publish-only Flutter SDK constraint; the
 # server is plain Dart, so that one line is dropped for the container build.
-COPY pubspec.yaml pubspec.lock ./
+# pubspec.lock is not committed (a package, not an app): the [k] glob makes
+# the copy optional, so the build works from a git checkout and from a dev tree.
+COPY pubspec.yaml pubspec.loc[k] ./
 RUN sed -i -E "/^\s*flutter:\s*['\"]>=/d" pubspec.yaml && dart pub get
 
 COPY . .

@@ -1,5 +1,7 @@
 #include "Router.h"
 
+#include <algorithm>
+
 #include <string_view>
 
 namespace nitroserver {
@@ -234,6 +236,51 @@ MatchResult Router::match(Method method, const std::string& customMethod,
     }
     out.params.assign(ps.rbegin(), ps.rend());
   }
+  return out;
+}
+
+}  // namespace nitroserver
+
+namespace nitroserver {
+
+void Router::collectAllowed(const Node* node,
+                            const std::vector<std::string_view>& segs,
+                            size_t idx, std::vector<std::string>& out) const {
+  if (!node) return;
+  auto take = [&](const Node* n) {
+    if (!n) return;
+    for (const auto& kv : n->entries) {
+      const RouteEntry& e = kv.second;
+      if (e.method == Method::All) {
+        for (const Method m : {Method::Get, Method::Head, Method::Post,
+                               Method::Put, Method::Delete, Method::Patch,
+                               Method::Options, Method::Trace})
+          out.emplace_back(methodToken(m));
+      } else if (e.method == Method::Custom) {
+        out.push_back(e.customMethod);
+      } else {
+        out.emplace_back(methodToken(e.method));
+        if (e.method == Method::Get) out.emplace_back("HEAD");
+      }
+    }
+  };
+  // A wildcard at this depth swallows the rest of the path.
+  take(node->wildcard.get());
+  if (idx == segs.size()) {
+    take(node);
+    return;
+  }
+  auto sit = node->statik.find(segs[idx]);
+  if (sit != node->statik.end()) collectAllowed(sit->second.get(), segs, idx + 1, out);
+  if (node->param) collectAllowed(node->param.get(), segs, idx + 1, out);
+}
+
+std::vector<std::string> Router::allowedMethods(const std::string& path) const {
+  std::vector<std::string> out;
+  const auto segs = split(path);
+  collectAllowed(&root_, segs, 0, out);
+  std::sort(out.begin(), out.end());
+  out.erase(std::unique(out.begin(), out.end()), out.end());
   return out;
 }
 

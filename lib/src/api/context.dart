@@ -9,26 +9,73 @@ import 'http_method.dart';
 import 'json_writer.dart';
 import 'multipart.dart';
 
-/// Identity for server TLS. Empty means plain HTTP; any field set requires a
-/// build with TLS support, otherwise `start()` throws [ServerTlsException].
+/// The lowest TLS protocol version a server accepts.
+enum TlsVersion { v12, v13 }
+
+/// Identity and policy for server TLS. An empty identity means plain HTTP; a
+/// certificate set requires a build with TLS support, otherwise `start()`
+/// throws [ServerTlsException].
+///
+/// Policy: [minVersion] (default TLS 1.2), [ciphers] (an OpenSSL cipher list
+/// for TLS 1.2) and [cipherSuites] (TLS 1.3 suites) narrow what is
+/// negotiated — empty keeps OpenSSL's defaults. Mutual TLS: set [clientCaPem]
+/// or [clientCaFile] (trust anchors) and every client must present a
+/// certificate chaining to them; a connection without one is refused at the
+/// handshake. A policy value OpenSSL rejects (an unknown cipher) fails `bind`
+/// with [ServerTlsException] rather than the first client.
 class TlsConfig {
   const TlsConfig({
     this.certPem = '',
     this.keyPem = '',
     this.certFile = '',
     this.keyFile = '',
+    this.minVersion = TlsVersion.v12,
+    this.ciphers = '',
+    this.cipherSuites = '',
+    this.clientCaPem = '',
+    this.clientCaFile = '',
   });
 
   final String certPem;
   final String keyPem;
   final String certFile;
   final String keyFile;
+  final TlsVersion minVersion;
+  final String ciphers;
+  final String cipherSuites;
+  final String clientCaPem;
+  final String clientCaFile;
 
   bool get enabled =>
       certPem.isNotEmpty ||
       keyPem.isNotEmpty ||
       certFile.isNotEmpty ||
       keyFile.isNotEmpty;
+
+  /// Whether clients must present a certificate.
+  bool get mutual => clientCaPem.isNotEmpty || clientCaFile.isNotEmpty;
+
+  TlsConfig copyWith({
+    String? certPem,
+    String? keyPem,
+    String? certFile,
+    String? keyFile,
+    TlsVersion? minVersion,
+    String? ciphers,
+    String? cipherSuites,
+    String? clientCaPem,
+    String? clientCaFile,
+  }) => TlsConfig(
+    certPem: certPem ?? this.certPem,
+    keyPem: keyPem ?? this.keyPem,
+    certFile: certFile ?? this.certFile,
+    keyFile: keyFile ?? this.keyFile,
+    minVersion: minVersion ?? this.minVersion,
+    ciphers: ciphers ?? this.ciphers,
+    cipherSuites: cipherSuites ?? this.cipherSuites,
+    clientCaPem: clientCaPem ?? this.clientCaPem,
+    clientCaFile: clientCaFile ?? this.clientCaFile,
+  );
 }
 
 /// The highest HTTP version a server negotiates (see [ServerConfig.protocol]).
@@ -73,21 +120,16 @@ class ServerConfig {
     this.protocol = HttpProtocol.http2,
     this.responseTiming = true,
     this.tls = const TlsConfig(),
-  }) : assert(port >= 0 && port <= 65535, 'port out of range: $port'),
-       assert(wsMaxBufferBytes > 0, 'wsMaxBufferBytes must be positive'),
-       assert(isolates >= 0, 'isolates must be non-negative'),
-       assert(maxConnections >= 0, 'maxConnections must be non-negative'),
-       assert(
-         maxConnectionsPerIp >= 0,
-         'maxConnectionsPerIp must be non-negative',
-       ),
-       assert(backlog > 0, 'backlog must be positive'),
-       assert(maxBodyBytes > 0, 'maxBodyBytes must be positive'),
-       assert(
-         maxRequestsPerConnection >= 0,
-         'maxRequestsPerConnection must be non-negative',
-       ),
-       assert(workerThreads >= 0, 'workerThreads must be non-negative');
+    this.exposeErrorDetails = false,
+    this.bodyTimeout = Duration.zero,
+    this.wsIdleTimeout = const Duration(seconds: 60),
+    this.maxConnectionAge = Duration.zero,
+    this.maxInFlightRequests = 0,
+    this.proxyProtocol = false,
+    this.streamIdleTimeout = const Duration(minutes: 5),
+    this.streamMaxBufferBytes = 4 * 1024 * 1024,
+    this.maxBufferedBodyBytes = 64 * 1024 * 1024,
+  });
 
   final String host;
   final int port;
@@ -172,6 +214,131 @@ class ServerConfig {
   final bool responseTiming;
   final TlsConfig tls;
 
+  /// Whether the default 500 answer names the thrown error. Off, a throwing
+  /// handler answers a generic `internal server error` body and the error is
+  /// reported on [NitroServer.events] instead — exception text can carry
+  /// paths, SQL, tokens or internal state. Turn on for local development only.
+  final bool exposeErrorDetails;
+
+  /// Stall window for a request body still arriving (head parsed, bytes
+  /// trickling in; restarts on every read): past it the engine answers `408`
+  /// and closes. Applies to buffered, streamed (`streamBody`) and HTTP/2
+  /// uploads alike. [Duration.zero] means [keepAliveTimeout] is the window.
+  final Duration bodyTimeout;
+
+  /// WebSocket liveness: a session quiet for half this is pinged by the
+  /// engine; one still silent at the full window (no pong, no frame) is
+  /// closed `1001` and a `clientError` event is emitted. [Duration.zero]
+  /// disables (a dead peer then holds its connection until the OS notices).
+  final Duration wsIdleTimeout;
+
+  /// Hard lifetime of a connection (load-balancer rebalancing, leak
+  /// bounding): past it an idle connection closes, a busy HTTP/1.1 one closes
+  /// after its answer, a WebSocket is closed `1001`, an HTTP/2 session gets
+  /// `GOAWAY` and ends once its streams finish. [Duration.zero] = unbounded.
+  final Duration maxConnectionAge;
+
+  /// Global budget of requests dispatched and not yet answered, across every
+  /// connection and protocol. Past it the engine answers `503` with
+  /// `Retry-After: 1` without reaching a handler. `0` = unlimited.
+  ///
+  /// Memory is bounded per connection, not by this knob: an HTTP/1.1
+  /// connection holds at most one request body ([maxBodyBytes], or the
+  /// route's own cap) plus a 64 KiB parse buffer; an HTTP/2 session holds at
+  /// most [maxBufferedBodyBytes] of request bodies across its streams; on the
+  /// write side a WebSocket queues at most [wsMaxBufferBytes] and a streaming
+  /// response at most [streamMaxBufferBytes]. Multiply by [maxConnections]
+  /// (set it: `0` is unlimited) for the server-wide bound.
+  final int maxInFlightRequests;
+
+  /// A streaming response (SSE, chunked, file) that writes nothing for this
+  /// long — and has nothing queued — is closed: the handler stopped feeding
+  /// it. A live stream must send something (an SSE `: ping` comment will do)
+  /// more often than this. `Duration.zero` disables. Default 5 minutes.
+  final Duration streamIdleTimeout;
+
+  /// Unsent bytes a streaming response may queue when its reader falls
+  /// behind; past it the connection is dropped and the handler's later
+  /// chunks are discarded (the WebSocket equivalent is [wsMaxBufferBytes]).
+  /// `0` = unlimited. Default 4 MiB.
+  final int streamMaxBufferBytes;
+
+  /// Request-body bytes one HTTP/2 session may hold across its concurrent
+  /// streams. A stream reserves its declared `Content-Length` (or its body
+  /// cap when undeclared) on its HEADERS frame; one that would exceed the
+  /// budget is answered `503` (`Retry-After: 1`), one larger than the whole
+  /// budget `413`. Must be at least [maxBodyBytes]; a route whose own cap is
+  /// larger than the budget answers `413` to bodies over the budget, so raise
+  /// this alongside such a route. `0` = unlimited. Default 64 MiB.
+  final int maxBufferedBodyBytes;
+
+  /// Expect a HAProxy PROXY protocol header (v1 text or v2 binary) first on
+  /// every accepted connection, ahead of TLS and HTTP/2 alike. The source
+  /// address it names becomes [RequestContext.clientIp] (so `rateLimit`,
+  /// `accessLog` and handlers see the real client behind an L4 balancer); a
+  /// connection without a valid header is closed and a `clientError` event
+  /// is emitted. Turn it on only for a listener reachable solely through the
+  /// proxy that sends it — a direct client could otherwise name any address.
+  final bool proxyProtocol;
+
+  /// Checks every range constraint and throws [ArgumentError] on the first
+  /// violation. `bind` calls it, so a bad value fails loudly in AOT builds
+  /// too (an `assert` would be compiled out, and a negative [maxBodyBytes]
+  /// used to mean "no cap"). Call it yourself to validate early.
+  void validate() {
+    void check(bool ok, String message) {
+      if (!ok) throw ArgumentError('ServerConfig: $message');
+    }
+
+    check(port >= 0 && port <= 65535, 'port out of range: $port');
+    check(backlog > 0, 'backlog must be positive');
+    check(maxBodyBytes > 0, 'maxBodyBytes must be positive');
+    check(isolates >= 0, 'isolates must be non-negative');
+    check(workerThreads >= 0, 'workerThreads must be non-negative');
+    check(maxConnections >= 0, 'maxConnections must be non-negative');
+    check(maxConnectionsPerIp >= 0, 'maxConnectionsPerIp must be non-negative');
+    check(
+      maxRequestsPerConnection >= 0,
+      'maxRequestsPerConnection must be non-negative',
+    );
+    check(wsMaxBufferBytes > 0, 'wsMaxBufferBytes must be positive');
+    check(
+      streamMaxBufferBytes >= 0,
+      'streamMaxBufferBytes must be non-negative',
+    );
+    check(
+      maxBufferedBodyBytes >= 0,
+      'maxBufferedBodyBytes must be non-negative',
+    );
+    check(
+      maxBufferedBodyBytes == 0 || maxBufferedBodyBytes >= maxBodyBytes,
+      'maxBufferedBodyBytes must be at least maxBodyBytes',
+    );
+    check(
+      !streamIdleTimeout.isNegative,
+      'streamIdleTimeout must not be negative',
+    );
+    check(!defaultTimeout.isNegative, 'defaultTimeout must not be negative');
+    check(
+      !keepAliveTimeout.isNegative,
+      'keepAliveTimeout must not be negative',
+    );
+    check(!headerTimeout.isNegative, 'headerTimeout must not be negative');
+    check(!writeTimeout.isNegative, 'writeTimeout must not be negative');
+    check(!bodyTimeout.isNegative, 'bodyTimeout must not be negative');
+    check(!wsIdleTimeout.isNegative, 'wsIdleTimeout must not be negative');
+    check(
+      !maxConnectionAge.isNegative,
+      'maxConnectionAge must not be negative',
+    );
+    check(maxInFlightRequests >= 0, 'maxInFlightRequests must be non-negative');
+    check(
+      tls.enabled || !tls.mutual,
+      'client certificates (clientCaPem/clientCaFile) need a server '
+      'certificate',
+    );
+  }
+
   /// A copy with any of [host], [port], [backlog], [maxBodyBytes],
   /// [defaultTimeout], [keepAliveTimeout], [maxRequestsPerConnection],
   /// [workerThreads], [isolates], [maxConnections], [maxConnectionsPerIp],
@@ -196,6 +363,15 @@ class ServerConfig {
     HttpProtocol? protocol,
     bool? responseTiming,
     TlsConfig? tls,
+    bool? exposeErrorDetails,
+    Duration? bodyTimeout,
+    Duration? wsIdleTimeout,
+    Duration? maxConnectionAge,
+    int? maxInFlightRequests,
+    bool? proxyProtocol,
+    Duration? streamIdleTimeout,
+    int? streamMaxBufferBytes,
+    int? maxBufferedBodyBytes,
   }) {
     return ServerConfig(
       host: host ?? this.host,
@@ -217,17 +393,34 @@ class ServerConfig {
       protocol: protocol ?? this.protocol,
       responseTiming: responseTiming ?? this.responseTiming,
       tls: tls ?? this.tls,
+      exposeErrorDetails: exposeErrorDetails ?? this.exposeErrorDetails,
+      bodyTimeout: bodyTimeout ?? this.bodyTimeout,
+      wsIdleTimeout: wsIdleTimeout ?? this.wsIdleTimeout,
+      maxConnectionAge: maxConnectionAge ?? this.maxConnectionAge,
+      maxInFlightRequests: maxInFlightRequests ?? this.maxInFlightRequests,
+      proxyProtocol: proxyProtocol ?? this.proxyProtocol,
+      streamIdleTimeout: streamIdleTimeout ?? this.streamIdleTimeout,
+      streamMaxBufferBytes: streamMaxBufferBytes ?? this.streamMaxBufferBytes,
+      maxBufferedBodyBytes: maxBufferedBodyBytes ?? this.maxBufferedBodyBytes,
     );
   }
 
   /// Reads config from [environment] (pass `Platform.environment`), overlaid on
   /// [base]. Only the variables present are applied, so unset ones keep
-  /// [base]'s value:
+  /// [base]'s value. A value that does not parse (`PORT=abc`) throws a
+  /// [FormatException] rather than being silently ignored:
   ///
-  /// `HOST`, `PORT`, `ISOLATES`, `WORKER_THREADS`, `MAX_BODY_BYTES`,
-  /// `MAX_CONNECTIONS`, `MAX_CONNECTIONS_PER_IP`, `KEEP_ALIVE_TIMEOUT_MS`,
-  /// `DEFAULT_TIMEOUT_MS`, `RESPONSE_TIMING` (`true`/`false`/`1`/`0`),
-  /// `WS_COMPRESSION`.
+  /// `HOST`, `PORT`, `BACKLOG`, `ISOLATES`, `WORKER_THREADS`, `MAX_BODY_BYTES`,
+  /// `MAX_CONNECTIONS`, `MAX_CONNECTIONS_PER_IP`, `MAX_REQUESTS_PER_CONNECTION`,
+  /// `KEEP_ALIVE_TIMEOUT_MS`, `DEFAULT_TIMEOUT_MS`, `HEADER_TIMEOUT_MS`,
+  /// `WRITE_TIMEOUT_MS`, `BODY_TIMEOUT_MS`, `WS_IDLE_TIMEOUT_MS`,
+  /// `MAX_CONNECTION_AGE_MS`, `MAX_IN_FLIGHT_REQUESTS`, `WS_MAX_BUFFER_BYTES`,
+  /// `WS_COMPRESSION`, `RESPONSE_TIMING`, `EXPOSE_ERROR_DETAILS`
+  /// (`true`/`false`/`1`/`0`),
+  /// `PROXY_PROTOCOL`, `HTTP_PROTOCOL` (`http1`/`http2`), and TLS as
+  /// `TLS_CERT_FILE` + `TLS_KEY_FILE` or `TLS_CERT_PEM` + `TLS_KEY_PEM`, with
+  /// policy `TLS_MIN_VERSION` (`1.2`/`1.3`), `TLS_CIPHERS`, `TLS_CIPHER_SUITES`
+  /// and mutual TLS via `TLS_CLIENT_CA_FILE` or `TLS_CLIENT_CA_PEM`.
   ///
   /// ```dart
   /// final server = await NitroServer.bind(
@@ -239,45 +432,116 @@ class ServerConfig {
     Map<String, String> environment, {
     ServerConfig base = const ServerConfig(),
   }) {
-    int? asInt(String key) => int.tryParse(environment[key] ?? '');
+    String? raw(String key) {
+      final v = environment[key];
+      return v == null || v.isEmpty ? null : v;
+    }
+
+    int? asInt(String key) {
+      final v = raw(key);
+      if (v == null) return null;
+      return int.tryParse(v) ??
+          (throw FormatException('$key must be an integer, got "$v"'));
+    }
+
     Duration? asMs(String key) {
       final v = asInt(key);
       return v == null ? null : Duration(milliseconds: v);
     }
 
     bool? asBool(String key) {
-      final v = environment[key]?.toLowerCase();
+      final v = raw(key)?.toLowerCase();
       if (v == null) return null;
-      return v == 'true' || v == '1' || v == 'yes' || v == 'on';
+      return switch (v) {
+        'true' || '1' || 'yes' || 'on' => true,
+        'false' || '0' || 'no' || 'off' => false,
+        _ => throw FormatException('$key must be a boolean, got "$v"'),
+      };
     }
 
     HttpProtocol? asProtocol(String key) {
-      switch (environment[key]?.toLowerCase().replaceAll('.', '')) {
-        case 'http1' || 'http11' || '1' || '11':
-          return HttpProtocol.http1;
-        case 'http2' || 'h2' || '2':
-          return HttpProtocol.http2;
-        case 'http3' || 'h3' || '3':
-          return HttpProtocol.http3;
-        case _:
-          return null;
-      }
+      final v = raw(key);
+      if (v == null) return null;
+      return switch (v.toLowerCase().replaceAll('.', '')) {
+        'http1' || 'http11' || '1' || '11' => HttpProtocol.http1,
+        'http2' || 'h2' || '2' => HttpProtocol.http2,
+        'http3' || 'h3' || '3' => HttpProtocol.http3,
+        _ => throw FormatException('$key must be http1/http2/http3, got "$v"'),
+      };
     }
 
-    final host = environment['HOST'];
+    TlsConfig? tls;
+    final certFile = raw('TLS_CERT_FILE'), keyFile = raw('TLS_KEY_FILE');
+    final certPem = raw('TLS_CERT_PEM'), keyPem = raw('TLS_KEY_PEM');
+    if (certFile != null || keyFile != null) {
+      if (certFile == null || keyFile == null) {
+        throw const FormatException(
+          'TLS_CERT_FILE and TLS_KEY_FILE must be set together',
+        );
+      }
+      tls = TlsConfig(certFile: certFile, keyFile: keyFile);
+    } else if (certPem != null || keyPem != null) {
+      if (certPem == null || keyPem == null) {
+        throw const FormatException(
+          'TLS_CERT_PEM and TLS_KEY_PEM must be set together',
+        );
+      }
+      tls = TlsConfig(certPem: certPem, keyPem: keyPem);
+    }
+    TlsVersion? minVersion;
+    if (raw('TLS_MIN_VERSION') case final v?) {
+      minVersion = switch (v.replaceAll('.', '').toLowerCase()) {
+        '12' || 'tls12' || 'tlsv12' => TlsVersion.v12,
+        '13' || 'tls13' || 'tlsv13' => TlsVersion.v13,
+        _ => throw FormatException(
+          'TLS_MIN_VERSION must be 1.2 or 1.3, got "$v"',
+        ),
+      };
+    }
+    final policy = <String, String?>{
+      'ciphers': raw('TLS_CIPHERS'),
+      'cipherSuites': raw('TLS_CIPHER_SUITES'),
+      'clientCaFile': raw('TLS_CLIENT_CA_FILE'),
+      'clientCaPem': raw('TLS_CLIENT_CA_PEM'),
+    };
+    if (minVersion != null || policy.values.any((v) => v != null)) {
+      tls = (tls ?? base.tls).copyWith(
+        minVersion: minVersion,
+        ciphers: policy['ciphers'],
+        cipherSuites: policy['cipherSuites'],
+        clientCaFile: policy['clientCaFile'],
+        clientCaPem: policy['clientCaPem'],
+      );
+    }
+
     return base.copyWith(
-      host: host != null && host.isNotEmpty ? host : null,
+      host: raw('HOST'),
       port: asInt('PORT'),
+      backlog: asInt('BACKLOG'),
       isolates: asInt('ISOLATES'),
       workerThreads: asInt('WORKER_THREADS'),
       maxBodyBytes: asInt('MAX_BODY_BYTES'),
       maxConnections: asInt('MAX_CONNECTIONS'),
       maxConnectionsPerIp: asInt('MAX_CONNECTIONS_PER_IP'),
+      maxRequestsPerConnection: asInt('MAX_REQUESTS_PER_CONNECTION'),
       keepAliveTimeout: asMs('KEEP_ALIVE_TIMEOUT_MS'),
       defaultTimeout: asMs('DEFAULT_TIMEOUT_MS'),
-      responseTiming: asBool('RESPONSE_TIMING'),
+      headerTimeout: asMs('HEADER_TIMEOUT_MS'),
+      writeTimeout: asMs('WRITE_TIMEOUT_MS'),
+      bodyTimeout: asMs('BODY_TIMEOUT_MS'),
+      wsIdleTimeout: asMs('WS_IDLE_TIMEOUT_MS'),
+      maxConnectionAge: asMs('MAX_CONNECTION_AGE_MS'),
+      maxInFlightRequests: asInt('MAX_IN_FLIGHT_REQUESTS'),
+      wsMaxBufferBytes: asInt('WS_MAX_BUFFER_BYTES'),
+      streamIdleTimeout: asMs('STREAM_IDLE_TIMEOUT_MS'),
+      streamMaxBufferBytes: asInt('STREAM_MAX_BUFFER_BYTES'),
+      maxBufferedBodyBytes: asInt('MAX_BUFFERED_BODY_BYTES'),
       wsCompression: asBool('WS_COMPRESSION'),
+      responseTiming: asBool('RESPONSE_TIMING'),
+      exposeErrorDetails: asBool('EXPOSE_ERROR_DETAILS'),
+      proxyProtocol: asBool('PROXY_PROTOCOL'),
       protocol: asProtocol('HTTP_PROTOCOL'),
+      tls: tls,
     );
   }
 }
@@ -345,8 +609,29 @@ class RequestContext {
   /// Query parameters, parsed from [query] on first access. Repeated keys
   /// collapse to the last value — use [queryParametersAll] to keep every value.
   late final Map<String, String> queryParameters =
-      _queryParameters ??
-      (query.isEmpty ? const {} : Uri.splitQueryString(query));
+      _queryParameters ?? _parseQuery(query);
+
+  /// Malformed percent-encoding (`%zz`, a truncated `%E`) keeps the raw
+  /// text instead of throwing: a client's bad escape is its own problem,
+  /// never a 500 on this side.
+  static Map<String, String> _parseQuery(String query) {
+    if (query.isEmpty) return const {};
+    try {
+      return Uri.splitQueryString(query);
+    } on ArgumentError {
+      return {
+        for (final e in _parseQueryAll(query).entries) e.key: e.value.last,
+      };
+    }
+  }
+
+  static String _decodeLenient(String component) {
+    try {
+      return Uri.decodeQueryComponent(component);
+    } on ArgumentError {
+      return component;
+    }
+  }
 
   /// Every query parameter value by name, repeats preserved (`?tag=a&tag=b` →
   /// `{'tag': ['a', 'b']}`); parsed from [query] on first access.
@@ -362,9 +647,7 @@ class RequestContext {
       final eq = pair.indexOf('=');
       final key = eq == -1 ? pair : pair.substring(0, eq);
       final value = eq == -1 ? '' : pair.substring(eq + 1);
-      (out[Uri.decodeQueryComponent(key)] ??= []).add(
-        Uri.decodeQueryComponent(value),
-      );
+      (out[_decodeLenient(key)] ??= []).add(_decodeLenient(value));
     }
     return out;
   }
@@ -429,12 +712,22 @@ class RequestContext {
   }
 
   /// The `multipart/form-data` parts of the body, in order. Throws
-  /// [FormatException] when the request is not multipart or the body is
-  /// malformed. Fields have no [MultipartPart.filename]; uploads do.
-  List<MultipartPart> multipart() {
+  /// [FormatException] when the request is not multipart, the body is
+  /// malformed, or a limit is crossed ([maxParts] parts,
+  /// [maxPartHeaderBytes] per part's headers — see [parseMultipart]).
+  /// Fields have no [MultipartPart.filename]; uploads do.
+  List<MultipartPart> multipart({
+    int maxParts = 1000,
+    int maxPartHeaderBytes = 8 * 1024,
+  }) {
     final type = header('content-type');
     if (type == null) throw const FormatException('no content-type header');
-    return parseMultipart(body, type);
+    return parseMultipart(
+      body,
+      type,
+      maxParts: maxParts,
+      maxPartHeaderBytes: maxPartHeaderBytes,
+    );
   }
 
   /// The body decoded as JSON. Untyped by nature; prefer [jsonMap], [jsonList]
@@ -563,32 +856,15 @@ class ResponseContext {
   /// True when this answer streams ([bodyStream] != null).
   bool get isStream => bodyStream != null;
 
-  /// This answer plus [cookie] (see [cookies]).
-  ResponseContext withCookie(SetCookie cookie) => ResponseContext(
-    status: status,
-    headers: headers,
-    body: body,
-    bodyStream: bodyStream,
-    streamBufferSize: streamBufferSize,
-    filePath: filePath,
-    fileOffset: fileOffset,
-    fileLength: fileLength,
-    cookies: [...cookies, cookie],
-  );
-
   /// This answer with header [name] set to [value] (replacing any existing
   /// value). Keeps the body, stream, file and cookies intact.
-  ResponseContext withHeader(String name, String value) => ResponseContext(
-    status: status,
-    headers: {...headers, name: value},
-    body: body,
-    bodyStream: bodyStream,
-    streamBufferSize: streamBufferSize,
-    filePath: filePath,
-    fileOffset: fileOffset,
-    fileLength: fileLength,
-    cookies: cookies,
-  );
+  ResponseContext withHeader(String name, String value) =>
+      copyWith(headers: {...headers, name: value});
+
+  /// This answer with [cookie] added to its `Set-Cookie` list. Keeps the
+  /// body, stream, writer and file intact.
+  ResponseContext withCookie(SetCookie cookie) =>
+      copyWith(cookies: [...cookies, cookie]);
 
   /// A copy with [status] and/or [headers] replaced, carrying over every
   /// body-bearing field — the one-shot [body], the [bodyStream] and its
@@ -597,26 +873,33 @@ class ResponseContext {
   /// this: rebuilding via the constructor and copying just `body` silently
   /// drops a streaming, SSE or file answer (and any set-cookies), so the
   /// response goes out empty. See [withHeader] for a single header.
-  ResponseContext copyWith({int? status, Map<String, String>? headers}) =>
-      ResponseContext(
-        status: status ?? this.status,
-        headers: headers ?? this.headers,
-        body: body,
-        bodyWriter: bodyWriter,
-        bodyStream: bodyStream,
-        streamBufferSize: streamBufferSize,
-        filePath: filePath,
-        fileOffset: fileOffset,
-        fileLength: fileLength,
-        cookies: cookies,
-      );
+  ResponseContext copyWith({
+    int? status,
+    Map<String, String>? headers,
+    List<SetCookie>? cookies,
+  }) => ResponseContext(
+    status: status ?? this.status,
+    headers: headers ?? this.headers,
+    body: body,
+    bodyWriter: bodyWriter,
+    bodyStream: bodyStream,
+    streamBufferSize: streamBufferSize,
+    filePath: filePath,
+    fileOffset: fileOffset,
+    fileLength: fileLength,
+    cookies: cookies ?? this.cookies,
+  );
 
   /// True when this answer is a file ([filePath] != null).
   bool get isFile => filePath != null;
 
-  /// Answers with the bytes of the file at [path], sent by the native
-  /// worker (`sendfile` on macOS and Linux) — the file never crosses into
-  /// Dart. A missing or unreadable file answers 404. [offset] and [length]
+  /// Answers with the bytes of the file at [path], read and written by the
+  /// engine on the connection's loop thread in 256 KiB chunks, each read only
+  /// once the previous write has drained — the file never crosses into Dart,
+  /// a slow reader holds one chunk, and a file larger than memory is fine
+  /// (over HTTP/2 the range is buffered per stream, see doc/http2.md). A
+  /// missing or unreadable path, or anything that is not a regular file (a
+  /// directory, a FIFO), answers 404. [offset] and [length]
   /// select a byte range (`length` `-1` means to the end); the caller sets
   /// the matching status and `content-range` — [staticFiles] does all of
   /// that for a directory.
@@ -1002,6 +1285,56 @@ class SetCookie {
   final SameSite? sameSite;
 
   /// The header value, e.g. `id=42; Path=/; Max-Age=3600; HttpOnly`.
+  /// Why this cookie cannot go on the wire, or null when it can: the name
+  /// must be an HTTP token, the value cookie-octets (no control bytes,
+  /// whitespace, `"`, `,`, `;` or `\`), and the domain/path attributes free
+  /// of control bytes and `;` (RFC 6265 §4.1.1). A violating cookie would let
+  /// attacker-influenced data split the response or inject attributes; the
+  /// runner refuses such an answer with a 500 and a `handlerError` event.
+  String? get validationError {
+    if (name.isEmpty) return 'empty cookie name';
+    for (final c in name.codeUnits) {
+      final token =
+          (c >= 0x30 && c <= 0x39) ||
+          (c >= 0x41 && c <= 0x5a) ||
+          (c >= 0x61 && c <= 0x7a) ||
+          c == 0x21 ||
+          (c >= 0x23 && c <= 0x27) ||
+          c == 0x2a ||
+          c == 0x2b ||
+          c == 0x2d ||
+          c == 0x2e ||
+          c == 0x5e ||
+          c == 0x5f ||
+          c == 0x60 ||
+          c == 0x7c ||
+          c == 0x7e;
+      if (!token) return 'cookie name "$name" is not a token';
+    }
+    for (final c in value.codeUnits) {
+      final octet =
+          c == 0x21 ||
+          (c >= 0x23 && c <= 0x2b) ||
+          (c >= 0x2d && c <= 0x3a) ||
+          (c >= 0x3c && c <= 0x5b) ||
+          (c >= 0x5d && c <= 0x7e);
+      if (!octet) {
+        return 'cookie "$name" value has a byte that is not a cookie-octet';
+      }
+    }
+    for (final attr in [domain, path]) {
+      if (attr == null) {
+        continue;
+      }
+      for (final c in attr.codeUnits) {
+        if (c < 0x20 || c == 0x7f || c == 0x3b) {
+          return 'cookie "$name" attribute has a control byte or ";"';
+        }
+      }
+    }
+    return null;
+  }
+
   String toHeaderValue() {
     final out = StringBuffer('$name=$value');
     if (expires case final expires?) {

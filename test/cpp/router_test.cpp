@@ -166,3 +166,41 @@ TEST(RouterTest, RootPath) {
 }
 
 }  // namespace
+
+
+TEST(RouterTest, AllowedMethodsListsWhatIsRegisteredAtThePath) {
+  Router r;
+  RouteEntry get;
+  get.method = Method::Get;
+  get.pattern = "/a/:id";
+  ASSERT_TRUE(r.add(get));
+  RouteEntry post;
+  post.method = Method::Post;
+  post.pattern = "/a/:id";
+  ASSERT_TRUE(r.add(post));
+  RouteEntry custom;
+  custom.method = Method::Custom;
+  custom.customMethod = "PURGE";
+  custom.pattern = "/a/fixed";
+  ASSERT_TRUE(r.add(custom));
+  RouteEntry wild;
+  wild.method = Method::Put;
+  wild.pattern = "/files/*";
+  ASSERT_TRUE(r.add(wild));
+  RouteEntry all;
+  all.method = Method::All;
+  all.pattern = "/any";
+  ASSERT_TRUE(r.add(all));
+  using V = std::vector<std::string>;
+  EXPECT_EQ(r.allowedMethods("/a/42"), (V{"GET", "HEAD", "POST"}));
+  // The static sibling and the param node both apply to /a/fixed.
+  EXPECT_EQ(r.allowedMethods("/a/fixed"), (V{"GET", "HEAD", "POST", "PURGE"}));
+  EXPECT_EQ(r.allowedMethods("/files/x/y"), (V{"PUT"}));
+  EXPECT_EQ(r.allowedMethods("/files"), (V{"PUT"}));
+  EXPECT_EQ(r.allowedMethods("/any"),
+            (V{"DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "TRACE"}));
+  EXPECT_TRUE(r.allowedMethods("/nothing").empty());
+  EXPECT_TRUE(r.allowedMethods("/a").empty());
+  EXPECT_STREQ(methodToken(Method::All), "*");
+  EXPECT_STREQ(methodToken(Method::Custom), "");
+}

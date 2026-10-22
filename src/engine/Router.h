@@ -68,6 +68,13 @@ class Router {
   MatchResult match(Method method, const std::string& customMethod,
                     const std::string& path) const;
 
+  /// The method tokens registered at [path] (RFC 9110 §10.2.1 `Allow`), for
+  /// a 405 when [match] found the path but not the method. Sorted, unique;
+  /// `GET` implies `HEAD`; an All-route lists every standard method. Empty
+  /// when nothing is registered at the path (a 404). Not on the hot path: only
+  /// called after a miss.
+  std::vector<std::string> allowedMethods(const std::string& path) const;
+
   /// Test seam: number of registered routes.
   size_t size() const { return size_; }
 
@@ -92,6 +99,8 @@ class Router {
                         std::vector<std::string_view>& segs);
   static bool validPattern(const std::string& pattern);
 
+  void collectAllowed(const Node* node, const std::vector<std::string_view>& segs,
+                      size_t idx, std::vector<std::string>& out) const;
   const Node* findNode(const std::vector<std::string_view>& segs) const;
   Node* findNodeMut(const std::vector<std::string_view>& segs);
 

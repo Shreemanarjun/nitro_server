@@ -21,6 +21,57 @@ String _basic(String user, String pass) =>
     'Basic ${base64.encode(utf8.encode('$user:$pass'))}';
 
 void main() {
+  test('originPolicy admits listed origins only (RFC 6455 §10.2)', () async {
+    final client = await NitroTestClient.start();
+    addTearDown(client.close);
+    final s = client.server;
+    await s.get(
+      '/o',
+      (_) => ResponseContext.text('ok'),
+      middleware: [
+        originPolicy(['https://App.example.com', 'http://localhost:3000/']),
+      ],
+    );
+    await s.get(
+      '/lenient',
+      (_) => ResponseContext.text('ok'),
+      middleware: [
+        originPolicy(['https://app.example.com'], allowMissing: true),
+      ],
+    );
+    expect((await client.get('/o')).status, 403); // no Origin at all
+    expect(
+      (await client.get(
+        '/o',
+        headers: {'origin': 'https://evil.example'},
+      )).status,
+      403,
+    );
+    expect(
+      (await client.get(
+        '/o',
+        headers: {'origin': 'https://app.example.com'},
+      )).status,
+      200,
+    );
+    expect(
+      (await client.get(
+        '/o',
+        headers: {'origin': 'http://localhost:3000'},
+      )).status,
+      200,
+    );
+    expect((await client.get('/lenient')).status, 200);
+    expect(
+      (await client.get(
+        '/lenient',
+        headers: {'origin': 'https://evil.example'},
+      )).status,
+      403,
+    );
+    expect(() => originPolicy(const []), throwsArgumentError);
+  });
+
   // --- client harness: compress (features_test setUp, no /ok) ---
   group('client (compress)', () {
     late NitroTestClient client;
@@ -203,6 +254,17 @@ void main() {
       });
     });
 
+    group('cors misconfiguration', () {
+      test('a wildcard origin with credentials is refused up front', () {
+        expect(() => cors(allowCredentials: true), throwsArgumentError);
+        expect(
+          () =>
+              cors(allowOrigin: 'https://app.example', allowCredentials: true),
+          returnsNormally,
+        );
+      });
+    });
+
     group('requestId', () {
       test('generates an X-Request-Id when the client sends none', () async {
         await client.server.use(requestId());
@@ -229,6 +291,42 @@ void main() {
           )).headers['x-request-id'],
           'corr',
         );
+      });
+
+      test('an unsafe inbound id is replaced, never reflected', () async {
+        await client.server.use(requestId());
+        await client.server.get('/ok', (_) => ResponseContext.text('ok'));
+        for (final bad in [
+          'ok\r\nInjected: yes',
+          'ok\nInjected: yes',
+          'has space',
+          'a' * 129,
+          'tab\there',
+          '',
+        ]) {
+          final id = (await client.get(
+            '/ok',
+            headers: {'x-request-id': bad},
+          )).headers['x-request-id'];
+          expect(id, isNotNull, reason: bad);
+          expect(id, isNot(bad), reason: bad);
+          expect(id, matches(RegExp(r'^[A-Za-z0-9._:-]{1,128}$')), reason: bad);
+        }
+        // The safe alphabet round-trips untouched (UUID, ULID, trace ids).
+        for (final good in [
+          '123e4567-e89b-12d3-a456-426614174000',
+          '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+          'svc:req.42_x',
+          'a' * 128,
+        ]) {
+          expect(
+            (await client.get(
+              '/ok',
+              headers: {'x-request-id': good},
+            )).headers['x-request-id'],
+            good,
+          );
+        }
       });
 
       test('a handler-set id wins', () async {
@@ -276,9 +374,11 @@ void main() {
         expect((await client.get('/ok')).status, 200); // new window
       });
 
-      test('keys per client via X-Forwarded-For, then X-Real-IP', () async {
+      test('ignores X-Forwarded-For / X-Real-IP unless the peer is a trusted '
+          'proxy', () async {
         await client.server.use(rateLimit(maxRequests: 1));
-        // Client A exhausts its bucket.
+        // The in-memory client has no peer address, so everything shares
+        // one bucket — forged headers cannot mint fresh ones.
         expect(
           (await client.get(
             '/ok',
@@ -289,27 +389,136 @@ void main() {
         expect(
           (await client.get(
             '/ok',
-            headers: {'x-forwarded-for': '1.1.1.1, p'},
-          )).status,
-          429, // same first hop
-        );
-        // Client B (different hop) has its own bucket.
-        expect(
-          (await client.get(
-            '/ok',
             headers: {'x-forwarded-for': '2.2.2.2'},
           )).status,
-          200,
-        );
-        // X-Real-IP path (no XFF).
-        expect(
-          (await client.get('/ok', headers: {'x-real-ip': '3.3.3.3'})).status,
-          200,
+          429,
         );
         expect(
           (await client.get('/ok', headers: {'x-real-ip': '3.3.3.3'})).status,
           429,
         );
+      });
+
+      test('with trustedProxies, keys on the nearest untrusted hop', () {
+        final limit = rateLimit(
+          maxRequests: 1,
+          trustedProxies: ['10.0.0.0/8', '::1'],
+        );
+        // Drive the middleware directly with a peer address of our choosing.
+        Future<int> hit(String peer, Map<String, String> headers) async {
+          final r = await limit(
+            RequestContext(
+              method: HttpMethod.get,
+              customMethod: '',
+              path: '/ok',
+              query: '',
+              headers: {
+                for (final e in headers.entries) e.key: [e.value],
+              },
+              params: const {},
+              routePattern: '/ok',
+              body: Uint8List(0),
+              clientIp: peer,
+            ),
+            (_) async => ResponseContext.text('ok'),
+          );
+          return r.status;
+        }
+
+        return () async {
+          // Untrusted peer: headers ignored, keyed on the peer itself.
+          expect(await hit('203.0.113.9', {'x-forwarded-for': '1.1.1.1'}), 200);
+          expect(await hit('203.0.113.9', {'x-forwarded-for': '2.2.2.2'}), 429);
+          // Trusted proxy: the client is the nearest hop that is not a proxy.
+          expect(await hit('10.1.2.3', {'x-forwarded-for': '1.1.1.1'}), 200);
+          expect(
+            await hit('10.1.2.3', {'x-forwarded-for': '1.1.1.1, 10.9.9.9'}),
+            429, // same client behind a second trusted hop
+          );
+          expect(await hit('10.1.2.3', {'x-forwarded-for': '5.5.5.5'}), 200);
+          // Garbage in the chain stops the walk; falls back to X-Real-IP.
+          expect(
+            await hit('10.1.2.3', {
+              'x-forwarded-for': 'junk, 10.9.9.9',
+              'x-real-ip': '7.7.7.7',
+            }),
+            200,
+          );
+          expect(await hit('10.1.2.3', {'x-real-ip': '7.7.7.7'}), 429);
+          // No usable header from a trusted proxy: the proxy's own address.
+          expect(await hit('10.1.2.3', {}), 200);
+          expect(await hit('10.1.2.3', {'x-real-ip': 'nope'}), 429);
+          // IPv6 proxy, IPv6 client.
+          expect(await hit('::1', {'x-forwarded-for': '2001:db8::1'}), 200);
+          expect(await hit('::1', {'x-forwarded-for': '2001:db8::1'}), 429);
+          // No peer address at all: one shared bucket.
+          expect(await hit('', {}), 200);
+          expect(await hit('', {}), 429);
+        }();
+      });
+
+      test('an IPv4-mapped IPv6 peer matches v4 CIDRs and keys', () {
+        final limit = rateLimit(
+          maxRequests: 1,
+          trustedProxies: ['127.0.0.0/8'],
+        );
+        Future<int> hit(String peer, Map<String, String> headers) async =>
+            (await limit(
+              RequestContext(
+                method: HttpMethod.get,
+                customMethod: '',
+                path: '/ok',
+                query: '',
+                headers: {
+                  for (final e in headers.entries) e.key: [e.value],
+                },
+                params: const {},
+                routePattern: '/ok',
+                body: Uint8List(0),
+                clientIp: peer,
+              ),
+              (_) async => ResponseContext.text('ok'),
+            )).status;
+        return () async {
+          // The proxy arrives as ::ffff:127.0.0.1 through a `::` listener.
+          expect(
+            await hit('::ffff:127.0.0.1', {'x-forwarded-for': '10.1.1.1'}),
+            200,
+          );
+          expect(
+            await hit('::ffff:127.0.0.1', {'x-forwarded-for': '10.1.1.1'}),
+            429,
+          );
+          expect(
+            await hit('::ffff:127.0.0.1', {'x-forwarded-for': '10.1.1.2'}),
+            200,
+          );
+          // Mapped hops are keyed as their IPv4 self.
+          expect(
+            await hit('::ffff:127.0.0.1', {
+              'x-forwarded-for': '::ffff:10.1.1.2',
+            }),
+            429,
+          );
+        }();
+      });
+
+      test('trustedProxies entries must be IPs or CIDRs', () {
+        expect(
+          () => rateLimit(maxRequests: 1, trustedProxies: ['proxy.local']),
+          throwsArgumentError,
+        );
+        expect(
+          () => rateLimit(maxRequests: 1, trustedProxies: ['10.0.0.0/33']),
+          throwsArgumentError,
+        );
+        expect(
+          () => rateLimit(maxRequests: 1, trustedProxies: ['10.0.0.0/x']),
+          throwsArgumentError,
+        );
+        // A v4 network never matches a v6 peer (different lengths).
+        final limit = rateLimit(maxRequests: 1, trustedProxies: ['0.0.0.0/0']);
+        expect(limit, isNotNull);
       });
 
       test('with no proxy headers, all clients share one bucket', () async {
@@ -340,21 +549,70 @@ void main() {
         );
       });
 
-      test('evicts expired keys on a new window', () async {
-        await client.server.use(
-          rateLimit(maxRequests: 1, window: const Duration(milliseconds: 40)),
-        );
-        await client.get('/ok', headers: {'x-real-ip': 'old'});
-        await Future<void>.delayed(const Duration(milliseconds: 60));
-        // A fresh request for a different key triggers eviction of 'old'.
-        expect(
-          (await client.get('/ok', headers: {'x-real-ip': 'new'})).status,
-          200,
-        );
+      test('the in-memory store evicts expired keys, then the soonest to '
+          'expire, and never exceeds maxKeys', () async {
+        final store = InMemoryRateLimitStore(maxKeys: 10);
+        const short = Duration(milliseconds: 30);
+        const long = Duration(minutes: 5);
+        for (var i = 0; i < 10; i++) {
+          expect(store.hit('k$i', short).count, 1);
+        }
+        expect(store.size, 10);
+        // A known key still counts up without evicting anything.
+        expect(store.hit('k0', short).count, 2);
+        expect(store.size, 10);
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        // Full + a new key: the expired ones go first.
+        expect(store.hit('fresh', short).count, 1);
+        expect(store.size, 1);
+        // Full of live keys: the soonest-to-expire tenth (here: one key,
+        // `fresh`) is dropped so the newcomer fits; the rest keep counting.
+        for (var i = 0; i < 9; i++) {
+          store.hit('live$i', long);
+        }
+        expect(store.size, 10);
+        store.hit('one-more', long);
+        expect(store.size, 10);
+        expect(store.hit('live0', long).count, 2); // survived
+        // `fresh` was the one dropped: re-hitting it starts a new window (and,
+        // the store being full again, evicts the next soonest key).
+        expect(store.hit('fresh', long).count, 1);
+        expect(store.size, 10);
+        expect(() => InMemoryRateLimitStore(maxKeys: 0), throwsA(anything));
       });
 
-      test('rejects a non-positive limit', () {
-        expect(() => rateLimit(maxRequests: 0), throwsA(isA<AssertionError>()));
+      test('rateLimit honours maxKeys through the default store', () async {
+        final limit = rateLimit(
+          maxRequests: 1,
+          maxKeys: 2,
+          keyExtractor: (r) => r.path,
+        );
+        Future<int> hit(String path) async => (await limit(
+          RequestContext(
+            method: HttpMethod.get,
+            customMethod: '',
+            path: path,
+            query: '',
+            headers: const {},
+            params: const {},
+            routePattern: '/*',
+            body: Uint8List(0),
+          ),
+          (_) async => ResponseContext.text('ok'),
+        )).status;
+        expect(await hit('/a'), 200);
+        expect(await hit('/b'), 200);
+        expect(await hit('/c'), 200); // evicts one of a/b (both live)
+        expect(await hit('/c'), 429);
+      });
+
+      test('rejects a non-positive limit, in AOT too (no assert)', () {
+        expect(() => rateLimit(maxRequests: 0), throwsArgumentError);
+        expect(() => InMemoryRateLimitStore(maxKeys: 0), throwsArgumentError);
+        expect(
+          () => validateJsonBody(const ApiSchema.object({}), maxErrors: 0),
+          throwsArgumentError,
+        );
       });
 
       test(

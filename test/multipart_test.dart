@@ -82,6 +82,85 @@ void main() {
         );
       });
 
+      test('refuses hostile boundaries and bounds parts and part headers', () {
+        Uint8List body(String s) => Uint8List.fromList(utf8.encode(s));
+        // RFC 2046: 1-70 bchars, not ending in a space.
+        for (final bad in ['', 'x' * 71, 'a b ', 'a"b', 'a\\b', 'a;b']) {
+          expect(
+            () => parseMultipart(
+              body('--$bad\r\n\r\n--$bad--'),
+              'multipart/form-data; boundary="$bad"',
+            ),
+            throwsFormatException,
+            reason: bad,
+          );
+        }
+        // Too many parts.
+        final many = StringBuffer();
+        for (var i = 0; i < 5; i++) {
+          many.write(
+            '--b\r\nContent-Disposition: form-data; name=f$i\r\n\r\nv\r\n',
+          );
+        }
+        many.write('--b--');
+        const type = 'multipart/form-data; boundary=b';
+        expect(parseMultipart(body(many.toString()), type), hasLength(5));
+        expect(
+          () => parseMultipart(body(many.toString()), type, maxParts: 4),
+          throwsFormatException,
+        );
+        // An oversized part header block.
+        final fat =
+            '--b\r\nContent-Disposition: form-data; name=a\r\n'
+            'X-Pad: ${'p' * 100}\r\n\r\nv\r\n--b--';
+        expect(parseMultipart(body(fat), type), hasLength(1));
+        expect(
+          () => parseMultipart(body(fat), type, maxPartHeaderBytes: 64),
+          throwsFormatException,
+        );
+        // The request accessor forwards the limits.
+        final req = RequestContext(
+          method: HttpMethod.post,
+          customMethod: '',
+          path: '/',
+          query: '',
+          headers: const {
+            'content-type': [type],
+          },
+          params: const {},
+          routePattern: '/',
+          body: body(many.toString()),
+        );
+        expect(req.multipart(), hasLength(5));
+        expect(() => req.multipart(maxParts: 2), throwsFormatException);
+        // A boundary whose first byte is common in the body (first-byte skip
+        // + verify) still finds exactly the real delimiters.
+        const tricky =
+            '--ab\r\nContent-Disposition: form-data; name=x\r\n\r\n'
+            '-a-ab-a-\r\n--ab--';
+        final parts = parseMultipart(
+          body(tricky),
+          'multipart/form-data; boundary=ab',
+        );
+        expect(parts.single.text(), '-a-ab-a-');
+      });
+
+      test('a UTF-8 filename (what browsers send) parses', () {
+        final body = Uint8List.fromList(
+          utf8.encode(
+            '--b\r\nContent-Disposition: form-data; name="f"; '
+            'filename="résumé ✓.pdf"\r\nContent-Type: application/pdf\r\n\r\n'
+            'PDF\r\n--b--',
+          ),
+        );
+        final part = parseMultipart(
+          body,
+          'multipart/form-data; boundary=b',
+        ).single;
+        expect(part.filename, 'résumé ✓.pdf');
+        expect(part.text(), 'PDF');
+      });
+
       test('rejects non-multipart and malformed bodies loudly', () {
         const ok = 'multipart/form-data; boundary=b';
         expect(

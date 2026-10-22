@@ -181,17 +181,19 @@ Future<void> setup(NitroServer server) async {
 
   // Protected routes — one per auth family. Each declares `requiresAuth` so
   // Swagger shows the padlock and sends the credential, and wires the matching
-  // middleware so the live route actually enforces it. Dev creds: bearer token
-  // `dev`, API key `dev`, basic `admin:dev`.
+  // middleware so the live route actually enforces it. There are NO built-in
+  // credentials: until API_TOKEN / API_KEY / BASIC_USER+BASIC_PASSWORD are set
+  // the protected routes refuse every caller (401), so an image started with
+  // defaults exposes nothing (e.g. `API_TOKEN=dev` for local play).
   await api.get(
     '/api/v1/me',
     (_) => ResponseContext.jsonBody({'ok': true}),
     middleware: [
       rateLimit(maxRequests: 100),
-      bearerAuth((token) => token == (env['API_TOKEN'] ?? 'dev')),
+      bearerAuth((token) => _configured(env['API_TOKEN'], token)),
     ],
     doc: const OpenApiOperation(
-      summary: 'Who am I (bearer — token: dev)',
+      summary: 'Who am I (bearer — token: \$API_TOKEN)',
       requiresAuth: ['bearer'],
     ),
   );
@@ -199,9 +201,9 @@ Future<void> setup(NitroServer server) async {
   await api.get(
     '/api/v1/key',
     (_) => ResponseContext.jsonBody({'ok': true}),
-    middleware: [apiKeyAuth((key) => key == (env['API_KEY'] ?? 'dev'))],
+    middleware: [apiKeyAuth((key) => _configured(env['API_KEY'], key))],
     doc: const OpenApiOperation(
-      summary: 'API-key protected (x-api-key: dev)',
+      summary: 'API-key protected (x-api-key: \$API_KEY)',
       requiresAuth: ['apiKey'],
     ),
   );
@@ -209,9 +211,15 @@ Future<void> setup(NitroServer server) async {
   await api.get(
     '/api/v1/admin',
     (_) => ResponseContext.jsonBody({'ok': true}),
-    middleware: [basicAuth((user, pass) => user == 'admin' && pass == 'dev')],
+    middleware: [
+      basicAuth(
+        (user, pass) =>
+            _configured(env['BASIC_USER'], user) &&
+            _configured(env['BASIC_PASSWORD'], pass),
+      ),
+    ],
     doc: const OpenApiOperation(
-      summary: 'Basic protected (admin:dev)',
+      summary: 'Basic protected (\$BASIC_USER:\$BASIC_PASSWORD)',
       requiresAuth: ['basic'],
     ),
   );
@@ -219,11 +227,12 @@ Future<void> setup(NitroServer server) async {
   // Static files from ./public (serves index.html; 404 if the dir is absent).
   await server.get('/static/*', staticFiles('public'));
 
-  // WebSocket echo.
+  // WebSocket echo: the payload back verbatim (text as text, bytes as bytes)
+  // — what an echo client, and the Autobahn conformance suite, expect.
   await server.ws('/ws/echo', (session) async {
     await for (final message in session.messages) {
       if (message is WsText) {
-        session.sendText('echo: ${message.text}');
+        session.sendText(message.text);
       } else if (message is WsBinary) {
         session.sendBytes(message.bytes);
       }
@@ -231,8 +240,57 @@ Future<void> setup(NitroServer server) async {
   });
 
   // Operational endpoints (single handler isolate, so metrics are consistent).
-  await serveObservability(server); // /metrics, /healthz, /readyz, /dashboard
-  await api.serve(); // /openapi.json, /docs
+  // On a public listener they are guarded: HTTP basic auth when ADMIN_USER +
+  // ADMIN_PASSWORD are set, otherwise loopback clients only. /healthz and
+  // /readyz stay open for probes.
+  final adminUser = env['ADMIN_USER'], adminPassword = env['ADMIN_PASSWORD'];
+  final ops = <Middleware>[
+    if (adminUser != null && adminPassword != null)
+      basicAuth(
+        (user, pass) =>
+            secureEquals(user, adminUser) && secureEquals(pass, adminPassword),
+      )
+    else
+      loopbackOnly,
+  ];
+  await serveObservability(server, middleware: ops);
+  await api.serve(middleware: ops); // /openapi.json, /docs
+}
+
+/// Compares two secrets in time independent of where they differ, so a
+/// response-time oracle cannot recover a credential byte by byte.
+bool secureEquals(String a, String b) {
+  final x = utf8.encode(a), y = utf8.encode(b);
+  var diff = x.length ^ y.length;
+  for (var i = 0; i < x.length && i < y.length; i++) {
+    diff |= x[i] ^ y[i];
+  }
+  return diff == 0;
+}
+
+/// Admits only clients connecting from this host (an SSH tunnel, a sidecar);
+/// A configured secret matches the presented one in constant time; an unset
+/// secret matches nothing — there is no default credential to guess.
+bool _configured(String? secret, String presented) =>
+    secret != null && secureEquals(secret, presented);
+
+/// everyone else is 403. The example's stand-in for real admin auth — and
+/// only that: behind a reverse proxy on the SAME host every peer is loopback,
+/// so there set `ADMIN_USER`/`ADMIN_PASSWORD` (basic auth replaces this
+/// check) or the proxy must not forward these paths.
+Future<ResponseContext> loopbackOnly(
+  RequestContext request,
+  RequestHandler next,
+) async {
+  final ip = request.clientIp;
+  if (ip == '127.0.0.1' || ip == '::1' || ip == '::ffff:127.0.0.1') {
+    return next(request);
+  }
+  return ResponseContext.problem(
+    title: 'Operational endpoints are loopback-only',
+    status: 403,
+    detail: 'set ADMIN_USER and ADMIN_PASSWORD to reach them remotely',
+  );
 }
 
 Future<void> main() async {
@@ -259,6 +317,18 @@ Future<void> main() async {
 
   // Graceful drain on SIGTERM/SIGINT (containers, Ctrl-C).
   shutdownOnSignals(server, drain: const Duration(seconds: 15));
+
+  // No credential configured = the matching example route refuses everyone.
+  if (env['API_TOKEN'] == null ||
+      env['API_KEY'] == null ||
+      env['BASIC_USER'] == null ||
+      env['BASIC_PASSWORD'] == null) {
+    stderr.writeln(
+      '  ! API_TOKEN / API_KEY / BASIC_USER+BASIC_PASSWORD unset: the example '
+      'routes they protect answer 401 to everyone until set '
+      '(ADMIN_USER/ADMIN_PASSWORD guard /metrics, /dashboard, /docs off-host)',
+    );
+  }
 
   startup.stop();
   stdout.writeln(

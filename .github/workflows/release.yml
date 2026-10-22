@@ -7,6 +7,14 @@
 #
 # Asset names MUST match hook/build.dart: <os> in {macos,linux,windows},
 # <arch> in {arm64,x64} (Architecture.name), <ext> in {dylib,so,dll}.
+#
+# Consumers do not trust these assets by their sidecars: the hook verifies a
+# download against hook/prebuilt_checksums.json, which ships inside the pub
+# package. The `verify` job below fills it for the tag with
+# `tool/update_prebuilt_lock.sh` (cosign-verified bundles) and then pulls
+# every asset back through the hook's own verification path
+# (`tool/verify_prebuilt_lock.dart`, strict Sigstore mode); the resulting lock
+# is a workflow artifact. Commit it, THEN `dart pub publish`.
 name: release
 on:
   push:
@@ -14,10 +22,37 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write  # create the release + upload assets
+  contents: write      # create the release + upload assets
+  id-token: write      # provenance attestation (Sigstore)
+  attestations: write
 
 jobs:
+  # Nothing is published from a tag that does not pass the suites.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: stable
+      - run: sudo apt-get update && sudo apt-get install -y clang llvm pkg-config libssl-dev libuv1-dev libbrotli-dev libnghttp2-dev
+      - run: flutter pub get
+      - run: dart analyze
+      - run: cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release -DNITRO_SERVER_BUILD_TESTS=ON -DNITRO_SERVER_HTTP2=ON -DNITRO_SERVER_WERROR=ON
+      - run: cmake --build build/lib --parallel
+      - run: ./build/lib/nitro_server_tests/nitro_server_engine_tests
+      - run: dart test
+      # The tag ships nothing a sanitizer or the fuzzers would reject.
+      - run: >
+          cmake -S src -B build/asan -DCMAKE_BUILD_TYPE=Debug
+          -DNITRO_SERVER_BUILD_TESTS=ON -DNITRO_SERVER_HTTP2=ON -DNITRO_SERVER_SANITIZE=address
+      - run: cmake --build build/asan --parallel --target nitro_server_engine_tests
+      - run: ASAN_OPTIONS=detect_leaks=1:detect_container_overflow=0 ./build/asan/nitro_server_tests/nitro_server_engine_tests
+      - run: sudo apt-get install -y libclang-rt-dev && CXX=clang++ bash tool/fuzz.sh 30
+
   prebuilt:
+    needs: test
     strategy:
       fail-fast: false
       # `deps` selects how the four dependencies are provisioned as PIC static
@@ -39,7 +74,7 @@ jobs:
           - { os: windows-latest,  tag: windows-x64,  deps: vcpkg, triplet: x64-windows-static-md, lib: nitro_server.dll,    out: libnitro_server-windows-x64.dll }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - if: matrix.deps == 'brew'
         run: brew install cmake pkg-config openssl@3 libuv brotli nghttp2
@@ -95,9 +130,65 @@ jobs:
           fi
           cat "${{ matrix.out }}.sha256"
 
+      # Build provenance (SLSA-style, Sigstore-signed) for each prebuilt: a
+      # consumer can verify the asset was built by this workflow from this
+      # commit with `gh attestation verify <file> --repo <owner/repo>`.
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: dist/${{ matrix.out }}
+
+      # Keyless Sigstore signature (OIDC identity of this workflow, no key to
+      # manage or leak) as a self-contained bundle. Verify with:
+      #   cosign verify-blob --bundle <asset>.sigstore.json \
+      #     --certificate-identity-regexp 'github.com/<owner>/<repo>/' \
+      #     --certificate-oidc-issuer https://token.actions.githubusercontent.com <asset>
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+      - name: Sign the asset
+        shell: bash
+        run: cosign sign-blob --yes --bundle "dist/${{ matrix.out }}.sigstore.json" "dist/${{ matrix.out }}"
+
+      # SPDX SBOM of the asset (what it was built from: the deps linked in).
+      - uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          file: dist/${{ matrix.out }}
+          format: spdx-json
+          output-file: dist/${{ matrix.out }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
       - name: Upload to the release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             dist/${{ matrix.out }}
             dist/${{ matrix.out }}.sha256
+            dist/${{ matrix.out }}.sigstore.json
+            dist/${{ matrix.out }}.spdx.json
+
+  # The consumer path, end to end, against the release just published: lock
+  # the assets (sidecar cross-check + cosign bundle verification), then
+  # download each one through hook/prebuilt_lock.dart exactly as a consumer's
+  # build hook would, in strict Sigstore mode. A tag whose assets a consumer
+  # would refuse fails here. The lock is attached as an artifact to commit
+  # before `dart pub publish`.
+  verify:
+    needs: prebuilt
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: stable
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+      - run: flutter pub get
+      - name: Lock the release's assets (cosign-verified)
+        run: tool/update_prebuilt_lock.sh "${GITHUB_REF_NAME#v}"
+      - name: Pull every asset back through the hook's verification path
+        env:
+          NITRO_SERVER_VERIFY_SIGSTORE: '1'
+        run: dart tool/verify_prebuilt_lock.dart "${GITHUB_REF_NAME#v}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: prebuilt_checksums
+          path: hook/prebuilt_checksums.json

@@ -154,12 +154,20 @@ void main() {
 
         test('ServerConfig rejects negative budgets', () {
           expect(
-            () => ServerConfig(maxRequestsPerConnection: -1),
-            throwsA(isA<AssertionError>()),
+            const ServerConfig(maxRequestsPerConnection: -1).validate,
+            throwsArgumentError,
           );
           expect(
-            () => ServerConfig(workerThreads: -1),
-            throwsA(isA<AssertionError>()),
+            const ServerConfig(workerThreads: -1).validate,
+            throwsArgumentError,
+          );
+          expect(
+            const ServerConfig(maxConnections: -1).validate,
+            throwsArgumentError,
+          );
+          expect(
+            const ServerConfig(maxConnectionsPerIp: -1).validate,
+            throwsArgumentError,
           );
         });
 

@@ -130,11 +130,31 @@ class RawTlsConfig {
   final String certFile;
   final String keyFile;
 
+  /// Lowest TLS version accepted: `12` or `13`.
+  final int minVersion;
+
+  /// OpenSSL cipher list for TLS 1.2 (`SSL_CTX_set_cipher_list`); empty keeps
+  /// the library default.
+  final String ciphers;
+
+  /// TLS 1.3 cipher suites (`SSL_CTX_set_ciphersuites`); empty = default.
+  final String cipherSuites;
+
+  /// Mutual TLS: trust anchors clients must chain to, as PEM text or a file
+  /// path. Either set makes a client certificate mandatory.
+  final String clientCaPem;
+  final String clientCaFile;
+
   const RawTlsConfig({
     this.certPem = '',
     this.keyPem = '',
     this.certFile = '',
     this.keyFile = '',
+    this.minVersion = 12,
+    this.ciphers = '',
+    this.cipherSuites = '',
+    this.clientCaPem = '',
+    this.clientCaFile = '',
   });
 }
 
@@ -179,8 +199,49 @@ class RawServerConfig {
   /// with 1009. `<= 0` means 1 MiB.
   final int wsMaxBufferBytes;
 
+  /// Unsent bytes a streaming response (SSE / chunked) may queue before the
+  /// connection is dropped (a reader that fell behind). `<= 0` means
+  /// unlimited.
+  final int streamMaxBufferBytes;
+
+  /// A streaming response with no chunk written for this long (and nothing
+  /// queued) is closed: the handler stopped feeding it. `<= 0` means never.
+  final int streamIdleTimeoutMs;
+
+  /// Request-body bytes one HTTP/2 session may hold across its streams at
+  /// once; a stream reserves its declared Content-Length (else its body cap)
+  /// and a stream that would exceed the budget is answered `503`. `<= 0`
+  /// means unlimited.
+  final int maxBufferedBodyBytes;
+
   /// Negotiate `permessage-deflate` (RFC 7692) when a client offers it.
   final bool wsCompression;
+
+  /// Stall window for a request body in progress (head parsed, bytes still
+  /// arriving; restarts on every read): `408` + close past it. `<= 0` means
+  /// the keep-alive idle timeout applies.
+  final int bodyTimeoutMs;
+
+  /// WebSocket liveness: a session quiet for half this is pinged; one still
+  /// quiet at the full window (no pong, no frame) is closed `1001`.
+  /// `<= 0` disables.
+  final int wsIdleTimeoutMs;
+
+  /// Hard lifetime of a connection: past it an idle one closes, a busy
+  /// HTTP/1.1 one closes after its answer, a WebSocket gets `1001`, an h2
+  /// session `GOAWAY`. `<= 0` means unbounded.
+  final int maxConnectionAgeMs;
+
+  /// Requests dispatched and not yet answered, over every connection and
+  /// protocol; past it a request is answered `503` (`Retry-After: 1`)
+  /// without reaching a handler. `<= 0` means unlimited.
+  final int maxInFlightRequests;
+
+  /// Expect a HAProxy PROXY protocol (v1/v2) header first on every accepted
+  /// connection; its source address becomes the client address. A connection
+  /// without a valid header is closed. Only for a listener reachable solely
+  /// through the proxy.
+  final bool proxyProtocol;
 
   /// Negotiate HTTP/2 (ALPN `h2` over TLS, and the h2c prior-knowledge preface)
   /// when the engine was built with it. Default on; set false to force
@@ -202,7 +263,15 @@ class RawServerConfig {
     this.headerTimeoutMs = 0,
     this.writeTimeoutMs = 30000,
     this.wsMaxBufferBytes = 1048576,
+    this.streamMaxBufferBytes = 4194304,
+    this.streamIdleTimeoutMs = 300000,
+    this.maxBufferedBodyBytes = 67108864,
     this.wsCompression = true,
+    this.bodyTimeoutMs = 0,
+    this.wsIdleTimeoutMs = 60000,
+    this.maxConnectionAgeMs = 0,
+    this.maxInFlightRequests = 0,
+    this.proxyProtocol = false,
     this.http2 = true,
     this.tls = const RawTlsConfig(),
   });
@@ -485,6 +554,16 @@ abstract class NitroServerNative extends HybridObject {
   /// on the in-flight count.
   @nitroFast
   int liveConnections();
+
+  /// Identity of this bridge object's emitter inside the engine (nonzero,
+  /// stable for the object's lifetime). A helper isolate reports it at boot
+  /// so the main isolate can [detachEmitter] it should the helper die.
+  int emitterId();
+
+  /// Removes emitter [id] from the engine's dispatch rotation — a helper
+  /// isolate declared dead must stop being dealt requests. Idempotent; true
+  /// when the emitter was attached.
+  bool detachEmitter(int id);
 
   /// Answers a pending request with [length] bytes of the file at [path]
   /// starting at [offset] (`length` `< 0` means to the end). The status

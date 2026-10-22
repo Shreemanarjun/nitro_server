@@ -194,6 +194,97 @@ void main() {
         await client.server.get('/app.js', staticFiles(root.path));
         expect((await client.get('/app.js')).text(), 'console.log(1)');
       });
+
+      group('containment (doc/production-audit.md P0-1)', () {
+        late Directory outer;
+        late Directory served;
+
+        setUp(() {
+          outer = Directory.systemTemp.createTempSync('nitro_static_outer');
+          served = Directory('${outer.path}/public')..createSync();
+          File('${served.path}/index.html').writeAsStringSync('hi');
+          File('${served.path}/.env').writeAsStringSync('TOKEN=x');
+          Directory('${served.path}/.well-known').createSync();
+          File('${served.path}/.well-known/x').writeAsStringSync('well-known');
+          File('${outer.path}/secret.txt').writeAsStringSync('SECRET');
+          File('${served.path}/inner.txt').writeAsStringSync('inner');
+          Link('${served.path}/escape').createSync('${outer.path}/secret.txt');
+          Link('${served.path}/alias').createSync('${served.path}/inner.txt');
+          Link('${served.path}/updir').createSync(outer.path);
+        });
+
+        tearDown(() => outer.deleteSync(recursive: true));
+
+        test('percent-encoded traversal never leaves the root', () async {
+          await client.server.get('/s/*', staticFiles(served.path));
+          for (final path in [
+            '/s/../secret.txt',
+            '/s/..%2fsecret.txt',
+            '/s/%2e%2e%2fsecret.txt',
+            '/s/%2e%2e/secret.txt',
+            '/s/%2e%2e%5csecret.txt',
+            '/s/..%5csecret.txt',
+            '/s/.%2e/secret.txt',
+            '/s/%00/index.html',
+            '/s/%2fetc%2fpasswd',
+            '/s/%zz',
+          ]) {
+            final r = await client.get(path);
+            expect(r.status, 404, reason: path);
+            expect(r.text(), isNot(contains('SECRET')), reason: path);
+          }
+          // A benign encoded segment still resolves.
+          expect((await client.get('/s/%69ndex.html')).text(), 'hi');
+          expect((await client.get('/s/./index.html')).text(), 'hi');
+        });
+
+        test('a symlink out of the root is a 404; one inside serves', () async {
+          await client.server.get('/s/*', staticFiles(served.path));
+          expect((await client.get('/s/escape')).status, 404);
+          expect((await client.get('/s/updir/secret.txt')).status, 404);
+          expect((await client.get('/s/alias')).text(), 'inner');
+        });
+
+        test('followSymlinks: false refuses even an in-root link', () async {
+          await client.server.get(
+            '/s/*',
+            staticFiles(served.path, followSymlinks: false),
+          );
+          expect((await client.get('/s/alias')).status, 404);
+          expect((await client.get('/s/inner.txt')).text(), 'inner');
+        });
+
+        test(
+          'a root that does not exist (yet) serves 404, never throws',
+          () async {
+            await client.server.get(
+              '/m/*',
+              staticFiles('${outer.path}/not-yet-created'),
+            );
+            expect((await client.get('/m/index.html')).status, 404);
+            // A file that vanishes between stat and resolve is a 404 too.
+            final ghost = File('${served.path}/ghost.txt')
+              ..writeAsStringSync('g');
+            await client.server.get('/g/*', staticFiles(served.path));
+            expect((await client.get('/g/ghost.txt')).text(), 'g');
+            ghost.deleteSync();
+            expect((await client.get('/g/ghost.txt')).status, 404);
+          },
+        );
+
+        test('dotfiles are hidden unless opted in', () async {
+          await client.server.get('/s/*', staticFiles(served.path));
+          expect((await client.get('/s/.env')).status, 404);
+          expect((await client.get('/s/.well-known/x')).status, 404);
+          await client.server.get(
+            '/d/*',
+            staticFiles(served.path, dotfiles: true),
+          );
+          expect((await client.get('/d/.env')).text(), 'TOKEN=x');
+          expect((await client.get('/d/.well-known/x')).text(), 'well-known');
+          expect((await client.get('/d/..%2fsecret.txt')).status, 404);
+        });
+      });
     });
 
     group('ResponseContext.file', () {

@@ -12,6 +12,9 @@ hide a whole framework's difference):
   `oha`, in a pinned container).
 - **Disjoint pinned cores** — server and load generator on different cores
   (needs a Linux container host; `colima start` on macOS).
+- **Two builds of nitro (before/after a change) → `run.sh --base <ref>`**:
+  the baseline tree is built into the same image and served as `nitro-base`,
+  interleaved with the working tree in one run.
 - **Interleave + median, never two separate full runs** — measure every target
   once per rep, loop N reps, report the median. Two separate full runs are
   banned (their drift dwarfs the real delta — it once invented a phantom

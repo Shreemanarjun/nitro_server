@@ -29,7 +29,32 @@ struct ServerConfig {
   int64_t headerTimeoutMs = 0;      // <= 0: the idle timeout applies.
   int64_t writeTimeoutMs = 30000;   // <= 0: 30 s.
   int64_t wsMaxBufferBytes = 1 << 20;  // <= 0: 1 MiB.
+  // Unsent bytes a streaming response (SSE / chunked) may queue before the
+  // connection is dropped (a reader that fell behind). <= 0: unlimited.
+  int64_t streamMaxBufferBytes = 4 << 20;
+  // A streaming response with no chunk written for this long (and nothing
+  // queued) is closed: the handler stopped feeding it. <= 0: never.
+  int64_t streamIdleTimeoutMs = 300000;
+  // Request-body bytes one HTTP/2 session may hold across its streams at
+  // once (a stream reserves its declared Content-Length, else its body cap;
+  // over the budget a new stream is answered 503). <= 0: unlimited.
+  int64_t maxBufferedBodyBytes = 64 << 20;
   bool wsCompression = true;
+  // Stall window for a request body in progress (head parsed, bytes still
+  // arriving, refreshed on every read): 408 + close past it. <= 0: the
+  // keep-alive idle timeout applies.
+  int64_t bodyTimeoutMs = 0;
+  // WebSocket liveness: a session quiet for half this is pinged; one quiet for
+  // all of it (no pong, no frame) is closed 1001. <= 0: off.
+  int64_t wsIdleTimeoutMs = 60000;
+  // Hard lifetime of any connection: past it an idle one is closed, a busy
+  // HTTP/1.1 one closes after its answer, a WebSocket is closed 1001 and an
+  // h2 session gets GOAWAY. <= 0: unbounded.
+  int64_t maxConnectionAgeMs = 0;
+  // Requests dispatched and not yet answered, across every connection and
+  // protocol; a request past the budget is answered 503 (Retry-After: 1)
+  // without reaching a handler. <= 0: unlimited.
+  int64_t maxInFlightRequests = 0;
   // Negotiate HTTP/2 (ALPN `h2` over TLS, and the h2c prior-knowledge preface)
   // when the engine was built with it. Default on; a server can turn it off to
   // force HTTP/1.1 without rebuilding. Ignored in a non-HTTP/2 build.
@@ -40,6 +65,22 @@ struct ServerConfig {
   std::string tlsKeyPem;
   std::string tlsCertFile;
   std::string tlsKeyFile;
+  // TLS policy (applies whenever tlsRequested): lowest protocol version
+  // accepted (12 or 13), an OpenSSL cipher list for TLS 1.2 and cipher suites
+  // for TLS 1.3 (empty: library defaults), and client-certificate trust
+  // anchors — set either and every handshake must present a certificate
+  // chaining to them (mutual TLS); a connection without one is refused.
+  int64_t tlsMinVersion = 12;
+  std::string tlsCiphers;
+  std::string tlsCipherSuites;
+  std::string tlsClientCaPem;
+  std::string tlsClientCaFile;
+  // HAProxy PROXY protocol (v1 text / v2 binary) expected first on every
+  // accepted connection: the address it names replaces the socket peer as the
+  // client address (handlers, rate limits, logs); a connection that does not
+  // start with a valid header is closed. For a listener reachable only through
+  // the proxy that sends it.
+  bool proxyProtocol = false;
 };
 
 struct StatusResult {
@@ -57,6 +98,9 @@ struct ParsedHead {
   std::string version;
   std::vector<Header> headers;
   bool ok = false;
+  // Request line names an HTTP version this server does not speak (answer
+  // 505 rather than 400).
+  bool badVersion = false;
 };
 
 /// Parses one request head; `headEnd` is the offset of its `\r\n\r\n`.

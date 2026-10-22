@@ -133,11 +133,15 @@ class ServerRunner {
   int _answered = 0;
   int _errors = 0;
 
+  /// Answers per status class, index 1..5 (`1xx`..`5xx`); index 0 unused.
+  final _statusClasses = List<int>.filled(6, 0);
+
   /// A snapshot of the counters and latency quantiles so far.
   ServerMetrics get metrics => ServerMetrics(
     requests: _answered,
     errors: _errors,
     inFlight: _pending.length,
+    byStatusClass: List.unmodifiable(_statusClasses),
     byRoute: {
       for (final entry in _metrics.entries) entry.key: entry.value.snapshot(),
     },
@@ -150,6 +154,7 @@ class ServerRunner {
     'requests': _answered,
     'errors': _errors,
     'inFlight': _pending.length,
+    'status': List<int>.of(_statusClasses),
     'routes': [for (final acc in _metrics.values) acc.toWire()],
   };
 
@@ -225,15 +230,27 @@ class ServerRunner {
   static ResponseContext _defaultNotFound(RequestContext _) =>
       const ResponseContext(status: 404);
 
-  /// The 500 answer before any override: a text body naming the error.
-  static ResponseContext _defaultError(Object error, RequestContext _) =>
-      ResponseContext.text('handler error: $error', status: 500);
+  /// Whether the default 500 names the thrown error (see
+  /// [ServerConfig.exposeErrorDetails]). Off: a fixed generic body, and the
+  /// error goes to [events] as [ServerEventKind.handlerError] instead.
+  bool _exposeErrorDetails = false;
+
+  /// The 500 answer before any override.
+  ResponseContext _defaultError(Object error, RequestContext _) =>
+      _exposeErrorDetails
+      ? ResponseContext.text('handler error: $error', status: 500)
+      : _genericError;
+
+  static final _genericError = ResponseContext.text(
+    'internal server error',
+    status: 500,
+  );
 
   /// Answers unmatched requests. Defaults to an empty 404.
   NotFoundHandler _notFoundHandler = _defaultNotFound;
 
   /// Answers requests whose handler threw. Defaults to a 500 text body.
-  ErrorHandler _errorHandler = _defaultError;
+  late ErrorHandler _errorHandler = _defaultError;
 
   /// Every (method-token, pattern) pair currently registered in the engine —
   /// handler, WebSocket AND static routes alike, since the engine holds one
@@ -270,6 +287,43 @@ class ServerRunner {
   /// The re-broadcast engine events (lifecycle, timeouts, client errors).
   Stream<ServerEvent> get events => _events.stream;
 
+  /// Emits a server-level [ServerEventKind.notice] (helper supervision,
+  /// operator-facing conditions the engine does not see).
+  void emitNotice(String message) {
+    if (_closed) return;
+    _events.add(
+      ServerEvent(kind: ServerEventKind.notice, requestId: 0, message: message),
+    );
+  }
+
+  /// This runner's emitter identity in the engine (see
+  /// `NitroServerNative.emitterId`); 0 on a fake.
+  int get emitterId {
+    try {
+      return _native.emitterId();
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  /// Drops emitter [id] from the engine's rotation (a dead helper isolate).
+  bool detachEmitter(int id) {
+    try {
+      return _native.detachEmitter(id);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Live connections the engine holds; 0 before start or on a fake.
+  int get liveConnections {
+    try {
+      return _native.liveConnections();
+    } catch (_) {
+      return 0;
+    }
+  }
+
   /// Test seam: ids with an unfinished request.
   Set<int> get pendingIdsForTesting => {..._pending.keys};
 
@@ -295,6 +349,12 @@ class ServerRunner {
   /// sets the `Server-Timing` toggle directly (mirrors
   /// [ServerConfig.responseTiming]).
   set responseTimingForTesting(bool value) => _responseTiming = value;
+
+  /// Test seam for [ServerConfig.exposeErrorDetails] (same reason).
+  set exposeErrorDetailsForTesting(bool value) => _exposeErrorDetails = value;
+
+  /// Test seam for [ServerConfig.wsMaxBufferBytes] (same reason).
+  set wsMaxBufferBytesForTesting(int value) => _wsMaxBufferBytes = value;
 
   /// Marks [requestId] answered: drops the in-flight entry, records the
   /// id so a stale duplicate head can never dispatch again, and sends the
@@ -552,11 +612,18 @@ class ServerRunner {
   /// the engine was started with; helpers inherit it via [prepareHelper]).
   bool _wsCompression = true;
 
+  /// Cap on one inflated WebSocket message (mirrors
+  /// [ServerConfig.wsMaxBufferBytes], which the engine applies to the wire
+  /// frame; this applies it to what the frame expands to).
+  int _wsMaxBufferBytes = 1024 * 1024;
+
   int start(ServerConfig config) {
     _ensureListening();
     _fast ??= _bindFast();
     _wsCompression = config.wsCompression;
     _responseTiming = config.responseTiming;
+    _exposeErrorDetails = config.exposeErrorDetails;
+    _wsMaxBufferBytes = config.wsMaxBufferBytes;
     _native.configureServer(
       RawServerConfig(
         host: config.host,
@@ -572,7 +639,15 @@ class ServerRunner {
         headerTimeoutMs: config.headerTimeout.inMilliseconds,
         writeTimeoutMs: config.writeTimeout.inMilliseconds,
         wsMaxBufferBytes: config.wsMaxBufferBytes,
+        streamMaxBufferBytes: config.streamMaxBufferBytes,
+        streamIdleTimeoutMs: config.streamIdleTimeout.inMilliseconds,
+        maxBufferedBodyBytes: config.maxBufferedBodyBytes,
         wsCompression: config.wsCompression,
+        bodyTimeoutMs: config.bodyTimeout.inMilliseconds,
+        wsIdleTimeoutMs: config.wsIdleTimeout.inMilliseconds,
+        maxConnectionAgeMs: config.maxConnectionAge.inMilliseconds,
+        maxInFlightRequests: config.maxInFlightRequests,
+        proxyProtocol: config.proxyProtocol,
         // HTTP/1.1 is always served; the engine's h2 path turns on for http2
         // and above (h3 is not implemented yet, so it caps at h2).
         http2: config.protocol != HttpProtocol.http1,
@@ -581,6 +656,11 @@ class ServerRunner {
           keyPem: config.tls.keyPem,
           certFile: config.tls.certFile,
           keyFile: config.tls.keyFile,
+          minVersion: config.tls.minVersion == TlsVersion.v13 ? 13 : 12,
+          ciphers: config.tls.ciphers,
+          cipherSuites: config.tls.cipherSuites,
+          clientCaPem: config.tls.clientCaPem,
+          clientCaFile: config.tls.clientCaFile,
         ),
       ),
     );
@@ -624,11 +704,18 @@ class ServerRunner {
   /// Readies a runner that will not call [start] — a helper isolate behind
   /// a server another isolate started: subscribe the streams and bind the
   /// fast path, so the first dealt request finds everything in place.
-  void prepareHelper({bool wsCompression = true, bool responseTiming = true}) {
+  void prepareHelper({
+    bool wsCompression = true,
+    bool responseTiming = true,
+    bool exposeErrorDetails = false,
+    int wsMaxBufferBytes = 1024 * 1024,
+  }) {
     _ensureListening();
     _fast ??= _bindFast();
     _wsCompression = wsCompression;
     _responseTiming = responseTiming;
+    _exposeErrorDetails = exposeErrorDetails;
+    _wsMaxBufferBytes = wsMaxBufferBytes;
   }
 
   /// The fast path needs a real engine instance behind [_native]; a fake
@@ -811,11 +898,14 @@ class ServerRunner {
   void _onEvent(RawServerEvent event) {
     if (_closed) return;
     final kind = ServerEventKind.values[event.kind];
-    if (kind == ServerEventKind.clientDisconnect) {
-      // The client went away mid-request. Cancel the handler's outbound stream
-      // subscription so an indefinite source (e.g. an SSE `Stream.periodic`)
-      // stops producing into a dead connection, and release the request. A
-      // one-shot handler has already finished; this is the streaming case.
+    if (kind == ServerEventKind.clientDisconnect ||
+        kind == ServerEventKind.handlerTimeout) {
+      // The client went away mid-request, or the engine answered 408 for a
+      // handler that missed its deadline: either way nothing this side sends
+      // can land. Cancel the handler's outbound stream subscription so an
+      // indefinite source (e.g. an SSE `Stream.periodic`) stops producing,
+      // and release the request so `inFlight` and readiness stay honest even
+      // when the handler never returns.
       _outbound.remove(event.requestId)?.cancel();
       _complete(event.requestId);
     }
@@ -892,8 +982,8 @@ class ServerRunner {
     final FutureOr<ResponseContext> result;
     try {
       result = piped(context);
-    } catch (error) {
-      _guardedError(error, context).then((response) {
+    } catch (error, stack) {
+      _guardedError(head.requestId, error, stack, context).then((response) {
         _deliver(head.requestId, response);
       });
       return;
@@ -906,8 +996,8 @@ class ServerRunner {
       (response) {
         _deliver(head.requestId, response);
       },
-      onError: (Object error) {
-        _guardedError(error, context).then((response) {
+      onError: (Object error, StackTrace stack) {
+        _guardedError(head.requestId, error, stack, context).then((response) {
           _deliver(head.requestId, response);
         });
       },
@@ -918,19 +1008,66 @@ class ServerRunner {
   /// `respond`; stream bodies open a chunked stream instead. Fallbacks share
   /// this path, so a custom error page may stream too.
   void _deliver(int requestId, ResponseContext response) {
-    _record(requestId, response.status);
+    // A request the engine already retired (408 on a missed deadline, peer
+    // gone) has no connection to answer on: drop the late answer here rather
+    // than hand it to the engine, which would discard it anyway.
+    if (_completed.contains(requestId) && !_pending.containsKey(requestId)) {
+      response.bodyWriterOrNull?.release();
+      return;
+    }
     // Normalize response header names to lowercase (HTTP/1.1 is case-
     // insensitive; HTTP/2 REQUIRES lowercase — nghttp2 RSTs a mixed-case name,
-    // and a mixed-case duplicate would otherwise survive on the wire), and
-    // stamp the default server identity (a handler/middleware `x-server` wins).
-    // One place covers the one-shot, stream and file answer paths. copyWith
-    // keeps the body.
-    response = response.copyWith(
-      headers: {
-        'x-server': 'Nitro Dart Server',
-        for (final e in response.headers.entries) e.key.toLowerCase(): e.value,
-      },
-    );
+    // and a mixed-case duplicate would otherwise survive on the wire), drop
+    // the hop-by-hop / framing fields the engine owns, and stamp the default
+    // server identity (a handler/middleware `x-server` wins). A name that is
+    // not a token or a value carrying CR / LF / NUL could split the response
+    // (a reflected request header is the classic route): that answer is
+    // replaced by a 500 and reported, never sent. One place covers the
+    // one-shot, stream and file answer paths. copyWith keeps the body.
+    final headers = <String, String>{'x-server': 'Nitro Dart Server'};
+    for (final e in response.headers.entries) {
+      final name = e.key.toLowerCase();
+      if (_engineOwnedHeaders.contains(name) || name.startsWith('proxy-')) {
+        continue;
+      }
+      if (!_isToken(name) || !_isSafeHeaderValue(e.value)) {
+        _events.add(
+          ServerEvent(
+            kind: ServerEventKind.handlerError,
+            requestId: requestId,
+            message:
+                'response header rejected: "${e.key}" (invalid name or '
+                'control byte in value)',
+          ),
+        );
+        response = _genericError;
+        headers.clear();
+        headers['x-server'] = 'Nitro Dart Server';
+        break;
+      }
+      headers[name] = e.value;
+    }
+    // Cookies ride a separate field and build their own header lines, so
+    // they get the same gate: a CR/LF, `;` or control byte in a value would
+    // split the response or inject attributes.
+    for (final cookie in response.cookies) {
+      final problem = cookie.validationError;
+      if (problem == null) continue;
+      _events.add(
+        ServerEvent(
+          kind: ServerEventKind.handlerError,
+          requestId: requestId,
+          message: 'set-cookie rejected: $problem',
+        ),
+      );
+      response = _genericError;
+      headers
+        ..clear()
+        ..['x-server'] = 'Nitro Dart Server';
+      break;
+    }
+    response = response.copyWith(headers: headers);
+    _record(requestId, response.status);
     // Dispatch-to-answer time, emitted as `Server-Timing`. Computed once here
     // (the pending entry is still live) and reused by whichever answer path
     // runs. -1 when timing is off or the request is already gone.
@@ -949,6 +1086,49 @@ class ServerRunner {
     }
   }
 
+  /// RFC 9110 §7.6.1 hop-by-hop and framing fields: the engine's to set.
+  static const _engineOwnedHeaders = {
+    'content-length',
+    'connection',
+    'transfer-encoding',
+    'keep-alive',
+    'upgrade',
+    'trailer',
+    'te',
+  };
+
+  /// RFC 9110 §5.6.2 token (field-name alphabet).
+  static bool _isToken(String name) {
+    if (name.isEmpty) return false;
+    for (final c in name.codeUnits) {
+      final ok =
+          (c >= 0x30 && c <= 0x39) ||
+          (c >= 0x41 && c <= 0x5a) ||
+          (c >= 0x61 && c <= 0x7a) ||
+          c == 0x21 ||
+          (c >= 0x23 && c <= 0x27) ||
+          c == 0x2a ||
+          c == 0x2b ||
+          c == 0x2d ||
+          c == 0x2e ||
+          c == 0x5e ||
+          c == 0x5f ||
+          c == 0x60 ||
+          c == 0x7c ||
+          c == 0x7e;
+      if (!ok) return false;
+    }
+    return true;
+  }
+
+  /// No CR / LF / NUL / other control byte (HTAB excepted) in a field value.
+  static bool _isSafeHeaderValue(String value) {
+    for (final c in value.codeUnits) {
+      if ((c < 0x20 && c != 0x09) || c == 0x7f) return false;
+    }
+    return true;
+  }
+
   /// Counts one answer against its route (dispatch to answer, in µs).
   void _record(int requestId, int status) {
     final pending = _pending[requestId];
@@ -958,6 +1138,8 @@ class ServerRunner {
     acc.record(_clock.elapsedMicroseconds - pending.startedUs, status);
     _answered++;
     if (status >= 500) _errors++;
+    final cls = status ~/ 100;
+    if (cls >= 1 && cls <= 5) _statusClasses[cls]++;
   }
 
   /// A file answer: the engine writes the head now and sends the bytes
@@ -993,16 +1175,29 @@ class ServerRunner {
     }
   }
 
-  /// Runs the error fallback. A throwing fallback degrades to the default
-  /// 500 text body.
+  /// Runs the error fallback after reporting the failure on [events] (the
+  /// only place the error text and stack are guaranteed to surface: the
+  /// client gets a generic 500 unless `exposeErrorDetails`). A throwing
+  /// fallback degrades to the default 500 body.
   Future<ResponseContext> _guardedError(
+    int requestId,
     Object error,
+    StackTrace stack,
     RequestContext context,
   ) async {
+    _events.add(
+      ServerEvent(
+        kind: ServerEventKind.handlerError,
+        requestId: requestId,
+        message:
+            '${context.method == HttpMethod.custom ? context.customMethod : context.method.token} '
+            '${context.path}: $error\n$stack',
+      ),
+    );
     try {
       return await _errorHandler(error, context);
     } catch (_) {
-      return ResponseContext.text('handler error: $error', status: 500);
+      return _defaultError(error, context);
     }
   }
 
@@ -1227,6 +1422,7 @@ class ServerRunner {
         _wsAcked.remove(connectionId);
       },
     );
+    session.maxInbound = _wsMaxBufferBytes;
     _wsSessions[connectionId] = session;
     _wsOpened.add(connectionId);
     if (identical(gate, _identity)) {
@@ -1323,7 +1519,10 @@ class ServerRunner {
     final Uint8List bytes;
     if (aux == 1) {
       try {
-        bytes = wsInflate(copy);
+        bytes = wsInflate(copy, maxBytes: _wsMaxBufferBytes);
+      } on WsInflateLimitExceeded {
+        session._closeLocal(1009); // Message too big once inflated.
+        return;
       } on Object {
         session._closeLocal(1007); // Undecodable: invalid frame payload.
         return;
@@ -1376,6 +1575,14 @@ class _WsSessionImpl implements WsSession {
   final void Function() _onDone;
 
   final _messages = StreamController<WsMessage>();
+
+  /// Inbound bytes delivered by the engine but not yet consumed by the
+  /// handler. A handler slower than its peer would otherwise let this grow
+  /// without bound; past [maxInbound] the session closes 1009.
+  int _inboundBuffered = 0;
+
+  /// Cap on [_inboundBuffered] (the runner sets `wsMaxBufferBytes`).
+  int maxInbound = 1 << 20;
   bool _done = false;
   int? _closeCode;
 
@@ -1391,8 +1598,16 @@ class _WsSessionImpl implements WsSession {
   @override
   RequestContext get handshake => _handshake;
 
+  late final Stream<WsMessage> _consumed = _messages.stream.map((m) {
+    _inboundBuffered -= _sizeOf(m);
+    return m;
+  });
+
   @override
-  Stream<WsMessage> get messages => _messages.stream;
+  Stream<WsMessage> get messages => _consumed;
+
+  static int _sizeOf(WsMessage m) =>
+      m is WsBinary ? m.bytes.length : (m as WsText).text.length;
 
   @override
   int? get closeCode => _closeCode;
@@ -1425,7 +1640,16 @@ class _WsSessionImpl implements WsSession {
   }
 
   void _add(WsMessage message) {
-    if (!_done) _messages.add(message);
+    if (_done) return;
+    final size = _sizeOf(message);
+    if (_inboundBuffered + size > maxInbound) {
+      _closeLocal(
+        1009,
+      ); // the handler is not keeping up: message too big to hold
+      return;
+    }
+    _inboundBuffered += size;
+    _messages.add(message);
   }
 
   /// The shared close path: mark done, complete the closing handshake natively

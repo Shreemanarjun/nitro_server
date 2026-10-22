@@ -37,6 +37,7 @@ export DYLD_LIBRARY_PATH="/opt/homebrew/lib:${DYLD_LIBRARY_PATH:-}" # harmless o
 declare -A LAUNCH=(
   [nitro-native]="build/native_cli/bundle/bin/compare --keep-alive --isolates $SRV_N --serve nitro"
   [nitro-dylib]="env NITRO_SERVER_DYLIB=/app/build/lib/libnitro_server.so ./compare_dylib --keep-alive --isolates $SRV_N --serve nitro"
+  [nitro-base]="env NITRO_SERVER_DYLIB=/app/libnitro_server_base.so ./compare_dylib_base --keep-alive --isolates $SRV_N --serve nitro"
   [dartio]="./compare_dylib --keep-alive --isolates $SRV_N --serve dartio"
   [shelf]="./compare_dylib --keep-alive --isolates $SRV_N --serve shelf"
   [go]="env GOMAXPROCS=$SRV_N ./compare_go_server"
@@ -46,6 +47,7 @@ declare -A LAUNCH=(
 declare -A CONFIG=(
   [nitro-native]="@Native code asset; isolates=$SRV_N (engine fans CPU work across them)"
   [nitro-dylib]="DynamicLibrary; isolates=$SRV_N (engine fans CPU work across them)"
+  [nitro-base]="A/B baseline — the tree at ${BASE_REF:-?}, same build as nitro-dylib; isolates=$SRV_N"
   [dartio]="dart:io HttpServer; shared isolates=$SRV_N (SO_REUSEPORT)"
   [shelf]="shelf_io.serve; shared isolates=$SRV_N (SO_REUSEPORT, dart:io underneath)"
   [go]="net/http; GOMAXPROCS=$SRV_N"
@@ -249,6 +251,52 @@ flatness=("`p50:p99` is the tail-flatness ratio: **lower = flatter distribution,
           f"i.e. {_rd:.1f}× of a slow number. **bold** req/s = fastest for that route."
           if (_rd and _rn) else "`p50:p99` is the tail-flatness ratio: **lower = flatter distribution, NOT faster.** **bold** req/s = fastest for that route.")
 
+# @Native vs DynamicLibrary, from THIS run's medians (never a remembered number):
+# the two variants are reported as "within noise" only when every route agrees
+# within 10%; otherwise the widest gap is named so a real divergence is visible.
+_gaps=[]
+for rt in routes:
+    a,b=med("nitro-native",rt,"rps"),med("nitro-dylib",rt,"rps")
+    if a and b: _gaps.append((abs(a-b)/max(a,b), rt, a, b))
+if _gaps:
+    _worst=max(_gaps)
+    _h=next((g for g in _gaps if g[1]=="/hello"), _gaps[0])
+    _w=next((g for g in _gaps if g[1]=="/work"), None)
+    _pair=f"{_k(_h[2])}/{_k(_h[3])} on `{_h[1]}`" + (f", {_k(_w[2])}/{_k(_w[3])} on `/work`" if _w else "")
+    if _worst[0] <= 0.10:
+        native_vs_dylib=(f"**nitro-native ≈ nitro-dylib on every route** ({_pair}; widest gap "
+                         f"{_worst[0]*100:.0f}% on `{_worst[1]}`) — within run-to-run noise. The `@Native` "
+                         "code-asset vs `DynamicLibrary` FFI boundary costs nothing measurable.")
+    else:
+        native_vs_dylib=(f"**nitro-native vs nitro-dylib differ by {_worst[0]*100:.0f}% on `{_worst[1]}`** "
+                         f"({_k(_worst[2])} vs {_k(_worst[3])}; {_pair}) — more than noise in this run; "
+                         "re-run before drawing a conclusion (interleaved reps, same harness).")
+else:
+    native_vs_dylib="(only one nitro variant ran: no @Native vs DynamicLibrary comparison in this report)"
+
+# A/B of two nitro builds (run.sh --base <ref>): the baseline tree and the
+# working tree ran INTERLEAVED in this run, so their per-route medians are
+# directly comparable — the only comparison the methodology accepts for a small
+# delta. Positive = the working tree is faster.
+_ab=[]
+for rt in routes:
+    a,b=med("nitro-base",rt,"rps"),med("nitro-dylib",rt,"rps")
+    if a and b: _ab.append((rt,a,b,(b-a)/a))
+if _ab:
+    _wab=max(_ab,key=lambda g: abs(g[3]))
+    base_vs_tree=["## nitro-base vs nitro-dylib (A/B of two builds, interleaved in this run)", "",
+                  f"Baseline = `{__import__('os').environ.get('BASE_REF','?')}`; working tree = nitro-dylib. "
+                  "Medians over the same interleaved reps; delta = (tree − base) / base.", "",
+                  "| route | nitro-base req/s | nitro-dylib req/s | delta | base p99 | tree p99 |", "|---|--:|--:|--:|--:|--:|"]
+    for rt,a,b,d in _ab:
+        base_vs_tree.append(f"| {rt} | {a:.0f} | {b:.0f} | {d*100:+.1f}% | {med('nitro-base',rt,'p99_ms'):.2f} | {med('nitro-dylib',rt,'p99_ms'):.2f} |")
+    base_vs_tree += ["", (f"**Every route within ±5%** (widest {_wab[3]*100:+.1f}% on `{_wab[0]}`): no measurable difference between the two builds at this rep count."
+                          if abs(_wab[3])<=0.05 else
+                          f"**Widest delta {_wab[3]*100:+.1f}% on `{_wab[0]}`** ({_wab[1]:.0f} → {_wab[2]:.0f} req/s) — beyond the ±5% noise band; rerun with more reps before believing it.")]
+    base_vs_tree="\n".join(base_vs_tree)
+else:
+    base_vs_tree=""
+
 doc=[ "# Blackbox cross-framework benchmark", "",
       "Throughput + full latency distribution + peak memory, one run, medians over reps.",
       "",
@@ -256,10 +304,8 @@ doc=[ "# Blackbox cross-framework benchmark", "",
       "",
       flatness,
       "",
-      "**nitro-native ≈ nitro-dylib on every route** (181k/181k on `/hello`, 45.5k/46.0k "
-      "on `/work`) — within run-to-run noise. The `@Native` code-asset vs `DynamicLibrary` "
-      "FFI boundary costs nothing measurable; the architecture pays no penalty for either.",
-      "", machine, "",
+      native_vs_dylib,
+      "", base_vs_tree, "", machine, "",
       table("Equal-work routes (same handler work, equal CPU budget)", EQUAL,
             "`/work` encodes 200 JSON records **per request** on every framework "
             "(byte-identical output, validated below). An earlier version of this "

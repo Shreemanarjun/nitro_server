@@ -58,6 +58,18 @@ RUN cp build.yaml /tmp/build.yaml.bak && cp lib/src/nitro_server.g.dart /tmp/g.n
     dart compile exe benchmark/compare.dart -o compare_dylib; \
     cp /tmp/build.yaml.bak build.yaml && cp /tmp/g.native.bak lib/src/nitro_server.g.dart
 
+# 3b. Optional A/B baseline (`run.sh --base <ref>`): the tree at <ref>, exported
+# into benchmark/blackbox/base/, built exactly like step 1+3 and served as
+# `nitro-base`, so two nitro builds are measured interleaved in ONE run.
+ARG BASE_REF=""
+ENV BASE_REF="$BASE_REF"
+RUN if [ -f benchmark/blackbox/base/pubspec.yaml ]; then set -e; cd benchmark/blackbox/base; \
+      rm -f pubspec.lock; python3 /app/benchmark/blackbox/fix_pubspec.py; dart pub get; \
+      cmake -S src -B build/lib $ENGINE_FLAGS && cmake --build build/lib --parallel; \
+      sed -i '/options:/d; /native_assets: true/d' build.yaml; dart run build_runner build; \
+      dart compile exe benchmark/compare.dart -o /app/compare_dylib_base; \
+      cp build/lib/libnitro_server.so /app/libnitro_server_base.so; fi
+
 # 4. Go server + 4 KiB POST body for /echo
 RUN go build -o compare_go_server benchmark/compare_go_server.go
 RUN head -c 4096 /dev/zero | tr '\0' 'x' > benchmark/blackbox/echo4k.bin

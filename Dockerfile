@@ -1,51 +1,66 @@
 # syntax=docker/dockerfile:1
 #
-# nitro_server: builds the native C++ engine library and AOT-compiles the server
-# entrypoint (bin/server.dart), then ships both in a slim runtime image.
+# nitro_server: builds the native C++ engine (all features: TLS, brotli,
+# HTTP/2, dependencies linked statically) and the AOT server (bin/server.dart)
+# with `dart build cli`, which runs the package's build hook so the engine ships
+# inside the bundle as a code asset. Base images are digest-pinned; bump the
+# digests deliberately (`docker buildx imagetools inspect <image>`).
 #
 #   docker build -t nitro-server .
 #   docker run --rm -p 8080:8080 nitro-server
 #
-# The default engine build has TLS/brotli OFF, so the runtime needs only the C/C++
-# runtime. To enable TLS or brotli, add `-DNITRO_SERVER_TLS=ON` (and libssl-dev in
-# build / libssl3 in runtime) resp. the brotli flags, below.
+# Config via env: HOST (0.0.0.0), PORT (8080), ADMIN_USER + ADMIN_PASSWORD (guard
+# /metrics, /dashboard, /docs — loopback-only without them), API_TOKEN, API_KEY,
+# and every ServerConfig.fromEnv variable (see README "From the environment").
 
-# ---- build stage: native engine + AOT server ----
-FROM dart:stable AS build
+# ---- build stage: native engine + AOT bundle -------------------------------
+FROM dart:stable@sha256:efc6116982a4d178babd453b05555b37693316945fd6012a2d10232a940caa19 AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      cmake clang make && rm -rf /var/lib/apt/lists/*
+      cmake clang make pkg-config \
+      libuv1-dev libssl-dev libbrotli-dev libnghttp2-dev zlib1g-dev libzstd-dev \
+ && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
-# Cache dependencies on the pubspec layer.
+# Resolve dependencies on the pubspec layer. nitro_server is also a Flutter FFI
+# plugin, so its pubspec carries a publish-only Flutter SDK constraint; the
+# server is plain Dart, so that one line is dropped for the container build.
 COPY pubspec.yaml pubspec.lock ./
-RUN dart pub get
+RUN sed -i -E "/^\s*flutter:\s*['\"]>=/d" pubspec.yaml && dart pub get
 
-# Build the native engine library (Release) and AOT-compile the server.
 COPY . .
-RUN dart pub get --offline
+RUN sed -i -E "/^\s*flutter:\s*['\"]>=/d" pubspec.yaml && dart pub get --offline
+
+# Engine: portable (no -march=native — the image runs on any CPU of its arch),
+# every feature on, static deps so the runtime image needs no libuv/ssl/brotli
+# (Debian's static libcrypto wants zlib + zstd, hence the *-dev here / runtime libs below).
 RUN cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release \
-    && cmake --build build/lib --parallel
-RUN dart compile exe bin/server.dart -o /app/server
+      -DNITRO_SERVER_NATIVE_TUNE=OFF -DNITRO_SERVER_HTTP2=ON \
+      -DNITRO_SERVER_STATIC_DEPS=ON \
+ && cmake --build build/lib --parallel
 
-# ---- runtime stage: slim, non-root ----
-FROM debian:stable-slim AS runtime
+# `dart build cli`, never `dart compile exe`: only the former runs the build
+# hook that bundles the engine (bundle/lib/) next to the executable.
+# NO_DOWNLOAD: the engine was just built; never reach for a prebuilt here.
+RUN NITRO_SERVER_NO_DOWNLOAD=1 dart build cli -t bin/server.dart -o /app/out
+
+# ---- runtime stage: slim, non-root ------------------------------------------
+FROM debian:stable-slim@sha256:a717a33469731894e77e912ea7d714e27c2dc38ee6554fd1a3102e92999cfc66 AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates libstdc++6 curl && rm -rf /var/lib/apt/lists/*
+      ca-certificates libstdc++6 zlib1g libzstd1 curl \
+ && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY --from=build /app/server /app/server
-COPY --from=build /app/build/lib/libnitro_server.so /app/libnitro_server.so
+COPY --from=build /app/out/bundle/ /app/
 
-ENV NITRO_SERVER_DYLIB=/app/libnitro_server.so \
-    HOST=0.0.0.0 \
+ENV HOST=0.0.0.0 \
     PORT=8080
 EXPOSE 8080
 
 RUN useradd --system --uid 10001 nitro
 USER nitro
 
-# Uses the built-in readiness endpoint (503 while draining) so orchestrators and
-# `docker run` both see shutdown correctly.
+# The built-in readiness endpoint (503 while draining or when a helper isolate
+# died) so orchestrators and `docker run` both see shutdown correctly.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
   CMD curl -fsS "http://127.0.0.1:${PORT}/readyz" || exit 1
 
-ENTRYPOINT ["/app/server"]
+ENTRYPOINT ["/app/bin/server"]

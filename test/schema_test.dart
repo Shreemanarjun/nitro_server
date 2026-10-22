@@ -99,6 +99,39 @@ void main() {
     });
   });
 
+  group('validateJsonBody error cap', () {
+    test(
+      'a body with thousands of violations answers a bounded list',
+      () async {
+        final client = await NitroTestClient.start();
+        addTearDown(client.close);
+        const schema = ApiSchema.array(ApiSchema.integer());
+        await client.server.post(
+          '/n',
+          (_) => ResponseContext.text('ok'),
+          middleware: [validateJsonBody(schema, maxErrors: 5)],
+        );
+        final res = await client.post(
+          '/n',
+          body: utf8.encode(jsonEncode(List.filled(1000, 'x'))),
+          headers: const {'content-type': 'application/json'},
+        );
+        expect(res.status, 422);
+        final errors = (res.json() as Map)['errors'] as List;
+        expect(errors, hasLength(6));
+        expect(errors.last, '… 995 more error(s) omitted');
+        // Deep nesting cannot blow the stack: dart:convert parses iteratively.
+        final deep = '${'[' * 100000}${']' * 100000}';
+        final nested = await client.post(
+          '/n',
+          body: utf8.encode(deep),
+          headers: const {'content-type': 'application/json'},
+        );
+        expect(nested.status, 422); // an array of arrays, not integers
+      },
+    );
+  });
+
   group('validateJsonBody middleware', () {
     late NitroTestClient client;
     setUp(() => NitroTestClient.start().then((c) => client = c));

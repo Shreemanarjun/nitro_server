@@ -1,0 +1,33 @@
+# Nightly soak + long fuzz (doc/production-audit.md). Soak: keep-alive HTTP,
+# WebSocket, chunked streaming and SSE traffic against one server for 10
+# minutes, failing on any request error or on RSS growth past 25% between the
+# quarter mark and the end. Fuzz: 10 minutes per libFuzzer target (the PR
+# smoke in ci.yml is 60 s).
+name: soak
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: stable
+      - run: sudo apt-get update && sudo apt-get install -y clang pkg-config libssl-dev libuv1-dev libbrotli-dev libnghttp2-dev
+      - run: flutter pub get
+      - run: cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release -DNITRO_SERVER_HTTP2=ON
+      - run: cmake --build build/lib --parallel
+      - run: dart run tool/soak.dart --seconds 600 --max-growth-percent 25
+
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: sudo apt-get update && sudo apt-get install -y clang libclang-rt-dev libuv1-dev libssl-dev libbrotli-dev cmake
+      - run: CXX=clang++ bash tool/fuzz.sh 600

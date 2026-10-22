@@ -1,4 +1,5 @@
 #include "UvReactor.h"
+#include <ctime>
 
 #ifdef NITRO_SERVER_LIBUV
 
@@ -92,7 +93,8 @@ int uvPortOf(const sockaddr_storage& ss) {
 // first the client also offers); otherwise only `http/1.1`. A client that offers
 // neither gets no selection and falls back to HTTP/1.1.
 int reactorAlpnSelect(SSL*, const unsigned char** out, unsigned char* outlen,
-                      const unsigned char* in, unsigned int inlen, void* arg) {
+                      const unsigned char* in, unsigned int inlen,
+                      [[maybe_unused]] void* arg) {
   static const unsigned char h11[] = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
   const unsigned char* prefs = h11;
   unsigned int prefsLen = sizeof(h11);
@@ -146,29 +148,139 @@ bool uvIequals(const std::string& a, const char* b) {
   return true;
 }
 
-// Response head with engine framing (Content-Length + Connection); caller
-// headers minus content-length/connection ride ahead.
+std::string uvTrim(const std::string& s) {
+  size_t a = 0, b = s.size();
+  while (a < b && (s[a] == ' ' || s[a] == '\t')) a++;
+  while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t')) b--;
+  return s.substr(a, b - a);
+}
+
+// RFC 9110 §5.1 token: tchar / 1*tchar — the only legal field-name alphabet.
+bool uvIsToken(const std::string& name) {
+  if (name.empty()) return false;
+  for (const unsigned char ch : name) {
+    if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+        (ch >= '0' && ch <= '9'))
+      continue;
+    switch (ch) {
+      case '!': case '#': case '$': case '%': case '&': case '\'': case '*':
+      case '+': case '-': case '.': case '^': case '_': case '`': case '|':
+      case '~': continue;
+      default: return false;
+    }
+  }
+  return true;
+}
+
+// A field value the head may carry verbatim: no CR / LF / NUL / other control
+// byte (HTAB excepted). A value that fails this could split the response.
+bool uvIsSafeValue(const std::string& value) {
+  for (const unsigned char ch : value)
+    if ((ch < 0x20 && ch != '\t') || ch == 0x7f) return false;
+  return true;
+}
+
+// Hop-by-hop and framing fields are the engine's to set (RFC 9110 §7.6.1); a
+// handler-supplied one would desynchronise the connection.
+bool uvIsEngineOwnedHeader(const std::string& name) {
+  static const char* const owned[] = {"content-length", "connection",
+                                      "transfer-encoding", "keep-alive",
+                                      "upgrade", "trailer", "te"};
+  for (const char* o : owned)
+    if (uvIequals(name, o)) return true;
+  if (name.size() > 6) {  // Proxy-Connection, Proxy-Authenticate, …
+    std::string lead = name.substr(0, 6);
+    for (char& ch : lead)
+      if (ch >= 'A' && ch <= 'Z') ch += 32;
+    if (lead == "proxy-") return true;
+  }
+  return false;
+}
+
+// RFC 9110 §6.6.1: an origin server with a clock MUST send Date. Formatted
+// once per second per loop thread; every head in that second reuses it.
+const std::string& uvDateHeader() {
+  static thread_local std::time_t cachedSec = 0;
+  static thread_local std::string cached;
+  const std::time_t now = std::time(nullptr);
+  if (now != cachedSec || cached.empty()) {
+    char buf[40];
+    std::tm tm{};
+#ifdef _WIN32
+    gmtime_s(&tm, &now);
+#else
+    gmtime_r(&now, &tm);
+#endif
+    const size_t n = std::strftime(buf, sizeof buf, "%a, %d %b %Y %H:%M:%S GMT", &tm);
+    cached.assign("Date: ").append(buf, n).append("\r\n");
+    cachedSec = now;
+  }
+  return cached;
+}
+
+// Response head with engine framing (Content-Length + Connection + Date);
+// caller headers ride ahead — minus anything the engine owns, and minus any
+// field whose name is not a token or whose value carries a control byte (the
+// Dart runner already refuses those with a 500; this is the last line).
 std::string uvBuildHead(int64_t status, const std::vector<Header>& headers,
                       int64_t contentLength, bool keepAlive,
                       int64_t keepAliveSecs) {
   std::string out;
-  out.reserve(160);
+  out.reserve(192);
   out.append("HTTP/1.1 ");
   out.append(std::to_string(status));
   out.push_back(' ');
   out.append(reasonPhrase(status));
   out.append("\r\n");
+  out.append(uvDateHeader());
   for (const auto& h : headers) {
-    if (uvIequals(h.name, "content-length")) continue;
-    if (uvIequals(h.name, "connection")) continue;
+    if (uvIsEngineOwnedHeader(h.name)) continue;
+    if (!uvIsToken(h.name) || !uvIsSafeValue(h.value)) continue;
     out.append(h.name);
     out.append(": ");
     out.append(h.value);
     out.append("\r\n");
   }
-  out.append("Content-Length: ");
-  out.append(std::to_string(contentLength));
+  // RFC 9110 §8.6: no Content-Length on 1xx / 204 (and none needed on 304, a
+  // body-less answer whose length describes the entity, not this message).
+  const bool bodyless =
+      status == 204 || status == 304 || (status >= 100 && status < 200);
+  if (!bodyless) {
+    out.append("Content-Length: ");
+    out.append(std::to_string(contentLength));
+    out.append("\r\n");
+  }
+  if (keepAlive) {
+    out.append("Connection: keep-alive\r\nKeep-Alive: timeout=");
+    out.append(std::to_string(keepAliveSecs));
+    out.append("\r\n\r\n");
+  } else {
+    out.append("Connection: close\r\n\r\n");
+  }
+  return out;
+}
+
+// The chunked-stream head: the same filtered caller headers and Date as a
+// one-shot head, framed with Transfer-Encoding: chunked instead of a length.
+std::string uvBuildStreamHead(int64_t status, const std::vector<Header>& headers,
+                              bool keepAlive, int64_t keepAliveSecs) {
+  std::string out;
+  out.reserve(192);
+  out.append("HTTP/1.1 ");
+  out.append(std::to_string(status));
+  out.push_back(' ');
+  out.append(reasonPhrase(status));
   out.append("\r\n");
+  out.append(uvDateHeader());
+  for (const auto& h : headers) {
+    if (uvIsEngineOwnedHeader(h.name)) continue;
+    if (!uvIsToken(h.name) || !uvIsSafeValue(h.value)) continue;
+    out.append(h.name);
+    out.append(": ");
+    out.append(h.value);
+    out.append("\r\n");
+  }
+  out.append("Transfer-Encoding: chunked\r\n");
   if (keepAlive) {
     out.append("Connection: keep-alive\r\nKeep-Alive: timeout=");
     out.append(std::to_string(keepAliveSecs));
@@ -198,12 +310,22 @@ bool uvClientWantsKeepAlive(const ParsedHead& head) {
   const Header* conn = uvFindHeader(head.headers, "connection");
   const bool http10 = head.version == "HTTP/1.0";
   if (conn) {
-    if (conn->value.find("close") != std::string::npos ||
-        conn->value.find("Close") != std::string::npos)
-      return false;
-    if (conn->value.find("keep-alive") != std::string::npos ||
-        conn->value.find("Keep-Alive") != std::string::npos)
-      return true;
+    // RFC 9110 §7.6.1: Connection is a comma-separated list of case-
+    // insensitive tokens — matched whole, so `CLOSE` closes and `enclose`
+    // does not.
+    bool close = false, keep = false;
+    size_t pos = 0;
+    const std::string& v = conn->value;
+    while (pos <= v.size()) {
+      size_t comma = v.find(',', pos);
+      if (comma == std::string::npos) comma = v.size();
+      const std::string tok = uvTrim(v.substr(pos, comma - pos));
+      if (uvIequals(tok, "close")) close = true;
+      else if (uvIequals(tok, "keep-alive")) keep = true;
+      pos = comma + 1;
+    }
+    if (close) return false;
+    if (keep) return true;
   }
   return !http10;
 }
@@ -218,45 +340,104 @@ std::string uvErrorResponse(int64_t status, const char* msg,
   return out;
 }
 
-std::string uvTrim(const std::string& s) {
-  size_t a = 0, b = s.size();
-  while (a < b && (s[a] == ' ' || s[a] == '\t')) a++;
-  while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t')) b--;
-  return s.substr(a, b - a);
-}
 
 // Request-smuggling defense (RFC 9112 §6.1/§6.3.3/§3.2): reject conflicting or
 // duplicated Content-Length, Content-Length with Transfer-Encoding, and a
-// missing or duplicated Host on HTTP/1.1. Returns the reason, or null when OK.
-const char* uvFramingError(const ParsedHead& head) {
+// missing or duplicated Host on HTTP/1.1. Transfer-Encoding is parsed as the
+// comma-separated, case-insensitive token list it is: the only coding this
+// server implements is `chunked`, which must be the sole (hence final) coding;
+// any other coding is answered 501 (§6.1), a duplicated field, an empty list,
+// a repeated `chunked`, or TE on HTTP/1.0 is a 400. Returns {0, nullptr} when
+// the framing is sound; `chunked` reports whether the body is chunked.
+struct FramingVerdict {
+  int status;          // 0 = ok, else the status to answer with
+  const char* reason;  // why (diagnostics only)
+};
+FramingVerdict uvFraming(const ParsedHead& head, bool& chunked) {
+  chunked = false;
   const std::string* cl = nullptr;
-  bool hasTe = false, hasHost = false, dupHost = false, dupCl = false;
+  const std::string* te = nullptr;
+  bool hasHost = false, dupHost = false, dupCl = false, dupTe = false;
   for (const auto& h : head.headers) {
     if (uvIequals(h.name, "content-length")) {
-      if (cl && uvTrim(*cl) != uvTrim(h.value)) return "conflicting content-length";
+      if (cl && uvTrim(*cl) != uvTrim(h.value)) return {400, "conflicting content-length"};
       if (cl) dupCl = true;
       cl = &h.value;
     } else if (uvIequals(h.name, "transfer-encoding")) {
-      hasTe = true;
+      if (te) dupTe = true;
+      te = &h.value;
     } else if (uvIequals(h.name, "host")) {
       dupHost = dupHost || hasHost;
       hasHost = true;
     }
   }
-  if (dupCl) return "duplicate content-length";
-  if (cl && hasTe) return "content-length with transfer-encoding";
-  // A non-numeric Content-Length is unparseable framing.
-  if (cl) {
-    char* end = nullptr;
-    const long long v = std::strtoll(cl->c_str(), &end, 10);
-    if (end == cl->c_str() || *end != '\0' || v < 0) return "bad content-length";
+  if (dupCl) return {400, "duplicate content-length"};
+  if (dupTe) return {400, "duplicate transfer-encoding"};
+  if (cl && te) return {400, "content-length with transfer-encoding"};
+  if (te) {
+    if (head.version == "HTTP/1.0") return {400, "transfer-encoding on http/1.0"};
+    int codings = 0, chunkedAt = -1;  // every coding matched whole, any case
+    size_t pos = 0;
+    while (pos <= te->size()) {
+      size_t comma = te->find(',', pos);
+      if (comma == std::string::npos) comma = te->size();
+      const std::string tok = uvTrim(te->substr(pos, comma - pos));
+      pos = comma + 1;
+      if (tok.empty()) continue;
+      ++codings;
+      if (uvIequals(tok, "chunked")) {
+        if (chunkedAt >= 0) return {400, "repeated chunked coding"};
+        chunkedAt = codings;
+      } else {
+        return {501, "unsupported transfer coding"};
+      }
+    }
+    if (codings == 0) return {400, "empty transfer-encoding"};
+    chunked = true;  // exactly one coding, and it is chunked
+  }
+  if (cl) {  // RFC 9110 §8.6: 1*DIGIT — no sign, no space, no hex
+    if (cl->empty() || cl->size() > 18) return {400, "bad content-length"};
+    for (const char ch : *cl)
+      if (ch < '0' || ch > '9') return {400, "bad content-length"};
   }
   if (head.version == "HTTP/1.1") {
-    if (!hasHost) return "missing host header";
-    if (dupHost) return "duplicate host header";
+    if (!hasHost) return {400, "missing host header"};
+    if (dupHost) return {400, "duplicate host header"};
   }
-  return nullptr;
+  return {0, nullptr};
 }
+
+// RFC 9112 §7.1 chunk-size: 1*HEXDIG then optional `;` extensions, ending at
+// the CRLF at [eol]. Returns the size, or -1 for anything else — a sign, a
+// non-hex tail (`4zz`), an empty size, or more digits than an int64 holds
+// (an overflow would wrap into a small, accepted size).
+int64_t uvChunkSize(const std::string& buf, size_t pos, size_t eol) {
+  int64_t size = 0;
+  size_t digits = 0;
+  while (pos < eol) {
+    const char ch = buf[pos];
+    int d;
+    if (ch >= '0' && ch <= '9') d = ch - '0';
+    else if (ch >= 'a' && ch <= 'f') d = ch - 'a' + 10;
+    else if (ch >= 'A' && ch <= 'F') d = ch - 'A' + 10;
+    else break;
+    if (++digits > 15) return -1;  // 60 bits: far past any body cap
+    size = (size << 4) | d;
+    ++pos;
+  }
+  if (digits == 0) return -1;
+  if (pos < eol) {  // optional chunk extensions `;name[=value]` … to the CRLF
+    if (buf[pos] != ';') return -1;
+    for (size_t i = pos; i < eol; ++i)
+      if ((unsigned char)buf[i] < 0x20) return -1;
+  }
+  return size;
+}
+
+// Trailer section budget (RFC 9112 §7.1.2): bounded so an endless stream of
+// trailer lines cannot park the connection or grow the buffer unbounded.
+constexpr size_t kMaxTrailerBytes = 8 * 1024;
+constexpr int kMaxTrailerLines = 32;
 
 // Decodes a chunked request body from [buf] starting at [start].
 // Returns: 1 complete (out = body, end = offset past the terminating CRLF),
@@ -276,25 +457,31 @@ int decodeChunked(const std::string& buf, size_t start, int64_t maxBody,
     const size_t eol = buf.find("\r\n", pos);
     if (eol == std::string::npos)  // size line not fully buffered
       return overCap() ? -2 : 0;
-    char* endp = nullptr;
-    const long sz = std::strtol(buf.c_str() + pos, &endp, 16);
-    if (endp == buf.c_str() + pos || sz < 0) return -1;  // malformed size
+    const int64_t sz = uvChunkSize(buf, pos, eol);
+    if (sz < 0) return -1;  // malformed size line
     pos = eol + 2;
     if (sz == 0) {  // terminal chunk: consume trailers to the blank line
       size_t t = pos;
+      int lines = 0;
       while (true) {
         const size_t e2 = buf.find("\r\n", t);
-        if (e2 == std::string::npos) return overCap() ? -2 : 0;
+        if (e2 == std::string::npos) {
+          if (buf.size() - pos > kMaxTrailerBytes) return -1;
+          return overCap() ? -2 : 0;
+        }
         if (e2 == t) {
           end = t + 2;
           return 1;
         }
+        if (++lines > kMaxTrailerLines || e2 - pos > kMaxTrailerBytes) return -1;
         t = e2 + 2;  // skip one trailer line
       }
     }
     if ((int64_t)out.size() + sz > maxBody) return -2;  // declared over the cap
     if (buf.size() < pos + (size_t)sz + 2)  // data + CRLF not in yet
       return overCap() ? -2 : 0;
+    // The data MUST be followed by CRLF (§7.1); anything else is desync.
+    if (buf[pos + (size_t)sz] != '\r' || buf[pos + (size_t)sz + 1] != '\n') return -1;
     out.append(buf, pos, (size_t)sz);
     pos += (size_t)sz + 2;
   }
@@ -332,11 +519,31 @@ struct UvReactor::Conn {
   // parser is bypassed; freed with the Conn.
   std::unique_ptr<Http2Session> h2;
 #endif
+  // A file answer in progress (loop thread): the next chunk is read from
+  // [fileFd] at [fileOffset] once the previous write has drained, so one
+  // slow reader costs one chunk of memory, never the file.
+  int fileFd = -1;
+  int64_t fileOffset = 0;
+  int64_t fileRemaining = 0;
+  bool fileKeepAlive = false;
   int64_t writePending = 0;     // bytes queued to the socket, not yet written
   std::chrono::steady_clock::time_point writeStartedAt;  // oldest pending write
   std::chrono::steady_clock::time_point lastActive;   // idle-timeout anchor
+  // Streaming response (SSE / chunked / file) in progress: set by the first
+  // answer byte, cleared when the answer finishes. `lastWriteAt` anchors
+  // streamIdleTimeout — a stream the handler stopped feeding is closed.
+  bool responseStarted = false;
+  std::chrono::steady_clock::time_point lastWriteAt;
+  std::chrono::steady_clock::time_point openedAt;     // accepted (max age)
   std::chrono::steady_clock::time_point reqDeadline;  // valid while busy+handler
   bool hasDeadline = false;
+  bool bodyPending = false;  // head parsed, body still arriving (stall window)
+  bool headPending = false;  // first byte of a request head seen, head not complete
+  std::chrono::steady_clock::time_point headStartedAt;  // anchors headerTimeout
+  bool proxyDone = false;    // PROXY protocol header consumed (cfg.proxyProtocol)
+  std::string proxyBuf;      // bytes held until the PROXY header is complete
+  bool ageExpired = false;   // past maxConnectionAge: next answer closes
+  bool wsPingSent = false;   // liveness ping out, no frame back yet
   // WebSocket state (set after a successful upgrade).
   bool ws = false;
   Emitter* wsEmitter = nullptr;  // the sink this session's messages go to
@@ -428,10 +635,12 @@ void UvReactor::addEmitter(Emitter* e) {
   emitters_.push_back(e);
 }
 
-void UvReactor::removeEmitter(Emitter* e) {
+bool UvReactor::removeEmitter(Emitter* e) {
   std::lock_guard<std::mutex> lk(emitterMutex_);
+  const size_t before = emitters_.size();
   emitters_.erase(std::remove(emitters_.begin(), emitters_.end(), e),
                   emitters_.end());
+  return emitters_.size() != before;
 }
 
 size_t UvReactor::emitterCountForTesting() {
@@ -464,35 +673,132 @@ void UvReactor::broadcastEvent(ServerEventKind kind, int64_t requestId,
 }
 
 // Read on the caller's thread (fine — not a loop thread), answer like a body.
+// Loop thread: read the next chunk of a file answer and write it; the last
+// chunk finishes the response. A read failure mid-body breaks the framing,
+// so the connection is closed rather than left desynchronised.
+void UvReactor::continueFileSend(Conn* c) {
+  if (c->fileFd < 0 || c->closing) return;
+  constexpr int64_t kChunk = 256 * 1024;
+  const int64_t want = std::min<int64_t>(kChunk, c->fileRemaining);
+  std::string chunk((size_t)want, '\0');
+  uv_buf_t buf = uv_buf_init(chunk.data(), (unsigned)want);
+  uv_fs_t req;
+  const int got = uv_fs_read(nullptr, &req, c->fileFd, &buf, 1, c->fileOffset, nullptr);
+  uv_fs_req_cleanup(&req);
+  if (got <= 0) {  // EOF before the promised length, or an I/O error
+    uv_fs_t closeReq;
+    uv_fs_close(nullptr, &closeReq, c->fileFd, nullptr);
+    uv_fs_req_cleanup(&closeReq);
+    c->fileFd = -1;
+    broadcastEvent(ServerEventKind::ClientError, c->id, "file answer truncated");
+    c->closing = true;
+    if (!uv_is_closing((uv_handle_t*)&c->handle))
+      uv_close((uv_handle_t*)&c->handle, &UvReactor::onCloseConn);
+    return;
+  }
+  chunk.resize((size_t)got);
+  c->fileOffset += got;
+  c->fileRemaining -= got;
+  const bool last = c->fileRemaining <= 0;
+  if (last) {
+    uv_fs_t closeReq;
+    uv_fs_close(nullptr, &closeReq, c->fileFd, nullptr);
+    uv_fs_req_cleanup(&closeReq);
+    c->fileFd = -1;
+  }
+  writeAnswer(c, std::move(chunk), c->fileKeepAlive, /*finish=*/last);
+}
+
+// Any thread: answer with a byte range of a regular file. The head goes out
+// with the exact Content-Length; the bytes follow in 256 KiB chunks read on
+// the connection's loop thread as each write drains (see continueFileSend),
+// so a slow reader never holds more than one chunk and a file larger than
+// memory is fine. Anything that is not a regular file is a 404.
 void UvReactor::respondFile(int64_t id, int64_t status,
                             const std::vector<Header>& headers,
                             const std::string& path, int64_t offset,
                             int64_t length) {
   if (!running_.load()) return;  // no-op after stop() (see respond)
-  FILE* f = std::fopen(path.c_str(), "rb");
-  if (!f) {
+  auto notFound = [&]() {
     static const char msg[] = "not found";
     std::vector<Header> h{{"Content-Type", "text/plain"}};
     respond(id, 404, h, (const uint8_t*)msg, sizeof(msg) - 1);
+  };
+  uv_fs_t openReq;
+  const int fd = uv_fs_open(nullptr, &openReq, path.c_str(), UV_FS_O_RDONLY, 0, nullptr);
+  uv_fs_req_cleanup(&openReq);
+  if (fd < 0) {
+    notFound();
     return;
   }
-  std::fseek(f, 0, SEEK_END);
-  const long size = std::ftell(f);
+  auto closeFd = [&]() {
+    uv_fs_t closeReq;
+    uv_fs_close(nullptr, &closeReq, fd, nullptr);
+    uv_fs_req_cleanup(&closeReq);
+  };
+  uv_fs_t statReq;
+  if (uv_fs_fstat(nullptr, &statReq, fd, nullptr) != 0 ||
+      (statReq.statbuf.st_mode & S_IFMT) != S_IFREG) {  // a directory, FIFO, device
+    uv_fs_req_cleanup(&statReq);
+    closeFd();
+    notFound();
+    return;
+  }
+  const int64_t size = (int64_t)statReq.statbuf.st_size;
+  uv_fs_req_cleanup(&statReq);
   if (offset < 0) offset = 0;
   if (offset > size) {  // a range that starts past the end has no bytes → 404
-    std::fclose(f);
-    static const char msg[] = "not found";
-    std::vector<Header> h{{"Content-Type", "text/plain"}};
-    respond(id, 404, h, (const uint8_t*)msg, sizeof(msg) - 1);
+    closeFd();
+    notFound();
     return;
   }
-  const long end = length < 0 ? size : std::min<long>(size, offset + length);
-  const long n = end > offset ? end - offset : 0;
-  std::string body((size_t)n, '\0');
-  std::fseek(f, offset, SEEK_SET);
-  if (n > 0 && std::fread(&body[0], 1, (size_t)n, f) != (size_t)n) body.clear();
-  std::fclose(f);
-  respond(id, status, headers, (const uint8_t*)body.data(), body.size());
+  const int64_t end = length < 0 ? size : std::min<int64_t>(size, offset + length);
+  const int64_t n = end > offset ? end - offset : 0;
+  ReqLoc loc;
+  if (!lookupReq(id, loc, /*erase=*/false)) {
+    closeFd();
+    return;  // unknown / already answered
+  }
+  // HEAD, an empty range, or an h2 stream (whose session wants the body
+  // whole: h2 responses are buffered per stream, see doc/http2.md): hand the
+  // bytes to respond() — bounded by the range the handler asked for.
+  if (loc.isHead || n == 0 || loc.isH2) {
+    std::string body;
+    if (!loc.isHead && n > 0) {
+      body.assign((size_t)n, '\0');
+      uv_buf_t buf = uv_buf_init(body.data(), (unsigned)n);
+      uv_fs_t readReq;
+      const int got = uv_fs_read(nullptr, &readReq, fd, &buf, 1, offset, nullptr);
+      uv_fs_req_cleanup(&readReq);
+      if (got != n) body.clear();
+    }
+    closeFd();
+    // respond() frames Content-Length from bodyLen; for HEAD that is the
+    // entity length with no bytes appended.
+    respond(id, status, headers, (const uint8_t*)body.data(),
+            loc.isHead ? (size_t)n : body.size());
+    return;
+  }
+  if (!lookupReq(id, loc, /*erase=*/true)) {
+    closeFd();
+    return;
+  }
+  completions_.fetch_add(1, std::memory_order_release);
+  const int64_t kaSecs = (cfg_.keepAliveTimeoutMs + 999) / 1000;
+  Loop* lp = loops_[loc.loopIdx].get();
+  Loop::Pending p;
+  p.connId = loc.connId;
+  p.bytes = uvBuildHead(status, headers, n, loc.keepAlive, kaSecs);
+  p.keepAlive = loc.keepAlive;
+  p.finish = false;
+  p.fileFd = fd;
+  p.fileOffset = offset;
+  p.fileRemaining = n;
+  {
+    std::lock_guard<std::mutex> lk(lp->qMutex);
+    lp->queue.push_back(std::move(p));
+  }
+  uv_async_send(&lp->async);
 }
 
 MatchResult UvReactor::match(Method m, const std::string& custom,
@@ -701,6 +1007,12 @@ void UvReactor::onConnection(uv_stream_t* server, int status) {
       else
         uv_ip4_name(reinterpret_cast<const sockaddr_in*>(&ss), ip, sizeof(ip));
       peerIp = ip;
+      // A dual-stack listener (`::`) reports IPv4 peers as `::ffff:a.b.c.d`;
+      // present them as IPv4 so per-IP caps, trusted-proxy CIDRs and logs
+      // see one address family.
+      if (peerIp.size() > 7 && peerIp.compare(0, 7, "::ffff:") == 0 &&
+          peerIp.find('.') != std::string::npos)
+        peerIp.erase(0, 7);
     }
   }
   c->clientIp = peerIp;  // reported to handlers; independent of the per-IP cap
@@ -755,6 +1067,7 @@ void UvReactor::onConnection(uv_stream_t* server, int status) {
   self->liveConns_.fetch_add(1);
   uv_tcp_nodelay(&c->handle, 1);
   c->lastActive = Clock::now();
+  c->openedAt = c->lastActive;
 #ifdef NITRO_SERVER_TLS
   if (self->sslCtx_.load(std::memory_order_acquire) && !self->tlsInit(c)) {
     c->closing = true;
@@ -792,6 +1105,12 @@ void UvReactor::releaseAdmission(Conn* c) {
 
 void UvReactor::onCloseConn(uv_handle_t* h) {
   Conn* c = (Conn*)h;
+  if (c->fileFd >= 0) {  // a file answer cut short by the peer
+    uv_fs_t closeReq;
+    uv_fs_close(nullptr, &closeReq, c->fileFd, nullptr);
+    uv_fs_req_cleanup(&closeReq);
+    c->fileFd = -1;
+  }
   if (c->lp) {
     UvReactor* self = c->lp->owner;
     c->lp->conns.erase(c->id);
@@ -840,6 +1159,82 @@ void UvReactor::onCloseConn(uv_handle_t* h) {
   delete c;
 }
 
+// HAProxy PROXY protocol, v1 (text) and v2 (binary). Returns 1 with [used]
+// bytes consumed and [ip] set to the client address the header names (empty
+// for LOCAL / UNKNOWN: keep the socket peer), 0 when more bytes are needed,
+// -1 for anything that is not a well-formed header.
+static int uvParseProxyHeader(const std::string& buf, std::string& ip,
+                              size_t& used) {
+  static const char kV2Sig[12] = {'\r', '\n', '\r', '\n', 0, '\r', '\n',
+                                  'Q', 'U', 'I', 'T', '\n'};
+  ip.clear();
+  used = 0;
+  const size_t n = buf.size();
+  // v2: 12-byte signature, version/command, family, 2-byte length, addresses.
+  if (n >= 12 && std::memcmp(buf.data(), kV2Sig, 12) == 0) {
+    if (n < 16) return 0;
+    const unsigned char verCmd = (unsigned char)buf[12];
+    const unsigned char fam = (unsigned char)buf[13];
+    const size_t len = ((size_t)(unsigned char)buf[14] << 8) | (unsigned char)buf[15];
+    if ((verCmd & 0xF0) != 0x20) return -1;
+    if (n < 16 + len) return 0;
+    used = 16 + len;
+    const unsigned char cmd = verCmd & 0x0F;
+    if (cmd == 0x0) return 1;  // LOCAL: health check from the proxy itself
+    if (cmd != 0x1) return -1;
+    const unsigned char af = fam >> 4;
+    const unsigned char* a = (const unsigned char*)buf.data() + 16;
+    char text[INET6_ADDRSTRLEN] = {0};
+    if (af == 0x1) {  // AF_INET: src(4) dst(4) sport(2) dport(2)
+      if (len < 12 || !inet_ntop(AF_INET, a, text, sizeof text)) return -1;
+      ip = text;
+    } else if (af == 0x2) {  // AF_INET6: src(16) dst(16) sport dport
+      if (len < 36 || !inet_ntop(AF_INET6, a, text, sizeof text)) return -1;
+      ip = text;
+    } else if (af != 0x0) {  // AF_UNIX / unknown: no usable address
+      return -1;
+    }
+    return 1;
+  }
+  // v1: "PROXY TCP4|TCP6|UNKNOWN src dst sport dport\r\n", at most 107 bytes.
+  static const char kV1[6] = {'P', 'R', 'O', 'X', 'Y', ' '};
+  const size_t cmp = n < 6 ? n : 6;
+  if (std::memcmp(buf.data(), kV1, cmp) != 0) {
+    // Could still be the first bytes of a v2 signature.
+    if (n < 12 && std::memcmp(buf.data(), kV2Sig, n) == 0) return 0;
+    return -1;
+  }
+  const size_t eol = buf.find("\r\n");
+  if (eol == std::string::npos) return n >= 108 ? -1 : 0;
+  if (eol > 106) return -1;
+  used = eol + 2;
+  std::vector<std::string> tok;
+  size_t pos = 6;
+  while (pos <= eol) {
+    size_t sp = buf.find(' ', pos);
+    if (sp == std::string::npos || sp > eol) sp = eol;
+    tok.push_back(buf.substr(pos, sp - pos));
+    pos = sp + 1;
+  }
+  if (tok.empty()) return -1;
+  if (tok[0] == "UNKNOWN") return 1;  // keep the socket peer
+  if (tok.size() != 5) return -1;
+  const int af = tok[0] == "TCP4" ? AF_INET : tok[0] == "TCP6" ? AF_INET6 : -1;
+  if (af < 0) return -1;
+  unsigned char raw[16];
+  if (inet_pton(af, tok[1].c_str(), raw) != 1 ||
+      inet_pton(af, tok[2].c_str(), raw) != 1)
+    return -1;
+  for (int i = 3; i < 5; i++) {
+    if (tok[i].empty() || tok[i].size() > 5) return -1;
+    for (const char ch : tok[i])
+      if (ch < '0' || ch > '9') return -1;
+    if (std::stoi(tok[i]) > 65535) return -1;
+  }
+  ip = tok[1];
+  return 1;
+}
+
 void UvReactor::readCb(uv_stream_t* s, ssize_t nread, const uv_buf_t* b) {
   Conn* c = (Conn*)s;
   if (nread < 0) {
@@ -859,13 +1254,84 @@ void UvReactor::readCb(uv_stream_t* s, ssize_t nread, const uv_buf_t* b) {
     return;
   }
   if (nread == 0) return;
+  // Progress on the wire — a body still arriving, a WebSocket frame or pong —
+  // is activity: the stall/idle windows restart from here.
+  c->lastActive = Clock::now();
+  c->wsPingSent = false;
+  const char* data = b->base;
+  size_t len = (size_t)nread;
+  std::string carry;
+  // PROXY protocol: the very first bytes name the real client; they precede
+  // the TLS handshake and the HTTP/2 preface alike, so they are consumed here
+  // before either path sees the stream.
+  UvReactor* self = c->lp->owner;
+  if (self->cfg_.proxyProtocol && !c->proxyDone) {
+    c->proxyBuf.append(data, len);
+    std::string ip;
+    size_t used = 0;
+    const int r = uvParseProxyHeader(c->proxyBuf, ip, used);
+    if (r == 0) {
+      // v2 is 16 bytes + a 16-bit length (TLVs included): 65551 at most.
+      if (c->proxyBuf.size() > 16 + 65535) {
+        c->closing = true;
+        uv_close((uv_handle_t*)s, &UvReactor::onCloseConn);
+      }
+      return;
+    }
+    if (r < 0) {
+      self->broadcastEvent(ServerEventKind::ClientError, c->id,
+                           "invalid PROXY protocol header");
+      c->closing = true;
+      uv_close((uv_handle_t*)s, &UvReactor::onCloseConn);
+      return;
+    }
+    c->proxyDone = true;
+    if (!ip.empty()) {
+      c->clientIp = ip;
+      // The per-IP cap counted the socket peer (the proxy) at accept; move
+      // the slot to the client the header names so the cap means clients,
+      // not the balancer. Over the cap for that client: refuse now.
+      if (self->cfg_.maxConnectionsPerIp > 0 && ip != c->peerIp) {
+        bool over = false;
+        {
+          std::lock_guard<std::mutex> lk(self->ipMutex_);
+          if (!c->peerIp.empty()) {
+            auto it = self->ipCounts_.find(c->peerIp);
+            if (it != self->ipCounts_.end() && --it->second <= 0)
+              self->ipCounts_.erase(it);
+            c->peerIp.clear();
+          }
+          auto& count = self->ipCounts_[ip];
+          if (count >= self->cfg_.maxConnectionsPerIp) {
+            over = true;
+            if (count == 0) self->ipCounts_.erase(ip);
+          } else {
+            count += 1;
+            c->peerIp = ip;
+          }
+        }
+        if (over) {
+          c->closing = true;
+          uv_close((uv_handle_t*)s, &UvReactor::onCloseConn);
+          return;
+        }
+      }
+    }
+    carry.assign(c->proxyBuf, used, std::string::npos);
+    c->proxyBuf.clear();
+    c->proxyBuf.shrink_to_fit();
+    if (carry.empty()) return;
+    data = carry.data();
+    len = carry.size();
+  }
 #ifdef NITRO_SERVER_TLS
   if (c->ssl) {
-    c->lp->owner->tlsOnRead(c, b->base, (size_t)nread);  // decrypts + processes
+    self->tlsOnRead(c, data, len);  // decrypts + processes
     return;
   }
 #endif
-  c->buf.append(b->base, (size_t)nread);
+  c->buf.append(data, len);
+  if (self->overBusyBuffer(c)) return;
   if (c->streamingBody) {
     if (c->streamChunked) c->lp->owner->emitStreamChunked(c);
     else c->lp->owner->emitStreamBytes(c);
@@ -907,22 +1373,30 @@ void UvReactor::emitStreamChunked(Conn* c) {
   while (true) {
     if (c->chunkNeedCrlf) {  // trailing CRLF after a chunk's data
       if (c->buf.size() < 2) break;
+      if (c->buf[0] != '\r' || c->buf[1] != '\n') { malformed = true; break; }
       c->buf.erase(0, 2);
       c->chunkNeedCrlf = false;
     }
     if (c->chunkRemaining == 0) {  // read the next size line
       const size_t eol = c->buf.find("\r\n");
-      if (eol == std::string::npos) break;
-      char* endp = nullptr;
-      const long sz = std::strtol(c->buf.c_str(), &endp, 16);
-      if (endp == c->buf.c_str() || sz < 0) { malformed = true; break; }
+      if (eol == std::string::npos) {
+        if (c->buf.size() > kMaxTrailerBytes) malformed = true;  // endless size line
+        break;
+      }
+      const int64_t sz = uvChunkSize(c->buf, 0, eol);
+      if (sz < 0) { malformed = true; break; }
       if (sz == 0) {  // terminal: consume the size line + trailers to a blank line
         size_t t = eol + 2;
         bool ok = false;
+        int lines = 0;
         while (true) {
           const size_t e2 = c->buf.find("\r\n", t);
-          if (e2 == std::string::npos) break;
+          if (e2 == std::string::npos) {
+            if (c->buf.size() - (eol + 2) > kMaxTrailerBytes) malformed = true;
+            break;
+          }
           if (e2 == t) { c->buf.erase(0, t + 2); ok = true; break; }
+          if (++lines > kMaxTrailerLines) { malformed = true; break; }
           t = e2 + 2;
         }
         if (ok) done = true;
@@ -1014,12 +1488,15 @@ void UvReactor::createH2Session(Conn* c) {
       [this, c](const uint8_t* d, size_t n) {
         writeRaw(c, std::string((const char*)d, n));
       },
-      c->clientIp, cap, [this, cid, loopIdx]() -> int64_t {
+      c->clientIp, cap,
+      [this, cid, loopIdx]() -> int64_t {
         const int64_t id = nextId_.fetch_add(1);
         std::lock_guard<std::mutex> lk(reqMutex_);
         reqLoc_[id] = ReqLoc{loopIdx, cid, false, false, true};
         return id;
-      });
+      },
+      cfg_.defaultTimeoutMs, [this]() { return !overInFlightBudget(); },
+      cfg_.maxBufferedBodyBytes);
   c->h2->pump();  // flush the server connection preface (SETTINGS)
 }
 
@@ -1089,26 +1566,36 @@ void UvReactor::processConn(Conn* c) {
       if (c->buf.size() > 64 * 1024) {  // header flood
         c->closing = true;
         uv_close((uv_handle_t*)&c->handle, &UvReactor::onCloseConn);
+        return;
+      }
+      // A head has started arriving: headerTimeout is an absolute deadline
+      // from this moment (a byte trickle does not extend it).
+      if (!c->buf.empty() && !c->headPending) {
+        c->headPending = true;
+        c->headStartedAt = Clock::now();
       }
       return;
     }
+    c->headPending = false;
     ParsedHead head = parseRequestHead(c->buf, headEnd);
     if (!head.ok) {
-      writeAnswer(c, uvBuildHead(400, {}, 0, false, 0), false, true);
+      writeAnswer(c, uvBuildHead(head.badVersion ? 505 : 400, {}, 0, false, 0),
+                  false, true);
       return;
     }
-    if (uvFramingError(head)) {  // request-smuggling / bad framing → 400, close
-      writeAnswer(c, uvBuildHead(400, {}, 0, false, 0), false, true);
+    bool chunked = false;
+    if (const FramingVerdict fv = uvFraming(head, chunked); fv.status != 0) {
+      // request-smuggling / bad framing → 400 (501 for a transfer coding this
+      // server does not implement), close.
+      writeAnswer(c, uvBuildHead(fv.status, {}, 0, false, 0), false, true);
       return;
     }
-    // Body: Content-Length or Transfer-Encoding: chunked. Either is read whole
-    // into the connection buffer, then emitted (head → chunk → end).
+    // Body: Content-Length or Transfer-Encoding: chunked (the validated
+    // framing decides which; nothing re-inspects the header). Either is read
+    // whole into the connection buffer, then emitted (head → chunk → end).
     int64_t clen = 0;
     if (const Header* cl = uvFindHeader(head.headers, "content-length"))
       clen = std::strtoll(cl->value.c_str(), nullptr, 10);
-    bool chunked = false;
-    if (const Header* te = uvFindHeader(head.headers, "transfer-encoding"))
-      if (te->value.find("chunked") != std::string::npos) chunked = true;
     if (clen < 0) {  // malformed Content-Length
       writeAnswer(c, uvBuildHead(400, {}, 0, false, 0), false, true);
       return;
@@ -1151,8 +1638,14 @@ void UvReactor::processConn(Conn* c) {
         int loopIdx = 0;
         for (size_t i = 0; i < loops_.size(); i++)
           if (loops_[i].get() == c->lp) { loopIdx = (int)i; break; }
+        if (overInFlightBudget()) {  // global budget: refuse before dispatch
+          writeAnswer(c, uvErrorResponse(503, "server busy", {{"Retry-After", "1"}}),
+                      false, true);
+          return;
+        }
         const bool ka = uvClientWantsKeepAlive(head) &&
                         cfg_.keepAliveTimeoutMs > 0 && !draining_.load() &&
+                        !c->ageExpired &&
                         (cfg_.maxRequestsPerConn <= 0 ||
                          c->served + 1 < cfg_.maxRequestsPerConn);
         {
@@ -1195,7 +1688,10 @@ void UvReactor::processConn(Conn* c) {
     if (chunked) {
       size_t end = 0;
       const int r = decodeChunked(c->buf, headEnd + 4, maxBody, bodyBytes, end);
-      if (r == 0) return;  // await the rest of the chunked body
+      if (r == 0) {  // await the rest of the chunked body
+        c->bodyPending = true;
+        return;
+      }
       if (r == -1) {       // malformed framing
         writeAnswer(c, uvBuildHead(400, {}, 0, false, 0), false, true);
         return;
@@ -1208,7 +1704,10 @@ void UvReactor::processConn(Conn* c) {
       clen = (int64_t)bodyBytes.size();  // the head reports the decoded length
     } else {
       reqEnd = headEnd + 4 + (size_t)clen;
-      if (c->buf.size() < reqEnd) return;  // await the rest of the body
+      if (c->buf.size() < reqEnd) {  // await the rest of the body
+        c->bodyPending = true;
+        return;
+      }
       if (clen > 0) bodyBytes = c->buf.substr(headEnd + 4, (size_t)clen);
     }
 
@@ -1216,9 +1715,10 @@ void UvReactor::processConn(Conn* c) {
         cfg_.maxRequestsPerConn <= 0 || c->served + 1 < cfg_.maxRequestsPerConn;
     const bool keepAlive = uvClientWantsKeepAlive(head) &&
                            cfg_.keepAliveTimeoutMs > 0 && !draining_.load() &&
-                           underBudget;
+                           underBudget && !c->ageExpired;
     const int64_t kaSecs = (cfg_.keepAliveTimeoutMs + 999) / 1000;
     c->buf.erase(0, reqEnd);  // consume this request
+    c->bodyPending = false;
     c->lastActive = Clock::now();
 
     const bool wsUpgrade = uvIsWebSocketUpgrade(head);
@@ -1227,6 +1727,16 @@ void UvReactor::processConn(Conn* c) {
       // not a misleading 404.
       if (wsUpgrade) {
         writeAnswer(c, uvErrorResponse(426, "websocket not supported", {{"Sec-WebSocket-Version", "13"}}), false, true);
+        continue;
+      }
+      // RFC 9110 §15.5.6: a path that exists for other methods is 405 with
+      // Allow, not a misleading 404. Only computed on a miss (never hot).
+      const std::vector<std::string> allowed = router_.allowedMethods(path);
+      if (!allowed.empty()) {
+        std::string allow;
+        for (const auto& t : allowed) allow += (allow.empty() ? "" : ", ") + t;
+        writeAnswer(c, uvBuildHead(405, {{"Allow", allow}}, 0, keepAlive, kaSecs),
+                    keepAlive, true);
       } else {
         writeAnswer(c, uvBuildHead(404, {}, 0, keepAlive, kaSecs), keepAlive, true);
       }
@@ -1266,6 +1776,11 @@ void UvReactor::processConn(Conn* c) {
                                   (int64_t)sr.body.size(), ka, kaSecs);
       if (head.method != Method::Head) out.append(sr.body);
       writeAnswer(c, std::move(out), ka, true);
+      continue;
+    }
+    if (overInFlightBudget()) {  // global budget: refuse before dispatch
+      writeAnswer(c, uvErrorResponse(503, "server busy", {{"Retry-After", "1"}}),
+                  false, true);
       continue;
     }
     // Handler route: dispatch to Dart, one in flight, answered via respond().
@@ -1319,6 +1834,8 @@ void UvReactor::writeAnswer(Conn* c, std::string bytes, bool keepAlive,
   // the handler has responded, so the sweep must not later splice a 408 into a
   // long streaming body. Clearing on the first write makes this TTFB-only.
   c->hasDeadline = false;
+  c->responseStarted = true;
+  c->lastWriteAt = Clock::now();
   std::string* payload;
 #ifdef NITRO_SERVER_TLS
   if (c->ssl) {
@@ -1348,6 +1865,16 @@ void UvReactor::writeAnswer(Conn* c, std::string bytes, bool keepAlive,
   if (c->ws && !c->wsClosing && cfg_.wsMaxBufferBytes > 0 &&
       c->writePending > cfg_.wsMaxBufferBytes) {
     wsCloseConn(c, 1009);
+  } else if (!c->ws && !finish && cfg_.streamMaxBufferBytes > 0 &&
+             c->writePending > cfg_.streamMaxBufferBytes && !c->closing) {
+    // A streaming response (SSE / chunked) whose reader has fallen behind by
+    // more than the cap: the queue would otherwise grow with the handler's
+    // output. Drop the connection; the handler's later chunks are no-ops.
+    broadcastEvent(ServerEventKind::ClientError, c->id,
+                   "stream buffer limit exceeded");
+    c->closing = true;
+    if (!uv_is_closing((uv_handle_t*)&c->handle))
+      uv_close((uv_handle_t*)&c->handle, &UvReactor::onCloseConn);
   }
 }
 
@@ -1391,9 +1918,15 @@ void UvReactor::onWrite(uv_write_t* req, int status) {
     }
     return;
   }
-  if (!finish) return;  // a chunked stream continues; stay busy for the rest
+  if (!finish) {
+    // A file answer reads its next chunk only now, once this write landed:
+    // the socket's pace bounds the memory, not the file's size.
+    if (c->fileFd >= 0 && c->writePending == 0) c->lp->owner->continueFileSend(c);
+    return;  // a chunked stream continues; stay busy for the rest
+  }
   c->served++;
   c->hasDeadline = false;
+  c->responseStarted = false;
   c->reqIdInFlight = -1;
   c->continueSent = false;
   c->lastActive = Clock::now();
@@ -1458,7 +1991,11 @@ void UvReactor::respond(int64_t id, int64_t status,
   const int64_t kaSecs = (cfg_.keepAliveTimeoutMs + 999) / 1000;
   std::string out = uvBuildHead(status, headers, (int64_t)bodyLen, loc.keepAlive,
                                 kaSecs);
-  if (!loc.isHead && body && bodyLen) out.append((const char*)body, bodyLen);
+  // RFC 9110 §6.4.1: 1xx/204/304 have no content — a handler body is dropped
+  // (the head already carries no Content-Length), never spliced into the next
+  // response on the connection.
+  const bool bodyless = status == 204 || status == 304 || (status >= 100 && status < 200);
+  if (!loc.isHead && !bodyless && body && bodyLen) out.append((const char*)body, bodyLen);
   pushWrite(loc, std::move(out), /*finish=*/true);
 }
 
@@ -1500,31 +2037,8 @@ void UvReactor::startStream(int64_t id, int64_t status,
     return;
   }
 #endif
-  std::string out;
-  out.reserve(160);
-  out.append("HTTP/1.1 ");
-  out.append(std::to_string(status));
-  out.push_back(' ');
-  out.append(reasonPhrase(status));
-  out.append("\r\n");
-  for (const auto& h : headers) {
-    if (uvIequals(h.name, "content-length")) continue;
-    if (uvIequals(h.name, "connection")) continue;
-    if (uvIequals(h.name, "transfer-encoding")) continue;
-    out.append(h.name);
-    out.append(": ");
-    out.append(h.value);
-    out.append("\r\n");
-  }
-  out.append("Transfer-Encoding: chunked\r\n");
   const int64_t kaSecs = (cfg_.keepAliveTimeoutMs + 999) / 1000;
-  if (loc.keepAlive) {
-    out.append("Connection: keep-alive\r\nKeep-Alive: timeout=");
-    out.append(std::to_string(kaSecs));
-    out.append("\r\n\r\n");
-  } else {
-    out.append("Connection: close\r\n\r\n");
-  }
+  std::string out = uvBuildStreamHead(status, headers, loc.keepAlive, kaSecs);
   // HEAD: headers only; the terminal chunk finishes it with no body.
   pushWrite(loc, std::move(out), /*finish=*/loc.isHead);
   if (loc.isHead) lookupReq(id, loc, /*erase=*/true);
@@ -1641,13 +2155,31 @@ void UvReactor::onAsync(uv_async_t* async) {
       continue;
     }
 #endif
+    if (batch[i].fileFd >= 0) {  // a file answer: head now, chunks as writes drain
+      auto hit = lp->conns.find(batch[i].connId);
+      if (hit == lp->conns.end() || hit->second->closing) {
+        uv_fs_t closeReq;
+        uv_fs_close(nullptr, &closeReq, batch[i].fileFd, nullptr);
+        uv_fs_req_cleanup(&closeReq);
+      } else {
+        Conn* fc = hit->second;
+        fc->fileFd = batch[i].fileFd;
+        fc->fileOffset = batch[i].fileOffset;
+        fc->fileRemaining = batch[i].fileRemaining;
+        fc->fileKeepAlive = batch[i].keepAlive;
+        lp->owner->writeAnswer(fc, std::move(batch[i].bytes), batch[i].keepAlive,
+                               /*finish=*/false);
+      }
+      ++i;
+      continue;
+    }
     const int64_t cid = batch[i].connId;
     std::string merged = std::move(batch[i].bytes);
     bool keepAlive = batch[i].keepAlive;
     bool finish = batch[i].finish;
     size_t j = i + 1;
     while (!finish && j < batch.size() && batch[j].connId == cid &&
-           !batch[j].isH2) {
+           !batch[j].isH2 && batch[j].fileFd < 0) {
       merged.append(batch[j].bytes);
       keepAlive = batch[j].keepAlive;
       finish = batch[j].finish;
@@ -1712,16 +2244,30 @@ void UvReactor::onSweep(uv_timer_t* timer) {
   if (!self->loops_.empty() && lp == self->loops_[0].get())
     self->runDispatchController();
   const auto now = Clock::now();
-  std::vector<Conn*> idle;
-  std::vector<int64_t> timedOut;  // reqIds whose handler missed its deadline
+  const ServerConfig& cfg = self->cfg_;
+  [[maybe_unused]] const bool draining = self->draining_.load();
+  auto ms = [](int64_t v) { return std::chrono::milliseconds(v); };
+  std::vector<Conn*> idle;     // closed silently (idle / expired / finished)
+  std::vector<Conn*> stalled;  // a request body stopped arriving: 408 + close
+  std::vector<Conn*> streamIdle;  // a streaming response went silent: close
+  struct Expired {
+    int64_t connId;
+    ServerEventKind kind;
+    const char* why;
+  };
+  std::vector<Expired> timedOut;  // a dispatched request past its deadline
   const int64_t writeMs =
-      self->cfg_.writeTimeoutMs > 0 ? self->cfg_.writeTimeoutMs : 30000;
+      cfg.writeTimeoutMs > 0 ? cfg.writeTimeoutMs : 30000;
+  // Window with no progress on a body in flight (head parsed, bytes still
+  // arriving): readCb restarts it on every read.
+  const int64_t bodyMs =
+      cfg.bodyTimeoutMs > 0 ? cfg.bodyTimeoutMs : cfg.keepAliveTimeoutMs;
   for (auto& kv : lp->conns) {
     Conn* c = kv.second;
     if (c->closing) continue;
     // A peer that stopped reading: its write has been pending too long.
     if (c->writePending > 0 &&
-        now - c->writeStartedAt >= std::chrono::milliseconds(writeMs)) {
+        now - c->writeStartedAt >= ms(writeMs)) {
       c->closing = true;
       self->broadcastEvent(ServerEventKind::ClientError, c->id,
                            "write timed out");
@@ -1729,34 +2275,146 @@ void UvReactor::onSweep(uv_timer_t* timer) {
         uv_close((uv_handle_t*)&c->handle, &UvReactor::onCloseConn);
       continue;
     }
-    if (c->busy) {
-      if (c->hasDeadline && now >= c->reqDeadline && c->reqIdInFlight >= 0)
-        timedOut.push_back(c->id);
-    } else {
+    // Hard lifetime: an HTTP/1.1 connection closes after its current answer
+    // (or now, when idle); a WebSocket is told 1001 (going away); an h2
+    // session gets GOAWAY and closes once its streams finish.
+    if (cfg.maxConnectionAgeMs > 0 && !c->ageExpired &&
+        now - c->openedAt >= ms(cfg.maxConnectionAgeMs)) {
+      c->ageExpired = true;
 #ifdef NITRO_SERVER_HTTP2
+      if (c->h2) c->h2->goAway();
+#endif
+      if (c->ws) {
+        self->wsCloseConn(c, 1001);
+        continue;
+      }
+      // A request already dispatched carries its keep-alive decision in its
+      // reqLoc (the answer is framed from it, off this thread): flip it so
+      // the answer in flight says close.
+      if (c->busy && c->reqIdInFlight >= 0) {
+        std::lock_guard<std::mutex> lk(self->reqMutex_);
+        auto it = self->reqLoc_.find(c->reqIdInFlight);
+        if (it != self->reqLoc_.end()) it->second.keepAlive = false;
+      }
+    }
+#ifdef NITRO_SERVER_HTTP2
+    if (c->h2) {
+      // Graceful drain (RFC 9113 §6.8): GOAWAY once; the peer opens no new
+      // streams and the session reports "finished" when the open ones end.
+      if (draining) c->h2->goAway();
+      for (const int64_t reqId : c->h2->sweep(now, bodyMs)) {
+        ReqLoc loc;
+        if (self->lookupReq(reqId, loc, /*erase=*/true))
+          self->broadcastEvent(ServerEventKind::HandlerTimeout, reqId,
+                               "handler timed out");
+      }
+      if (!c->h2->wantRead() && !c->h2->wantWrite()) {  // GOAWAY completed
+        idle.push_back(c);
+        continue;
+      }
       // An h2 connection serving one or more streams is actively busy even
       // though it never sets c->busy (that flag is the HTTP/1.1 one-request-
-      // at-a-time gate). Don't idle-reap it mid-request — otherwise a stream
-      // that outlives keepAliveTimeout, or a server stream to a quiet client,
-      // is killed underneath the handler.
-      if (c->h2 && c->h2->hasOpenStreams()) continue;
-#endif
-      const int64_t idleMs =
-          (c->served == 0 && self->cfg_.headerTimeoutMs > 0)
-              ? self->cfg_.headerTimeoutMs
-              : self->cfg_.keepAliveTimeoutMs;
-      if (idleMs > 0 &&
-          now - c->lastActive >= std::chrono::milliseconds(idleMs))
+      // at-a-time gate). Don't idle-reap it mid-request.
+      if (c->h2->hasOpenStreams()) continue;
+      if (c->ageExpired) {
         idle.push_back(c);
+        continue;
+      }
     }
+#endif
+    if (c->ws) {
+      // Liveness: ping a quiet peer at half the window; a peer still silent
+      // at the full window (no pong, no frame) is gone — 1001 and close.
+      if (cfg.wsIdleTimeoutMs > 0) {
+        const auto quiet = now - c->lastActive;
+        if (quiet >= ms(cfg.wsIdleTimeoutMs)) {
+          self->broadcastEvent(ServerEventKind::ClientError, c->id,
+                               "websocket idle timeout");
+          self->wsCloseConn(c, 1001);
+        } else if (!c->wsPingSent && quiet >= ms(cfg.wsIdleTimeoutMs / 2)) {
+          std::vector<uint8_t> frame;
+          ws::encodeFrame(ws::kPing, nullptr, 0, true, frame);
+          self->writeAnswer(c, std::string(frame.begin(), frame.end()), true,
+                            false);
+          c->wsPingSent = true;
+        }
+      }
+      continue;
+    }
+    if (c->busy) {
+      if (c->hasDeadline && now >= c->reqDeadline && c->reqIdInFlight >= 0) {
+        timedOut.push_back({c->id, ServerEventKind::HandlerTimeout,
+                            "handler timed out"});
+      } else if (c->streamingBody && c->reqIdInFlight >= 0 && bodyMs > 0 &&
+                 now - c->lastActive >= ms(bodyMs)) {
+        // A streamed upload that stopped arriving: the handler is waiting on
+        // bytes that never come. Same retirement as a deadline miss.
+        timedOut.push_back({c->id, ServerEventKind::ClientError,
+                            "request body timed out"});
+      } else if (c->responseStarted && c->reqIdInFlight >= 0 &&
+                 c->writePending == 0 && cfg.streamIdleTimeoutMs > 0 &&
+                 now - c->lastWriteAt >= ms(cfg.streamIdleTimeoutMs)) {
+        // A streaming response the handler stopped feeding (no chunk for the
+        // whole window, nothing queued): the stream is dead, close it. A live
+        // stream sends heartbeats more often than this.
+        streamIdle.push_back(c);
+      }
+      continue;
+    }
+    if (c->bodyPending) {  // head parsed, body still arriving: stall window
+      if (bodyMs > 0 && now - c->lastActive >= ms(bodyMs)) stalled.push_back(c);
+      continue;
+    }
+    // Slow-loris: a request head (or a TLS handshake) that has not completed
+    // within headerTimeout of its first byte is dropped, however steadily
+    // the bytes trickle in.
+    if (cfg.headerTimeoutMs > 0) {
+      bool handshaking = false;
+#ifdef NITRO_SERVER_TLS
+      handshaking = c->ssl != nullptr && !c->tlsHandshakeDone;
+#endif
+      if ((c->headPending && now - c->headStartedAt >= ms(cfg.headerTimeoutMs)) ||
+          (handshaking && now - c->openedAt >= ms(cfg.headerTimeoutMs))) {
+        self->broadcastEvent(ServerEventKind::ClientError, c->id,
+                             "request head timed out");
+        idle.push_back(c);
+        continue;
+      }
+    }
+    if (c->ageExpired) {
+      idle.push_back(c);
+      continue;
+    }
+    const int64_t idleMs =
+        (c->served == 0 && cfg.headerTimeoutMs > 0)
+            ? cfg.headerTimeoutMs
+            : cfg.keepAliveTimeoutMs;
+    if (idleMs > 0 && now - c->lastActive >= ms(idleMs)) idle.push_back(c);
   }
   for (Conn* c : idle) {
     c->closing = true;
     if (!uv_is_closing((uv_handle_t*)&c->handle))
       uv_close((uv_handle_t*)&c->handle, &UvReactor::onCloseConn);
   }
-  for (int64_t connId : timedOut) {
-    auto it = lp->conns.find(connId);
+  for (Conn* c : stalled) {
+    self->broadcastEvent(ServerEventKind::ClientError, c->id,
+                         "request body timed out");
+    self->writeAnswer(c, uvBuildHead(408, {}, 0, false, 0), false, true);
+  }
+  for (Conn* c : streamIdle) {
+    ReqLoc loc;
+    const int64_t reqId = c->reqIdInFlight;
+    self->lookupReq(reqId, loc, /*erase=*/true);  // later chunks are no-ops
+    self->broadcastEvent(ServerEventKind::ClientError, reqId,
+                         "stream idle timeout");
+    c->reqIdInFlight = -1;
+    c->responseStarted = false;
+    c->closing = true;
+    if (!uv_is_closing((uv_handle_t*)&c->handle))
+      uv_close((uv_handle_t*)&c->handle, &UvReactor::onCloseConn);
+  }
+  for (const Expired& e : timedOut) {
+    auto it = lp->conns.find(e.connId);
     if (it == lp->conns.end()) continue;
     Conn* c = it->second;
     ReqLoc loc;
@@ -1765,9 +2423,9 @@ void UvReactor::onSweep(uv_timer_t* timer) {
     if (self->lookupReq(reqId, loc, /*erase=*/true)) {
       c->hasDeadline = false;
       c->reqIdInFlight = -1;
+      c->streamingBody = false;
       self->writeAnswer(c, uvBuildHead(408, {}, 0, false, 0), false, true);
-      self->broadcastEvent(ServerEventKind::HandlerTimeout, reqId,
-                           "handler timed out");
+      self->broadcastEvent(e.kind, reqId, e.why);
     }
   }
 }
@@ -1807,6 +2465,32 @@ int64_t UvReactor::inFlightRequests() {
   return (int64_t)reqLoc_.size();
 }
 
+// A connection whose request is being answered keeps reading (a pipelined
+// request may follow), but what it may hold unprocessed is bounded: the head
+// cap plus one body. Past that the peer is pumping bytes nobody will read
+// (every byte would otherwise be kept until the handler answered) — 400 and
+// close. Streaming uploads, WebSocket and h2 have their own bounds.
+bool UvReactor::overBusyBuffer(Conn* c) {
+  if (!c->busy || c->streamingBody || c->ws) return false;
+#ifdef NITRO_SERVER_HTTP2
+  if (c->h2) return false;
+#endif
+  const int64_t maxBody = cfg_.maxBodyBytes > 0 ? cfg_.maxBodyBytes : (10 << 20);
+  if ((int64_t)c->buf.size() <= 64 * 1024 + maxBody) return false;
+  broadcastEvent(ServerEventKind::ClientError, c->id,
+                 "pipelined bytes exceed the buffer cap");
+  c->buf.clear();
+  c->buf.shrink_to_fit();
+  writeAnswer(c, uvBuildHead(400, {}, 0, false, 0), false, true);
+  return true;
+}
+
+bool UvReactor::overInFlightBudget() {
+  if (cfg_.maxInFlightRequests <= 0) return false;
+  std::lock_guard<std::mutex> lk(reqMutex_);
+  return (int64_t)reqLoc_.size() >= cfg_.maxInFlightRequests;
+}
+
 // ── WebSocket ────────────────────────────────────────────────────────────────
 
 // Loop thread: send a close frame with [code], then close the connection.
@@ -1834,11 +2518,23 @@ void UvReactor::wsHandshake(Conn* c, const ParsedHead& head,
                             const std::string& query) {
   const Header* key = uvFindHeader(head.headers, "sec-websocket-key");
   const Header* ver = uvFindHeader(head.headers, "sec-websocket-version");
-  if (!key || key->value.empty()) {
+  // RFC 6455 §4.2.1: the key is 16 random bytes base64-encoded (24 chars,
+  // `==` padding) and the version is exactly 13 — anything else is 400 / 426.
+  auto validKey = [](const std::string& k) {
+    if (k.size() != 24 || k[22] != '=' || k[23] != '=') return false;
+    for (size_t i = 0; i < 22; i++) {
+      const char ch = k[i];
+      const bool b64 = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+                       (ch >= '0' && ch <= '9') || ch == '+' || ch == '/';
+      if (!b64) return false;
+    }
+    return true;
+  };
+  if (!key || !validKey(uvTrim(key->value))) {
     writeAnswer(c, uvBuildHead(400, {}, 0, false, 0), false, true);
     return;
   }
-  if (!ver || ver->value.find("13") == std::string::npos) {
+  if (!ver || uvTrim(ver->value) != "13") {
     writeAnswer(c, uvErrorResponse(426, "websocket not supported", {{"Sec-WebSocket-Version", "13"}}), false, true);
     return;
   }
@@ -1917,6 +2613,15 @@ void UvReactor::wsProcess(Conn* c) {
       wsCloseConn(c, 1002);
       return;
     }
+    // RFC 6455 §5.5: a control frame is never fragmented and carries at most
+    // 125 bytes. Judged from the first two bytes, before the header parser
+    // (which treats such a frame as unparseable, i.e. "wait for more" —
+    // leaving the connection hanging until the idle timeout).
+    if (ws::isControl(opcode) &&
+        (!(b0 & 0x80) || (c->buf[1] & 0x7f) > 125)) {
+      wsCloseConn(c, 1002);
+      return;
+    }
     ws::FrameHeader h;
     if (!ws::parseHeader((const uint8_t*)c->buf.data(), c->buf.size(), h,
                          /*allowRsv1=*/c->deflate))
@@ -1944,9 +2649,27 @@ void UvReactor::wsProcess(Conn* c) {
     }
     if (h.opcode == ws::kPong) continue;
     if (h.opcode == ws::kClose) {
+      // RFC 6455 §5.5.1 / §7.4: an empty payload means "no code" (echoed as
+      // 1000); one byte is malformed; otherwise a valid code followed by a
+      // UTF-8 reason. Violations are protocol errors (1002), a bad reason is
+      // invalid data (1007).
       int code = 1005;
-      if (payload.size() >= 2)
+      if (payload.size() == 1) {
+        wsCloseConn(c, 1002);
+        return;
+      }
+      if (payload.size() >= 2) {
         code = ((uint8_t)payload[0] << 8) | (uint8_t)payload[1];
+        if (!ws::validCloseCode(code)) {
+          wsCloseConn(c, 1002);
+          return;
+        }
+        if (!ws::validUtf8((const uint8_t*)payload.data() + 2,
+                           payload.size() - 2)) {
+          wsCloseConn(c, 1007);
+          return;
+        }
+      }
       wsCloseConn(c, code);  // emits the close to the runner + echoes the frame
       return;
     }
@@ -2052,7 +2775,61 @@ StatusResult UvReactor::buildSslCtx(const std::string& certPem,
   };
   SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
   if (!ctx) return fail("SSL_CTX_new failed");
-  SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+  // Policy (cfg_): protocol floor, cipher lists, client-certificate anchors.
+  if (cfg_.tlsMinVersion != 12 && cfg_.tlsMinVersion != 13) {
+    SSL_CTX_free(ctx);
+    return {ErrorKind::TlsError, "tlsMinVersion must be 12 or 13", 0};
+  }
+  SSL_CTX_set_min_proto_version(
+      ctx, cfg_.tlsMinVersion == 13 ? TLS1_3_VERSION : TLS1_2_VERSION);
+  if (!cfg_.tlsCiphers.empty() &&
+      SSL_CTX_set_cipher_list(ctx, cfg_.tlsCiphers.c_str()) != 1) {
+    SSL_CTX_free(ctx);
+    return fail("no usable TLS 1.2 cipher in tlsCiphers");
+  }
+  if (!cfg_.tlsCipherSuites.empty() &&
+      SSL_CTX_set_ciphersuites(ctx, cfg_.tlsCipherSuites.c_str()) != 1) {
+    SSL_CTX_free(ctx);
+    return fail("no usable TLS 1.3 cipher suite in tlsCipherSuites");
+  }
+  if (!cfg_.tlsClientCaPem.empty() || !cfg_.tlsClientCaFile.empty()) {
+    X509_STORE* store = SSL_CTX_get_cert_store(ctx);
+    STACK_OF(X509_NAME)* names = sk_X509_NAME_new_null();
+    int anchors = 0;
+    if (!cfg_.tlsClientCaPem.empty()) {
+      BIO* bio = BIO_new_mem_buf(cfg_.tlsClientCaPem.data(),
+                                 (int)cfg_.tlsClientCaPem.size());
+      X509* ca;
+      while ((ca = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr)) != nullptr) {
+        if (X509_STORE_add_cert(store, ca) == 1) {
+          sk_X509_NAME_push(names, X509_NAME_dup(X509_get_subject_name(ca)));
+          anchors++;
+        }
+        X509_free(ca);
+      }
+      BIO_free(bio);
+    } else {
+      if (SSL_CTX_load_verify_locations(ctx, cfg_.tlsClientCaFile.c_str(),
+                                        nullptr) == 1) {
+        STACK_OF(X509_NAME)* fromFile =
+            SSL_load_client_CA_file(cfg_.tlsClientCaFile.c_str());
+        if (fromFile) {
+          while (sk_X509_NAME_num(fromFile) > 0)
+            sk_X509_NAME_push(names, sk_X509_NAME_shift(fromFile));
+          sk_X509_NAME_free(fromFile);
+        }
+        anchors = sk_X509_NAME_num(names);
+      }
+    }
+    if (anchors == 0) {
+      sk_X509_NAME_pop_free(names, X509_NAME_free);
+      SSL_CTX_free(ctx);
+      return fail("no client CA certificate could be loaded");
+    }
+    SSL_CTX_set_client_CA_list(ctx, names);  // takes ownership
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+                       nullptr);
+  }
   SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE |
                             SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER |
                             SSL_MODE_AUTO_RETRY);
@@ -2189,6 +2966,7 @@ void UvReactor::tlsOnRead(Conn* c, const char* data, size_t n) {
   while ((r = SSL_read(c->ssl, plain, sizeof(plain))) > 0)
     c->buf.append(plain, (size_t)r);
   tlsRawWrite(c, tlsDrain(c));  // anything SSL_read produced
+  if (overBusyBuffer(c)) return;
   if (c->streamingBody) {
     if (c->streamChunked) emitStreamChunked(c); else emitStreamBytes(c);
   } else if (c->ws) {

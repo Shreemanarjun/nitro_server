@@ -45,7 +45,11 @@ TEST(CommonTest, ReasonPhrasesForEveryEmittedStatus) {
   EXPECT_STREQ(reasonPhrase(204), "No Content");
   EXPECT_STREQ(reasonPhrase(405), "Method Not Allowed");
   EXPECT_STREQ(reasonPhrase(500), "Internal Server Error");
-  EXPECT_STREQ(reasonPhrase(999), "Unknown");
+  EXPECT_STREQ(reasonPhrase(429), "Too Many Requests");
+  // An unlisted code still gets a sensible class phrase, never "Unknown".
+  EXPECT_STREQ(reasonPhrase(999), "Server Error");
+  EXPECT_STREQ(reasonPhrase(499), "Client Error");
+  EXPECT_STREQ(reasonPhrase(299), "Success");
 }
 
 TEST(RegistryTest, ResolveSharesOneInstancePerKeyUntilReset) {

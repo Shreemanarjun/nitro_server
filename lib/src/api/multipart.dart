@@ -37,11 +37,27 @@ class MultipartPart {
 
 /// Parses [body] as `multipart/form-data` with the boundary named in
 /// [contentType]. Throws [FormatException] on a missing boundary or a body
-/// that does not follow the delimiter grammar.
-List<MultipartPart> parseMultipart(Uint8List body, String contentType) {
+/// that does not follow the delimiter grammar. A part's `filename` is the
+/// client's string verbatim (`../x` included): take its basename before
+/// touching the filesystem.
+///
+/// Resource limits (each a [FormatException] when crossed, so a hostile body
+/// is refused rather than walked): the boundary must be 1–70 `bchars`
+/// (RFC 2046 §5.1.1), at most [maxParts] parts, and each part's header block
+/// at most [maxPartHeaderBytes]. Part bodies are views into [body] (bounded by
+/// the server's `maxBodyBytes`); the boundary scan is linear in the body.
+List<MultipartPart> parseMultipart(
+  Uint8List body,
+  String contentType, {
+  int maxParts = 1000,
+  int maxPartHeaderBytes = 8 * 1024,
+}) {
   final boundary = _boundaryOf(contentType);
   if (boundary == null) {
     throw FormatException('not multipart/form-data: $contentType');
+  }
+  if (boundary.isEmpty || boundary.length > 70 || !_bchars.hasMatch(boundary)) {
+    throw const FormatException('multipart: invalid boundary');
   }
   final delimiter = ascii.encode('--$boundary');
   final parts = <MultipartPart>[];
@@ -56,11 +72,23 @@ List<MultipartPart> parseMultipart(Uint8List body, String contentType) {
       return parts;
     }
     pos = _skipCrlf(body, pos);
+    if (parts.length >= maxParts) {
+      throw FormatException('multipart: more than $maxParts parts');
+    }
     final headEnd = _indexOf(body, _crlfCrlf, pos);
     if (headEnd < 0) {
       throw const FormatException('multipart: unterminated part');
     }
-    final headers = _parseHeaders(ascii.decode(body.sublist(pos, headEnd)));
+    if (headEnd - pos > maxPartHeaderBytes) {
+      throw FormatException(
+        'multipart: part headers exceed $maxPartHeaderBytes bytes',
+      );
+    }
+    // Part headers are what browsers send: raw UTF-8 in `filename=` (RFC 7578
+    // §5.1.3 says so), so decode as UTF-8 and never throw on a stray byte.
+    final headers = _parseHeaders(
+      utf8.decode(body.sublist(pos, headEnd), allowMalformed: true),
+    );
     final dataStart = headEnd + 4;
     final next = _indexOf(body, delimiter, dataStart);
     if (next < 0) {
@@ -88,6 +116,10 @@ List<MultipartPart> parseMultipart(Uint8List body, String contentType) {
 }
 
 final _crlfCrlf = Uint8List.fromList([13, 10, 13, 10]);
+
+/// RFC 2046 §5.1.1 `bchars`: digits, letters, `'()+_,-./:=?` and space (not
+/// trailing). Anything else cannot be a boundary and is refused.
+final _bchars = RegExp(r"^[0-9A-Za-z'()+_,\-./:=? ]*[0-9A-Za-z'()+_,\-./:=?]$");
 
 String? _boundaryOf(String contentType) {
   final lower = contentType.toLowerCase();
@@ -129,14 +161,22 @@ int _skipCrlf(Uint8List body, int pos) {
   throw const FormatException('multipart: expected CRLF after boundary');
 }
 
+/// First index of [needle] in [hay] at or after [from]. Jumps between
+/// candidates with the native first-byte search, then verifies; with the
+/// boundary bounded to 72 bytes this is linear in [hay] for any input.
 int _indexOf(Uint8List hay, List<int> needle, int from) {
   final last = hay.length - needle.length;
-  outer:
-  for (var i = from; i <= last; i++) {
-    for (var j = 0; j < needle.length; j++) {
-      if (hay[i + j] != needle[j]) continue outer;
+  final first = needle[0];
+  var i = from;
+  while (i <= last) {
+    i = hay.indexOf(first, i);
+    if (i < 0 || i > last) return -1;
+    var j = 1;
+    while (j < needle.length && hay[i + j] == needle[j]) {
+      j++;
     }
-    return i;
+    if (j == needle.length) return i;
+    i++;
   }
   return -1;
 }

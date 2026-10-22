@@ -1,4 +1,7 @@
+import 'dart:async';
+
 import 'package:nitro_server/nitro_server.dart';
+import 'package:nitro_server/src/api/metrics.dart' show MetricsAccumulator;
 // Implementation import for the internal CPU helpers (same package).
 import 'package:nitro_server/src/api/observability.dart'
     show cpuPercent, parseProcStatTicks;
@@ -28,6 +31,55 @@ ServerMetrics _metrics() => const ServerMetrics(
 
 void main() {
   group('prometheusFormat', () {
+    test('emits status classes, gauges and the summary _sum', () {
+      final acc = MetricsAccumulator('/x')
+        ..record(100, 200)
+        ..record(300, 500);
+      final metrics = ServerMetrics(
+        requests: 2,
+        errors: 1,
+        inFlight: 0,
+        byStatusClass: const [0, 0, 1, 0, 0, 1],
+        byRoute: {'/x': acc.snapshot()},
+      );
+      final text = prometheusFormat(metrics, gauges: {'connections': 7});
+      expect(
+        text,
+        contains('# TYPE nitro_connections gauge\nnitro_connections 7\n'),
+      );
+      expect(text, contains('nitro_responses_total{class="2xx"} 1'));
+      expect(text, contains('nitro_responses_total{class="5xx"} 1'));
+      expect(text, contains('nitro_responses_total{class="4xx"} 0'));
+      expect(
+        text,
+        contains('nitro_route_latency_microseconds_sum{route="/x"} 400'),
+      );
+      expect(
+        text,
+        contains('nitro_route_latency_microseconds_count{route="/x"} 2'),
+      );
+      expect(acc.snapshot().latency.sumUs, 400);
+      expect(metricsJson(metrics)['byStatusClass'], {
+        '1xx': 0,
+        '2xx': 1,
+        '3xx': 0,
+        '4xx': 0,
+        '5xx': 1,
+      });
+      expect(
+        serverStatsJson(
+          metrics,
+          reqPerSec: 0,
+          rssBytes: 0,
+          cpuPercent: null,
+          uptimeSeconds: 0,
+          connections: 3,
+          eventLoopLagMicros: 1500,
+        ),
+        containsPair('eventLoopLagMs', 1.5),
+      );
+    });
+
     test('emits process totals, per-route series and a latency summary', () {
       final out = prometheusFormat(_metrics());
       expect(out, contains('# TYPE nitro_requests_total counter'));
@@ -80,6 +132,34 @@ void main() {
       expect(out, contains('\napp_requests_total 1\n'));
       expect(out, contains(r'route="/a\"\\b"'));
     });
+  });
+
+  group('EventLoopLagProbe', () {
+    test(
+      'runs while retained, measures lateness, stops when released',
+      () async {
+        final probe = EventLoopLagProbe.shared;
+        expect(probe.running, isFalse);
+        final holdA = Completer<void>();
+        final holdB = Completer<void>();
+        probe.retain(holdA.future);
+        probe.retain(holdB.future);
+        expect(probe.running, isTrue);
+        // Block the loop for longer than a tick: the next tick is late.
+        await Future<void>.delayed(const Duration(milliseconds: 120));
+        final t = Stopwatch()..start();
+        while (t.elapsedMilliseconds < 150) {}
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        expect(probe.lastLagMicros, greaterThan(20 * 1000));
+        holdA.complete();
+        await Future<void>.delayed(Duration.zero);
+        expect(probe.running, isTrue); // still held by B
+        holdB.complete();
+        await Future<void>.delayed(Duration.zero);
+        expect(probe.running, isFalse);
+        expect(probe.lastLagMicros, 0);
+      },
+    );
   });
 
   group('metricsJson / serverStatsJson', () {
@@ -170,6 +250,69 @@ void main() {
         contains('nitro_route_requests_total{route="/x"}'),
       );
     });
+
+    test('operational answers are no-store; probes stay open behind '
+        'middleware; readiness tracks helper health', () async {
+      await serveObservability(
+        client.server,
+        middleware: [basicAuth((u, p) => u == 'ops' && p == 'pw')],
+      );
+      for (final path in ['/healthz', '/readyz']) {
+        final r = await client.get(path);
+        expect(r.status, 200, reason: path);
+        expect(r.headers['cache-control'], 'no-store', reason: path);
+      }
+      // Guarded: /metrics, the dashboard, its feed and its socket.
+      expect((await client.get('/metrics')).status, 401);
+      expect((await client.get('/dashboard')).status, 401);
+      expect((await client.get('/dashboard.json')).status, 401);
+      const auth = {'authorization': 'Basic b3BzOnB3'}; // ops:pw
+      final metrics = await client.get('/metrics', headers: auth);
+      expect(metrics.status, 200);
+      expect(metrics.headers['cache-control'], 'no-store');
+      expect(metrics.text(), contains('nitro_connections 0'));
+      expect(metrics.text(), contains('nitro_event_loop_lag_seconds '));
+      expect(metrics.text(), contains('nitro_helper_isolates_alive 0'));
+      expect(
+        (await client.get(
+          '/dashboard',
+          headers: auth,
+        )).headers['cache-control'],
+        'no-store',
+      );
+      final feed = await client.get('/dashboard.json', headers: auth);
+      final j = feed.json() as Map<String, Object?>;
+      expect(j['connections'], 0);
+      expect(j['eventLoopLagMs'], isA<double>());
+      // The WS feed is gated by the same chain: 4401 without credentials.
+      final ws = await client.ws('/dashboard/ws');
+      expect(await ws.closedCode, 4401);
+      // Single-isolate: helpers are trivially healthy.
+      expect(client.server.helpersHealthy, isTrue);
+      expect(client.server.helpersAlive, 0);
+      expect(EventLoopLagProbe.shared.running, isTrue);
+    });
+
+    test(
+      'dashboard viewers are capped: the next socket is closed 1013',
+      () async {
+        await serveObservability(
+          client.server,
+          maxDashboardViewers: 1,
+          refreshInterval: const Duration(milliseconds: 20),
+        );
+        final first = await client.ws('/dashboard/ws');
+        await first.messages.first; // a live frame: the viewer is counted
+        final second = await client.ws('/dashboard/ws');
+        expect(await second.closedCode, 1013);
+        await first.close();
+        await Future<void>.delayed(const Duration(milliseconds: 30));
+        // The slot is released once the first viewer is gone.
+        final third = await client.ws('/dashboard/ws');
+        await third.messages.first;
+        await third.close();
+      },
+    );
 
     test('dashboard page + JSON feed + embedded docs link', () async {
       await client.server.get('/x', (_) => ResponseContext.text('x'));

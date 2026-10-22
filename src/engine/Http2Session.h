@@ -22,6 +22,7 @@ typedef SSIZE_T ssize_t;
 #include <nghttp2/nghttp2.h>
 
 #include <cstdint>
+#include <chrono>
 #include <functional>
 #include <string>
 #include <unordered_map>
@@ -42,13 +43,24 @@ class Http2Session final : public ProtocolSession {
   /// the reactor's shared counter so ids are unique across every connection; the
   /// default (empty) uses a per-session counter, correct for a lone session.
   using IdAllocator = std::function<int64_t()>;
+  using Clock = std::chrono::steady_clock;
+  /// Admission check run before a complete request is dispatched; false
+  /// answers it `503` (the reactor's global in-flight budget).
+  using Admit = std::function<bool()>;
 
   /// [maxBodyBytes] caps a request body (`<= 0` means unlimited); an over-cap
   /// upload is refused `413` before the handler runs, the h2 analogue of the
-  /// HTTP/1.1 cap. [allocId] — see IdAllocator.
+  /// HTTP/1.1 cap — a route's own `maxBodyBytes` overrides it once the HEADERS
+  /// frame has routed the stream. [allocId] — see IdAllocator.
+  /// [defaultTimeoutMs] is the handler deadline a route without its own
+  /// inherits (`<= 0`: none); see [sweep]. [admit] — see Admit. [bodyBudget]
+  /// caps the request-body bytes held across streams (`<= 0`: unlimited): a
+  /// stream over the remaining budget is answered 503, one larger than the
+  /// whole budget 413.
   Http2Session(Emitter* emitter, const Router& router, WriteSink sink,
                std::string clientIp, int64_t maxBodyBytes = -1,
-               IdAllocator allocId = {});
+               IdAllocator allocId = {}, int64_t defaultTimeoutMs = 0,
+               Admit admit = {}, int64_t bodyBudget = 0);
   ~Http2Session();
   Http2Session(const Http2Session&) = delete;
   Http2Session& operator=(const Http2Session&) = delete;
@@ -84,6 +96,22 @@ class Http2Session final : public ProtocolSession {
   /// on a fast peer). Streams are erased in onStreamClose, after END_STREAM.
   bool hasOpenStreams() const { return !streams_.empty(); }
 
+  /// Graceful shutdown (RFC 9113 §6.8): sends GOAWAY naming the last stream
+  /// this side processed, so the peer opens no more and in-flight streams
+  /// finish; once they have, [wantRead]/[wantWrite] both turn false and the
+  /// reactor closes the connection. Idempotent. Loop thread, never from inside
+  /// an nghttp2 callback.
+  void goAway();
+  bool goAwaySent() const { return goawaySent_; }
+
+  /// Deadline sweep, called by the reactor's timer (loop thread, outside any
+  /// callback). A dispatched stream whose handler has missed its deadline is
+  /// answered `408` and its request id returned, so the reactor can retire
+  /// the id (a late respond() is then a no-op) and report the timeout. A
+  /// stream still receiving its body with no DATA for [bodyStallMs] (`<= 0`:
+  /// never) is answered `408` as well (not returned: never dispatched).
+  std::vector<int64_t> sweep(Clock::time_point now, int64_t bodyStallMs);
+
  private:
   struct Stream {
     int64_t requestId = 0;
@@ -95,7 +123,17 @@ class Http2Session final : public ProtocolSession {
     std::string authority;
     std::vector<Header> headers;
     int64_t contentLength = -1;
-    bool rejected = false;  // over the body cap: 413 sent, do not emit/buffer
+    bool rejected = false;  // answered by the engine (413/405/408/503): no emit
+    bool matched = false;   // router result, taken on the HEADERS frame
+    std::string pattern;    // matched route pattern ("" when unmatched)
+    std::vector<RouteParam> params;
+    int64_t maxBody = -1;   // effective body cap (route's, else the session's)
+    int64_t reserved = 0;   // body bytes reserved from the session's budget
+    int64_t timeoutMs = 0;  // handler deadline once dispatched (<= 0: none)
+    bool emitted = false;   // handed to the emitter (request id allocated)
+    bool hasDeadline = false;
+    Clock::time_point deadline;      // valid while emitted && hasDeadline
+    Clock::time_point lastProgress;  // last HEADERS/DATA byte (body stall)
     std::string body;       // accumulated request body (POST)
     std::string respBody;   // response body; outlives respond() until read EOF
     size_t respOff = 0;
@@ -118,7 +156,11 @@ class Http2Session final : public ProtocolSession {
 
   Stream* streamFor(int32_t streamId);
   void emitComplete(Stream* st, int32_t streamId);
-  void rejectOversize(int32_t streamId, Stream* st);  // 413 + mark rejected
+  // Answer [status] from the engine (no handler) and mark the stream rejected
+  // so nothing is emitted or buffered for it. Only queues the frame: the
+  // caller pumps (feed()'s epilogue, or sweep()).
+  void rejectStream(int32_t streamId, Stream* st, int status,
+                    const std::vector<Header>& extra = {});
 
   Emitter* emitter_;
   const Router& router_;
@@ -126,6 +168,15 @@ class Http2Session final : public ProtocolSession {
   std::string clientIp_;
   int64_t maxBodyBytes_ = -1;  // request body cap; <= 0 = unlimited
   IdAllocator allocId_;        // empty => use the per-session nextId_
+  int64_t defaultTimeoutMs_ = 0;
+  Admit admit_;                // empty => always admit
+  // Request-body budget across the session's streams (<= 0: unlimited): a
+  // stream reserves its declared Content-Length — its body cap when
+  // undeclared — on its HEADERS frame and releases it when it closes. The
+  // session therefore never holds more than bodyBudget_ of request bodies.
+  int64_t bodyBudget_ = 0;
+  int64_t reserved_ = 0;
+  bool goawaySent_ = false;
   bool stopped_ = false;       // set by stop(): feed/respond become no-ops
   nghttp2_session* sess_ = nullptr;
   int64_t nextId_ = 1;  // fallback id source when allocId_ is empty

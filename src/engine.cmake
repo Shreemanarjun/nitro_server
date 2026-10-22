@@ -61,7 +61,25 @@ function(nitro_server_attach_libuv target)
     pkg_check_modules(LIBUV QUIET libuv)
     if(LIBUV_FOUND)
       if(NITRO_SERVER_STATIC_DEPS AND LIBUV_STATIC_LIBRARIES)
-        set(_uv_libs ${LIBUV_STATIC_LIBRARIES})
+        # `pkg-config --static` yields bare names (uv;pthread;dl;rt); linking
+        # `uv` lets the linker prefer libuv.so where both exist (Debian,
+        # Homebrew), leaving a "static" engine that still needs libuv.so.1 at
+        # runtime. Pin the archive itself; keep the rest of the static list.
+        find_library(NITRO_LIBUV_A NAMES libuv.a uv_a
+          HINTS ${LIBUV_STATIC_LIBRARY_DIRS} ${LIBUV_LIBRARY_DIRS}
+                /opt/homebrew/lib /usr/local/lib /usr/lib
+                /usr/lib/${CMAKE_LIBRARY_ARCHITECTURE})
+        if(NITRO_LIBUV_A)
+          set(_uv_libs ${NITRO_LIBUV_A})
+          foreach(_l ${LIBUV_STATIC_LIBRARIES})
+            if(NOT _l STREQUAL "uv")
+              list(APPEND _uv_libs ${_l})
+            endif()
+          endforeach()
+          message(STATUS "nitro_server: libuv linked statically (${NITRO_LIBUV_A})")
+        else()
+          set(_uv_libs ${LIBUV_STATIC_LIBRARIES})
+        endif()
       else()
         set(_uv_libs ${LIBUV_LIBRARIES})
       endif()

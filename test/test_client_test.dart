@@ -257,13 +257,159 @@ void main() {
     expect(order, ['global', 'handler']);
   });
 
-  test('a throwing handler is a 500 naming the error', () async {
+  test(
+    'a throwing handler is a generic 500; the error goes to events',
+    () async {
+      await client.server.get('/boom', (_) async {
+        throw StateError('kaput');
+      });
+      final events = <ServerEvent>[];
+      final sub = client.server.events.listen(events.add);
+      final response = await client.get('/boom');
+      expect(response.status, 500);
+      expect(response.text(), 'internal server error');
+      expect(response.text(), isNot(contains('kaput')));
+      await Future<void>.delayed(Duration.zero);
+      await sub.cancel();
+      final event = events.singleWhere(
+        (e) => e.kind == ServerEventKind.handlerError,
+      );
+      expect(event.message, contains('GET /boom'));
+      expect(event.message, contains('kaput'));
+      expect(event.message, contains('test_client_test.dart')); // stack trace
+    },
+  );
+
+  test('exposeErrorDetails names the error in the 500 body', () async {
+    final verbose = await NitroTestClient.start(exposeErrorDetails: true);
+    addTearDown(verbose.close);
+    await verbose.server.get('/boom', (_) async {
+      throw StateError('kaput');
+    });
+    final response = await verbose.get('/boom');
+    expect(response.status, 500);
+    expect(response.text(), contains('kaput'));
+  });
+
+  test('a throwing errorHandler degrades to the generic 500', () async {
     await client.server.get('/boom', (_) async {
       throw StateError('kaput');
     });
+    client.server.errorHandler = (error, request) => throw StateError('again');
     final response = await client.get('/boom');
     expect(response.status, 500);
-    expect(response.text(), contains('kaput'));
+    expect(response.text(), 'internal server error');
+  });
+
+  group('response header hardening', () {
+    test(
+      'a header value with CR/LF is never sent: generic 500 + event',
+      () async {
+        await client.server.get(
+          '/split',
+          (r) => ResponseContext.text(
+            'ok',
+          ).withHeader('x-echo', 'a\r\nInjected: yes'),
+        );
+        final events = <ServerEvent>[];
+        final sub = client.server.events.listen(events.add);
+        final response = await client.get('/split');
+        expect(response.status, 500);
+        expect(response.headers.containsKey('x-echo'), isFalse);
+        expect(response.headers.containsKey('injected'), isFalse);
+        await Future<void>.delayed(Duration.zero);
+        await sub.cancel();
+        expect(
+          events.map((e) => e.message),
+          contains(contains('response header rejected: "x-echo"')),
+        );
+      },
+    );
+
+    test('a non-token header name is refused the same way', () async {
+      await client.server.get(
+        '/badname',
+        (r) => ResponseContext.text('ok').withHeader('bad name', 'v'),
+      );
+      expect((await client.get('/badname')).status, 500);
+    });
+
+    test('hop-by-hop and framing headers are stripped, not sent', () async {
+      await client.server.get(
+        '/hop',
+        (r) => ResponseContext.text(
+          'ok',
+          headers: const {
+            'Connection': 'close',
+            'Transfer-Encoding': 'chunked',
+            'Keep-Alive': 'timeout=1',
+            'Upgrade': 'h2c',
+            'Proxy-Connection': 'keep-alive',
+            'X-Kept': 'yes',
+          },
+        ),
+      );
+      final response = await client.get('/hop');
+      expect(response.status, 200);
+      expect(response.headers['x-kept'], 'yes');
+      for (final gone in [
+        'connection',
+        'transfer-encoding',
+        'keep-alive',
+        'upgrade',
+        'proxy-connection',
+      ]) {
+        expect(response.headers.containsKey(gone), isFalse, reason: gone);
+      }
+    });
+
+    test('a Set-Cookie that would split the response is refused', () async {
+      await client.server.get(
+        '/c',
+        (r) => ResponseContext.text(
+          'ok',
+        ).withCookie(const SetCookie('sid', 'ok\r\nX-Injected: yes')),
+      );
+      await client.server.get(
+        '/attr',
+        (r) => ResponseContext.text(
+          'ok',
+        ).withCookie(const SetCookie('a', 'b; Domain=evil.example')),
+      );
+      await client.server.get(
+        '/fine',
+        (r) => ResponseContext.text('ok').withCookie(
+          const SetCookie('a', 'b-c_d!', domain: 'example.com', path: '/x'),
+        ),
+      );
+      final events = <ServerEvent>[];
+      final sub = client.server.events.listen(events.add);
+      expect((await client.get('/c')).status, 500);
+      expect((await client.get('/attr')).status, 500);
+      final fine = await client.get('/fine');
+      expect(fine.status, 200);
+      await Future<void>.delayed(Duration.zero);
+      await sub.cancel();
+      expect(
+        events.map((e) => e.message),
+        containsAll([contains('set-cookie rejected'), contains('cookie "a"')]),
+      );
+      expect(const SetCookie('ok', 'v').validationError, isNull);
+      expect(const SetCookie('', 'v').validationError, contains('empty'));
+      expect(const SetCookie('a b', 'v').validationError, contains('token'));
+      expect(
+        const SetCookie('n', 'v', path: '/p;x').validationError,
+        contains('attribute'),
+      );
+    });
+
+    test('an HTAB inside a value is allowed (OWS)', () async {
+      await client.server.get(
+        '/tab',
+        (r) => ResponseContext.text('ok').withHeader('x-tab', 'a\tb'),
+      );
+      expect((await client.get('/tab')).headers['x-tab'], 'a\tb');
+    });
   });
 
   test('unrouted paths bypass the runner fallbacks, like the engine', () async {

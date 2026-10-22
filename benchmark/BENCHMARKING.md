@@ -136,3 +136,24 @@ request — `/work` peak RSS dropped ~6× (≈1485→253 MB per isolate). CPU-bo
 handlers should also encode **inline** (no intermediate `List<Map>` per request);
 the `/work` handler does. `/echo` (body echo) is a separate path not covered by
 the writer pool. See [[cpu-bound-perf-levers]] in memory.
+
+## Comparing two builds of nitro (hardening, a refactor, a flag change)
+
+Two separate full runs cannot prove a small delta: the machine drifts more
+between them than the delta you are looking for. Measure both builds in ONE
+run, interleaved, and compare medians:
+
+```
+benchmark/blackbox/run.sh --cpus 0-5 --mem 4g --reps 5 --duration 8s \
+  --base <git-ref> --frameworks "nitro-base nitro-dylib"
+```
+
+`--base <ref>` exports the tree at `<ref>` (a clean `git archive`, never the
+dirty checkout), builds it inside the image exactly like the working tree and
+serves it as `nitro-base`; the report then carries a "nitro-base vs
+nitro-dylib" section with the per-route delta. A delta inside ±5% on every
+route is noise at this rep count; outside it, rerun with more reps before
+believing it.
+
+The latest full run's report is tracked at `benchmark/blackbox/REPORT.md`
+(copy `benchmark/blackbox/out/report.md` there after a run worth keeping).

@@ -1,0 +1,7 @@
+{
+  "outdir": "/reports",
+  "servers": [{"agent": "nitro_server", "url": "ws://127.0.0.1:8080/ws/echo"}],
+  "cases": ["*"],
+  "exclude-cases": ["9.*", "12.*", "13.*"],
+  "exclude-agent-cases": {}
+}

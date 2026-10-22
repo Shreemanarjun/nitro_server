@@ -20,6 +20,31 @@ void main() {
 
   tearDown(() => client.close());
 
+  test(
+    'originPolicy gates the handshake: 4403 unless the Origin is listed',
+    () async {
+      await server.ws(
+        '/origin',
+        (s) async {},
+        middleware: [
+          originPolicy(['https://app.example.com']),
+        ],
+      );
+      final bare = await client.ws('/origin'); // browsers always send Origin
+      expect(await bare.closedCode, 4403);
+      final wrong = await client.ws(
+        '/origin',
+        headers: {'origin': 'https://evil.example'},
+      );
+      expect(await wrong.closedCode, 4403);
+      final ok = await client.ws(
+        '/origin',
+        headers: {'origin': 'https://app.example.com'},
+      );
+      expect(await ok.closedCode, 1000); // the handler ran and returned
+    },
+  );
+
   test('no middleware: the handler runs and its return closes 1000', () async {
     var ran = false;
     await server.ws('/plain', (s) async {

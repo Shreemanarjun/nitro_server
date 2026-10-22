@@ -17,7 +17,7 @@ test/
 # the blackbox harness + vendored nitro); exclude only generated outputs.
 benchmark/docker/out/
 benchmark/blackbox/out/
-docs/
+doc/
 .git/
 .github/
 *.iml

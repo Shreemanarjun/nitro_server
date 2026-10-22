@@ -1,0 +1,22 @@
+# clang-tidy gate for the C++ engine (CI: `run-clang-tidy -p build/tidy src/engine`).
+# Static-analyzer paths plus the bugprone/performance checks that flag real
+# defects; style-only families are left to review.
+Checks: >
+  clang-analyzer-*,
+  bugprone-use-after-move,
+  bugprone-dangling-handle,
+  bugprone-infinite-loop,
+  bugprone-integer-division,
+  bugprone-sizeof-expression,
+  bugprone-string-constructor,
+  bugprone-suspicious-memset-usage,
+  bugprone-undelegated-constructor,
+  bugprone-unused-raii,
+  bugprone-unused-return-value,
+  misc-unused-using-decls,
+  performance-move-const-arg,
+  performance-unnecessary-copy-initialization,
+  -clang-analyzer-optin.performance.Padding
+WarningsAsErrors: '*'
+HeaderFilterRegex: 'src/engine/.*'
+FormatStyle: none

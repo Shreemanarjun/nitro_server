@@ -3,7 +3,7 @@ library;
 
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io' show GZipCodec, stdout;
+import 'dart:io' show GZipCodec, InternetAddress, stdout;
 import 'dart:typed_data';
 
 import '../internal/ansi.dart';
@@ -109,7 +109,12 @@ Middleware requestId({
   final name = headerName.toLowerCase();
   return (request, next) async {
     final incoming = request.header(name) ?? request.header('x-correlation-id');
-    final id = (incoming != null && incoming.isNotEmpty) ? incoming : gen();
+    // An inbound id is reflected only when it is a bounded opaque token:
+    // anything else (a CR/LF, a space, 4 KB of junk) is replaced, so the
+    // header can never carry a client's bytes back into the response head.
+    final id = (incoming != null && _isSafeRequestId(incoming))
+        ? incoming
+        : gen();
     final response = await next(request);
     // Handler-set value wins (any casing); otherwise stamp ours. Case-
     // insensitive so a handler's `X-Request-Id` isn't duplicated under
@@ -121,6 +126,24 @@ Middleware requestId({
 }
 
 var _idCounter = 0;
+
+/// `[A-Za-z0-9._:-]{1,128}` — enough for UUIDs, ULIDs, trace ids and the
+/// generated form; nothing that could shape a header or a log line.
+bool _isSafeRequestId(String id) {
+  if (id.isEmpty || id.length > 128) return false;
+  for (final c in id.codeUnits) {
+    final ok =
+        (c >= 0x30 && c <= 0x39) || // 0-9
+        (c >= 0x41 && c <= 0x5a) || // A-Z
+        (c >= 0x61 && c <= 0x7a) || // a-z
+        c == 0x2e ||
+        c == 0x5f ||
+        c == 0x3a ||
+        c == 0x2d; // . _ : -
+    if (!ok) return false;
+  }
+  return true;
+}
 
 /// A compact, collision-resistant-enough request id for correlation (not a
 /// security token): time-seeded base-36 + a per-isolate counter.
@@ -135,11 +158,19 @@ String _randomId() {
 /// check never drift. A malformed body answers `400`, a schema violation `422`
 /// (both `application/problem+json`, the errors under an `errors` member); a
 /// valid body passes through. Use on body-bearing routes (not `streamBody`).
+/// The `errors` list is capped at [maxErrors] entries (a body of ten thousand
+/// bad elements does not come back as ten thousand lines); the last entry
+/// then says how many were omitted. Decoding itself is bounded by the route's
+/// `maxBodyBytes` — `dart:convert`'s parser is iterative, so nesting depth
+/// cannot exhaust the stack.
 ///
 /// ```dart
 /// await server.post('/users', createUser, middleware: [validateJsonBody(user)]);
 /// ```
-Middleware validateJsonBody(ApiSchema schema) {
+Middleware validateJsonBody(ApiSchema schema, {int maxErrors = 100}) {
+  if (maxErrors <= 0) {
+    throw ArgumentError.value(maxErrors, 'maxErrors', 'must be positive');
+  }
   return (request, next) async {
     Object? decoded;
     try {
@@ -147,8 +178,15 @@ Middleware validateJsonBody(ApiSchema schema) {
     } on FormatException {
       return ResponseContext.problem(title: 'Invalid JSON body');
     }
-    final errors = schema.validate(decoded);
+    var errors = schema.validate(decoded);
     if (errors.isNotEmpty) {
+      if (errors.length > maxErrors) {
+        final omitted = errors.length - maxErrors;
+        errors = [
+          ...errors.take(maxErrors),
+          '… $omitted more error(s) omitted',
+        ];
+      }
       return ResponseContext.problem(
         title: 'Request body failed validation',
         status: 422,
@@ -174,6 +212,14 @@ Middleware cors({
   bool allowCredentials = false,
   Duration? maxAge = const Duration(days: 1),
 }) {
+  // RFC 6454 / Fetch: browsers reject `Access-Control-Allow-Origin: *` with
+  // credentials, and a reflected wildcard would be an open credentialed
+  // cross-origin door — refuse the combination at construction.
+  if (allowOrigin == '*' && allowCredentials) {
+    throw ArgumentError(
+      'cors(): allowCredentials requires an explicit allowOrigin, not "*"',
+    );
+  }
   final policy = <String, String>{
     'access-control-allow-origin': allowOrigin,
     'access-control-allow-methods': allowMethods,
@@ -315,16 +361,20 @@ String? _headerValue(Map<String, String> headers, String name) {
 /// await server.use(rateLimit(maxRequests: 100)); // 100/min per client
 /// ```
 ///
-/// The client key comes from [keyExtractor]; the default reads the first hop of
-/// `X-Forwarded-For`, then `X-Real-IP`, then the peer's `clientIp` — so it keys
-/// per client with or without a proxy. Pass a [keyExtractor] for a key you
-/// trust instead (an API key, a session id).
+/// The client key comes from [keyExtractor]; the default is the socket peer
+/// (`clientIp`). Behind a reverse proxy pass [trustedProxies] — the proxy
+/// addresses (or CIDRs) you control — and the key becomes the nearest hop in
+/// `X-Forwarded-For` that is *not* a trusted proxy (then `X-Real-IP`), so a
+/// direct client cannot rotate forwarded headers to mint fresh buckets. Pass
+/// a [keyExtractor] for a key you trust instead (an API key, a session id).
 ///
 /// Counts live in [store] and reset each [window]. The default
 /// [InMemoryRateLimitStore] is **per isolate**, so with `isolates > 1` the
-/// effective limit is `maxRequests × isolates`. For a limit shared across
-/// isolates or hosts, pass a [RateLimitStore] backed by a shared counter
-/// (Redis, a coordinator isolate, …).
+/// effective limit is `maxRequests × isolates`; it holds at most
+/// [maxKeys] active keys (expired ones are evicted first, then the soonest-
+/// to-expire), so spoofed-key floods are bounded in memory. For a limit
+/// shared across isolates or hosts, pass a [RateLimitStore] backed by a
+/// shared counter (Redis, a coordinator isolate, …).
 ///
 /// `ponytail: fixed window (a burst can straddle two windows for up to 2x over
 /// a window boundary); switch to a token bucket if smooth pacing matters.`
@@ -334,10 +384,16 @@ Middleware rateLimit({
   String Function(RequestContext request)? keyExtractor,
   ResponseContext Function(Duration retryAfter)? onLimit,
   RateLimitStore? store,
+  List<String> trustedProxies = const [],
+  int maxKeys = 100000,
 }) {
-  assert(maxRequests > 0, 'maxRequests must be positive');
-  final backing = store ?? InMemoryRateLimitStore();
-  final keyOf = keyExtractor ?? _clientKey;
+  if (maxRequests <= 0) {
+    throw ArgumentError.value(maxRequests, 'maxRequests', 'must be positive');
+  }
+  final backing = store ?? InMemoryRateLimitStore(maxKeys: maxKeys);
+  final trusted = [for (final p in trustedProxies) _Cidr.parse(p)];
+  final keyOf =
+      keyExtractor ?? (request) => _clientKeyBehindProxies(request, trusted);
   return (request, next) async {
     final hit = await backing.hit(keyOf(request), window);
     if (hit.count > maxRequests) {
@@ -373,34 +429,132 @@ abstract interface class RateLimitStore {
   FutureOr<RateLimitHit> hit(String key, Duration window);
 }
 
-/// The default per-isolate, in-memory fixed-window store. Expired keys are
-/// evicted lazily, so memory tracks *active* keys per window, not total seen.
+/// The default per-isolate, in-memory fixed-window store, bounded to
+/// [maxKeys] active keys: expired keys go first, then — still full — the
+/// tenth of the keys soonest to expire, so a flood of never-repeated keys
+/// costs a bounded amount of memory and cannot reset the counts of the
+/// clients actually being limited.
 class InMemoryRateLimitStore implements RateLimitStore {
+  InMemoryRateLimitStore({this.maxKeys = 100000}) {
+    if (maxKeys <= 0) {
+      throw ArgumentError.value(maxKeys, 'maxKeys', 'must be positive');
+    }
+  }
+
+  /// Upper bound on active keys held at once.
+  final int maxKeys;
+
   final _windows = <String, RateLimitHit>{};
+
+  /// Active keys held right now.
+  int get size => _windows.length;
 
   @override
   RateLimitHit hit(String key, Duration window) {
     final now = DateTime.now();
     final current = _windows[key];
-    if (current == null || !now.isBefore(current.resetAt)) {
-      _windows.removeWhere((_, other) => !now.isBefore(other.resetAt));
-      return _windows[key] = RateLimitHit(count: 1, resetAt: now.add(window));
+    if (current != null && now.isBefore(current.resetAt)) {
+      return _windows[key] = RateLimitHit(
+        count: current.count + 1,
+        resetAt: current.resetAt,
+      );
     }
-    return _windows[key] = RateLimitHit(
-      count: current.count + 1,
-      resetAt: current.resetAt,
-    );
+    if (current == null && _windows.length >= maxKeys) _evict(now);
+    return _windows[key] = RateLimitHit(count: 1, resetAt: now.add(window));
+  }
+
+  void _evict(DateTime now) {
+    _windows.removeWhere((_, other) => !now.isBefore(other.resetAt));
+    if (_windows.length < maxKeys) return;
+    final soonest = _windows.entries.toList()
+      ..sort((a, b) => a.value.resetAt.compareTo(b.value.resetAt));
+    final drop = (soonest.length ~/ 10).clamp(1, soonest.length);
+    for (var i = 0; i < drop; i++) {
+      _windows.remove(soonest[i].key);
+    }
   }
 }
 
-/// Default rate-limit key: first hop of `X-Forwarded-For`, then `X-Real-IP`,
-/// then the socket peer `clientIp`, then a single shared bucket (`*`).
-String _clientKey(RequestContext request) {
+/// Default rate-limit key: the socket peer, unless the peer is one of
+/// [trustedProxies], in which case the nearest untrusted hop of
+/// `X-Forwarded-For` (walking right to left past trusted hops), then
+/// `X-Real-IP`, then the peer. Headers are only believed from a trusted
+/// proxy and only when they parse as IP addresses. `*` (one shared bucket)
+/// when there is no peer address at all.
+/// `::ffff:a.b.c.d` (an IPv4 peer seen through a dual-stack listener) as the
+/// IPv4 address it is, so v4 CIDRs and keys match it.
+InternetAddress _unmap(InternetAddress ip) {
+  final raw = ip.rawAddress;
+  if (raw.length != 16) return ip;
+  for (var i = 0; i < 10; i++) {
+    if (raw[i] != 0) return ip;
+  }
+  if (raw[10] != 0xff || raw[11] != 0xff) return ip;
+  return InternetAddress.fromRawAddress(raw.sublist(12));
+}
+
+String _clientKeyBehindProxies(
+  RequestContext request,
+  List<_Cidr> trustedProxies,
+) {
+  final peer = request.clientIp;
+  final parsed = InternetAddress.tryParse(peer);
+  if (parsed == null) return '*';
+  final peerIp = _unmap(parsed);
+  if (!trustedProxies.any((c) => c.contains(peerIp))) return peerIp.address;
   final fwd = request.header('x-forwarded-for');
-  if (fwd != null && fwd.isNotEmpty) return fwd.split(',').first.trim();
-  final real = request.header('x-real-ip');
-  if (real != null && real.isNotEmpty) return real.trim();
-  return request.clientIp.isNotEmpty ? request.clientIp : '*';
+  if (fwd != null && fwd.isNotEmpty) {
+    final hops = fwd.split(',').reversed;
+    for (final raw in hops) {
+      final parsedHop = InternetAddress.tryParse(raw.trim());
+      if (parsedHop == null) break; // garbage: stop believing the chain
+      final hop = _unmap(parsedHop);
+      if (!trustedProxies.any((c) => c.contains(hop))) return hop.address;
+    }
+  }
+  final real = InternetAddress.tryParse(
+    request.header('x-real-ip')?.trim() ?? '',
+  );
+  if (real != null) return _unmap(real).address;
+  return peerIp.address;
+}
+
+/// An IPv4/IPv6 address or `addr/prefix` network, for [rateLimit]'s
+/// `trustedProxies`.
+class _Cidr {
+  _Cidr(this.address, this.prefix);
+
+  final InternetAddress address;
+  final int prefix;
+
+  static _Cidr parse(String spec) {
+    final slash = spec.indexOf('/');
+    final addr = InternetAddress.tryParse(
+      slash < 0 ? spec.trim() : spec.substring(0, slash).trim(),
+    );
+    if (addr == null) {
+      throw ArgumentError.value(spec, 'trustedProxies', 'not an IP or CIDR');
+    }
+    final bits = addr.rawAddress.length * 8;
+    final prefix = slash < 0 ? bits : int.tryParse(spec.substring(slash + 1));
+    if (prefix == null || prefix < 0 || prefix > bits) {
+      throw ArgumentError.value(spec, 'trustedProxies', 'bad prefix length');
+    }
+    return _Cidr(addr, prefix);
+  }
+
+  bool contains(InternetAddress ip) {
+    final a = _unmap(address).rawAddress, b = _unmap(ip).rawAddress;
+    if (a.length != b.length) return false;
+    var remaining = prefix;
+    for (var i = 0; i < a.length && remaining > 0; i++) {
+      final take = remaining >= 8 ? 8 : remaining;
+      final mask = (0xff << (8 - take)) & 0xff;
+      if ((a[i] & mask) != (b[i] & mask)) return false;
+      remaining -= take;
+    }
+    return true;
+  }
 }
 
 /// HTTP Bearer-token auth: requires `Authorization: Bearer <token>` and calls
@@ -480,6 +634,36 @@ Middleware basicAuth(
     return _unauthorized(challenge);
   };
 }
+
+/// Admits a request only when its `Origin` header names one of [allowed]
+/// (`scheme://host[:port]`, compared case-insensitively) — the WebSocket
+/// origin policy of RFC 6455 §10.2, for `ws(middleware: [...])` (a rejection
+/// closes the socket `4403`) and for HTTP routes alike. A request without an
+/// `Origin` header is refused unless [allowMissing] is true (non-browser
+/// clients send none). [allowed] must not be empty.
+Middleware originPolicy(List<String> allowed, {bool allowMissing = false}) {
+  if (allowed.isEmpty) {
+    throw ArgumentError.value(allowed, 'allowed', 'must name an origin');
+  }
+  final set = {for (final o in allowed) _normalizeOrigin(o)};
+  return (request, next) {
+    final origin = request.header('origin');
+    if (origin == null) {
+      return allowMissing ? next(request) : _forbiddenOrigin();
+    }
+    return set.contains(_normalizeOrigin(origin))
+        ? next(request)
+        : _forbiddenOrigin();
+  };
+}
+
+String _normalizeOrigin(String origin) {
+  final t = origin.trim().toLowerCase();
+  return t.endsWith('/') ? t.substring(0, t.length - 1) : t;
+}
+
+ResponseContext _forbiddenOrigin() =>
+    ResponseContext.text('origin not allowed', status: 403);
 
 /// Decodes a Basic credential (`base64(user:password)`) into `(user, password)`,
 /// or null when the base64 or the `user:password` shape is malformed.

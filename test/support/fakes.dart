@@ -159,6 +159,17 @@ class FakeNitroServerNative extends NitroServerNative
   @override
   int liveConnections() => live > 0 ? live-- : 0;
 
+  final detached = <int>[];
+
+  @override
+  int emitterId() => 7;
+
+  @override
+  bool detachEmitter(int id) {
+    detached.add(id);
+    return true;
+  }
+
   /// File answers by request id: (status, headers, path, offset, length).
   final filesResponded = <int, (int, Map<String, String>, String, int, int)>{};
 

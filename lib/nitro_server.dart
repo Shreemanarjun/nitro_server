@@ -21,6 +21,7 @@ export 'src/api/native_loader.dart'
         nitroServerLibraryName;
 export 'src/api/observability.dart'
     show
+        EventLoopLagProbe,
         StatsSampler,
         metricsJson,
         prometheusFormat,
@@ -28,6 +29,7 @@ export 'src/api/observability.dart'
         serverStatsJson;
 export 'src/api/openapi.dart'
     show
+        swaggerUiPinnedVersion,
         OpenApi,
         OpenApiOperation,
         OpenApiParam,

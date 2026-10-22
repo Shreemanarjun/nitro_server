@@ -49,7 +49,9 @@ class UvReactor {
   /// across them; every message of a request goes to the sink that got its head.
   void setEmitter(Emitter* e);
   void addEmitter(Emitter* e);
-  void removeEmitter(Emitter* e);
+  /// Unbinds [e] (compared by identity, never dereferenced). Returns whether
+  /// it was bound.
+  bool removeEmitter(Emitter* e);
   size_t emitterCountForTesting();
   // Number of event loops (threads) the server started with. Test seam for the
   // workerThreads loop-count cap.
@@ -101,6 +103,9 @@ class UvReactor {
   int64_t liveConnections() const { return liveConns_.load(); }
   /// Handler requests dispatched but not yet answered.
   int64_t inFlightRequests();
+  /// True when `maxInFlightRequests` is set and already reached: the next
+  /// request is answered 503 instead of being dispatched.
+  bool overInFlightBudget();
 
   /// Answers request [id] from any thread. No-op if the connection is gone.
   void respond(int64_t id, int64_t status, const std::vector<Header>& headers,
@@ -148,6 +153,10 @@ class UvReactor {
       int64_t h2ReqId = 0;
       int h2Status = 0;
       std::vector<Header> h2Headers;
+      // A file answer: `bytes` is the head; the body streams from fileFd.
+      int fileFd = -1;
+      int64_t fileOffset = 0;
+      int64_t fileRemaining = 0;
     };
     std::vector<Pending> queue;
     bool stopping = false;  // set cross-thread; acted on by onAsync (loop thread)
@@ -191,6 +200,10 @@ class UvReactor {
   int loopIndexOf(const Conn* c) const; // this conn's loop index, for reqLoc
 #endif
   void wsProcess(Conn* c);              // decode WebSocket frames (loop thread)
+  void continueFileSend(Conn* c);       // next chunk of a file answer (loop thread)
+  // Bounds what a busy (answering) connection may buffer unprocessed; true
+  // when it just answered 400 and is closing.
+  bool overBusyBuffer(Conn* c);
   void wsCloseConn(Conn* c, int code);  // send a close frame + close (loop thread)
 #ifdef NITRO_SERVER_TLS
   // TLS over libuv via OpenSSL memory BIOs: ciphertext moves on the socket,

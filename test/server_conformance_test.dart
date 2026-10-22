@@ -810,7 +810,8 @@ void main() {
           utf8.decode(await _clientBody(port, 'GET', '/cached/anything')),
           'cached',
         );
-        // GET-only: a POST to the same path is an engine 404 (no All fallback).
+        // GET-only: a POST to the same path is an engine 405 naming what the
+        // path does accept (RFC 9110 §15.5.6) — never a misleading 404.
         final raw = await _raw(
           port,
           ascii.encode(
@@ -818,7 +819,8 @@ void main() {
             'Connection: close\r\n\r\n',
           ),
         );
-        expect(_statusOf(raw), 404);
+        expect(_statusOf(raw), 405);
+        expect(ascii.decode(raw).toLowerCase(), contains('allow: get, head'));
       }, skip: skipReason);
 
       test('HEAD is answered headers-only with the entity length', () async {

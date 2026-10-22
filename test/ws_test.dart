@@ -5,6 +5,7 @@ library;
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:nitro_server/nitro_server.dart';
@@ -38,6 +39,31 @@ void main() {
         expect(
           () => wsInflate(Uint8List.fromList([0xff, 0xff, 0xff])),
           throwsA(anything),
+        );
+      });
+
+      test('wsInflate caps the inflated size, not the wire size', () {
+        // 4 MiB of zeros deflates to a few KiB: a classic decompression bomb.
+        final bomb = wsDeflate(Uint8List(4 * 1024 * 1024));
+        expect(bomb.length, lessThan(16 * 1024));
+        expect(
+          () => wsInflate(bomb, maxBytes: 64 * 1024),
+          throwsA(
+            isA<WsInflateLimitExceeded>().having(
+              (e) => e.maxBytes,
+              'maxBytes',
+              64 * 1024,
+            ),
+          ),
+        );
+        expect(
+          wsInflate(bomb, maxBytes: 4 * 1024 * 1024).length,
+          4 * 1024 * 1024,
+        );
+        expect(wsInflate(bomb).length, 4 * 1024 * 1024); // -1 = uncapped
+        expect(
+          const WsInflateLimitExceeded(7).toString(),
+          contains('exceeds 7 bytes'),
         );
       });
 
@@ -89,8 +115,8 @@ void main() {
         expect(c.copyWith(port: 1).wsMaxBufferBytes, 4096);
         expect(c.copyWith(port: 1).protocol, HttpProtocol.http1); // sticky
         expect(
-          () => ServerConfig(wsMaxBufferBytes: 0),
-          throwsA(isA<AssertionError>()),
+          const ServerConfig(wsMaxBufferBytes: 0).validate,
+          throwsArgumentError,
         );
       });
     });
@@ -381,6 +407,84 @@ void main() {
           expect(session.sendText('late'), -1);
         },
       );
+
+      test(
+        'inbound messages a slow handler has not consumed are capped (1009)',
+        () async {
+          runner.wsMaxBufferBytesForTesting = 64 * 1024;
+          // The handler never reads: every delivered message stays buffered.
+          final session = await openSession(
+            660,
+            handler: (s) => Completer<void>().future,
+          );
+          for (var i = 0; i < 3; i++) {
+            inject(660, 2, Uint8List(40 * 1024));
+          }
+          await waitWsClosed(660);
+          expect(fake.wsClosed.single, (660, 1009));
+          expect(session.closeCode, 1009);
+          // A consuming handler sees every message and the cap never trips.
+          final seen = <int>[];
+          await openSession(
+            661,
+            handler: (s) => s.messages.forEach(
+              (m) => seen.add((m as WsBinary).bytes.length),
+            ),
+          );
+          for (var i = 0; i < 3; i++) {
+            inject(661, 2, Uint8List(40 * 1024));
+            await Future<void>.delayed(const Duration(milliseconds: 10));
+          }
+          await Future<void>.delayed(const Duration(milliseconds: 20));
+          expect(seen, [40 * 1024, 40 * 1024, 40 * 1024]);
+          expect(fake.wsClosed.where((c) => c.$1 == 661), isEmpty);
+        },
+      );
+
+      test('a corpus of random compression bombs all close 1009, none is '
+          'delivered (doc/production-audit.md P0-5)', () async {
+        runner.wsMaxBufferBytesForTesting = 64 * 1024;
+        for (var i = 0; i < 8; i++) {
+          final id = 700 + i;
+          final rnd = Random(i);
+          // Highly compressible, 1 byte to 4 MiB over the cap: a few KB on
+          // the wire, far more inflated.
+          final payload = Uint8List(64 * 1024 + 1 + rnd.nextInt(4 << 20));
+          for (var j = 0; j < payload.length; j++) {
+            payload[j] = rnd.nextInt(3);
+          }
+          final seen = <WsMessage>[];
+          await openSession(id, handler: (s) => s.messages.forEach(seen.add));
+          inject(id, 2, wsDeflate(payload), 1);
+          await waitWsClosed(id);
+          expect(fake.wsClosed.last, (id, 1009), reason: 'bomb #$i');
+          expect(seen, isEmpty);
+        }
+      });
+
+      test('a compressed message that inflates past wsMaxBufferBytes closes '
+          '1009 (doc/production-audit.md P0-5)', () async {
+        runner.wsMaxBufferBytesForTesting = 64 * 1024;
+        final seen = <WsMessage>[];
+        final session = await openSession(
+          650,
+          handler: (s) => s.messages.forEach(seen.add),
+        );
+        inject(650, 2, wsDeflate(Uint8List(4 * 1024 * 1024)), 1);
+        await waitWsClosed(650);
+        expect(fake.wsClosed.single, (650, 1009));
+        expect(seen, isEmpty);
+        expect(session.closeCode, 1009);
+        // Under the cap, the same path delivers.
+        final small = await openSession(
+          651,
+          handler: (s) => s.messages.forEach(seen.add),
+        );
+        inject(651, 2, wsDeflate(Uint8List(1024)), 1);
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        expect((seen.single as WsBinary).bytes.length, 1024);
+        expect(small.closeCode, isNull);
+      });
 
       test('a bridge failure on send reads as -1, never a throw', () async {
         final session = await openSession(642);

@@ -28,8 +28,19 @@ import 'server.dart';
 ///   link (embedded as an iframe when [embedOpenApi] is true). Pass
 ///   [dashboardPath]`: null` to skip the dashboard entirely.
 ///
+/// Exposure: [metricsPath] and the dashboard reveal route names, traffic and
+/// resource use, so on a public listener wrap them — [middleware] runs in
+/// front of `/metrics`, the dashboard page, its JSON feed and its WebSocket
+/// (`[basicAuth(...)]`, an IP allow-list, …). The liveness/readiness probes
+/// stay open so orchestrators can reach them. Every operational answer is
+/// `Cache-Control: no-store`. [maxDashboardViewers] bounds live dashboard
+/// sessions (each costs a sampler + timer); a viewer past it is closed 1013.
+/// Readiness also reflects helper-isolate health ([NitroServer.helpersHealthy])
+/// unless [ready] replaces it.
+///
 /// ```dart
 /// await serveObservability(server); // /metrics, /healthz, /readyz, /dashboard
+/// await serveObservability(server, middleware: [basicAuth(checkAdmin)]);
 /// ```
 Future<void> serveObservability(
   NitroServer server, {
@@ -45,16 +56,23 @@ Future<void> serveObservability(
   bool embedOpenApi = false,
   bool Function()? ready,
   String prefix = 'nitro',
+  List<Middleware> middleware = const [],
+  int maxDashboardViewers = 16,
 }) async {
   var up = true;
   unawaited(server.onClose.then((_) => up = false));
-  final isReady = ready ?? () => up;
-  await server.get(healthPath, (_) => ResponseContext.text('ok'));
+  final isReady = ready ?? () => up && server.helpersHealthy;
+  const noStore = {'cache-control': 'no-store'};
+  final lag = EventLoopLagProbe.shared..retain(server.onClose);
+  await server.get(
+    healthPath,
+    (_) => ResponseContext.text('ok', headers: noStore),
+  );
   await server.get(
     readyPath,
     (_) => isReady()
-        ? ResponseContext.text('ready')
-        : ResponseContext.text('draining', status: 503),
+        ? ResponseContext.text('ready', headers: noStore)
+        : ResponseContext.text('draining', status: 503, headers: noStore),
   );
   await server.get(metricsPath, (_) async {
     // Aggregated across every isolate by default, so a scrape reflects the
@@ -63,12 +81,23 @@ Future<void> serveObservability(
     return ResponseContext(
       headers: const {
         'content-type': 'text/plain; version=0.0.4; charset=utf-8',
+        ...noStore,
       },
       body: Uint8List.fromList(
-        utf8.encode(prometheusFormat(metrics, prefix: prefix)),
+        utf8.encode(
+          prometheusFormat(
+            metrics,
+            prefix: prefix,
+            gauges: {
+              'connections': server.liveConnections,
+              'event_loop_lag_seconds': lag.lastLagMicros / 1e6,
+              'helper_isolates_alive': server.helpersAlive,
+            },
+          ),
+        ),
       ),
     );
-  });
+  }, middleware: middleware);
   if (dashboardPath == null) return;
 
   // JSON feed (polling fallback): a fresh sampler per request still yields the
@@ -77,18 +106,36 @@ Future<void> serveObservability(
   await server.get(dashboardDataPath, (_) async {
     final metrics = await server.aggregatedMetrics();
     return ResponseContext(
-      headers: const {'content-type': 'application/json; charset=utf-8'},
+      headers: const {
+        'content-type': 'application/json; charset=utf-8',
+        ...noStore,
+      },
       body: Uint8List.fromList(
-        utf8.encode(jsonEncode(pollSampler.sample(metrics))),
+        utf8.encode(
+          jsonEncode(
+            pollSampler.sample(
+              metrics,
+              connections: server.liveConnections,
+              eventLoopLagMicros: lag.lastLagMicros,
+            ),
+          ),
+        ),
       ),
     );
-  });
+  }, middleware: middleware);
   // WebSocket feed: one sampler per viewer, pushed every [refreshInterval].
   // Each session is independent; the timer is torn down the instant the peer
   // goes away (a failed send) or the stream ends, and a throwing sample never
   // escapes the timer — so opening/closing many dashboards can neither leak
-  // timers nor crash the isolate.
-  await server.ws(dashboardWsPath, (session) async {
+  // timers nor crash the isolate. Viewers are capped: past the cap a session
+  // is closed 1013 (try again later) before any sampler exists.
+  var viewers = 0;
+  await server.ws(dashboardWsPath, middleware: middleware, (session) async {
+    if (viewers >= maxDashboardViewers) {
+      await session.close(1013);
+      return;
+    }
+    viewers++;
     final sampler = StatsSampler();
     Timer? timer;
     void stop() {
@@ -103,9 +150,14 @@ Future<void> serveObservability(
       // coverage:ignore-start
       try {
         final metrics = await server.aggregatedMetrics();
-        if (session.sendText(jsonEncode(sampler.sample(metrics))) < 0) {
-          stop();
-        }
+        final frame = jsonEncode(
+          sampler.sample(
+            metrics,
+            connections: server.liveConnections,
+            eventLoopLagMicros: lag.lastLagMicros,
+          ),
+        );
+        if (session.sendText(frame) < 0) stop();
       } catch (_) {
         stop();
       }
@@ -118,6 +170,7 @@ Future<void> serveObservability(
       await session.messages.drain<void>(); // until the peer closes
     } finally {
       stop();
+      viewers--;
     }
   });
   final page = _dashboardHtml(
@@ -127,7 +180,11 @@ Future<void> serveObservability(
     openApiDocsUrl,
     embedOpenApi,
   );
-  await server.get(dashboardPath, (_) => ResponseContext.html(page));
+  await server.get(
+    dashboardPath,
+    (_) => ResponseContext.html(page).withHeader('cache-control', 'no-store'),
+    middleware: middleware,
+  );
 }
 
 /// Samples live server stats: throughput (requests/sec since the last sample),
@@ -145,8 +202,13 @@ class StatsSampler {
   int? _lastCpuTicks;
 
   /// A stats snapshot for [metrics]. Call periodically (throughput and CPU are
-  /// deltas against the previous call).
-  Map<String, Object?> sample(ServerMetrics metrics) {
+  /// deltas against the previous call). [connections] and
+  /// [eventLoopLagMicros] are live gauges the caller reads from the server.
+  Map<String, Object?> sample(
+    ServerMetrics metrics, {
+    int connections = 0,
+    int eventLoopLagMicros = 0,
+  }) {
     final now = DateTime.now();
     final dt = now.difference(_lastAt).inMicroseconds / 1e6;
     final reqPerSec = dt > 0 ? (metrics.requests - _lastRequests) / dt : 0.0;
@@ -161,7 +223,54 @@ class StatsSampler {
       rssBytes: _rss(),
       cpuPercent: cpu,
       uptimeSeconds: now.difference(_startedAt).inSeconds,
+      connections: connections,
+      eventLoopLagMicros: eventLoopLagMicros,
     );
+  }
+}
+
+/// Measures this isolate's event-loop lag: a 100 ms periodic timer records
+/// how late each tick fires. A saturated isolate (a long synchronous handler,
+/// GC pressure) shows up here before it shows up as latency. One shared probe
+/// per isolate; [retain] keeps it alive until the given future completes and
+/// no other holder remains.
+class EventLoopLagProbe {
+  EventLoopLagProbe._();
+
+  static final shared = EventLoopLagProbe._();
+  static const _period = Duration(milliseconds: 100);
+
+  Timer? _timer;
+  int _holders = 0;
+  int _lastLagMicros = 0;
+  late DateTime _expected;
+
+  /// Lateness of the most recent tick, in microseconds (0 before the first).
+  int get lastLagMicros => _lastLagMicros;
+
+  /// Whether the probe timer is running.
+  bool get running => _timer != null;
+
+  /// Starts the probe (if idle) and releases it when [until] completes.
+  void retain(Future<void> until) {
+    _holders++;
+    if (_timer == null) {
+      _expected = DateTime.now().add(_period);
+      _timer = Timer.periodic(_period, (_) {
+        final now = DateTime.now();
+        final lag = now.difference(_expected).inMicroseconds;
+        _lastLagMicros = lag < 0 ? 0 : lag;
+        _expected = now.add(_period);
+      });
+    }
+    unawaited(until.then((_) => _release()));
+  }
+
+  void _release() {
+    if (--_holders > 0) return;
+    _timer?.cancel();
+    _timer = null;
+    _lastLagMicros = 0;
   }
 }
 
@@ -173,6 +282,8 @@ Map<String, Object?> serverStatsJson(
   required int rssBytes,
   required double? cpuPercent,
   required int uptimeSeconds,
+  int connections = 0,
+  int eventLoopLagMicros = 0,
 }) => {
   ...metricsJson(metrics),
   'reqPerSec': double.parse(reqPerSec.toStringAsFixed(1)),
@@ -181,6 +292,10 @@ Map<String, Object?> serverStatsJson(
       ? null
       : double.parse(cpuPercent.toStringAsFixed(1)),
   'uptimeSeconds': uptimeSeconds,
+  'connections': connections,
+  'eventLoopLagMs': double.parse(
+    (eventLoopLagMicros / 1000).toStringAsFixed(1),
+  ),
 };
 
 /// A JSON-ready snapshot of [metrics]: process totals plus a per-route list.
@@ -189,6 +304,9 @@ Map<String, Object?> metricsJson(ServerMetrics metrics) => {
   'requests': metrics.requests,
   'errors': metrics.errors,
   'inFlight': metrics.inFlight,
+  'byStatusClass': {
+    for (var c = 1; c <= 5; c++) '${c}xx': metrics.byStatusClass[c],
+  },
   'routes': [
     for (final r in metrics.byRoute.values)
       {
@@ -237,11 +355,17 @@ double? cpuPercent(int? ticks, int? lastTicks, double dtSec) {
 }
 
 /// Renders [metrics] as a Prometheus text-exposition document (version 0.0.4):
-/// process totals as counters/gauge, and per-route request/error counters plus
-/// a latency summary (p50/p90/p99 as `quantile` series, in microseconds).
-/// Metric names are prefixed with [prefix] (`nitro` by default). Pure and
-/// allocation-light — safe to call per scrape.
-String prometheusFormat(ServerMetrics metrics, {String prefix = 'nitro'}) {
+/// process totals as counters/gauge, answers per status class, and per-route
+/// request/error counters plus a latency summary (p50/p90/p99 as `quantile`
+/// series, `_sum` and `_count`, in microseconds). [gauges] adds live
+/// process gauges (`serveObservability` passes connections, event-loop lag and
+/// helper-isolate health). Metric names are prefixed with [prefix] (`nitro`
+/// by default). Pure and allocation-light — safe to call per scrape.
+String prometheusFormat(
+  ServerMetrics metrics, {
+  String prefix = 'nitro',
+  Map<String, num> gauges = const {},
+}) {
   final b = StringBuffer();
   void metric(
     String name,
@@ -287,6 +411,25 @@ String prometheusFormat(ServerMetrics metrics, {String prefix = 'nitro'}) {
     'Requests dispatched and not yet answered.',
     metrics.inFlight,
   );
+  for (final g in gauges.entries) {
+    metric(g.key, 'gauge', 'Live process gauge.', g.value);
+  }
+  b
+    ..write('# HELP ')
+    ..write(prefix)
+    ..write('_responses_total Answers per status class.\n')
+    ..write('# TYPE ')
+    ..write(prefix)
+    ..write('_responses_total counter\n');
+  for (var c = 1; c <= 5; c++) {
+    b
+      ..write(prefix)
+      ..write('_responses_total{class="')
+      ..write(c)
+      ..write('xx"} ')
+      ..write(metrics.byStatusClass[c])
+      ..write('\n');
+  }
 
   // Per-route series share one HELP/TYPE header, then one line per route.
   void series(
@@ -362,6 +505,12 @@ String prometheusFormat(ServerMetrics metrics, {String prefix = 'nitro'}) {
     q('0.9', r.latency.p90Us);
     q('0.99', r.latency.p99Us);
     b
+      ..write(prefix)
+      ..write('_route_latency_microseconds_sum{route="')
+      ..write(route)
+      ..write('"} ')
+      ..write(r.latency.sumUs)
+      ..write('\n')
       ..write(prefix)
       ..write('_route_latency_microseconds_count{route="')
       ..write(route)
@@ -457,10 +606,18 @@ function render(m){
   \$('cpu').textContent = m.cpuPercent==null ? 'n/a' : m.cpuPercent.toFixed(1)+' %';
   \$('mem').textContent = mb(m.rssBytes);
   \$('up').textContent = dur(m.uptimeSeconds);
-  \$('rows').innerHTML = m.routes.map(r =>
-    `<tr><td>\${r.pattern}</td><td>\${r.requests}</td>`+
-    `<td class="\${r.errors?'err':''}">\${r.errors}</td>`+
-    `<td>\${ms(r.p50us)}</td><td>\${ms(r.p90us)}</td><td>\${ms(r.p99us)}</td><td>\${ms(r.maxUs)}</td></tr>`).join('');
+  const rows = \$('rows');
+  rows.replaceChildren(...m.routes.map(r => {
+    const tr = document.createElement('tr');
+    const cells = [r.pattern, r.requests, r.errors, ms(r.p50us), ms(r.p90us), ms(r.p99us), ms(r.maxUs)];
+    cells.forEach((v, i) => {
+      const td = document.createElement('td');
+      td.textContent = String(v); // text, never markup: patterns are data
+      if (i === 2 && r.errors) td.className = 'err';
+      tr.appendChild(td);
+    });
+    return tr;
+  }));
   \$('foot').textContent = 'updated '+new Date().toLocaleTimeString();
 }
 function live(on){ \$('dot').classList.toggle('live', on); }

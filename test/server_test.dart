@@ -96,17 +96,20 @@ void main() {
         expect(response.body, isEmpty);
       });
 
-      test('a throwing handler is a 500 naming the error', () async {
-        await server.get('/boom', (_) async => throw StateError('kaput'));
-        final response = await driveRequest(
-          fake,
-          requestId: 45,
-          path: '/boom',
-          routePattern: '/boom',
-        );
-        expect(response.status, 500);
-        expect(String.fromCharCodes(response.body), contains('kaput'));
-      });
+      test(
+        'a throwing handler is a generic 500 (details stay server-side)',
+        () async {
+          await server.get('/boom', (_) async => throw StateError('kaput'));
+          final response = await driveRequest(
+            fake,
+            requestId: 45,
+            path: '/boom',
+            routePattern: '/boom',
+          );
+          expect(response.status, 500);
+          expect(String.fromCharCodes(response.body), 'internal server error');
+        },
+      );
 
       test('custom error pages see the error, sync or async', () async {
         await server.get('/sync-boom', (_) => throw StateError('sync'));
@@ -143,7 +146,7 @@ void main() {
           routePattern: '/boom2',
         );
         expect(response.status, 500);
-        expect(String.fromCharCodes(response.body), contains('kaput'));
+        expect(String.fromCharCodes(response.body), 'internal server error');
       });
     });
 
@@ -770,14 +773,15 @@ void main() {
         );
       });
 
-      test('ServerConfig rejects nonsense', () {
-        expect(() => ServerConfig(port: -1), throwsA(isA<AssertionError>()));
-        expect(() => ServerConfig(port: 70000), throwsA(isA<AssertionError>()));
-        expect(() => ServerConfig(backlog: 0), throwsA(isA<AssertionError>()));
+      test('ServerConfig rejects nonsense at validate() (bind calls it)', () {
+        expect(const ServerConfig(port: -1).validate, throwsArgumentError);
+        expect(const ServerConfig(port: 70000).validate, throwsArgumentError);
+        expect(const ServerConfig(backlog: 0).validate, throwsArgumentError);
         expect(
-          () => ServerConfig(maxBodyBytes: 0),
-          throwsA(isA<AssertionError>()),
+          const ServerConfig(maxBodyBytes: 0).validate,
+          throwsArgumentError,
         );
+        expect(const ServerConfig().validate, returnsNormally);
       });
 
       test('ResponseContext rejects out-of-range statuses', () {

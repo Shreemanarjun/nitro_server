@@ -87,6 +87,42 @@ void main() {
         },
       );
 
+      test(
+        'answers are counted per status class, merged across isolates',
+        () async {
+          await client.server.get('/ok', (_) => ResponseContext.text('ok'));
+          await client.server.get(
+            '/gone',
+            (_) => const ResponseContext(status: 404),
+          );
+          await client.server.get('/boom', (_) => throw StateError('x'));
+          await client.get('/ok');
+          await client.get('/ok');
+          await client.get('/gone');
+          await client.get('/boom');
+          final m = client.server.metrics;
+          expect(m.byStatusClass, [0, 0, 2, 0, 1, 1]);
+          final merged = mergeIsolateMetrics([
+            client.server.metricsWireForTesting(),
+            client.server.metricsWireForTesting(),
+          ]);
+          expect(merged.byStatusClass, [0, 0, 4, 0, 2, 2]);
+          expect(merged.requests, 8);
+          // A snapshot without the field (an older helper) merges as zeros.
+          expect(
+            mergeIsolateMetrics([
+              {
+                'requests': 1,
+                'errors': 0,
+                'inFlight': 0,
+                'routes': <Object?>[],
+              },
+            ]).byStatusClass,
+            [0, 0, 0, 0, 0, 0],
+          );
+        },
+      );
+
       test('histogram buckets are monotonic and bounded', () {
         var last = -1;
         for (final us in [0, 1, 2, 3, 100, 1000, 1 << 20, 1 << 40]) {

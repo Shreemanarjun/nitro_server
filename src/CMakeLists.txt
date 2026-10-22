@@ -20,7 +20,12 @@ option(NITRO_SERVER_NATIVE_TUNE "Optimize for the build host CPU (-march=native)
 # -DNDEBUG: strip assertions and bounds checks
 # -fomit-frame-pointer: free up a register on x86_64
 # -funroll-loops: unroll hot loops (parser, header scan)
-# -ffast-math: allow reordering FP ops (no NaN/Inf sensitivity in HTTP)
+# -fno-math-errno: sqrt/pow inline without the errno dance (the only FP in
+#   the engine is the JSON float writer, which reads sign bits itself — no
+#   -ffast-math: it would change float semantics for no parsing gain)
+# Hardening (doc/production-audit.md): -fstack-protector-strong,
+#   _FORTIFY_SOURCE=2, hidden default visibility (only NITRO_EXPORT symbols
+#   leave the library), and on Linux RELRO/NOW + a non-executable stack.
 #
 # MSVC (cl.exe) understands none of this GCC/Clang syntax. Applying it there
 # silently drops CMake's default `/MD /O2`, leaving the build unoptimized AND on
@@ -33,8 +38,9 @@ if(NOT MSVC)
   else()
     set(_nitro_tune "")  # portable baseline for distributed prebuilts
   endif()
-  set(CMAKE_C_FLAGS_RELEASE   "-O3 ${_nitro_tune} -DNDEBUG -fomit-frame-pointer -funroll-loops -ffast-math -fno-rtti")
-  set(CMAKE_CXX_FLAGS_RELEASE "-O3 ${_nitro_tune} -DNDEBUG -fomit-frame-pointer -funroll-loops -ffast-math -fno-rtti")
+  set(_nitro_harden "-fstack-protector-strong -D_FORTIFY_SOURCE=2 -fvisibility=hidden")
+  set(CMAKE_C_FLAGS_RELEASE   "-O3 ${_nitro_tune} -DNDEBUG -fomit-frame-pointer -funroll-loops -fno-math-errno ${_nitro_harden}")
+  set(CMAKE_CXX_FLAGS_RELEASE "-O3 ${_nitro_tune} -DNDEBUG -fomit-frame-pointer -funroll-loops -fno-math-errno -fno-rtti ${_nitro_harden}")
   # Link-time optimization at the linker level (requires matching compile flags).
   set(CMAKE_EXE_LINKER_FLAGS_RELEASE  "-flto -O3")
   set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "-flto -O3")
@@ -49,12 +55,12 @@ endif()
 # unoptimized native code. Give any non-standard config Release-grade flags.
 string(TOUPPER "${CMAKE_BUILD_TYPE}" _NITRO_CFG)
 if(NOT MSVC AND NOT "${_NITRO_CFG}" MATCHES "^(DEBUG|RELEASE|RELWITHDEBINFO|MINSIZEREL|)$")
-  set(CMAKE_C_FLAGS_${_NITRO_CFG} "-O3 -march=native -mtune=native -DNDEBUG -fomit-frame-pointer -funroll-loops -ffast-math -fno-rtti")
-  set(CMAKE_CXX_FLAGS_${_NITRO_CFG} "-O3 -march=native -mtune=native -DNDEBUG -fomit-frame-pointer -funroll-loops -ffast-math -fno-rtti")
+  set(CMAKE_C_FLAGS_${_NITRO_CFG} "-O3 -march=native -mtune=native -DNDEBUG -fomit-frame-pointer -funroll-loops -fno-math-errno -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fvisibility=hidden")
+  set(CMAKE_CXX_FLAGS_${_NITRO_CFG} "-O3 -march=native -mtune=native -DNDEBUG -fomit-frame-pointer -funroll-loops -fno-math-errno -fno-rtti -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fvisibility=hidden")
 endif()
 
 set(NITRO_NATIVE "${CMAKE_CURRENT_SOURCE_DIR}/native")
-# NITRO_LINK_SPEC_CHECKSUM 4aa0e94125e2aa39
+# NITRO_LINK_SPEC_CHECKSUM be00ddd368517d4a
 set(GENERATED_CPP "${CMAKE_CURRENT_SOURCE_DIR}/../lib/src/generated/cpp")
 
 add_library(nitro_server SHARED
@@ -96,6 +102,28 @@ endif()
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/engine.cmake")
 nitro_server_attach_engine(nitro_server)
+
+# ── Warnings and link hardening ──────────────────────────────────────────────
+# Every engine TU builds with -Wall -Wextra; CI turns NITRO_SERVER_WERROR on so
+# a new warning fails the build there rather than accumulating.
+option(NITRO_SERVER_WERROR "Treat compiler warnings as errors" OFF)
+if(NOT MSVC)
+  # -Wno-missing-field-initializers: aggregate init with defaulted trailing
+  # members is idiomatic here (Pending{...}), not a defect.
+  target_compile_options(nitro_server PRIVATE -Wall -Wextra
+    -Wno-missing-field-initializers
+    $<$<BOOL:${NITRO_SERVER_WERROR}>:-Werror>)
+  # Vendored (Dart SDK) and nitrogen-generated sources are not ours to fix:
+  # compile them quietly so the gate judges only hand-written engine code.
+  set_source_files_properties(
+    "dart_api_dl.c"
+    "${GENERATED_CPP}/nitro_server.bridge.g.cpp"
+    PROPERTIES COMPILE_OPTIONS "-w")
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(nitro_server PRIVATE
+      "-Wl,-z,relro" "-Wl,-z,now" "-Wl,-z,noexecstack")
+  endif()
+endif()
 
 # ── Tests (desktop only, opt-in) ─────────────────────────────────────────────
 option(NITRO_SERVER_BUILD_TESTS "Build the C++ engine test suite" OFF)

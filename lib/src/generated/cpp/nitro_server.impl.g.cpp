@@ -134,6 +134,18 @@ public:
         // return 0;
     }
 
+    int64_t emitterId() override {
+        // TODO: implement emitterId
+        throw std::runtime_error("Not implemented: emitterId");
+        // return 0;
+    }
+
+    bool detachEmitter(int64_t id) override {
+        // TODO: implement detachEmitter
+        throw std::runtime_error("Not implemented: detachEmitter");
+        // return false;
+    }
+
     void respondFile(int64_t requestId, int64_t status, NitroCppBuffer headers, const std::string& path, int64_t offset, int64_t length) override {
         // TODO: implement respondFile
         throw std::runtime_error("Not implemented: respondFile");

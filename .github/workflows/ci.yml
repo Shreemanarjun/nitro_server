@@ -11,11 +11,11 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # This is a Flutter FFI plugin, so it declares a Flutter SDK constraint
       # (required to publish flutter.plugin.platforms). Use the Flutter SDK,
       # which bundles the Dart CLI the rest of the steps call.
-      - uses: subosito/flutter-action@v2
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
         with:
           channel: stable
       - if: runner.os == 'Linux'
@@ -25,7 +25,7 @@ jobs:
       - run: flutter pub get
       - run: dart analyze
       - run: dart format --output=none --set-exit-if-changed lib test benchmark tool
-      - run: cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release -DNITRO_SERVER_BUILD_TESTS=ON
+      - run: cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release -DNITRO_SERVER_BUILD_TESTS=ON -DNITRO_SERVER_WERROR=ON
       - run: cmake --build build/lib --parallel
       - run: ./build/lib/nitro_server_tests/nitro_server_engine_tests
       - run: bash tool/coverage.sh
@@ -55,9 +55,11 @@ jobs:
     # against the platform's non-instrumented libc++.
     env:
       TSAN_OPTIONS: halt_on_error=1
-      ASAN_OPTIONS: detect_leaks=0:detect_container_overflow=0
+      # Leak detection is on where LeakSanitizer exists (Linux); macOS ASan has
+      # none. detect_leaks=1 makes a native leak in the engine fail the job.
+      ASAN_OPTIONS: ${{ runner.os == 'Linux' && 'detect_leaks=1:detect_container_overflow=0' || 'detect_leaks=0:detect_container_overflow=0' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libssl-dev libuv1-dev libbrotli-dev
       - if: runner.os == 'macOS'
@@ -85,9 +87,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       TSAN_OPTIONS: halt_on_error=1
-      ASAN_OPTIONS: detect_leaks=0:detect_container_overflow=0
+      # Leak detection on Linux (LeakSanitizer): the h2 path is otherwise the
+      # one engine path never leak-checked.
+      ASAN_OPTIONS: ${{ runner.os == 'Linux' && 'detect_leaks=1:detect_container_overflow=0' || 'detect_leaks=0:detect_container_overflow=0' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev libuv1-dev libbrotli-dev libnghttp2-dev
       - if: runner.os == 'macOS'
@@ -98,6 +102,36 @@ jobs:
           -DNITRO_SERVER_SANITIZE=${{ matrix.sanitizer }}
       - run: cmake --build build/h2 --parallel --target nitro_server_engine_tests
       - run: ./build/h2/nitro_server_tests/nitro_server_engine_tests
+      # h2spec against the real server over h2c (plain Linux build only): the
+      # engine's documented floor is 136/145 (doc/http2.md); a regression below
+      # it fails the job. Uses the engine just built (build/lib ← build/h2).
+      - if: matrix.sanitizer == '' && runner.os == 'Linux'
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: stable
+      - if: matrix.sanitizer == '' && runner.os == 'Linux'
+        name: h2spec conformance floor
+        run: |
+          set -eu
+          flutter pub get
+          cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release -DNITRO_SERVER_HTTP2=ON
+          cmake --build build/lib --parallel
+          curl -fsSL https://github.com/summerwind/h2spec/releases/download/v2.6.0/h2spec_linux_amd64.tar.gz | tar xz
+          HOST=127.0.0.1 PORT=8080 NITRO_SERVER_NO_DOWNLOAD=1 dart run bin/server.dart > server.log 2>&1 &
+          for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8080/readyz >/dev/null 2>&1 && break; sleep 1; done
+          ./h2spec -h 127.0.0.1 -p 8080 --junit-report h2spec.xml > h2spec.txt || true
+          tail -3 h2spec.txt
+          passed=$(grep -Eo '[0-9]+ tests, [0-9]+ passed' h2spec.txt | tail -1 | grep -Eo '[0-9]+ passed' | grep -Eo '[0-9]+')
+          echo "h2spec passed=$passed (floor 136)"
+          test "${passed:-0}" -ge 136
+      - if: always() && matrix.sanitizer == '' && runner.os == 'Linux'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: h2spec
+          path: |
+            h2spec.txt
+            h2spec.xml
+          if-no-files-found: ignore
 
   # Cross-framework comparison (nitro vs dart:io vs shelf vs Go vs Node) across
   # every route and aspect — sequential + under-load p50/p99 latency and
@@ -118,14 +152,14 @@ jobs:
     continue-on-error: true
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
-      - uses: subosito/flutter-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
         with:
           channel: stable
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: stable
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: lts/*
       - if: runner.os == 'Linux'
@@ -167,7 +201,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload benchmark results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: benchmark-${{ matrix.os }}
           path: |
@@ -175,13 +209,117 @@ jobs:
             build/benchmark/table-${{ matrix.os }}.md
           if-no-files-found: warn
 
+  # Container gate (doc/production-audit.md P0-7): the image must build, start,
+  # and answer /readyz; then the runtime image is scanned for unfixed CRITICAL
+  # vulnerabilities in the OS layer.
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: docker build -t nitro-server:ci .
+      - name: Smoke the image
+        run: |
+          set -eu
+          docker run -d --rm --name nitro -p 8080:8080 nitro-server:ci
+          for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8080/readyz >/dev/null 2>&1 && break; sleep 1; done
+          curl -fsS http://127.0.0.1:8080/readyz | grep -q ready
+          curl -fsS http://127.0.0.1:8080/ | grep -q nitro_server
+          # Operational endpoints are loopback-only from the container's view:
+          # a request from the host network is refused.
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/metrics)" = "403"
+          # The example's protected routes have no built-in credentials:
+          # 401 for everyone until configured, then only the configured pair.
+          test "$(curl -s -o /dev/null -w '%{http_code}' -u admin:dev http://127.0.0.1:8080/api/v1/admin)" = "401"
+          docker logs nitro | tail -20
+          docker stop nitro
+          docker run -d --rm --name nitro2 -p 8081:8080 -e BASIC_USER=ops -e BASIC_PASSWORD=pw nitro-server:ci
+          for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8081/readyz >/dev/null 2>&1 && break; sleep 1; done
+          test "$(curl -s -o /dev/null -w '%{http_code}' -u ops:pw http://127.0.0.1:8081/api/v1/admin)" = "200"
+          test "$(curl -s -o /dev/null -w '%{http_code}' -u admin:dev http://127.0.0.1:8081/api/v1/admin)" = "401"
+          docker stop nitro2
+      - uses: aquasecurity/trivy-action@915b19bbe73b92a6cf82a1bc12b087c9a19a5fe2 # v0.28.0
+        with:
+          image-ref: nitro-server:ci
+          # HIGH too, not just CRITICAL; unfixed base-image CVEs are reported
+          # but do not block (nothing a rebuild could change).
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+
+  # libFuzzer smoke (head parser, WebSocket framing, the live reactor): 60 s
+  # per target from the checked-in corpora. A crash or sanitizer report fails.
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: sudo apt-get update && sudo apt-get install -y clang libclang-rt-dev libuv1-dev libssl-dev libbrotli-dev cmake
+      - run: CXX=clang++ bash tool/fuzz.sh 60
+
+  # clang-tidy over the engine (static analyzer + bugprone/performance checks
+  # from .clang-tidy). Warnings are errors; generated/vendored code is out.
+  tidy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: sudo apt-get update && sudo apt-get install -y clang clang-tidy pkg-config libuv1-dev libssl-dev libbrotli-dev libnghttp2-dev cmake
+      - run: >
+          cmake -S src -B build/tidy -DCMAKE_BUILD_TYPE=Debug -DNITRO_SERVER_HTTP2=ON
+          -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang
+      - run: run-clang-tidy -p build/tidy -quiet $(ls src/engine/*.cpp) src/HybridNitroServer.cpp
+
+  # Autobahn WebSocket conformance, a gate: any FAILED case fails the job
+  # (NON-STRICT — the server echoed a frame before failing a bad connection —
+  # and INFORMATIONAL count as passes, as the suite itself defines them).
+  # Local baseline 2026-10-22: 233 OK, 11 NON-STRICT, 3 INFORMATIONAL, 0 FAILED
+  # over the 247 non-compression/non-performance cases. The full report is
+  # uploaded on every run.
+  autobahn:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: stable
+      - run: sudo apt-get update && sudo apt-get install -y clang pkg-config libssl-dev libuv1-dev libbrotli-dev
+      - run: flutter pub get
+      - run: cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release && cmake --build build/lib --parallel
+      - name: Run the fuzzing client against /ws/echo
+        run: |
+          set -eu
+          HOST=127.0.0.1 PORT=8080 NITRO_SERVER_NO_DOWNLOAD=1 dart run bin/server.dart > server.log 2>&1 &
+          for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8080/readyz >/dev/null 2>&1 && break; sleep 1; done
+          mkdir -p build/autobahn
+          docker run --rm --network host -v "$PWD/tool/autobahn:/config:ro" -v "$PWD/build/autobahn:/reports" \
+            crossbario/autobahn-testsuite wstest -m fuzzingclient -s /config/fuzzingclient.json
+          python3 - <<'PY'
+          import json
+          r = json.load(open('build/autobahn/index.json'))['nitro_server']
+          counts = {}
+          for case, v in r.items():
+              counts[v['behavior']] = counts.get(v['behavior'], 0) + 1
+          print(counts)
+          failed = [c for c, v in r.items() if v['behavior'] == 'FAILED']
+          print('FAILED:', failed)
+          raise SystemExit(1 if failed else 0)
+          PY
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: autobahn-report
+          path: build/autobahn
+          if-no-files-found: ignore
+
   # Windows uses a single libuv listener (no SO_REUSEPORT). This job proves the
   # engine compiles and links on Windows/MSVC; the gtest suite is a POSIX-socket
   # harness and does not run here.
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install libuv + OpenSSL + Brotli (vcpkg)
         run: vcpkg install libuv openssl brotli --triplet x64-windows
       - name: Configure
@@ -209,8 +347,8 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: subosito/flutter-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
         with:
           channel: stable
       - run: sudo apt-get update && sudo apt-get install -y clang llvm libssl-dev libuv1-dev libbrotli-dev
@@ -251,8 +389,8 @@ jobs:
     continue-on-error: true
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: subosito/flutter-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
         with:
           channel: stable
       - run: sudo apt-get update && sudo apt-get install -y lcov clang llvm libssl-dev libuv1-dev libbrotli-dev

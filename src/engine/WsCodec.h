@@ -216,6 +216,15 @@ inline void encodeFrame(int opcode, const uint8_t* payload, size_t n,
 }
 
 /// Strict UTF-8 check for text messages (RFC 6455 §5.6: fail on invalid).
+/// RFC 6455 §7.4 + IANA registry: a close code a peer may put on the wire.
+/// 1004 (reserved), 1005/1006 (never sent), 1015 (TLS) and anything outside
+/// 1000-1014 / 3000-4999 is a protocol error.
+inline bool validCloseCode(int code) {
+  if (code >= 3000 && code <= 4999) return true;
+  if (code < 1000 || code > 1014) return false;
+  return code != 1004 && code != 1005 && code != 1006;
+}
+
 inline bool validUtf8(const uint8_t* data, size_t n) {
   size_t i = 0;
   while (i < n) {

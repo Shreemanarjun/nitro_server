@@ -16,12 +16,13 @@
 // The hook never throws out of `build`: if it cannot provision a library it
 // emits a hint and no asset, and the package's runtime loader
 // (`loadNitroServerNative`) still finds a manually-built `build/lib/<lib>`.
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:code_assets/code_assets.dart';
 import 'package:crypto/crypto.dart';
 import 'package:hooks/hooks.dart';
+
+import 'prebuilt_lock.dart';
 
 const _repo = 'Shreemanarjun/nitro_server';
 
@@ -44,6 +45,23 @@ void main(List<String> args) async {
         ),
       );
       output.dependencies.add(input.packageRoot.resolve('pubspec.yaml'));
+      output.dependencies.add(
+        input.packageRoot.resolve('hook/prebuilt_checksums.json'),
+      );
+      // Re-run when what the library was made from changes; without these the
+      // hooks runner serves its cached output and a rebuilt `build/lib` (or an
+      // edited engine source) never reaches `dart test` / `dart run`.
+      final reused = File.fromUri(
+        input.packageRoot.resolve('build/lib/${_libFileName(os)}'),
+      );
+      if (await reused.exists()) output.dependencies.add(reused.uri);
+      output.dependencies.add(input.packageRoot.resolve('CMakeLists.txt'));
+      final src = Directory.fromUri(input.packageRoot.resolve('src/'));
+      if (await src.exists()) {
+        await for (final f in src.list(recursive: true)) {
+          if (f is File) output.dependencies.add(f.uri);
+        }
+      }
     } catch (e) {
       stderr.writeln(
         'nitro_server build hook: could not provision the native library ($e).\n'
@@ -63,8 +81,13 @@ Future<File?> _provision(BuildInput input, OS os, Architecture arch) async {
   if (fromSource == '1' || fromSource == 'true') {
     return _buildFromSource(input, os, dest);
   }
-  final downloaded = await _download(input, os, arch, dest);
-  if (downloaded != null) return downloaded;
+  // NITRO_SERVER_NO_DOWNLOAD=1 skips the prebuilt lookup (an offline or
+  // air-gapped build, a container that already built the engine).
+  final noDownload = Platform.environment['NITRO_SERVER_NO_DOWNLOAD'];
+  if (noDownload != '1' && noDownload != 'true') {
+    final downloaded = await _download(input, os, arch, dest);
+    if (downloaded != null) return downloaded;
+  }
   // Reuse a library the package already built at `build/lib` (the repo's own
   // dev/CI flow) so the hook adds no rebuild there. Absent for a pub-cache
   // consumer (read-only package root, no build/lib).
@@ -92,23 +115,44 @@ Future<File?> _download(
   final version = _packageVersion(input);
   if (version == null) return null;
   final asset = 'libnitro_server-${_osTag(os)}-${arch.name}.${_ext(os)}';
-  final base = 'https://github.com/$_repo/releases/download/v$version/$asset';
+  // The digest comes from the lock shipped INSIDE this package, never from
+  // the release page: a replaced asset + sidecar cannot pass. No entry means
+  // this target has no verified prebuilt — fall back to a source build.
+  final lockFile = File.fromUri(
+    input.packageRoot.resolve('hook/prebuilt_checksums.json'),
+  );
+  if (!await lockFile.exists()) return null;
+  final lockJson = await lockFile.readAsString();
+  if (expectedDigest(lockJson, version, asset) == null) {
+    // Expected for a version whose release has not been cut (the lock is
+    // filled from the release's assets) and for an unsupported target.
+    stderr.writeln(
+      'nitro_server: no verified prebuilt locked for $version/$asset in '
+      'hook/prebuilt_checksums.json — building the engine from source',
+    );
+    return null;
+  }
+  final env = Platform.environment;
+  final strict = env['NITRO_SERVER_VERIFY_SIGSTORE'];
   final client = HttpClient()..connectionTimeout = const Duration(seconds: 20);
   try {
-    final expected = (await _fetch(
-      client,
-      Uri.parse('$base.sha256'),
-    ))?.let((b) => utf8.decode(b).trim().split(RegExp(r'\s+')).first);
-    if (expected == null) return null; // no prebuilt published for this target
-    final bytes = await _fetch(client, Uri.parse(base));
-    if (bytes == null) return null;
-    final actual = sha256.convert(bytes).toString();
-    if (actual != expected) {
-      throw StateError('checksum mismatch for $asset: $actual != $expected');
-    }
-    await dest.create(recursive: true);
-    await dest.writeAsBytes(bytes, flush: true);
-    return dest;
+    final ok = await fetchVerifiedPrebuilt(
+      base: prebuiltBaseUrl(_repo, version, env),
+      version: version,
+      asset: asset,
+      lockJson: lockJson,
+      repo: _repo,
+      dest: dest,
+      fetch: (url) => _fetch(client, url),
+      runCosign: (args) async => (await Process.run('cosign', args)).exitCode,
+      sha256Hex: (bytes) => sha256.convert(bytes).toString(),
+      // Strict mode: additionally verify the release's Sigstore bundle with
+      // cosign (keyless identity of the release workflow). Opt-in because it
+      // needs cosign on PATH; when asked for and not satisfiable, the
+      // prebuilt is refused rather than silently trusted.
+      strictSigstore: strict == '1' || strict == 'true',
+    );
+    return ok ? dest : null;
   } finally {
     client.close(force: true);
   }
@@ -122,9 +166,14 @@ Future<List<int>?> _fetch(HttpClient client, Uri url) async {
     await res.drain<void>();
     return null;
   }
+  // Bounded: a stalled or endless body cannot hang or balloon the build.
+  const maxBytes = 64 * 1024 * 1024;
   final out = <int>[];
-  await for (final chunk in res) {
+  await for (final chunk in res.timeout(const Duration(seconds: 60))) {
     out.addAll(chunk);
+    if (out.length > maxBytes) {
+      throw StateError('prebuilt download exceeds $maxBytes bytes');
+    }
   }
   return out;
 }
@@ -208,7 +257,3 @@ String _ext(OS os) => switch (os) {
   OS.macOS => 'dylib',
   _ => 'so',
 };
-
-extension<T> on T {
-  R let<R>(R Function(T) f) => f(this);
-}

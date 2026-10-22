@@ -134,15 +134,41 @@ Uint8List wsDeflate(Uint8List payload) {
   return Uint8List.sublistView(flushed, 0, end);
 }
 
+/// Thrown by [wsInflate] when the inflated message would exceed its cap: a
+/// small compressed frame can expand by three orders of magnitude, so the
+/// output — not just the input — is bounded.
+class WsInflateLimitExceeded implements Exception {
+  const WsInflateLimitExceeded(this.maxBytes);
+
+  /// The cap that was crossed.
+  final int maxBytes;
+
+  @override
+  String toString() =>
+      'WsInflateLimitExceeded: inflated message exceeds $maxBytes bytes';
+}
+
 /// Inverse of [wsDeflate]: appends the sync-flush tail and inflates.
-/// Throws on data that is not a deflate stream.
-Uint8List wsInflate(Uint8List payload) {
+/// Throws on data that is not a deflate stream, and
+/// [WsInflateLimitExceeded] once the output passes [maxBytes] (when >= 0):
+/// the inflater is drained incrementally, so memory is bounded by the cap
+/// plus one zlib output block, never by what the frame would expand to.
+Uint8List wsInflate(Uint8List payload, {int maxBytes = -1}) {
   final filter = RawZLibFilter.inflateFilter(raw: true);
   final tailed = Uint8List(payload.length + 4)
     ..setRange(0, payload.length, payload)
     ..setRange(payload.length, payload.length + 4, const [0, 0, 0xff, 0xff]);
   filter.process(tailed, 0, tailed.length);
-  return _drainFilter(filter);
+  final out = BytesBuilder(copy: false);
+  while (true) {
+    final chunk = filter.processed();
+    if (chunk == null) break;
+    out.add(chunk);
+    if (maxBytes >= 0 && out.length > maxBytes) {
+      throw WsInflateLimitExceeded(maxBytes);
+    }
+  }
+  return out.takeBytes();
 }
 
 /// Everything the filter has produced after a sync flush.

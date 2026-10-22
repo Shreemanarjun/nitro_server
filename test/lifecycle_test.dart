@@ -114,6 +114,37 @@ void main() {
         await sub.cancel();
       });
 
+      test(
+        'an engine 408 releases the request even if the handler never returns',
+        () async {
+          final never = Completer<ResponseContext>();
+          runner.addRoute(
+            HttpMethod.get,
+            '',
+            '/stuck',
+            null,
+            (_) => never.future,
+          );
+          fake.heads.add(
+            fakeHead(requestId: 9100, path: '/stuck', routePattern: '/stuck'),
+          );
+          await Future<void>.delayed(const Duration(milliseconds: 20));
+          expect(runner.metrics.inFlight, 1);
+          fake.events.add(
+            RawServerEvent(
+              kind: ServerEventKind.handlerTimeout.index,
+              requestId: 9100,
+              message: 'handler timed out',
+            ),
+          );
+          await Future<void>.delayed(const Duration(milliseconds: 20));
+          expect(runner.metrics.inFlight, 0);
+          never.complete(const ResponseContext()); // late: a no-op
+          await Future<void>.delayed(const Duration(milliseconds: 20));
+          expect(fake.responded.where((r) => r.requestId == 9100), isEmpty);
+        },
+      );
+
       test('a late answer after close is dropped, never sent', () async {
         final gate = Completer<ResponseContext>();
         runner.addRoute(HttpMethod.get, '', '/slow', null, (_) => gate.future);

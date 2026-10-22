@@ -13,6 +13,7 @@ class LatencyStats {
     required this.p50Us,
     required this.p90Us,
     required this.p99Us,
+    this.sumUs = 0,
   });
 
   static const empty = LatencyStats(
@@ -27,6 +28,9 @@ class LatencyStats {
   final int count;
   final double meanUs;
   final int maxUs;
+
+  /// Total of every sample (the Prometheus summary `_sum`).
+  final int sumUs;
 
   /// Quantiles from a log-scale histogram: exact to within 10% of the value.
   final int p50Us;
@@ -71,6 +75,7 @@ class ServerMetrics {
     required this.errors,
     required this.inFlight,
     required this.byRoute,
+    this.byStatusClass = const [0, 0, 0, 0, 0, 0],
   });
 
   /// Answered requests, every route.
@@ -81,6 +86,9 @@ class ServerMetrics {
 
   /// Requests dispatched and not yet answered.
   final int inFlight;
+
+  /// Answers per status class, indexed 1..5 (`1xx`..`5xx`); index 0 unused.
+  final List<int> byStatusClass;
 
   /// Per route pattern, insertion-ordered by first request.
   final Map<String, RouteMetrics> byRoute;
@@ -149,6 +157,7 @@ class MetricsAccumulator {
         : LatencyStats(
             count: requests,
             meanUs: sumUs / requests,
+            sumUs: sumUs,
             maxUs: maxUs,
             p50Us: _quantile(0.5),
             p90Us: _quantile(0.9),
@@ -188,11 +197,16 @@ class MetricsAccumulator {
 /// aggregate quantiles are as accurate as any single isolate's.
 ServerMetrics mergeIsolateMetrics(List<Map<String, Object?>> isolates) {
   var requests = 0, errors = 0, inFlight = 0;
+  final status = List<int>.filled(6, 0);
   final accumulators = <String, MetricsAccumulator>{};
   for (final iso in isolates) {
     requests += iso['requests'] as int? ?? 0;
     errors += iso['errors'] as int? ?? 0;
     inFlight += iso['inFlight'] as int? ?? 0;
+    final classes = iso['status'] as List? ?? const [];
+    for (var i = 0; i < classes.length && i < status.length; i++) {
+      status[i] += classes[i] as int;
+    }
     for (final wire in (iso['routes'] as List? ?? const [])) {
       final row = (wire as List).cast<Object?>();
       final pattern = row[0] as String;
@@ -203,6 +217,7 @@ ServerMetrics mergeIsolateMetrics(List<Map<String, Object?>> isolates) {
     requests: requests,
     errors: errors,
     inFlight: inFlight,
+    byStatusClass: List.unmodifiable(status),
     byRoute: {for (final e in accumulators.entries) e.key: e.value.snapshot()},
   );
 }

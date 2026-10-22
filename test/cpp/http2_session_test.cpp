@@ -9,8 +9,10 @@
 #include <nghttp2/nghttp2.h>
 
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -785,4 +787,335 @@ TEST(Http2SessionTest, HeadResponseHasNoBody) {
   nghttp2_session_del(client);
 }
 
+
+
+// ── Production-audit P1: h2 deadlines, per-route caps, admission, 405 ───────
+
+namespace {
+// Pump only client->server and server->client bytes, never answering jobs:
+// what a handler that has gone quiet looks like to the session.
+void driveWithoutAnswering(nghttp2_session* client, Http2Session& server,
+                           std::string& fromServer) {
+  for (int guard = 0; guard < 1000; ++guard) {
+    bool moved = false;
+    const uint8_t* out = nullptr;
+    for (ssize_t n; (n = nghttp2_session_mem_send(client, &out)) > 0;) {
+      EXPECT_TRUE(server.feed(out, static_cast<size_t>(n)));
+      moved = true;
+    }
+    if (!fromServer.empty()) {
+      nghttp2_session_mem_recv(client, reinterpret_cast<const uint8_t*>(fromServer.data()),
+                               fromServer.size());
+      fromServer.clear();
+      moved = true;
+    }
+    if (!moved) return;
+  }
+}
+
+std::pair<int, std::string> okAnswer(Method, const std::string& p, const std::string&) {
+  return {200, "ok:" + p};
+}
+}  // namespace
+
+TEST(Http2SessionTest, RouteTimeoutAnswers408AndRetiresTheRequest) {
+  RecordEmitter em(okAnswer);
+  Router r;
+  RouteEntry e;
+  e.method = Method::Get;
+  e.pattern = "/slow";
+  e.timeoutMs = 30;
+  ASSERT_TRUE(r.add(e));
+  std::string fromServer;
+  Http2Session server(&em, r, [&](const uint8_t* d, size_t n) {
+    fromServer.append(reinterpret_cast<const char*>(d), n);
+  }, "127.0.0.1", -1, {}, /*defaultTimeoutMs=*/5000);
+  ClientState cs;
+  nghttp2_session* client = makeClient(&cs);
+  const nghttp2_nv nv[] = {MAKE_NV(":method", "GET"), MAKE_NV(":scheme", "http"),
+                           MAKE_NV(":authority", "x"), MAKE_NV(":path", "/slow")};
+  const int32_t sid = nghttp2_submit_request(client, nullptr, nv, 4, nullptr, &cs);
+  driveWithoutAnswering(client, server, fromServer);
+  ASSERT_EQ(em.seen().size(), 1u);  // dispatched, handler never answers
+  // Before the deadline: nothing expires.
+  EXPECT_TRUE(server.sweep(Http2Session::Clock::now(), 0).empty());
+  std::this_thread::sleep_for(std::chrono::milliseconds(60));
+  const std::vector<int64_t> expired = server.sweep(Http2Session::Clock::now(), 0);
+  ASSERT_EQ(expired.size(), 1u);
+  EXPECT_EQ(expired[0], em.seen()[0].requestId);
+  driveWithoutAnswering(client, server, fromServer);
+  EXPECT_EQ(cs[sid].status, 408);
+  EXPECT_TRUE(cs[sid].closed);
+  // The late answer is a no-op (the id was retired).
+  RecordEmitter::Job job{};
+  ASSERT_TRUE(em.takeJob(job));
+  server.respond(job.requestId, 200, {}, "late");
+  driveWithoutAnswering(client, server, fromServer);
+  EXPECT_EQ(cs[sid].status, 408);
+  nghttp2_session_del(client);
+}
+
+TEST(Http2SessionTest, DefaultTimeoutAppliesToRoutesWithoutTheirOwn) {
+  RecordEmitter em(okAnswer);
+  const Router r = routerWith(Method::Get, "/x");
+  std::string fromServer;
+  Http2Session server(&em, r, [&](const uint8_t* d, size_t n) {
+    fromServer.append(reinterpret_cast<const char*>(d), n);
+  }, "127.0.0.1", -1, {}, /*defaultTimeoutMs=*/20);
+  ClientState cs;
+  nghttp2_session* client = makeClient(&cs);
+  const nghttp2_nv nv[] = {MAKE_NV(":method", "GET"), MAKE_NV(":scheme", "http"),
+                           MAKE_NV(":authority", "x"), MAKE_NV(":path", "/x")};
+  const int32_t sid = nghttp2_submit_request(client, nullptr, nv, 4, nullptr, &cs);
+  driveWithoutAnswering(client, server, fromServer);
+  std::this_thread::sleep_for(std::chrono::milliseconds(40));
+  EXPECT_EQ(server.sweep(Http2Session::Clock::now(), 0).size(), 1u);
+  driveWithoutAnswering(client, server, fromServer);
+  EXPECT_EQ(cs[sid].status, 408);
+  nghttp2_session_del(client);
+}
+
+TEST(Http2SessionTest, BodyStallIs408BeforeDispatch) {
+  RecordEmitter em(okAnswer);
+  const Router r = routerWith(Method::Post, "/up");
+  std::string fromServer;
+  Http2Session server(&em, r, [&](const uint8_t* d, size_t n) {
+    fromServer.append(reinterpret_cast<const char*>(d), n);
+  }, "127.0.0.1");
+  ClientState cs;
+  nghttp2_session* client = makeClient(&cs);
+  // A POST whose body never arrives: HEADERS without END_STREAM, no DATA.
+  const nghttp2_nv nv[] = {MAKE_NV(":method", "POST"), MAKE_NV(":scheme", "http"),
+                           MAKE_NV(":authority", "x"), MAKE_NV(":path", "/up"),
+                           MAKE_NV("content-length", "100")};
+  const std::string never;  // never read: the provider is only consulted if asked
+  cs.reqBody = &never;
+  nghttp2_data_provider dp{};
+  dp.source.ptr = &cs;
+  dp.read_callback = [](nghttp2_session*, int32_t, uint8_t*, size_t, uint32_t*,
+                        nghttp2_data_source*, void*) -> ssize_t {
+    return NGHTTP2_ERR_DEFERRED;  // the upload stalls
+  };
+  const int32_t sid = nghttp2_submit_request(client, nullptr, nv, 5, &dp, &cs);
+  driveWithoutAnswering(client, server, fromServer);
+  EXPECT_TRUE(em.seen().empty());
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));
+  EXPECT_TRUE(server.sweep(Http2Session::Clock::now(), /*bodyStallMs=*/20).empty());
+  driveWithoutAnswering(client, server, fromServer);
+  EXPECT_EQ(cs[sid].status, 408);
+  EXPECT_TRUE(em.seen().empty());  // never dispatched
+  nghttp2_session_del(client);
+}
+
+TEST(Http2SessionTest, PerRouteBodyCapOverridesTheSessionCap) {
+  RecordEmitter em(okAnswer);
+  Router r;
+  RouteEntry e;
+  e.method = Method::Post;
+  e.pattern = "/small";
+  e.maxBodyBytes = 4;
+  ASSERT_TRUE(r.add(e));
+  RouteEntry big;
+  big.method = Method::Post;
+  big.pattern = "/big";
+  big.maxBodyBytes = 1 << 20;
+  ASSERT_TRUE(r.add(big));
+  std::string fromServer;
+  Http2Session server(&em, r, [&](const uint8_t* d, size_t n) {
+    fromServer.append(reinterpret_cast<const char*>(d), n);
+  }, "127.0.0.1", /*maxBodyBytes=*/16);
+  ClientState cs;
+  nghttp2_session* client = makeClient(&cs);
+  const std::string body = "0123456789";  // 10 bytes: under 16, over 4
+  cs.reqBody = &body;
+  const nghttp2_nv small[] = {MAKE_NV(":method", "POST"), MAKE_NV(":scheme", "http"),
+                              MAKE_NV(":authority", "x"), MAKE_NV(":path", "/small")};
+  const int32_t s1 = submitPost(client, &cs, small, 4);
+  drive(client, server, fromServer, em, cs);
+  EXPECT_EQ(cs[s1].status, 413);  // the route's own cap wins
+  cs.reqOff = 0;
+  const nghttp2_nv large[] = {MAKE_NV(":method", "POST"), MAKE_NV(":scheme", "http"),
+                              MAKE_NV(":authority", "x"), MAKE_NV(":path", "/big")};
+  const int32_t s2 = submitPost(client, &cs, large, 4);
+  drive(client, server, fromServer, em, cs);
+  EXPECT_EQ(cs[s2].status, 200);  // a route may raise the cap too
+  nghttp2_session_del(client);
+}
+
+TEST(Http2SessionTest, AdmissionFalseIs503WithoutDispatch) {
+  RecordEmitter em(okAnswer);
+  const Router r = routerWith(Method::Get, "/x");
+  std::string fromServer;
+  bool admit = false;
+  Http2Session server(&em, r, [&](const uint8_t* d, size_t n) {
+    fromServer.append(reinterpret_cast<const char*>(d), n);
+  }, "127.0.0.1", -1, {}, 0, [&]() { return admit; });
+  ClientState cs;
+  nghttp2_session* client = makeClient(&cs);
+  const nghttp2_nv nv[] = {MAKE_NV(":method", "GET"), MAKE_NV(":scheme", "http"),
+                           MAKE_NV(":authority", "x"), MAKE_NV(":path", "/x")};
+  const int32_t s1 = nghttp2_submit_request(client, nullptr, nv, 4, nullptr, &cs);
+  drive(client, server, fromServer, em, cs);
+  EXPECT_EQ(cs[s1].status, 503);
+  bool retry = false;
+  for (const auto& h : cs[s1].headers)
+    if (h.first == "retry-after" && h.second == "1") retry = true;
+  EXPECT_TRUE(retry);
+  EXPECT_TRUE(em.seen().empty());
+  admit = true;
+  const int32_t s2 = nghttp2_submit_request(client, nullptr, nv, 4, nullptr, &cs);
+  drive(client, server, fromServer, em, cs);
+  EXPECT_EQ(cs[s2].status, 200);
+  nghttp2_session_del(client);
+}
+
+TEST(Http2SessionTest, MethodMismatchIs405WithAllow) {
+  RecordEmitter em(okAnswer);
+  const Router r = routerWith2(Method::Get, "/x", Method::Put, "/x");
+  std::string fromServer;
+  Http2Session server(&em, r, [&](const uint8_t* d, size_t n) {
+    fromServer.append(reinterpret_cast<const char*>(d), n);
+  }, "127.0.0.1");
+  ClientState cs;
+  nghttp2_session* client = makeClient(&cs);
+  const nghttp2_nv nv[] = {MAKE_NV(":method", "DELETE"), MAKE_NV(":scheme", "http"),
+                           MAKE_NV(":authority", "x"), MAKE_NV(":path", "/x")};
+  const int32_t sid = nghttp2_submit_request(client, nullptr, nv, 4, nullptr, &cs);
+  drive(client, server, fromServer, em, cs);
+  EXPECT_EQ(cs[sid].status, 405);
+  std::string allow;
+  for (const auto& h : cs[sid].headers)
+    if (h.first == "allow") allow = h.second;
+  EXPECT_EQ(allow, "GET, HEAD, PUT");
+  EXPECT_TRUE(em.seen().empty());
+  // An unregistered path still reaches the runner (its not-found handler).
+  const nghttp2_nv miss[] = {MAKE_NV(":method", "GET"), MAKE_NV(":scheme", "http"),
+                             MAKE_NV(":authority", "x"), MAKE_NV(":path", "/nope")};
+  nghttp2_submit_request(client, nullptr, miss, 4, nullptr, &cs);
+  drive(client, server, fromServer, em, cs);
+  EXPECT_EQ(em.seen().size(), 1u);
+  EXPECT_EQ(em.seen()[0].routePattern, "");
+  nghttp2_session_del(client);
+}
+
+TEST(Http2SessionTest, GoawayIsIdempotentAndFinishesWhenQuiet) {
+  RecordEmitter em(okAnswer);
+  const Router r = routerWith(Method::Get, "/x");
+  std::string fromServer;
+  Http2Session server(&em, r, [&](const uint8_t* d, size_t n) {
+    fromServer.append(reinterpret_cast<const char*>(d), n);
+  }, "127.0.0.1");
+  ClientState cs;
+  nghttp2_session* client = makeClient(&cs);
+  const nghttp2_nv nv[] = {MAKE_NV(":method", "GET"), MAKE_NV(":scheme", "http"),
+                           MAKE_NV(":authority", "x"), MAKE_NV(":path", "/x")};
+  const int32_t sid = nghttp2_submit_request(client, nullptr, nv, 4, nullptr, &cs);
+  drive(client, server, fromServer, em, cs);
+  EXPECT_EQ(cs[sid].status, 200);
+  EXPECT_FALSE(server.goAwaySent());
+  server.goAway();
+  server.goAway();  // idempotent
+  EXPECT_TRUE(server.goAwaySent());
+  drive(client, server, fromServer, em, cs);
+  // No open streams after GOAWAY: the session is finished.
+  EXPECT_FALSE(server.hasOpenStreams());
+  EXPECT_FALSE(server.wantRead());
+  EXPECT_FALSE(server.wantWrite());
+  nghttp2_session_del(client);
+}
+// --- Second re-audit: a session-wide request-body budget --------------------
+
+static Http2Session budgeted(RecordEmitter& em, const Router& r,
+                             std::string& fromServer, int64_t maxBody,
+                             int64_t budget) {
+  return Http2Session(
+      &em, r,
+      [&fromServer](const uint8_t* d, size_t n) {
+        fromServer.append(reinterpret_cast<const char*>(d), n);
+      },
+      "1.2.3.4", maxBody, {}, 0, {}, budget);
+}
+
+TEST(Http2SessionTest, BodyBudgetRefusesAStreamOverTheRemainder) {
+  RecordEmitter em([](Method, const std::string&, const std::string& b) {
+    return std::make_pair(200, "n=" + std::to_string(b.size()));
+  });
+  const Router router = routerWith(Method::Post, "/up");
+  std::string fromServer;
+  Http2Session server = budgeted(em, router, fromServer, /*maxBody=*/1000,
+                                 /*budget=*/100);
+  const std::string reqBody(60, 'z');
+  ClientState cs;
+  cs.reqBody = &reqBody;
+  nghttp2_session* client = makeClient(&cs);
+  const nghttp2_nv nv[] = {
+      MAKE_NV(":method", "POST"), MAKE_NV(":scheme", "http"),
+      MAKE_NV(":authority", "x"), MAKE_NV(":path", "/up"),
+      MAKE_NV("content-length", "60")};
+  // Two 60-byte uploads at once: 120 > 100, so the second is refused with
+  // 503 + retry-after while the first is still open.
+  const int32_t s1 = submitPost(client, &cs, nv, 5);
+  const int32_t s2 = submitPost(client, &cs, nv, 5);
+  ASSERT_GT(s1, 0);
+  ASSERT_GT(s2, 0);
+  drive(client, server, fromServer, em, cs);
+  EXPECT_EQ(cs[s1].status, 200);
+  EXPECT_EQ(cs[s1].body, "n=60");
+  EXPECT_EQ(cs[s2].status, 503);
+  bool retry = false;
+  for (const auto& h : cs[s2].headers)
+    if (h.first == "retry-after" && h.second == "1") retry = true;
+  EXPECT_TRUE(retry);
+  ASSERT_EQ(em.seen().size(), 1u);
+  // Both streams are closed: the budget is whole again, a third upload fits.
+  cs.reqOff = 0;  // the harness shares one upload cursor across streams
+  const int32_t s3 = submitPost(client, &cs, nv, 5);
+  drive(client, server, fromServer, em, cs);
+  EXPECT_EQ(cs[s3].status, 200);
+  EXPECT_EQ(em.seen().size(), 2u);
+  nghttp2_session_del(client);
+}
+
+TEST(Http2SessionTest, BodyBudgetRefuses413WhatCanNeverFit) {
+  RecordEmitter em(okAnswer);
+  const Router router = routerWith(Method::Post, "/up");
+  std::string fromServer;
+  Http2Session server = budgeted(em, router, fromServer, /*maxBody=*/1000,
+                                 /*budget=*/100);
+  ClientState cs;
+  const std::string reqBody(10, 'z');
+  cs.reqBody = &reqBody;
+  nghttp2_session* client = makeClient(&cs);
+  // Declared larger than the whole budget: 413 up front, nothing buffered.
+  const nghttp2_nv big[] = {
+      MAKE_NV(":method", "POST"), MAKE_NV(":scheme", "http"),
+      MAKE_NV(":authority", "x"), MAKE_NV(":path", "/up"),
+      MAKE_NV("content-length", "200")};
+  const int32_t s1 = submitPost(client, &cs, big, 5);
+  drive(client, server, fromServer, em, cs);
+  EXPECT_EQ(cs[s1].status, 413);
+  // Undeclared length reserves the body cap (1000 > 100): also 413 — the
+  // budget must be at least the cap for such a route to accept uploads.
+  cs.reqOff = 0;
+  const nghttp2_nv undeclared[] = {
+      MAKE_NV(":method", "POST"), MAKE_NV(":scheme", "http"),
+      MAKE_NV(":authority", "x"), MAKE_NV(":path", "/up")};
+  const int32_t s2 = submitPost(client, &cs, undeclared, 4);
+  drive(client, server, fromServer, em, cs);
+  EXPECT_EQ(cs[s2].status, 413);
+  // A bodyless request reserves nothing and is unaffected.
+  const Router getRouter = routerWith(Method::Get, "/x");
+  std::string fs2;
+  Http2Session getServer = budgeted(em, getRouter, fs2, 1000, 100);
+  ClientState cs2;
+  nghttp2_session* c2 = makeClient(&cs2);
+  const nghttp2_nv nv[] = {MAKE_NV(":method", "GET"), MAKE_NV(":scheme", "http"),
+                           MAKE_NV(":authority", "x"), MAKE_NV(":path", "/x")};
+  const int32_t g = nghttp2_submit_request(c2, nullptr, nv, 4, nullptr, &cs2);
+  drive(c2, getServer, fs2, em, cs2);
+  EXPECT_EQ(cs2[g].status, 200);
+  EXPECT_TRUE(em.seen().empty() || em.seen().size() == 1u);
+  nghttp2_session_del(client);
+  nghttp2_session_del(c2);
+}
 #endif  // NITRO_SERVER_HTTP2

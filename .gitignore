@@ -54,3 +54,5 @@ oom-*
 # runs in example/; never part of the published package (nitro tracks none).
 ios/FlutterFramework
 macos/FlutterFramework
+# blackbox A/B baseline export (run.sh --base), rebuilt per run
+benchmark/blackbox/base/

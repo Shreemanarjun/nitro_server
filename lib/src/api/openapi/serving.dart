@@ -9,8 +9,12 @@ part of '../openapi.dart';
 /// so register routes first (and call it again after a `reload`). All of
 /// [buildOpenApi]'s enrichment/config is forwarded.
 ///
-/// Swagger UI assets load from a version-pinned unpkg CDN ([swaggerUiVersion],
-/// default `5`); [uiTitle] overrides the page title.
+/// Swagger UI assets load from unpkg at an exact, pinned version
+/// ([swaggerUiVersion], default [swaggerUiPinnedVersion]) with Subresource
+/// Integrity hashes, so a CDN compromise cannot run script in the docs page;
+/// another version loads without SRI (its hashes are unknown here) — pin
+/// what you ship. [middleware] guards both the document and the UI (an
+/// admin auth, an IP allow-list); [uiTitle] overrides the page title.
 ///
 /// ```dart
 /// await setup(server);
@@ -37,11 +41,12 @@ Future<void> serveOpenApi(
   List<Map<String, Object?>> security = const [],
   List<OpenApiTag> tags = const [],
   bool includeNonStandard = true,
-  String swaggerUiVersion = '5',
+  String swaggerUiVersion = swaggerUiPinnedVersion,
   String? uiTitle,
   bool persistAuthorization = true,
   bool tryItOutEnabled = true,
   bool withCredentials = false,
+  List<Middleware> middleware = const [],
 }) async {
   final doc = utf8.encode(
     jsonEncode(
@@ -63,9 +68,13 @@ Future<void> serveOpenApi(
   await server.get(
     path,
     (_) => ResponseContext(
-      headers: const {'content-type': 'application/json; charset=utf-8'},
+      headers: const {
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'no-store',
+      },
       body: Uint8List.fromList(doc),
     ),
+    middleware: middleware,
   );
   if (docsPath != null) {
     final page = _swaggerHtml(
@@ -76,9 +85,24 @@ Future<void> serveOpenApi(
       tryItOutEnabled: tryItOutEnabled,
       withCredentials: withCredentials,
     );
-    await server.get(docsPath, (_) => ResponseContext.html(page));
+    await server.get(
+      docsPath,
+      (_) => ResponseContext.html(page).withHeader('cache-control', 'no-store'),
+      middleware: middleware,
+    );
   }
 }
+
+/// The Swagger UI release the docs page pins by default, with the SRI hashes
+/// of the two assets it loads. Bump both together (hashes:
+/// `curl -fsSL https://unpkg.com/swagger-ui-dist@<v>/<file> | openssl dgst -sha384 -binary | base64`).
+const swaggerUiPinnedVersion = '5.17.14';
+const _swaggerUiSri = {
+  'swagger-ui.css':
+      'sha384-wxLW6kwyHktdDGr6Pv1zgm/VGJh99lfUbzSn6HNHBENZlCN7W602k9VkGdxuFvPn',
+  'swagger-ui-bundle.js':
+      'sha384-wmyclcVGX/WhUkdkATwhaK1X1JtiNrr2EoYJ+diV3vj4v6OC5yCeSu+yW13SYJep',
+};
 
 /// Seamless OpenAPI: a thin wrapper over a [NitroServer] whose verb shorthands
 /// register the route **and** capture its OpenAPI metadata inline, so the spec
@@ -111,7 +135,7 @@ class OpenApi {
     this.security = const [],
     this.tags = const [],
     this.includeNonStandard = true,
-    this.swaggerUiVersion = '5',
+    this.swaggerUiVersion = swaggerUiPinnedVersion,
     this.persistAuthorization = true,
     this.tryItOutEnabled = true,
     this.withCredentials = false,
@@ -281,6 +305,7 @@ class OpenApi {
     String path = '/openapi.json',
     String? docsPath = '/docs',
     String? uiTitle,
+    List<Middleware> middleware = const [],
   }) => serveOpenApi(
     server,
     path: path,
@@ -300,6 +325,7 @@ class OpenApi {
     persistAuthorization: persistAuthorization,
     tryItOutEnabled: tryItOutEnabled,
     withCredentials: withCredentials,
+    middleware: middleware,
   );
 }
 
@@ -312,20 +338,25 @@ String _swaggerHtml(
   required bool withCredentials,
 }) {
   // uiVersion lands in HTML attribute context (href/src) — HTML-escape it, not
-  // JS-escape it.
+  // JS-escape it. SRI applies only to the pinned release (the hashes are
+  // per-file per-version); a CSP confines the page to that one origin.
   final base = 'https://unpkg.com/swagger-ui-dist@${_htmlEscape(uiVersion)}';
+  String sri(String file) => uiVersion == swaggerUiPinnedVersion
+      ? ' integrity="${_swaggerUiSri[file]}" crossorigin="anonymous"'
+      : '';
   return '''
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' https://unpkg.com; script-src https://unpkg.com 'unsafe-inline'; style-src https://unpkg.com 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' https:"/>
   <title>${_htmlEscape(title)}</title>
-  <link rel="stylesheet" href="$base/swagger-ui.css"/>
+  <link rel="stylesheet" href="$base/swagger-ui.css"${sri('swagger-ui.css')}/>
 </head>
 <body>
   <div id="swagger-ui"></div>
-  <script src="$base/swagger-ui-bundle.js"></script>
+  <script src="$base/swagger-ui-bundle.js"${sri('swagger-ui-bundle.js')}></script>
   <script>
     window.onload = () => SwaggerUIBundle({
       url: '${_jsString(specPath)}',

@@ -393,6 +393,7 @@ struct Fixture {
   std::shared_ptr<UvReactor> server;
   std::thread pump;
   std::atomic<bool> pumping{true};
+  std::atomic<bool> holding{false};  // true: park answers (requests stay in flight)
 
   explicit Fixture(RecordingEmitter::Answer answer)
       : emitter(std::move(answer)),
@@ -401,7 +402,7 @@ struct Fixture {
     pump = std::thread([this] {
       while (pumping.load()) {
         RecordingEmitter::Job job{0, 0, ""};
-        if (emitter.takeJob(job)) {
+        if (!holding.load() && emitter.takeJob(job)) {
           std::vector<uint8_t> bytes(job.body.begin(), job.body.end());
           server->respond(job.requestId, job.status,
                           {{"Content-Type", "text/plain"}}, bytes.data(),
@@ -2117,7 +2118,13 @@ TEST(UvReactorTest, ChunkedStreamFramesBodyExactly) {
   EXPECT_EQ(statusOf(res), 200);
   EXPECT_EQ(headerOf(res, "transfer-encoding"), "chunked");
   EXPECT_EQ(dechunk(bodyOf(res)), "abbccc");
-  EXPECT_EQ(res,
+  // Byte-exact apart from the Date line (RFC 9110 §6.6.1), whose value is
+  // the clock's.
+  std::string noDate = res;
+  const size_t d = noDate.find("Date: ");
+  ASSERT_NE(d, std::string::npos);
+  noDate.erase(d, noDate.find("\r\n", d) + 2 - d);
+  EXPECT_EQ(noDate,
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
             "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
             "1\r\na\r\n2\r\nbb\r\n3\r\nccc\r\n0\r\n\r\n");
@@ -2789,9 +2796,47 @@ struct TlsClient {
     }
     return sslConnectRetry(ssl) == 1;
   }
+  struct Opts {
+    const char* alpn = nullptr;
+    std::string preamble;  // raw bytes written before the handshake (PROXY)
+    std::string certPem;   // client certificate (mutual TLS)
+    std::string keyPem;
+    int maxVersion = 0;    // 12 caps the client at TLS 1.2; 0 = default
+  };
+  bool openWith(int port, const Opts& o) {
+    fd = connectTo(port);
+    if (fd < 0) return false;
+    timeval tv{5, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (!o.preamble.empty()) sendStr(fd, o.preamble);
+    ctx = SSL_CTX_new(TLS_client_method());
+    if (o.maxVersion == 12) SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION);
+    if (!o.certPem.empty()) {
+      BIO* bio = BIO_new_mem_buf(o.certPem.data(), (int)o.certPem.size());
+      X509* cert = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+      BIO_free(bio);
+      if (!cert || SSL_CTX_use_certificate(ctx, cert) != 1) return false;
+      X509_free(cert);
+      bio = BIO_new_mem_buf(o.keyPem.data(), (int)o.keyPem.size());
+      EVP_PKEY* key = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
+      BIO_free(bio);
+      if (!key || SSL_CTX_use_PrivateKey(ctx, key) != 1) return false;
+      EVP_PKEY_free(key);
+    }
+    ssl = SSL_new(ctx);
+    SSL_set_fd(ssl, fd);
+    if (o.alpn) {
+      unsigned char p[32];
+      p[0] = (unsigned char)strlen(o.alpn);
+      memcpy(p + 1, o.alpn, strlen(o.alpn));
+      SSL_set_alpn_protos(ssl, p, (unsigned)strlen(o.alpn) + 1);
+    }
+    return sslConnectRetry(ssl) == 1;
+  }
   bool write(const std::string& s) {
     return SSL_write(ssl, s.data(), (int)s.size()) == (int)s.size();
   }
+  std::string cipher() const { return ssl ? SSL_get_cipher_name(ssl) : ""; }
   // Reads one framed HTTP response (head + Content-Length body).
   std::string readResponse() {
     std::string out;
@@ -3155,3 +3200,1128 @@ TEST(UvReactorTest, Http2cPriorKnowledgeServedOverTheReactor) {
 }  // namespace
 
 #endif  // NITRO_SERVER_LIBUV
+
+// ── Production-audit regressions (doc/production-audit.md P0-2/3/4, P1 conformance) ──
+
+RecordingEmitter::Answer statusAnswer(int status) {
+  return [status](Method, const std::string&, const std::string&) {
+    return std::make_pair(status, std::string());
+  };
+}
+
+TEST(UvReactorTest, TransferEncodingIsAValidatedTokenList) {
+  // RFC 9112 §6.1: codings match whole and case-insensitively; `chunked` is
+  // the only one implemented and must be the sole coding; anything else is 501
+  // (not silently "no body"), duplicates / TE on HTTP/1.0 are 400.
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Post, "", "/echo", -1);
+  const int64_t port = f.startOnEphemeral();
+  const std::string chunked = "4\r\nabcd\r\n0\r\n\r\n";
+  auto post = [&](const std::string& te, const std::string& version = "HTTP/1.1") {
+    const int fd = connectTo((int)port);
+    sendStr(fd, "POST /echo " + version + "\r\nHost: x\r\nTransfer-Encoding: " + te +
+                    "\r\nConnection: close\r\n\r\n" + chunked);
+    const std::string r = readAll(fd);
+    close(fd);
+    return r;
+  };
+  // Any casing decodes the body — never "no body" with bytes left on the wire.
+  for (const char* te : {"chunked", "Chunked", "CHUNKED", " chunked "}) {
+    const std::string r = post(te);
+    EXPECT_EQ(statusOf(r), 200) << te;
+    EXPECT_EQ(bodyOf(r), "echo:abcd") << te;
+  }
+  // Unsupported codings are refused, not guessed.
+  for (const char* te : {"notchunked", "gzip", "chunked, gzip", "gzip, chunked"}) {
+    EXPECT_EQ(statusOf(post(te)), 501) << te;
+  }
+  EXPECT_EQ(statusOf(post("chunked, chunked")), 400);  // repeated
+  EXPECT_EQ(statusOf(post("")), 400);                  // empty list
+  EXPECT_EQ(statusOf(post("chunked", "HTTP/1.0")), 400);
+  {  // duplicated field
+    const int fd = connectTo((int)port);
+    sendStr(fd, "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
+                "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n" + chunked);
+    EXPECT_EQ(statusOf(readAll(fd)), 400);
+    close(fd);
+  }
+}
+
+TEST(UvReactorTest, ChunkSizeLinesAreStrict) {
+  // RFC 9112 §7.1: 1*HEXDIG, optional `;ext`, CRLF; data followed by CRLF.
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Post, "", "/echo", -1);
+  const int64_t port = f.startOnEphemeral();
+  auto post = [&](const std::string& body) {
+    const int fd = connectTo((int)port);
+    sendStr(fd, "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
+                "Connection: close\r\n\r\n" + body);
+    const std::string r = readAll(fd);
+    close(fd);
+    return r;
+  };
+  EXPECT_EQ(bodyOf(post("4;name=value\r\nabcd\r\n0\r\n\r\n")), "echo:abcd");  // extension ok
+  EXPECT_EQ(bodyOf(post("4\r\nabcd\r\n0\r\nX-Trailer: 1\r\n\r\n")), "echo:abcd");
+  EXPECT_EQ(statusOf(post("4zz\r\nabcd\r\n0\r\n\r\n")), 400);     // garbage after the size
+  EXPECT_EQ(statusOf(post("-4\r\nabcd\r\n0\r\n\r\n")), 400);      // sign
+  EXPECT_EQ(statusOf(post("\r\nabcd\r\n0\r\n\r\n")), 400);        // empty size
+  EXPECT_EQ(statusOf(post("4\r\nabcdXX0\r\n\r\n")), 400);         // data not followed by CRLF
+  EXPECT_EQ(statusOf(post("ffffffffffffffffffff\r\nabcd\r\n0\r\n\r\n")), 400);  // would overflow
+  {  // an unbounded trailer section is refused, not buffered forever
+    std::string trailers;
+    for (int i = 0; i < 40; ++i) trailers += "X-T: v\r\n";
+    EXPECT_EQ(statusOf(post("4\r\nabcd\r\n0\r\n" + trailers + "\r\n")), 400);
+  }
+}
+
+TEST(UvReactorTest, HeaderFieldLinesAreStrict) {
+  // RFC 9112 §5: a control byte inside a field line (how a value smuggles a
+  // second header), whitespace before the colon, and obs-fold are all 400.
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/hello", -1);
+  const int64_t port = f.startOnEphemeral();
+  auto get = [&](const std::string& extra) {
+    const int fd = connectTo((int)port);
+    sendStr(fd, "GET /hello HTTP/1.1\r\nHost: x\r\n" + extra + "Connection: close\r\n\r\n");
+    const std::string r = readAll(fd);
+    close(fd);
+    return r;
+  };
+  EXPECT_EQ(statusOf(get("X-Id: ok\nInjected: yes\r\n")), 400);   // bare LF in a value
+  EXPECT_EQ(statusOf(get(std::string("X-Id: a\0b\r\n", 12))), 400);  // NUL
+  EXPECT_EQ(statusOf(get("X-Id : v\r\n")), 400);                   // SP before the colon
+  EXPECT_EQ(statusOf(get("X-Id: v\r\n continued\r\n")), 400);     // obs-fold
+  EXPECT_EQ(statusOf(get("X-Id:\tv\r\n")), 200);                   // HTAB in OWS is fine
+}
+
+TEST(UvReactorTest, ResponseHeadConformance) {
+  // Date on every answer (RFC 9110 §6.6.1); no Content-Length on 204 (§8.6);
+  // a complete reason-phrase table; Connection parsed as tokens (§7.6.1).
+  Fixture f(statusAnswer(204));
+  f.server->registerRoute(Method::Get, "", "/nc", -1);
+  const int64_t port = f.startOnEphemeral();
+  {
+    const int fd = connectTo((int)port);
+    sendStr(fd, "GET /nc HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    const std::string r = readAll(fd);
+    close(fd);
+    EXPECT_EQ(statusOf(r), 204);
+    EXPECT_NE(headerOf(r, "date"), "");
+    EXPECT_EQ(headerOf(r, "content-length"), "");
+  }
+  // Token semantics: `CLOSE` closes, `enclose` does not, `keep-alive` keeps.
+  for (const auto& [conn, expectClose] :
+       std::vector<std::pair<std::string, bool>>{{"CLOSE", true}, {"keep-alive, close", true},
+                                                 {"enclose", false}, {"Keep-Alive", false}}) {
+    const int fd = connectTo((int)port);
+    sendStr(fd, "GET /nc HTTP/1.1\r\nHost: x\r\nConnection: " + conn + "\r\n\r\n");
+    const std::string r = readOneResponse(fd);
+    close(fd);
+    EXPECT_EQ(headerOf(r, "connection") == "close", expectClose) << conn;
+  }
+}
+
+TEST(UvReactorTest, ReasonPhrasesCoverCommonStatuses) {
+  Fixture f(statusAnswer(429));
+  f.server->registerRoute(Method::Get, "", "/r", -1);
+  const int64_t port = f.startOnEphemeral();
+  const int fd = connectTo((int)port);
+  sendStr(fd, "GET /r HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+  const std::string r = readAll(fd);
+  close(fd);
+  EXPECT_EQ(r.substr(0, 26), "HTTP/1.1 429 Too Many Requ");
+  EXPECT_EQ(std::string(reasonPhrase(304)), "Not Modified");
+  EXPECT_EQ(std::string(reasonPhrase(422)), "Unprocessable Content");
+  EXPECT_EQ(std::string(reasonPhrase(299)), "Success");  // never "Unknown"
+}
+
+TEST(UvReactorTest, UnsafeOrEngineOwnedHandlerHeadersNeverReachTheWire) {
+  // uvBuildHead is the last line against response splitting: a value with a
+  // control byte, a non-token name, or a hop-by-hop field is dropped.
+  Fixture f(echoAnswer());
+  RouteEntry e;
+  e.method = Method::Get;
+  e.pattern = "/static";
+  auto sr = std::make_shared<StaticResponse>();
+  sr->status = 200;
+  sr->body = "ok";
+  sr->headers = {{"x-good", "fine"},
+                 {"x-split", "a\r\nInjected: yes"},
+                 {"bad name", "v"},
+                 {"Transfer-Encoding", "chunked"},
+                 {"Proxy-Connection", "keep-alive"}};
+  e.staticResponse = sr;
+  ASSERT_EQ(f.server->registerStaticRoute(e).kind, ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+  const int fd = connectTo((int)port);
+  sendStr(fd, "GET /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+  const std::string r = readAll(fd);
+  close(fd);
+  EXPECT_EQ(statusOf(r), 200);
+  EXPECT_EQ(headerOf(r, "x-good"), "fine");
+  EXPECT_EQ(headerOf(r, "x-split"), "");
+  EXPECT_EQ(headerOf(r, "injected"), "");
+  EXPECT_EQ(headerOf(r, "bad name"), "");
+  EXPECT_EQ(headerOf(r, "transfer-encoding"), "");
+  EXPECT_EQ(headerOf(r, "proxy-connection"), "");
+  EXPECT_EQ(bodyOf(r), "ok");
+}
+
+
+// ── Production-audit P1: availability and conformance ────────────────────────
+
+TEST(UvReactorTest, MethodMismatchIs405WithAllow) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/x", -1);
+  f.server->registerRoute(Method::Put, "", "/x", -1);
+  f.server->registerRoute(Method::Custom, "PURGE", "/x", -1);
+  f.server->registerRoute(Method::All, "", "/any", -1);
+  f.server->registerRoute(Method::Post, "", "/items/:id", -1);
+  const int64_t port = f.startOnEphemeral();
+  auto req = [&](const std::string& line) {
+    const int fd = connectTo((int)port);
+    sendStr(fd, line + "\r\nHost: x\r\nConnection: close\r\n\r\n");
+    const std::string r = readAll(fd);
+    close(fd);
+    return r;
+  };
+  std::string r = req("POST /x HTTP/1.1");
+  EXPECT_EQ(statusOf(r), 405);
+  EXPECT_EQ(headerOf(r, "allow"), "GET, HEAD, PURGE, PUT");
+  EXPECT_EQ(statusOf(req("DELETE /items/42 HTTP/1.1")), 405);
+  EXPECT_EQ(headerOf(req("DELETE /items/42 HTTP/1.1"), "allow"), "POST");
+  EXPECT_EQ(statusOf(req("HEAD /x HTTP/1.1")), 200);  // HEAD falls to GET
+  EXPECT_EQ(statusOf(req("GET /nope HTTP/1.1")), 404);  // no route: still 404
+  // A custom method against an All route lists the standard methods.
+  r = req("PURGE /any HTTP/1.1");
+  EXPECT_EQ(statusOf(r), 405);
+  EXPECT_EQ(headerOf(r, "allow"), "DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT, TRACE");
+}
+
+TEST(UvReactorTest, InFlightBudgetAnswers503) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/slow", -1);
+  ServerConfig cfg;
+  cfg.maxInFlightRequests = 1;
+  const int64_t port = startWith(f, cfg);
+  f.holding.store(true);  // the first request stays in flight
+  const int a = connectTo((int)port);
+  sendStr(a, "GET /slow HTTP/1.1\r\nHost: x\r\n\r\n");
+  for (int i = 0; i < 100 && f.server->inFlightRequests() < 1; i++)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  ASSERT_EQ(f.server->inFlightRequests(), 1);
+  // Over budget: refused at the door, never dispatched.
+  const int b = connectTo((int)port);
+  sendStr(b, "GET /slow HTTP/1.1\r\nHost: x\r\n\r\n");
+  const std::string refused = readAll(b);
+  EXPECT_EQ(statusOf(refused), 503);
+  EXPECT_EQ(headerOf(refused, "retry-after"), "1");
+  EXPECT_EQ(headerOf(refused, "connection"), "close");
+  close(b);
+  EXPECT_EQ(f.emitter.seen().size(), 1u);
+  // Release: the held request completes, and the budget frees up.
+  f.holding.store(false);
+  EXPECT_EQ(statusOf(readHttpHead(a)), 200);
+  close(a);
+  for (int i = 0; i < 100 && f.server->inFlightRequests() > 0; i++)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  const int c = connectTo((int)port);
+  sendStr(c, "GET /slow HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+  EXPECT_EQ(statusOf(readAll(c)), 200);
+  close(c);
+}
+
+TEST(UvReactorTest, WsIdleIsPingedThenClosed1001) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/ws", -1, true);
+  ServerConfig cfg;
+  cfg.wsIdleTimeoutMs = 600;
+  const int64_t port = startWith(f, cfg);
+  const int fd = connectTo((int)port);
+  sendWsHandshake(fd, "/ws");
+  EXPECT_EQ(statusOf(readHttpHead(fd)), 101);
+  // Half the window quiet: a ping (empty payload) arrives, nothing else.
+  std::string payload;
+  EXPECT_EQ(readWsFrame(fd, payload), 0x9);
+  EXPECT_TRUE(payload.empty());
+  // Still silent at the full window: 1001 Going Away, then EOF.
+  EXPECT_EQ(readWsFrame(fd, payload), 0x8);
+  ASSERT_EQ(payload.size(), 2u);
+  EXPECT_EQ(((uint8_t)payload[0] << 8) | (uint8_t)payload[1], 1001);
+  EXPECT_EQ(readWsFrame(fd, payload), -1);
+  close(fd);
+  bool idleEvent = false;
+  for (const auto& e : f.emitter.events())
+    if (std::get<2>(e) == "websocket idle timeout") idleEvent = true;
+  EXPECT_TRUE(idleEvent);
+}
+
+TEST(UvReactorTest, WsPongKeepsTheSessionAlive) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/ws", -1, true);
+  ServerConfig cfg;
+  cfg.wsIdleTimeoutMs = 400;
+  const int64_t port = startWith(f, cfg);
+  const int fd = connectTo((int)port);
+  sendWsHandshake(fd, "/ws");
+  EXPECT_EQ(statusOf(readHttpHead(fd)), 101);
+  std::string payload;
+  // Answer three successive pings: the session outlives 3x the window.
+  for (int i = 0; i < 3; i++) {
+    EXPECT_EQ(readWsFrame(fd, payload), 0x9) << "ping " << i;
+    sendWsFrame(fd, 0xA, "");
+  }
+  // Any inbound frame also counts as liveness.
+  sendWsFrame(fd, 0x1, "hello");
+  for (int i = 0; i < 100 && f.emitter.wsSeen().empty(); i++)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  EXPECT_EQ(f.emitter.wsSeen().size(), 1u);
+  close(fd);
+}
+
+TEST(UvReactorTest, MaxConnectionAgeClosesIdleAndMarksBusyClose) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/x", -1);
+  ServerConfig cfg;
+  cfg.maxConnectionAgeMs = 300;
+  cfg.keepAliveTimeoutMs = 10000;
+  const int64_t port = startWith(f, cfg);
+  // Idle keep-alive connection: reaped once it is older than the age.
+  const int idle = connectTo((int)port);
+  sendStr(idle, "GET /x HTTP/1.1\r\nHost: x\r\n\r\n");
+  const std::string first = readHttpHead(idle);
+  EXPECT_EQ(statusOf(first), 200);
+  EXPECT_EQ(headerOf(first, "connection"), "keep-alive");
+  EXPECT_EQ(readAll(idle), "");  // EOF: closed by the sweep
+  close(idle);
+  // Busy connection: the answer that lands past the age says close.
+  f.holding.store(true);
+  const int busy = connectTo((int)port);
+  sendStr(busy, "GET /x HTTP/1.1\r\nHost: x\r\n\r\n");
+  std::this_thread::sleep_for(std::chrono::milliseconds(450));
+  f.holding.store(false);
+  const std::string late = readAll(busy);
+  EXPECT_EQ(statusOf(late), 200);
+  EXPECT_EQ(headerOf(late, "connection"), "close");
+  close(busy);
+}
+
+TEST(UvReactorTest, SlowBodyProgressIsNotIdleButAStallIs408) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Post, "", "/echo", -1);
+  ServerConfig cfg;
+  cfg.keepAliveTimeoutMs = 300;  // the stall window (bodyTimeoutMs unset)
+  const int64_t port = startWith(f, cfg);
+  // Progress every 150 ms over 600 ms: each read restarts the window.
+  const int slow = connectTo((int)port);
+  sendStr(slow, "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 8\r\n"
+                "Connection: close\r\n\r\nab");
+  for (const char* piece : {"cd", "ef", "gh"}) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    sendStr(slow, piece);
+  }
+  const std::string ok = readAll(slow);
+  EXPECT_EQ(statusOf(ok), 200);
+  EXPECT_EQ(bodyOf(ok), "echo:abcdefgh");
+  close(slow);
+  // No progress at all: 408 + close once the window passes.
+  const int stalled = connectTo((int)port);
+  sendStr(stalled, "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 8\r\n\r\nab");
+  const std::string r = readAll(stalled);
+  EXPECT_EQ(statusOf(r), 408);
+  close(stalled);
+  bool stallEvent = false;
+  for (const auto& e : f.emitter.events())
+    if (std::get<2>(e) == "request body timed out") stallEvent = true;
+  EXPECT_TRUE(stallEvent);
+}
+
+TEST(UvReactorTest, BodyTimeoutOverridesTheKeepAliveWindow) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Post, "", "/echo", -1);
+  ServerConfig cfg;
+  cfg.keepAliveTimeoutMs = 5000;
+  cfg.bodyTimeoutMs = 200;
+  const int64_t port = startWith(f, cfg);
+  const int fd = connectTo((int)port);
+  sendStr(fd, "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nab");
+  const auto t0 = std::chrono::steady_clock::now();
+  const std::string r = readAll(fd);
+  const auto waited = std::chrono::steady_clock::now() - t0;
+  EXPECT_EQ(statusOf(r), 408);
+  EXPECT_LT(waited, std::chrono::seconds(2));
+  close(fd);
+}
+
+TEST(UvReactorTest, StreamedUploadThatStallsIs408) {
+  Fixture f(echoAnswer());
+  RouteEntry e;
+  e.method = Method::Post;
+  e.pattern = "/up";
+  e.streamBody = true;
+  ASSERT_EQ(f.server->registerRoute(e).kind, ErrorKind::None);
+  ServerConfig cfg;
+  cfg.bodyTimeoutMs = 200;
+  const int64_t port = startWith(f, cfg);
+  const int fd = connectTo((int)port);
+  sendStr(fd, "POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nabc");
+  const std::string r = readAll(fd);
+  EXPECT_EQ(statusOf(r), 408);
+  close(fd);
+  EXPECT_EQ(f.server->inFlightRequests(), 0);  // the request id was retired
+}
+
+#ifdef NITRO_SERVER_HTTP2
+// Reads raw h2 frames off [fd] until EOF or [budgetMs]; records the frame types.
+static std::vector<int> h2FrameTypesUntilEof(int fd, int budgetMs, bool* eof) {
+  std::vector<int> types;
+  std::string buf;
+  timeval tv{0, 200 * 1000};
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(budgetMs);
+  *eof = false;
+  while (std::chrono::steady_clock::now() < end) {
+    char tmp[4096];
+    const ssize_t n = read(fd, tmp, sizeof tmp);
+    if (n == 0) { *eof = true; break; }
+    if (n < 0) continue;  // timeout: keep waiting for the sweep
+    buf.append(tmp, (size_t)n);
+    while (buf.size() >= 9) {
+      const size_t len = ((uint8_t)buf[0] << 16) | ((uint8_t)buf[1] << 8) | (uint8_t)buf[2];
+      if (buf.size() < 9 + len) break;
+      types.push_back((uint8_t)buf[3]);
+      buf.erase(0, 9 + len);
+    }
+  }
+  return types;
+}
+
+TEST(UvReactorTest, Http2DrainSendsGoawayAndClosesWhenQuiet) {
+  Fixture f([](Method, const std::string& p, const std::string&) {
+    return std::make_pair(200, "h2:" + p);
+  });
+  ASSERT_EQ(f.server->registerRoute(Method::Get, "", "/hello", -1).kind,
+            ErrorKind::None);
+  const int64_t port = f.startOnEphemeral();
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  // One full exchange first, so the session is established and idle.
+  const h2client::Resp r = h2client::get(fd, "/hello");
+  ASSERT_TRUE(r.closed);
+  EXPECT_EQ(r.status, 200);
+  f.server->beginDrain();
+  bool eof = false;
+  const std::vector<int> types = h2FrameTypesUntilEof(fd, 2000, &eof);
+  // GOAWAY (type 7) goes out on the next sweep; with no open stream the
+  // session is then finished and the connection closed.
+  EXPECT_NE(std::find(types.begin(), types.end(), 7), types.end());
+  EXPECT_TRUE(eof);
+  close(fd);
+}
+#endif
+
+
+// ── Production-audit P1: PROXY protocol and TLS policy ───────────────────────
+
+static std::string v2Header(unsigned char verCmd, unsigned char fam,
+                            const std::string& addrs) {
+  std::string h("\r\n\r\n\0\r\nQUIT\n", 12);
+  h.push_back((char)verCmd);
+  h.push_back((char)fam);
+  h.push_back((char)((addrs.size() >> 8) & 0xff));
+  h.push_back((char)(addrs.size() & 0xff));
+  return h + addrs;
+}
+
+TEST(UvReactorTest, ProxyProtocolV1AndV2SetTheClientAddress) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/hello", -1);
+  ServerConfig cfg;
+  cfg.proxyProtocol = true;
+  const int64_t port = startWith(f, cfg);
+  const std::string get = "GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+  auto roundTrip = [&](const std::string& bytes) {
+    const int fd = connectTo((int)port);
+    sendStr(fd, bytes);
+    const std::string r = readAll(fd);
+    close(fd);
+    return r;
+  };
+  // v1 TCP4 / TCP6: the named source replaces the socket peer.
+  EXPECT_EQ(statusOf(roundTrip("PROXY TCP4 203.0.113.9 10.0.0.1 51000 80\r\n" + get)), 200);
+  EXPECT_EQ(statusOf(roundTrip("PROXY TCP6 2001:db8::7 ::1 51000 80\r\n" + get)), 200);
+  // v1 UNKNOWN: keep the peer.
+  EXPECT_EQ(statusOf(roundTrip("PROXY UNKNOWN\r\n" + get)), 200);
+  // v2 PROXY/AF_INET: 198.51.100.7 -> 10.0.0.1, ports 51000 -> 80.
+  const std::string inet(
+      "\xc6\x33\x64\x07" "\x0a\x00\x00\x01" "\xc7\x38" "\x00\x50", 12);
+  EXPECT_EQ(statusOf(roundTrip(v2Header(0x21, 0x11, inet) + get)), 200);
+  // v2 LOCAL: a health check from the proxy itself; keep the peer.
+  EXPECT_EQ(statusOf(roundTrip(v2Header(0x20, 0x00, "") + get)), 200);
+  // A header split across writes still parses.
+  {
+    const int fd = connectTo((int)port);
+    sendStr(fd, "PROXY TC");
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    sendStr(fd, "P4 192.0.2.5 10.0.0.1 1 2\r\n" + get);
+    EXPECT_EQ(statusOf(readAll(fd)), 200);
+    close(fd);
+  }
+  std::vector<std::string> ips;
+  for (int i = 0; i < 100 && f.emitter.seen().size() < 6; i++)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  for (const auto& s : f.emitter.seen()) ips.push_back(s.clientIp);
+  ASSERT_EQ(ips.size(), 6u);
+  EXPECT_EQ(ips[0], "203.0.113.9");
+  EXPECT_EQ(ips[1], "2001:db8::7");
+  EXPECT_EQ(ips[2], "127.0.0.1");
+  EXPECT_EQ(ips[3], "198.51.100.7");
+  EXPECT_EQ(ips[4], "127.0.0.1");
+  EXPECT_EQ(ips[5], "192.0.2.5");
+}
+
+TEST(UvReactorTest, ProxyProtocolRefusesMissingOrMalformedHeaders) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/hello", -1);
+  ServerConfig cfg;
+  cfg.proxyProtocol = true;
+  const int64_t port = startWith(f, cfg);
+  auto refused = [&](const std::string& bytes) {
+    const int fd = connectTo((int)port);
+    sendStr(fd, bytes);
+    const std::string r = readAll(fd);
+    close(fd);
+    return r.empty();  // closed without an answer
+  };
+  EXPECT_TRUE(refused("GET /hello HTTP/1.1\r\nHost: x\r\n\r\n"));   // no header
+  EXPECT_TRUE(refused("PROXY TCP4 nonsense\r\nGET / HTTP/1.1\r\n\r\n"));
+  EXPECT_TRUE(refused("PROXY TCP4 999.1.1.1 10.0.0.1 1 2\r\n"));
+  EXPECT_TRUE(refused("PROXY TCP4 10.0.0.1 10.0.0.2 70000 2\r\n"));
+  EXPECT_TRUE(refused(v2Header(0x31, 0x11, std::string(12, '\0'))));  // bad version
+  EXPECT_TRUE(refused(v2Header(0x22, 0x11, std::string(12, '\0'))));  // bad command
+  EXPECT_TRUE(refused("PROXY " + std::string(600, 'x')));  // never terminates
+  EXPECT_TRUE(f.emitter.seen().empty());
+  bool event = false;
+  for (const auto& e : f.emitter.events())
+    if (std::get<2>(e) == "invalid PROXY protocol header") event = true;
+  EXPECT_TRUE(event);
+}
+
+#ifdef NITRO_SERVER_TLS
+TEST(TlsTest, ProxyProtocolHeaderPrecedesTheHandshake) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/hello", -1);
+  ServerConfig cfg;
+  cfg.port = 0;
+  cfg.tlsRequested = true;
+  cfg.tlsCertPem = nitroserver_test::kTestCertPem;
+  cfg.tlsKeyPem = nitroserver_test::kTestKeyPem;
+  cfg.proxyProtocol = true;
+  f.server->configure(cfg);
+  ASSERT_EQ(f.server->start().kind, ErrorKind::None);
+  TlsClient c;
+  TlsClient::Opts o;
+  o.preamble = "PROXY TCP4 203.0.113.9 10.0.0.1 51000 443\r\n";
+  ASSERT_TRUE(c.openWith((int)f.server->boundPort(), o));
+  ASSERT_TRUE(c.write("GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"));
+  EXPECT_EQ(statusOf(c.readResponse()), 200);
+  for (int i = 0; i < 100 && f.emitter.seen().empty(); i++)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  ASSERT_EQ(f.emitter.seen().size(), 1u);
+  EXPECT_EQ(f.emitter.seen()[0].clientIp, "203.0.113.9");
+}
+
+TEST(TlsTest, MutualTlsRequiresAClientCertificate) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/hello", -1);
+  ServerConfig cfg;
+  cfg.port = 0;
+  cfg.tlsRequested = true;
+  cfg.tlsCertPem = nitroserver_test::kTestCertPem;
+  cfg.tlsKeyPem = nitroserver_test::kTestKeyPem;
+  cfg.tlsClientCaPem = nitroserver_test::kTestCertPem;  // self-signed: its own anchor
+  f.server->configure(cfg);
+  ASSERT_EQ(f.server->start().kind, ErrorKind::None);
+  const int port = (int)f.server->boundPort();
+  {  // No certificate: the handshake is refused (or the first read fails).
+    TlsClient anon;
+    const bool opened = anon.openWith(port, {});
+    bool served = false;
+    if (opened) {
+      anon.write("GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+      served = statusOf(anon.readResponse()) == 200;
+    }
+    EXPECT_FALSE(served);
+  }
+  {  // With the certificate: served.
+    TlsClient c;
+    TlsClient::Opts o;
+    o.certPem = nitroserver_test::kTestCertPem;
+    o.keyPem = nitroserver_test::kTestKeyPem;
+    ASSERT_TRUE(c.openWith(port, o));
+    ASSERT_TRUE(c.write("GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"));
+    EXPECT_EQ(statusOf(c.readResponse()), 200);
+  }
+  EXPECT_EQ(f.emitter.seen().size(), 1u);
+}
+
+TEST(TlsTest, MinimumVersionAndCipherPolicy) {
+  {  // TLS 1.3 floor: a client capped at 1.2 cannot connect.
+    Fixture f(echoAnswer());
+    f.server->registerRoute(Method::Get, "", "/hello", -1);
+    ServerConfig cfg;
+    cfg.port = 0;
+    cfg.tlsRequested = true;
+    cfg.tlsCertPem = nitroserver_test::kTestCertPem;
+    cfg.tlsKeyPem = nitroserver_test::kTestKeyPem;
+    cfg.tlsMinVersion = 13;
+    f.server->configure(cfg);
+    ASSERT_EQ(f.server->start().kind, ErrorKind::None);
+    TlsClient old;
+    TlsClient::Opts o;
+    o.maxVersion = 12;
+    EXPECT_FALSE(old.openWith((int)f.server->boundPort(), o));
+    TlsClient modern;
+    EXPECT_TRUE(modern.openWith((int)f.server->boundPort(), {}));
+  }
+  {  // A TLS 1.2 cipher list is honoured.
+    Fixture f(echoAnswer());
+    f.server->registerRoute(Method::Get, "", "/hello", -1);
+    ServerConfig cfg;
+    cfg.port = 0;
+    cfg.tlsRequested = true;
+    cfg.tlsCertPem = nitroserver_test::kTestCertPem;
+    cfg.tlsKeyPem = nitroserver_test::kTestKeyPem;
+    cfg.tlsCiphers = "ECDHE-RSA-AES128-GCM-SHA256";
+    cfg.tlsCipherSuites = "TLS_AES_128_GCM_SHA256";
+    f.server->configure(cfg);
+    ASSERT_EQ(f.server->start().kind, ErrorKind::None);
+    TlsClient c12;
+    TlsClient::Opts o;
+    o.maxVersion = 12;
+    ASSERT_TRUE(c12.openWith((int)f.server->boundPort(), o));
+    EXPECT_EQ(c12.cipher(), "ECDHE-RSA-AES128-GCM-SHA256");
+    TlsClient c13;
+    ASSERT_TRUE(c13.openWith((int)f.server->boundPort(), {}));
+    EXPECT_EQ(c13.cipher(), "TLS_AES_128_GCM_SHA256");
+  }
+  {  // Misconfiguration fails start(), not the first client.
+    for (const auto& [ciphers, minVer] :
+         std::vector<std::pair<std::string, int64_t>>{{"NOT-A-CIPHER", 12}, {"", 11}}) {
+      Fixture f(echoAnswer());
+      ServerConfig cfg;
+      cfg.port = 0;
+      cfg.tlsRequested = true;
+      cfg.tlsCertPem = nitroserver_test::kTestCertPem;
+      cfg.tlsKeyPem = nitroserver_test::kTestKeyPem;
+      cfg.tlsCiphers = ciphers;
+      cfg.tlsMinVersion = minVer;
+      f.server->configure(cfg);
+      EXPECT_EQ(f.server->start().kind, ErrorKind::TlsError) << ciphers << minVer;
+    }
+    Fixture f(echoAnswer());
+    ServerConfig cfg;
+    cfg.port = 0;
+    cfg.tlsRequested = true;
+    cfg.tlsCertPem = nitroserver_test::kTestCertPem;
+    cfg.tlsKeyPem = nitroserver_test::kTestKeyPem;
+    cfg.tlsClientCaPem = "not a certificate";
+    f.server->configure(cfg);
+    EXPECT_EQ(f.server->start().kind, ErrorKind::TlsError);
+  }
+}
+#endif  // NITRO_SERVER_TLS
+
+
+// ── RFC 6455 control-frame and close-frame rules (Autobahn 2.5, 5.1, 7.3, 7.5, 7.9) ──
+
+static int wsCloseCodeOf(int fd) {
+  std::string payload;
+  int op;
+  // Skip any data/pong frames still in flight; the close frame carries the code.
+  for (int i = 0; i < 8; i++) {
+    op = readWsFrame(fd, payload);
+    if (op == 0x8 || op < 0) break;
+  }
+  if (op != 0x8 || payload.size() < 2) return -1;
+  return ((uint8_t)payload[0] << 8) | (uint8_t)payload[1];
+}
+
+TEST(UvReactorTest, WsOversizedOrFragmentedControlFramesAre1002) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/ws", -1, true);
+  const int64_t port = f.startOnEphemeral();
+  {  // ping with a 126-byte payload
+    const int fd = connectTo((int)port);
+    sendWsHandshake(fd, "/ws");
+    EXPECT_EQ(statusOf(readHttpHead(fd)), 101);
+    sendWsFrame(fd, 0x9, std::string(126, 'p'));
+    EXPECT_EQ(wsCloseCodeOf(fd), 1002);
+    close(fd);
+  }
+  {  // fragmented ping (FIN = 0)
+    const int fd = connectTo((int)port);
+    sendWsHandshake(fd, "/ws");
+    EXPECT_EQ(statusOf(readHttpHead(fd)), 101);
+    sendWsFrame(fd, 0x9, "frag", /*fin=*/false);
+    EXPECT_EQ(wsCloseCodeOf(fd), 1002);
+    close(fd);
+  }
+  {  // a 125-byte ping is fine and ponged
+    const int fd = connectTo((int)port);
+    sendWsHandshake(fd, "/ws");
+    EXPECT_EQ(statusOf(readHttpHead(fd)), 101);
+    sendWsFrame(fd, 0x9, std::string(125, 'p'));
+    std::string payload;
+    EXPECT_EQ(readWsFrame(fd, payload), 0xA);
+    EXPECT_EQ(payload.size(), 125u);
+    close(fd);
+  }
+}
+
+TEST(UvReactorTest, WsCloseFramesAreValidated) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/ws", -1, true);
+  const int64_t port = f.startOnEphemeral();
+  auto closeWith = [&](const std::string& payload) {
+    const int fd = connectTo((int)port);
+    sendWsHandshake(fd, "/ws");
+    EXPECT_EQ(statusOf(readHttpHead(fd)), 101);
+    sendWsFrame(fd, 0x8, payload);
+    const int code = wsCloseCodeOf(fd);
+    close(fd);
+    return code;
+  };
+  auto code = [](int c, const std::string& reason = "") {
+    return std::string{(char)(c >> 8), (char)(c & 0xff)} + reason;
+  };
+  EXPECT_EQ(closeWith(""), 1000);                 // no code: echoed as 1000
+  EXPECT_EQ(closeWith("\x03"), 1002);             // one byte: malformed
+  EXPECT_EQ(closeWith(code(1000)), 1000);
+  EXPECT_EQ(closeWith(code(1001, "going away")), 1001);
+  EXPECT_EQ(closeWith(code(3000)), 3000);          // application range
+  EXPECT_EQ(closeWith(code(4999)), 4999);
+  for (const int bad : {0, 999, 1004, 1005, 1006, 1015, 1016, 1100, 2000, 2999, 5000})
+    EXPECT_EQ(closeWith(code(bad)), 1002) << bad;
+  EXPECT_EQ(closeWith(code(1000, "\xff\xfe")), 1007);  // reason not UTF-8
+  EXPECT_EQ(closeWith(code(1000, "\xc3\xa9")), 1000);  // "é": fine
+}
+
+// ── Re-audit residuals (2026-10-22): request line, bodyless statuses, buffers ──
+
+TEST(UvReactorTest, RequestLineIsValidated) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/hello", -1);
+  f.server->registerRoute(Method::Post, "", "/hello", -1);
+  const int64_t port = f.startOnEphemeral();
+  auto req = [&](const std::string& bytes) {
+    const int fd = connectTo((int)port);
+    sendStr(fd, bytes);
+    const std::string r = readAll(fd);
+    close(fd);
+    return r;
+  };
+  EXPECT_EQ(statusOf(req("GET /hel\x01lo HTTP/1.1\r\nHost: x\r\n\r\n")), 400);   // CTL
+  EXPECT_EQ(statusOf(req("GET /hello\xe9 HTTP/1.1\r\nHost: x\r\n\r\n")), 400);   // >= 0x80
+  EXPECT_EQ(statusOf(req("GET /hello HTTP/9.9\r\nHost: x\r\n\r\n")), 505);
+  EXPECT_EQ(statusOf(req("GET /hello FOO\r\nHost: x\r\n\r\n")), 505);
+  EXPECT_EQ(statusOf(req("GET hello HTTP/1.1\r\nHost: x\r\n\r\n")), 400);          // not origin-form
+  EXPECT_EQ(statusOf(req("GET http://h/hello HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n")), 200);  // absolute-form
+  EXPECT_EQ(statusOf(req("GET / HTTP/1.0\r\n\r\n")), 404);  // zero header lines: parsed, routed
+  EXPECT_EQ(statusOf(req("GET /hello HTTP/1.0\r\n\r\n")), 200);
+  EXPECT_EQ(statusOf(req("GET /hello HTTP/1.1\r\nHost: x\r\nUser-Agent: caf\xe9\r\nConnection: close\r\n\r\n")), 400);  // Latin-1
+  EXPECT_EQ(statusOf(req("GET /hello HTTP/1.1\r\nHost: x\r\nUser-Agent: caf\xc3\xa9\r\nConnection: close\r\n\r\n")), 200);  // UTF-8
+  EXPECT_EQ(statusOf(req("POST /hello HTTP/1.1\r\nHost: x\r\nContent-Length: +3\r\n\r\nabc")), 400);
+  EXPECT_EQ(statusOf(req("POST /hello HTTP/1.1\r\nHost: x\r\nContent-Length: 0x3\r\n\r\nabc")), 400);
+}
+
+TEST(UvReactorTest, BodylessStatusesNeverCarryABody) {
+  Fixture f([](Method, const std::string& p, const std::string&) {
+    return std::make_pair(p == "/nc" ? 204 : 200, std::string("LEAKED"));
+  });
+  f.server->registerRoute(Method::Get, "", "/nc", -1);
+  f.server->registerRoute(Method::Get, "", "/ok", -1);
+  const int64_t port = f.startOnEphemeral();
+  const int fd = connectTo((int)port);
+  // Pipelined: a 204 whose handler returned a body, then a normal request.
+  sendStr(fd, "GET /nc HTTP/1.1\r\nHost: x\r\n\r\nGET /ok HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+  const std::string first = readHttpHead(fd);
+  EXPECT_EQ(statusOf(first), 204);
+  EXPECT_EQ(headerOf(first, "content-length"), "");
+  const std::string rest = readAll(fd);
+  close(fd);
+  EXPECT_EQ(rest.rfind("HTTP/1.1 200", 0), 0u) << rest.substr(0, 40);  // nothing leaked in between
+  EXPECT_EQ(bodyOf(rest), "LEAKED");
+}
+
+TEST(UvReactorTest, StreamHeadIsFilteredAndDated) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/s", -1);
+  const int64_t port = f.startOnEphemeral();
+  f.holding.store(true);
+  const int fd = connectTo((int)port);
+  sendStr(fd, "GET /s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+  RecordingEmitter::Job job{0, 0, ""};
+  for (int i = 0; i < 200 && !f.emitter.takeJob(job); i++)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  ASSERT_NE(job.requestId, 0);
+  f.server->startStream(job.requestId, 200,
+                        {{"x-ok", "1"},
+                         {"x-split", "a\r\nInjected: yes"},
+                         {"Upgrade", "h2c"},
+                         {"bad name", "v"}});
+  const uint8_t chunk[] = {'h', 'i'};
+  f.server->sendStreamChunk(job.requestId, chunk, 2, true);
+  const std::string r = readAll(fd);
+  close(fd);
+  EXPECT_EQ(statusOf(r), 200);
+  EXPECT_NE(headerOf(r, "date"), "");
+  EXPECT_EQ(headerOf(r, "x-ok"), "1");
+  EXPECT_EQ(headerOf(r, "x-split"), "");
+  EXPECT_EQ(headerOf(r, "injected"), "");
+  EXPECT_EQ(headerOf(r, "upgrade"), "");
+  EXPECT_EQ(headerOf(r, "transfer-encoding"), "chunked");
+  EXPECT_NE(r.find("2\r\nhi\r\n0\r\n\r\n"), std::string::npos);
+}
+
+TEST(UvReactorTest, BusyConnectionBufferIsCapped) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/slow", -1);
+  ServerConfig cfg;
+  cfg.maxBodyBytes = 1000;
+  const int64_t port = startWith(f, cfg);
+  f.holding.store(true);  // the answer is parked: the connection stays busy
+  const int fd = connectTo((int)port);
+  sendStr(fd, "GET /slow HTTP/1.1\r\nHost: x\r\n\r\n");
+  for (int i = 0; i < 100 && f.server->inFlightRequests() < 1; i++)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  sendStr(fd, std::string(200 * 1024, 'x'));  // far past 64 KiB + maxBody
+  const std::string r = readAll(fd);
+  close(fd);
+  EXPECT_EQ(statusOf(r), 400);
+  f.holding.store(false);
+  bool event = false;
+  for (const auto& e : f.emitter.events())
+    if (std::get<2>(e) == "pipelined bytes exceed the buffer cap") event = true;
+  EXPECT_TRUE(event);
+}
+
+TEST(UvReactorTest, HeaderTimeoutIsAnAbsoluteDeadline) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/hello", -1);
+  ServerConfig cfg;
+  cfg.headerTimeoutMs = 400;
+  cfg.keepAliveTimeoutMs = 10000;
+  const int64_t port = startWith(f, cfg);
+  const int fd = connectTo((int)port);
+  // One byte every 100 ms: each read refreshes activity, yet the head is
+  // dropped 400 ms after its first byte.
+  const std::string head = "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n";
+  const auto t0 = std::chrono::steady_clock::now();
+  bool closed = false;
+  for (size_t i = 0; i < head.size(); i++) {
+    if (send(fd, &head[i], 1, 0) <= 0) { closed = true; break; }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  const std::string r = readAll(fd);
+  close(fd);
+  const auto waited = std::chrono::steady_clock::now() - t0;
+  EXPECT_TRUE(closed || r.empty()) << r.substr(0, 40);
+  EXPECT_LT(waited, std::chrono::seconds(5));
+  bool event = false;
+  for (const auto& e : f.emitter.events())
+    if (std::get<2>(e) == "request head timed out") event = true;
+  EXPECT_TRUE(event);
+}
+
+TEST(UvReactorTest, WsHandshakeKeyAndVersionAreStrict) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/ws", -1, true);
+  const int64_t port = f.startOnEphemeral();
+  auto shake = [&](const std::string& key, const std::string& ver) {
+    const int fd = connectTo((int)port);
+    sendStr(fd, "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                "Sec-WebSocket-Key: " + key + "\r\nSec-WebSocket-Version: " + ver + "\r\n\r\n");
+    const int st = statusOf(readHttpHead(fd));
+    close(fd);
+    return st;
+  };
+  EXPECT_EQ(shake("dGhlIHNhbXBsZSBub25jZQ==", "13"), 101);
+  EXPECT_EQ(shake("abc", "13"), 400);                       // not 16 bytes
+  EXPECT_EQ(shake("dGhlIHNhbXBsZSBub25jZQ=!", "13"), 400);  // bad alphabet
+  EXPECT_EQ(shake("dGhlIHNhbXBsZSBub25jZQ==", "130"), 426);
+  EXPECT_EQ(shake("dGhlIHNhbXBsZSBub25jZQ==", "8"), 426);
+}
+
+TEST(UvReactorTest, PerIpCapFollowsTheProxyNamedClient) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/hello", -1);
+  ServerConfig cfg;
+  cfg.proxyProtocol = true;
+  cfg.maxConnectionsPerIp = 1;
+  cfg.keepAliveTimeoutMs = 10000;
+  const int64_t port = startWith(f, cfg);
+  const std::string hdrA = "PROXY TCP4 203.0.113.9 10.0.0.1 1 2\r\n";
+  const std::string hdrB = "PROXY TCP4 203.0.113.10 10.0.0.1 1 2\r\n";
+  const std::string get = "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n";
+  const int a = connectTo((int)port);
+  sendStr(a, hdrA + get);
+  EXPECT_EQ(statusOf(readHttpHead(a)), 200);  // client A holds its one slot
+  const int a2 = connectTo((int)port);        // the same proxy, same client: refused
+  sendStr(a2, hdrA + get);
+  EXPECT_EQ(readAll(a2), "");
+  close(a2);
+  const int b = connectTo((int)port);         // same proxy, another client: fine
+  sendStr(b, hdrB + get);
+  EXPECT_EQ(statusOf(readHttpHead(b)), 200);
+  close(a);
+  close(b);
+}
+
+TEST(UvReactorTest, DualStackPeersAreReportedAsIPv4) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/hello", -1);
+  ServerConfig cfg;
+  cfg.host = "::";
+  if (startWith(f, cfg) <= 0) GTEST_SKIP() << "no dual-stack listener here";
+  const int fd = connectTo((int)f.server->boundPort());
+  if (fd < 0) GTEST_SKIP() << "v4 connect to :: refused here";
+  sendStr(fd, "GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+  EXPECT_EQ(statusOf(readAll(fd)), 200);
+  close(fd);
+  ASSERT_EQ(f.emitter.seen().size(), 1u);
+  EXPECT_EQ(f.emitter.seen()[0].clientIp, "127.0.0.1");
+}
+
+
+// ── File answers stream in bounded chunks (re-audit #7) ─────────────────────
+
+static std::string tempFileOf(const std::string& bytes) {
+  char name[] = "/tmp/nitro_file_XXXXXX";
+  const int fd = mkstemp(name);
+  EXPECT_GE(fd, 0);
+  size_t off = 0;
+  while (off < bytes.size()) {
+    const ssize_t w = write(fd, bytes.data() + off, bytes.size() - off);
+    if (w <= 0) break;
+    off += (size_t)w;
+  }
+  close(fd);
+  return name;
+}
+
+TEST(UvReactorTest, FileAnswersStreamTheExactRangeAndKeepFraming) {
+  std::string content;
+  content.reserve(3 * 1024 * 1024 + 123);
+  for (size_t i = 0; content.size() < 3 * 1024 * 1024 + 123; i++)
+    content.push_back((char)('a' + (i * 7) % 26));
+  const std::string path = tempFileOf(content);
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/f", -1);
+  f.server->registerRoute(Method::Get, "", "/hello", -1);
+  ServerConfig cfg;
+  cfg.keepAliveTimeoutMs = 10000;
+  const int64_t port = startWith(f, cfg);
+  auto fetch = [&](const std::string& req, int64_t offset, int64_t length,
+                   bool keep) {
+    f.holding.store(true);
+    const int fd = connectTo((int)port);
+    sendStr(fd, req);
+    RecordingEmitter::Job job{0, 0, ""};
+    for (int i = 0; i < 400 && !f.emitter.takeJob(job); i++)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    EXPECT_NE(job.requestId, 0);
+    f.server->respondFile(job.requestId, 200, {{"Content-Type", "application/octet-stream"}},
+                          path, offset, length);
+    f.holding.store(false);
+    std::string r = keep ? readOneResponse(fd) : readAll(fd);
+    return std::make_pair(fd, r);
+  };
+  // Whole file, Connection: close.
+  {
+    auto [fd, r] = fetch("GET /f HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 0, -1, false);
+    close(fd);
+    EXPECT_EQ(statusOf(r), 200);
+    EXPECT_EQ(headerOf(r, "content-length"), std::to_string(content.size()));
+    EXPECT_EQ(bodyOf(r), content);
+  }
+  // A range, on a keep-alive connection, then a second request on the same
+  // socket: the framing after a file answer is exact.
+  {
+    auto [fd, r] = fetch("GET /f HTTP/1.1\r\nHost: x\r\n\r\n", 100, 1000, true);
+    EXPECT_EQ(statusOf(r), 200);
+    EXPECT_EQ(headerOf(r, "content-length"), "1000");
+    EXPECT_EQ(bodyOf(r), content.substr(100, 1000));
+    sendStr(fd, "GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    const std::string second = readAll(fd);
+    close(fd);
+    EXPECT_EQ(statusOf(second), 200);
+    EXPECT_EQ(bodyOf(second), "echo:");
+  }
+  // HEAD: the entity length, no bytes.
+  {
+    auto [fd, r] = fetch("HEAD /f HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 0, -1, false);
+    close(fd);
+    EXPECT_EQ(statusOf(r), 200);
+    EXPECT_EQ(headerOf(r, "content-length"), std::to_string(content.size()));
+    EXPECT_EQ(bodyOf(r), "");
+  }
+  // Not a regular file / missing: 404.
+  for (const std::string& bad : {std::string("/tmp"), std::string("/nonexistent/file")}) {
+    f.holding.store(true);
+    const int fd = connectTo((int)port);
+    sendStr(fd, "GET /f HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    RecordingEmitter::Job job{0, 0, ""};
+    for (int i = 0; i < 400 && !f.emitter.takeJob(job); i++)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    f.server->respondFile(job.requestId, 200, {}, bad, 0, -1);
+    f.holding.store(false);
+    EXPECT_EQ(statusOf(readAll(fd)), 404) << bad;
+    close(fd);
+  }
+  ::remove(path.c_str());
+}
+
+// --- Second re-audit: streaming responses are bounded in time and memory ----
+
+// A helper that reads until EOF or [ms] of silence; eof tells which.
+static std::string readUntilEof(int fd, int ms, bool* eof) {
+  timeval tv{ms / 1000, (ms % 1000) * 1000};
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+  std::string out;
+  char buf[4096];
+  ssize_t n;
+  while ((n = recv(fd, buf, sizeof(buf), 0)) > 0) out.append(buf, (size_t)n);
+  *eof = (n == 0);
+  return out;
+}
+
+TEST(UvReactorTest, StreamIdleTimeoutClosesAStreamTheHandlerStoppedFeeding) {
+  Fixture f(echoAnswer());
+  f.holding.store(true);  // the test streams the answer itself
+  f.server->registerRoute(Method::Get, "", "/s", -1);
+  ServerConfig cfg;
+  cfg.streamIdleTimeoutMs = 300;
+  const int64_t port = startWith(f, cfg);
+  std::string res;
+  bool eof = false;
+  std::thread client([&] {
+    const int fd = connectTo((int)port);
+    if (fd < 0) return;
+    sendStr(fd, "GET /s HTTP/1.1\r\nHost: x\r\n\r\n");
+    res = readUntilEof(fd, 5000, &eof);
+    close(fd);
+  });
+  ASSERT_TRUE(f.waitForSeen(1));
+  const int64_t id = f.emitter.seen()[0].requestId;
+  f.server->startStream(id, 200, {{"Content-Type", "text/plain"}});
+  const char* a = "a";
+  f.server->sendStreamChunk(id, (const uint8_t*)a, 1, false);
+  const auto t0 = std::chrono::steady_clock::now();
+  client.join();  // nothing more is ever sent: the sweep must cut the stream
+  const auto waited = std::chrono::steady_clock::now() - t0;
+  EXPECT_TRUE(eof) << "the server did not close the silent stream";
+  EXPECT_LT(waited, std::chrono::seconds(2));
+  EXPECT_EQ(statusOf(res), 200);
+  EXPECT_NE(res.find("1\r\na\r\n"), std::string::npos);
+  EXPECT_EQ(res.find("0\r\n\r\n"), std::string::npos);  // cut, not finished
+  bool ev = false;
+  for (const auto& e : f.emitter.events())
+    if (std::get<2>(e) == "stream idle timeout") ev = true;
+  EXPECT_TRUE(ev);
+  // The id was retired: a late chunk is a no-op, not a crash.
+  f.server->sendStreamChunk(id, (const uint8_t*)a, 1, true);
+}
+
+TEST(UvReactorTest, StreamIdleTimeoutSparesAStreamThatKeepsWriting) {
+  Fixture f(echoAnswer());
+  f.holding.store(true);
+  f.server->registerRoute(Method::Get, "", "/s", -1);
+  ServerConfig cfg;
+  cfg.streamIdleTimeoutMs = 300;
+  const int64_t port = startWith(f, cfg);
+  std::string res;
+  bool eof = false;
+  std::thread client([&] {
+    const int fd = connectTo((int)port);
+    if (fd < 0) return;
+    sendStr(fd, "GET /s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    res = readUntilEof(fd, 5000, &eof);
+    close(fd);
+  });
+  ASSERT_TRUE(f.waitForSeen(1));
+  const int64_t id = f.emitter.seen()[0].requestId;
+  f.server->startStream(id, 200, {{"Content-Type", "text/plain"}});
+  const char* a = "a";
+  // Heartbeats every 100 ms for 900 ms: three idle windows' worth, never cut.
+  for (int i = 0; i < 9; i++) {
+    f.server->sendStreamChunk(id, (const uint8_t*)a, 1, false);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  f.server->sendStreamChunk(id, (const uint8_t*)a, 1, true);
+  client.join();
+  EXPECT_TRUE(eof);
+  EXPECT_EQ(dechunk(bodyOf(res)), std::string(10, 'a'));
+  for (const auto& e : f.emitter.events())
+    EXPECT_NE(std::get<2>(e), "stream idle timeout");
+}
+
+TEST(UvReactorTest, StreamBufferCapDropsAReaderThatFellBehind) {
+  Fixture f(echoAnswer());
+  f.holding.store(true);
+  f.server->registerRoute(Method::Get, "", "/s", -1);
+  ServerConfig cfg;
+  cfg.streamMaxBufferBytes = 64 * 1024;
+  const int64_t port = startWith(f, cfg);
+  const int fd = connectTo((int)port);
+  ASSERT_GE(fd, 0);
+  sendStr(fd, "GET /s HTTP/1.1\r\nHost: x\r\n\r\n");
+  ASSERT_TRUE(f.waitForSeen(1));
+  const int64_t id = f.emitter.seen()[0].requestId;
+  f.server->startStream(id, 200, {{"Content-Type", "text/plain"}});
+  // 8 MiB queued at once while the client reads nothing: the queue, not the
+  // socket, is what the cap bounds.
+  const std::string chunk(64 * 1024, 'x');
+  for (int i = 0; i < 128; i++)
+    f.server->sendStreamChunk(id, (const uint8_t*)chunk.data(), chunk.size(),
+                              false);
+  bool ev = false;
+  for (int i = 0; i < 600 && !ev; i++) {
+    for (const auto& e : f.emitter.events())
+      if (std::get<2>(e) == "stream buffer limit exceeded") ev = true;
+    if (!ev) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_TRUE(ev);
+  // The connection is gone: draining it ends in EOF/reset, not 8 MiB.
+  bool eof = false;
+  const std::string got = readUntilEof(fd, 3000, &eof);
+  EXPECT_LT(got.size(), 8u * 1024 * 1024);
+  close(fd);
+  // Late chunks after the drop are no-ops.
+  f.server->sendStreamChunk(id, (const uint8_t*)chunk.data(), 1, true);
+}
+
+TEST(UvReactorTest, ProxyProtocolV2AcceptsTlvsUpToTheProtocolMaximum) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Get, "", "/hello", -1);
+  ServerConfig cfg;
+  cfg.proxyProtocol = true;
+  const int64_t port = startWith(f, cfg);
+  const std::string get =
+      "GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+  const std::string inet(
+      "\xc6\x33\x64\x07" "\x0a\x00\x00\x01" "\xc7\x38" "\x00\x50", 12);
+  // A 2 KiB TLV block (e.g. PP2_TYPE_SSL with a client certificate) after
+  // the addresses: well past the old 536-byte guess, within the 16-bit length.
+  std::string tlv;
+  tlv.push_back((char)0x20);  // PP2_TYPE_SSL
+  tlv.push_back((char)0x08);
+  tlv.push_back((char)0x00);  // length 2048
+  tlv += std::string(2048, 'c');
+  const int fd = connectTo((int)port);
+  sendStr(fd, v2Header(0x21, 0x11, inet + tlv) + get);
+  EXPECT_EQ(statusOf(readAll(fd)), 200);
+  close(fd);
+  ASSERT_TRUE(f.waitForSeen(1));
+  EXPECT_EQ(f.emitter.seen()[0].clientIp, "198.51.100.7");
+}

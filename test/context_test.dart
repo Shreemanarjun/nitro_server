@@ -104,6 +104,25 @@ void main() {
         },
       );
 
+      test(
+        'malformed percent-encoding keeps the raw text, never throws',
+        () async {
+          await client.server.get(
+            '/q',
+            (r) => ResponseContext.text(
+              '${r.queryParam('q')}|${r.queryParamAll('q').join(',')}',
+            ),
+          );
+          expect((await client.get('/q?q=%zz')).text(), '%zz|%zz');
+          expect((await client.get('/q?q=%')).text(), '%|%');
+          expect(
+            (await client.get('/q?q=%E0%A4%A')).text(),
+            '%E0%A4%A|%E0%A4%A',
+          );
+          expect((await client.get('/q?q=a%20b')).text(), 'a b|a b');
+        },
+      );
+
       test('decodes percent-encoding and bare keys', () async {
         await client.server.get(
           '/q',
@@ -322,8 +341,139 @@ void main() {
         isTrue,
       );
       expect(
-        ServerConfig.fromEnv(const {'WS_COMPRESSION': 'nope'}).wsCompression,
+        ServerConfig.fromEnv(const {'WS_COMPRESSION': 'off'}).wsCompression,
         isFalse,
+      );
+      // A value that is not a boolean is an error, never silently "false".
+      expect(
+        () => ServerConfig.fromEnv(const {'WS_COMPRESSION': 'nope'}),
+        throwsFormatException,
+      );
+    });
+
+    test('a non-numeric integer variable throws instead of being ignored', () {
+      expect(
+        () => ServerConfig.fromEnv(const {'PORT': 'abc'}),
+        throwsFormatException,
+      );
+      expect(
+        () => ServerConfig.fromEnv(const {'MAX_BODY_BYTES': '10MB'}),
+        throwsFormatException,
+      );
+      // Empty means unset.
+      expect(ServerConfig.fromEnv(const {'PORT': ''}).port, 0);
+    });
+
+    test('reads every documented variable', () {
+      final config = ServerConfig.fromEnv(const {
+        'BACKLOG': '64',
+        'MAX_REQUESTS_PER_CONNECTION': '1000',
+        'HEADER_TIMEOUT_MS': '5000',
+        'WRITE_TIMEOUT_MS': '7000',
+        'BODY_TIMEOUT_MS': '9000',
+        'WS_IDLE_TIMEOUT_MS': '30000',
+        'MAX_CONNECTION_AGE_MS': '600000',
+        'MAX_IN_FLIGHT_REQUESTS': '512',
+        'WS_MAX_BUFFER_BYTES': '4096',
+        'EXPOSE_ERROR_DETAILS': '1',
+      });
+      expect(config.bodyTimeout, const Duration(seconds: 9));
+      expect(config.wsIdleTimeout, const Duration(seconds: 30));
+      expect(config.maxConnectionAge, const Duration(minutes: 10));
+      expect(config.maxInFlightRequests, 512);
+      // Defaults: body stall = keep-alive window, WS liveness on at 60 s,
+      // age and in-flight budget unbounded.
+      expect(const ServerConfig().bodyTimeout, Duration.zero);
+      expect(const ServerConfig().wsIdleTimeout, const Duration(seconds: 60));
+      expect(const ServerConfig().maxConnectionAge, Duration.zero);
+      expect(const ServerConfig().maxInFlightRequests, 0);
+      expect(
+        const ServerConfig()
+            .copyWith(maxInFlightRequests: 3)
+            .maxInFlightRequests,
+        3,
+      );
+      expect(config.backlog, 64);
+      expect(config.maxRequestsPerConnection, 1000);
+      expect(config.headerTimeout, const Duration(seconds: 5));
+      expect(config.writeTimeout, const Duration(seconds: 7));
+      expect(config.wsMaxBufferBytes, 4096);
+      expect(config.exposeErrorDetails, isTrue);
+      expect(const ServerConfig().exposeErrorDetails, isFalse);
+      expect(
+        const ServerConfig()
+            .copyWith(exposeErrorDetails: true)
+            .exposeErrorDetails,
+        isTrue,
+      );
+    });
+
+    test('TLS policy, mutual TLS and PROXY protocol from the environment', () {
+      final c = ServerConfig.fromEnv(const {
+        'TLS_CERT_PEM': 'CERT',
+        'TLS_KEY_PEM': 'KEY',
+        'TLS_MIN_VERSION': '1.3',
+        'TLS_CIPHERS': 'ECDHE-RSA-AES128-GCM-SHA256',
+        'TLS_CIPHER_SUITES': 'TLS_AES_128_GCM_SHA256',
+        'TLS_CLIENT_CA_FILE': '/ca.pem',
+        'PROXY_PROTOCOL': 'true',
+      });
+      expect(c.tls.minVersion, TlsVersion.v13);
+      expect(c.tls.ciphers, 'ECDHE-RSA-AES128-GCM-SHA256');
+      expect(c.tls.cipherSuites, 'TLS_AES_128_GCM_SHA256');
+      expect(c.tls.clientCaFile, '/ca.pem');
+      expect(c.tls.mutual, isTrue);
+      expect(c.proxyProtocol, isTrue);
+      expect(const ServerConfig().proxyProtocol, isFalse);
+      expect(const TlsConfig().minVersion, TlsVersion.v12);
+      expect(const TlsConfig().mutual, isFalse);
+      // Policy alone (no identity) is kept on the base's TLS config.
+      expect(
+        ServerConfig.fromEnv(const {'TLS_MIN_VERSION': '12'}).tls.minVersion,
+        TlsVersion.v12,
+      );
+      expect(
+        () => ServerConfig.fromEnv(const {'TLS_MIN_VERSION': '1.1'}),
+        throwsFormatException,
+      );
+      // Mutual TLS without a server certificate cannot work: validate says so.
+      expect(
+        const ServerConfig(tls: TlsConfig(clientCaPem: 'CA')).validate,
+        throwsArgumentError,
+      );
+      expect(
+        const ServerConfig(
+          tls: TlsConfig(certPem: 'C', keyPem: 'K', clientCaPem: 'CA'),
+        ).validate,
+        returnsNormally,
+      );
+      expect(const TlsConfig(certPem: 'C').copyWith(ciphers: 'X').ciphers, 'X');
+      expect(
+        const ServerConfig().copyWith(proxyProtocol: true).proxyProtocol,
+        isTrue,
+      );
+    });
+
+    test('TLS from files or inline PEM, always as a pair', () {
+      final files = ServerConfig.fromEnv(const {
+        'TLS_CERT_FILE': '/c.pem',
+        'TLS_KEY_FILE': '/k.pem',
+      });
+      expect(files.tls.certFile, '/c.pem');
+      expect(files.tls.keyFile, '/k.pem');
+      final pem = ServerConfig.fromEnv(const {
+        'TLS_CERT_PEM': 'CERT',
+        'TLS_KEY_PEM': 'KEY',
+      });
+      expect(pem.tls.certPem, 'CERT');
+      expect(pem.tls.keyPem, 'KEY');
+      expect(
+        () => ServerConfig.fromEnv(const {'TLS_CERT_FILE': '/c.pem'}),
+        throwsFormatException,
+      );
+      expect(
+        () => ServerConfig.fromEnv(const {'TLS_KEY_PEM': 'KEY'}),
+        throwsFormatException,
       );
     });
 
@@ -341,12 +491,48 @@ void main() {
         ServerConfig.fromEnv(const {'HTTP_PROTOCOL': '3'}).protocol,
         HttpProtocol.http3,
       );
-      // Unset / unknown leaves the base default untouched.
+      // Unset leaves the base default untouched; unknown is an error.
       expect(ServerConfig.fromEnv(const {}).protocol, HttpProtocol.http2);
       expect(
-        ServerConfig.fromEnv(const {'HTTP_PROTOCOL': 'spdy'}).protocol,
-        HttpProtocol.http2,
+        () => ServerConfig.fromEnv(const {'HTTP_PROTOCOL': 'spdy'}),
+        throwsFormatException,
       );
+    });
+  });
+
+  group('ServerConfig.validate', () {
+    test('accepts the defaults and sensible values', () {
+      const ServerConfig().validate();
+      const ServerConfig(
+        port: 65535,
+        maxConnections: 10,
+        maxRequestsPerConnection: 5,
+      ).validate();
+    });
+
+    test('rejects what the asserts would, at runtime', () {
+      for (final bad in const <ServerConfig>[
+        ServerConfig(port: -1),
+        ServerConfig(port: 65536),
+        ServerConfig(maxBodyBytes: 0),
+        ServerConfig(maxBodyBytes: -1),
+        ServerConfig(backlog: 0),
+        ServerConfig(wsMaxBufferBytes: 0),
+        ServerConfig(maxConnections: -1),
+        ServerConfig(maxConnectionsPerIp: -1),
+        ServerConfig(maxRequestsPerConnection: -1),
+        ServerConfig(workerThreads: -1),
+        ServerConfig(defaultTimeout: Duration(seconds: -1)),
+        ServerConfig(keepAliveTimeout: Duration(seconds: -1)),
+        ServerConfig(headerTimeout: Duration(seconds: -1)),
+        ServerConfig(writeTimeout: Duration(seconds: -1)),
+        ServerConfig(bodyTimeout: Duration(seconds: -1)),
+        ServerConfig(wsIdleTimeout: Duration(seconds: -1)),
+        ServerConfig(maxConnectionAge: Duration(seconds: -1)),
+        ServerConfig(maxInFlightRequests: -1),
+      ]) {
+        expect(bad.validate, throwsArgumentError);
+      }
     });
   });
 
@@ -356,7 +542,7 @@ void main() {
       expect(base.isolates, 1);
       expect(base.copyWith(isolates: 0).isolates, 0);
       expect(base.copyWith(port: 8080).isolates, 1);
-      expect(() => ServerConfig(isolates: -1), throwsA(isA<AssertionError>()));
+      expect(const ServerConfig(isolates: -1).validate, throwsArgumentError);
     });
   });
 

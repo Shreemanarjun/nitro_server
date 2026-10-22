@@ -90,7 +90,10 @@ class BridgeEmitter final : public Emitter {
     // Backpressure.batch (nitro 0.7.6) coalesces on the bridge's completion
     // batcher: one post per head, heads arriving while Dart is busy delivered
     // as one message — replacing the hand-rolled per-isolate Combiner.
+    // The native buffer's ownership moves to the bridge (freed after the
+    // post), which the static analyzer cannot see across the FFI boundary.
     bridge_->emit_incomingRequests(req.toNativeBuffer());
+    // NOLINTNEXTLINE(clang-analyzer-unix.Malloc): buffer owned by the bridge now
   }
 
   void emitBodyData(int64_t requestId, uint8_t* payload, size_t n) override {
@@ -145,7 +148,9 @@ class BridgeEmitter final : public Emitter {
     ev.kind = (int64_t)kind;
     ev.requestId = requestId;
     ev.message = message;
+    // Ownership of the buffer moves to the bridge (see emitHead).
     bridge_->emit_serverEvents(ev.toNativeBuffer());
+    // NOLINTNEXTLINE(clang-analyzer-unix.Malloc): buffer owned by the bridge now
   }
 
  private:
@@ -214,7 +219,14 @@ class HybridNitroServerImpl final : public HybridNitroServerNative {
     cfg.headerTimeoutMs = raw.headerTimeoutMs;
     cfg.writeTimeoutMs = raw.writeTimeoutMs;
     cfg.wsMaxBufferBytes = raw.wsMaxBufferBytes;
+    cfg.streamMaxBufferBytes = raw.streamMaxBufferBytes;
+    cfg.streamIdleTimeoutMs = raw.streamIdleTimeoutMs;
+    cfg.maxBufferedBodyBytes = raw.maxBufferedBodyBytes;
     cfg.wsCompression = raw.wsCompression;
+    cfg.bodyTimeoutMs = raw.bodyTimeoutMs;
+    cfg.wsIdleTimeoutMs = raw.wsIdleTimeoutMs;
+    cfg.maxConnectionAgeMs = raw.maxConnectionAgeMs;
+    cfg.maxInFlightRequests = raw.maxInFlightRequests;
     cfg.http2 = raw.http2;
     cfg.tlsRequested = !raw.tls.certPem.empty() || !raw.tls.keyPem.empty() ||
                        !raw.tls.certFile.empty() || !raw.tls.keyFile.empty();
@@ -222,6 +234,12 @@ class HybridNitroServerImpl final : public HybridNitroServerNative {
     cfg.tlsKeyPem = raw.tls.keyPem;
     cfg.tlsCertFile = raw.tls.certFile;
     cfg.tlsKeyFile = raw.tls.keyFile;
+    cfg.tlsMinVersion = raw.tls.minVersion;
+    cfg.tlsCiphers = raw.tls.ciphers;
+    cfg.tlsCipherSuites = raw.tls.cipherSuites;
+    cfg.tlsClientCaPem = raw.tls.clientCaPem;
+    cfg.tlsClientCaFile = raw.tls.clientCaFile;
+    cfg.proxyProtocol = raw.proxyProtocol;
     server_->configure(cfg);
   }
 
@@ -278,6 +296,17 @@ class HybridNitroServerImpl final : public HybridNitroServerNative {
   int64_t inFlightRequests() override { return server_->inFlightRequests(); }
 
   int64_t liveConnections() override { return server_->liveConnections(); }
+
+  int64_t emitterId() override {
+    return static_cast<int64_t>(reinterpret_cast<uintptr_t>(&emitter_));
+  }
+
+  bool detachEmitter(int64_t id) override {
+    // The pointer is only compared against the attached set, never
+    // dereferenced, so a stale id from an already-destroyed bridge is safe.
+    return server_->removeEmitter(
+        reinterpret_cast<Emitter*>(static_cast<uintptr_t>(id)));
+  }
 
   void respondFile(int64_t requestId, int64_t status, NitroCppBuffer headers,
                    const std::string& path, int64_t offset,

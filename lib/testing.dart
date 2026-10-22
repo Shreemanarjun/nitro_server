@@ -72,13 +72,19 @@ class NitroTestClient {
   /// ports, no background threads beyond the runner's streams. A request
   /// or WebSocket handshake unanswered after [responseTimeout] throws
   /// [StateError] (there are no route timeouts here to do it).
+  /// [exposeErrorDetails] and [wsMaxBufferBytes] mirror the [ServerConfig]
+  /// fields of the same name.
   static Future<NitroTestClient> start({
     Duration responseTimeout = const Duration(seconds: 5),
     bool responseTiming = true,
+    bool exposeErrorDetails = false,
+    int wsMaxBufferBytes = 1024 * 1024,
   }) async {
     final native = _InMemoryNative();
     final runner = ServerRunner(native)
-      ..responseTimingForTesting = responseTiming;
+      ..responseTimingForTesting = responseTiming
+      ..exposeErrorDetailsForTesting = exposeErrorDetails
+      ..wsMaxBufferBytesForTesting = wsMaxBufferBytes;
     return NitroTestClient._(runner, native, responseTimeout);
   }
 
@@ -490,6 +496,12 @@ class _InMemoryNative extends NitroServerNative with NitroServerNativeDefaults {
 
   @override
   int liveConnections() => 0;
+
+  @override
+  int emitterId() => 1;
+
+  @override
+  bool detachEmitter(int id) => false;
   // coverage:ignore-end
 
   /// File answers are read here and delivered as plain bodies — the engine

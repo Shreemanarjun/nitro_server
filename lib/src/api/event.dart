@@ -12,6 +12,13 @@ enum ServerEventKind {
   clientError,
   notice,
   clientDisconnect,
+
+  /// A handler (or middleware) threw, or produced a response the server
+  /// refused to send (a header carrying CR/LF). Emitted by the Dart runner,
+  /// never by the engine, so it sits after the engine-mirrored kinds. The
+  /// message names the error and carries its stack trace; the client only
+  /// sees a generic 500 unless `ServerConfig.exposeErrorDetails` is on.
+  handlerError,
 }
 
 /// An observation from the engine that is not a request: lifecycle, a timed

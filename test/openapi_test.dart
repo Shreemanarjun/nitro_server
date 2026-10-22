@@ -362,7 +362,6 @@ void main() {
         client.server,
         title: 'Ping API',
         uiTitle: 'Ping Docs',
-        swaggerUiVersion: '5.17.14',
       );
 
       final spec = await client.get('/openapi.json');
@@ -422,13 +421,35 @@ void main() {
     });
 
     test(
-      'defaults: UI title falls back to the API title, UI pinned to v5',
+      'defaults: UI title falls back to the API title, UI pinned with SRI',
       () async {
         await serveOpenApi(client.server, title: 'Defaulted');
         final docs = await client.get('/docs');
         expect(docs.status, 200);
+        expect(docs.headers['cache-control'], 'no-store');
         expect(docs.text(), contains('<title>Defaulted</title>'));
-        expect(docs.text(), contains('swagger-ui-dist@5/'));
+        expect(
+          docs.text(),
+          contains('swagger-ui-dist@$swaggerUiPinnedVersion/'),
+        );
+        expect(docs.text(), contains('integrity="sha384-'));
+        expect(docs.text(), contains('crossorigin="anonymous"'));
+        expect(docs.text(), contains('Content-Security-Policy'));
+        // Another version: pinned as asked, but no SRI (hashes unknown).
+        await serveOpenApi(
+          client.server,
+          title: 'Other',
+          docsPath: '/docs2',
+          path: '/openapi2.json',
+          swaggerUiVersion: '5.0.0',
+        );
+        final other = await client.get('/docs2');
+        expect(other.text(), contains('swagger-ui-dist@5.0.0/'));
+        expect(other.text(), isNot(contains('integrity=')));
+        expect(
+          (await client.get('/openapi2.json')).headers['cache-control'],
+          'no-store',
+        );
       },
     );
   });

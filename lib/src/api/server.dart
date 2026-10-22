@@ -60,6 +60,29 @@ class NitroServer with RouteRegistrar<NitroServer> {
   /// single-isolate server). Closed with the server.
   List<_Helper> _helpers = const [];
 
+  /// How long the main isolate waits for a helper isolate to start, reload,
+  /// report metrics or close before declaring it dead. A helper that misses
+  /// the deadline is killed, a `notice` event names it, [helpersHealthy]
+  /// turns false (so `serveObservability`'s default readiness answers 503),
+  /// and the operation proceeds without it — a wedged helper can never hang
+  /// `bind`, `reload`, `aggregatedMetrics` or `close`.
+  static Duration helperTimeout = const Duration(seconds: 10);
+
+  /// Helper isolates still alive (0 for a single-isolate server).
+  int get helpersAlive => _helpers.where((h) => h.alive).length;
+
+  /// False once any helper isolate has been declared dead (see
+  /// [helperTimeout]). The engine stops dealing requests to it; the rest of
+  /// the server keeps serving at reduced capacity.
+  bool get helpersHealthy => _helpers.every((h) => h.alive);
+
+  /// Live connections the engine currently holds (every protocol).
+  int get liveConnections => _runner.liveConnections;
+
+  /// Test seam: this isolate's metrics in the cross-isolate wire form.
+  @visibleForTesting
+  Map<String, Object?> metricsWireForTesting() => _runner.metricsWire();
+
   /// Binds [config.host]:[config.port] and starts accepting. A config port of
   /// 0 asks the OS for a free port — read it back from [port].
   ///
@@ -72,6 +95,7 @@ class NitroServer with RouteRegistrar<NitroServer> {
     ServerConfig config = const ServerConfig(),
     ServerSetup? setup,
   ]) async {
+    config.validate();
     _ensureNativeLoaded();
     // Auto (`isolates: 0`): scale to the machine so the engine can fan a
     // CPU-bound handler across cores — but ONLY when a `setup` is given, since
@@ -106,6 +130,10 @@ class NitroServer with RouteRegistrar<NitroServer> {
         dylibPath: loadedNitroServerNativePath,
         wsCompression: config.wsCompression,
         responseTiming: config.responseTiming,
+        exposeErrorDetails: config.exposeErrorDetails,
+        wsMaxBufferBytes: config.wsMaxBufferBytes,
+        detach: runner.detachEmitter,
+        notice: runner.emitNotice,
       );
     }
     server._port = runner.start(config);
@@ -232,7 +260,10 @@ class NitroServer with RouteRegistrar<NitroServer> {
   Future<ServerMetrics> aggregatedMetrics() async {
     final snapshots = <Map<String, Object?>>[_runner.metricsWire()];
     for (final helper in _helpers) {
-      snapshots.add(await helper.collectMetrics());
+      if (!helper.alive) continue;
+      final snapshot = await helper.collectMetrics();
+      if (snapshot != null) snapshots.add(snapshot);
+      _noteIfDead(helper, 'aggregatedMetrics');
     }
     return mergeIsolateMetrics(snapshots);
   }
@@ -455,9 +486,21 @@ class NitroServer with RouteRegistrar<NitroServer> {
     _setup = rebuild;
     await _runner.reload(() async => rebuild(this));
     for (final helper in _helpers) {
+      if (!helper.alive) continue;
       await helper.reload(rebuild);
+      _noteIfDead(helper, 'reload');
     }
     return this;
+  }
+
+  /// Reports a helper the last operation found unresponsive (and killed).
+  void _noteIfDead(_Helper helper, String during) {
+    if (helper.alive || helper.reported) return;
+    helper.reported = true;
+    _runner.emitNotice(
+      'helper isolate ${helper.name} unresponsive during $during '
+      '(> ${helperTimeout.inMilliseconds} ms): killed; serving without it',
+    );
   }
 
   final _closed = Completer<void>();
@@ -496,10 +539,44 @@ class NitroServer with RouteRegistrar<NitroServer> {
 /// One helper isolate: a [ServerRunner] on the same engine key, dealt every
 /// n-th request by the engine. Lives until the server closes.
 class _Helper {
-  _Helper(this._control, this._replies);
+  _Helper(
+    this._control,
+    this._replies,
+    this._isolate,
+    this.name,
+    this.emitterId,
+    this._detach,
+  );
 
   final SendPort _control;
   final ReceivePort _replies;
+  final Isolate _isolate;
+  final String name;
+
+  /// The helper's emitter in the engine (see `NitroServerNative.emitterId`).
+  final int emitterId;
+
+  /// Drops [emitterId] from the engine's dispatch rotation.
+  final bool Function(int emitterId) _detach;
+
+  /// False once a reply missed [NitroServer.helperTimeout]: the isolate was
+  /// killed and nothing is sent to it again.
+  bool alive = true;
+
+  /// Whether the death has been reported on the server's event stream.
+  bool reported = false;
+
+  /// The isolate's uncaught-error port (separate from replies).
+  ReceivePort? _errors;
+
+  /// The isolate's exit port: a helper that dies (killed, `Isolate.exit`, a
+  /// fatal VM error) is noticed the moment it exits, not on the next reply
+  /// that times out — readiness goes red at once.
+  ReceivePort? _exits;
+
+  /// Set by [close] before the helper is told to stop, so its orderly exit
+  /// is not reported as a death.
+  bool _closing = false;
 
   static Future<List<_Helper>> spawnAll({
     required int count,
@@ -508,14 +585,23 @@ class _Helper {
     required String? dylibPath,
     required bool wsCompression,
     required bool responseTiming,
+    required bool exposeErrorDetails,
+    required int wsMaxBufferBytes,
+    required bool Function(int emitterId) detach,
+    required void Function(String message) notice,
   }) async {
     final helpers = <_Helper>[];
     for (var i = 0; i < count; i++) {
       final replies = ReceivePort();
-      // Uncaught errors in the helper (a throwing `setup`) land on the same
-      // port, so a failure surfaces here instead of hanging `bind`.
+      // Uncaught errors in the helper (a throwing `setup`, a stray timer)
+      // get their own port: on the reply port they would be read as the
+      // acknowledgement of whatever was in flight and desynchronise it.
+      final errors = ReceivePort();
+      final exits = ReceivePort();
+      final name = 'nitro_server:$key:${i + 1}';
+      final Isolate isolate;
       try {
-        await Isolate.spawn(
+        isolate = await Isolate.spawn(
           _helperMain,
           _HelperBoot(
             key,
@@ -524,9 +610,12 @@ class _Helper {
             replies.sendPort,
             wsCompression,
             responseTiming,
+            exposeErrorDetails,
+            wsMaxBufferBytes,
           ),
-          debugName: 'nitro_server:$key:${i + 1}',
-          onError: replies.sendPort,
+          debugName: name,
+          onError: errors.sendPort,
+          onExit: exits.sendPort,
         );
       } on ArgumentError catch (e) {
         // The only non-sendable thing in the boot message is `setup`: a
@@ -541,6 +630,8 @@ class _Helper {
         // sent to every isolate), so no helper is ever live here — nothing to
         // close but this iteration's `replies` port.
         replies.close();
+        errors.close();
+        exits.close();
         throw ArgumentError(
           'nitro_server: `setup` must be sendable across isolates for a '
           'multi-isolate server (isolates > 1 or auto `isolates: 0`) — use a '
@@ -549,20 +640,65 @@ class _Helper {
         );
       }
       final queue = StreamIterator<Object?>(replies);
-      // The first message is the control port, sent once routes are
-      // registered and streams subscribed — the engine may deal to this
-      // helper from that moment on.
-      if (!await queue.moveNext() || queue.current is! SendPort) {
+      // The first message is `[control port, emitter id]`, sent once routes
+      // are registered and streams subscribed — the engine may deal to this
+      // helper from that moment on. A helper whose `setup` never returns
+      // (wedged) misses [NitroServer.helperTimeout] and is killed: `bind`
+      // fails loudly instead of hanging.
+      // A `setup` that throws reports on the error port; race it against the
+      // hello so `bind` fails with the real error instead of the timeout.
+      // One listener for the port's whole life (a ReceivePort cannot be
+      // re-listened): before the hello it captures the boot failure, after it
+      // every uncaught error is reported as a notice, never read as an ack.
+      Object? spawnError;
+      var booted = false;
+      final firstError = Completer<void>();
+      errors.listen((e) {
+        if (booted) {
+          notice('helper isolate $name uncaught error: $e');
+          return;
+        }
+        spawnError ??= e;
+        if (!firstError.isCompleted) firstError.complete();
+      });
+      final started = await Future.any<bool>([
+        queue.moveNext(),
+        firstError.future.then((_) => false),
+      ]).timeout(NitroServer.helperTimeout, onTimeout: () => false);
+      final hello = started ? queue.current : null;
+      if (hello is! List || hello.length != 2 || hello[0] is! SendPort) {
+        isolate.kill(priority: Isolate.immediate);
         replies.close();
+        errors.close();
+        exits.close();
         for (final helper in helpers) {
           await helper.close();
         }
         throw StateError(
           'nitro_server: helper isolate ${i + 1} failed to start: '
-          '${queue.current}',
+          '${spawnError ?? (started ? queue.current : 'no reply within '
+                        '${NitroServer.helperTimeout.inMilliseconds} ms')}',
         );
       }
-      final helper = _Helper(queue.current as SendPort, replies);
+      final helper = _Helper(
+        hello[0] as SendPort,
+        replies,
+        isolate,
+        name,
+        hello[1] as int,
+        detach,
+      );
+      booted = true; // later uncaught errors are notices, never an ack
+      helper._errors = errors;
+      helper._exits = exits;
+      // Death is detected here, not by a reply that never comes: the helper
+      // is marked dead, detached from the engine and reported at once, and
+      // a reply someone is waiting on fails now (the port closes).
+      exits.listen((_) {
+        if (helper._closing || !helper.alive) return;
+        notice('helper isolate $name exited');
+        helper._die();
+      });
       helper._queue = queue;
       helpers.add(helper);
     }
@@ -571,24 +707,61 @@ class _Helper {
 
   late final StreamIterator<Object?> _queue;
 
-  /// Tells the helper to rebuild its routes from [setup], matching the main
-  /// isolate's [NitroServer.reload]. [setup] must be sendable across isolates.
-  Future<void> reload(ServerSetup setup) async {
-    _control.send(setup);
-    await _queue.moveNext(); // 'reloaded'
+  /// Waits for the helper's next reply. On [NitroServer.helperTimeout] the
+  /// helper is declared dead and killed; returns false. Never throws.
+  Future<bool> _reply() async {
+    if (!alive) return false;
+    final ok = await _queue.moveNext().timeout(
+      NitroServer.helperTimeout,
+      onTimeout: () => false,
+    );
+    if (ok) return true;
+    _die();
+    return false;
   }
 
-  /// Asks the helper for its metrics as an isolate-portable map.
-  Future<Map<String, Object?>> collectMetrics() async {
+  void _die() {
+    if (!alive) return;
+    alive = false;
+    // Order matters: stop the engine dealing to it first, so no request lands
+    // on a port that is about to vanish; then kill. Requests already dealt
+    // run into their route timeout (408) — the engine retires those itself.
+    _detach(emitterId);
+    _isolate.kill(priority: Isolate.immediate);
+    _replies.close();
+    _errors?.close();
+    _exits?.close();
+  }
+
+  /// Tells the helper to rebuild its routes from [setup], matching the main
+  /// isolate's [NitroServer.reload]. [setup] must be sendable across isolates.
+  /// A helper that does not confirm in time is killed (see [alive]).
+  Future<void> reload(ServerSetup setup) async {
+    if (!alive) return;
+    _control.send(setup);
+    await _reply(); // 'reloaded'
+  }
+
+  /// Asks the helper for its metrics as an isolate-portable map; null when
+  /// the helper is (or just became) dead.
+  Future<Map<String, Object?>?> collectMetrics() async {
+    if (!alive) return null;
     _control.send(_HelperBoot.collectSignal);
-    await _queue.moveNext();
-    return (_queue.current as Map).cast<String, Object?>();
+    if (!await _reply()) return null;
+    final reply = _queue.current;
+    if (reply is! Map) return null; // never cast a stray message
+    return reply.cast<String, Object?>();
   }
 
   Future<void> close() async {
+    if (!alive) return;
+    _closing = true; // its exit is expected, not a death
     _control.send(_HelperBoot.closeSignal);
-    await _queue.moveNext(); // 'closed' — the helper's runner is shut.
-    _replies.close();
+    if (await _reply()) {
+      _replies.close(); // 'closed' — the helper's runner is shut.
+      _errors?.close();
+      _exits?.close();
+    }
   }
 }
 
@@ -600,6 +773,8 @@ class _HelperBoot {
     this.reply,
     this.wsCompression,
     this.responseTiming,
+    this.exposeErrorDetails,
+    this.wsMaxBufferBytes,
   );
 
   static const closeSignal = 'close';
@@ -611,6 +786,8 @@ class _HelperBoot {
   final SendPort reply;
   final bool wsCompression;
   final bool responseTiming;
+  final bool exposeErrorDetails;
+  final int wsMaxBufferBytes;
 }
 
 /// Helper isolate entry: same key, own runner, same routes, then wait for
@@ -627,9 +804,11 @@ Future<void> _helperMain(_HelperBoot boot) async {
   runner.prepareHelper(
     wsCompression: boot.wsCompression,
     responseTiming: boot.responseTiming,
+    exposeErrorDetails: boot.exposeErrorDetails,
+    wsMaxBufferBytes: boot.wsMaxBufferBytes,
   );
   final control = ReceivePort();
-  boot.reply.send(control.sendPort);
+  boot.reply.send([control.sendPort, runner.emitterId]);
   await for (final message in control) {
     if (message == _HelperBoot.closeSignal) break;
     if (message == _HelperBoot.collectSignal) {

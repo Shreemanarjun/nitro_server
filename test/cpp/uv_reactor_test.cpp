@@ -3945,11 +3945,16 @@ TEST(UvReactorTest, BodylessStatusesNeverCarryABody) {
   const int fd = connectTo((int)port);
   // Pipelined: a 204 whose handler returned a body, then a normal request.
   sendStr(fd, "GET /nc HTTP/1.1\r\nHost: x\r\n\r\nGET /ok HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
-  const std::string first = readHttpHead(fd);
+  // Both answers may land in one read (Linux does), so split the stream
+  // ourselves instead of reading the first head and then "the rest".
+  const std::string all = readAll(fd);
+  close(fd);
+  const size_t headEnd = all.find("\r\n\r\n");
+  ASSERT_NE(headEnd, std::string::npos) << all.substr(0, 60);
+  const std::string first = all.substr(0, headEnd + 4);
   EXPECT_EQ(statusOf(first), 204);
   EXPECT_EQ(headerOf(first, "content-length"), "");
-  const std::string rest = readAll(fd);
-  close(fd);
+  const std::string rest = all.substr(headEnd + 4);
   EXPECT_EQ(rest.rfind("HTTP/1.1 200", 0), 0u) << rest.substr(0, 40);  // nothing leaked in between
   EXPECT_EQ(bodyOf(rest), "LEAKED");
 }

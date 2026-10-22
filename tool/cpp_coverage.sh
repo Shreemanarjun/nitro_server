@@ -13,8 +13,10 @@ cmake -S src -B build/cov -DCMAKE_BUILD_TYPE=Debug -DNITRO_SERVER_BUILD_TESTS=ON
   -DNITRO_SERVER_COVERAGE=ON -DCMAKE_CXX_COMPILER="${CXX:-clang++}" >/dev/null
 cmake --build build/cov --parallel --target nitro_server_engine_tests >/dev/null
 rm -f build/cov/engine-*.profraw
+# Keep the test output: a failing test must name itself in the CI log.
 LLVM_PROFILE_FILE=build/cov/engine-%p.profraw \
-  ./build/cov/nitro_server_tests/nitro_server_engine_tests >/dev/null
+  ./build/cov/nitro_server_tests/nitro_server_engine_tests > build/cov/tests.log 2>&1 \
+  || { grep -E "FAILED|Failure|Expected|Which is" build/cov/tests.log | tail -40; exit 1; }
 "$PROFDATA" merge -sparse build/cov/engine-*.profraw -o build/cov/engine.profdata
 "$COV" report ./build/cov/nitro_server_tests/nitro_server_engine_tests \
   -instr-profile=build/cov/engine.profdata src/engine | tee build/cov/report.txt

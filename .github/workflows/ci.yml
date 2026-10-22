@@ -121,7 +121,7 @@ jobs:
           for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8080/readyz >/dev/null 2>&1 && break; sleep 1; done
           ./h2spec -h 127.0.0.1 -p 8080 --junit-report h2spec.xml > h2spec.txt || true
           tail -3 h2spec.txt
-          passed=$(grep -Eo '[0-9]+ tests, [0-9]+ passed' h2spec.txt | tail -1 | grep -Eo '[0-9]+ passed' | grep -Eo '[0-9]+')
+          passed=$(grep -aEo '[0-9]+ tests, [0-9]+ passed' h2spec.txt | tail -1 | grep -Eo '[0-9]+ passed' | grep -Eo '[0-9]+')  # -a: the report has escape bytes
           echo "h2spec passed=$passed (floor 136)"
           test "${passed:-0}" -ge 136
       - if: always() && matrix.sanitizer == '' && runner.os == 'Linux'
@@ -238,7 +238,7 @@ jobs:
           test "$(curl -s -o /dev/null -w '%{http_code}' -u ops:pw http://127.0.0.1:8081/api/v1/admin)" = "200"
           test "$(curl -s -o /dev/null -w '%{http_code}' -u admin:dev http://127.0.0.1:8081/api/v1/admin)" = "401"
           docker stop nitro2
-      - uses: aquasecurity/trivy-action@915b19bbe73b92a6cf82a1bc12b087c9a19a5fe2 # v0.28.0
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0 (v0.28.0's setup-trivy tag no longer exists)
         with:
           image-ref: nitro-server:ci
           # HIGH too, not just CRITICAL; unfixed base-image CVEs are reported

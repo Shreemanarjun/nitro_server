@@ -32,9 +32,8 @@ migrate_working_dir/
 /build/
 /coverage/
 
-# Fuzzing: dev-only libFuzzer targets, seed corpus growth, and crash finds
-# (run locally via tool/fuzz.sh; build output already covered by /build/).
-/test/fuzz/
+# Fuzzing: libFuzzer crash finds (the targets and seed corpus in test/fuzz are
+# tracked — CI's fuzz job needs them; growth goes to build/fuzz/corpus/).
 crash-*
 leak-*
 timeout-*

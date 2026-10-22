@@ -57,7 +57,7 @@ jobs:
       TSAN_OPTIONS: halt_on_error=1
       # Leak detection is on where LeakSanitizer exists (Linux); macOS ASan has
       # none. detect_leaks=1 makes a native leak in the engine fail the job.
-      ASAN_OPTIONS: ${{ runner.os == 'Linux' && 'detect_leaks=1:detect_container_overflow=0' || 'detect_leaks=0:detect_container_overflow=0' }}
+      ASAN_OPTIONS: ${{ startsWith(matrix.os, 'ubuntu') && 'detect_leaks=1:detect_container_overflow=0' || 'detect_leaks=0:detect_container_overflow=0' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - if: runner.os == 'Linux'
@@ -89,7 +89,7 @@ jobs:
       TSAN_OPTIONS: halt_on_error=1
       # Leak detection on Linux (LeakSanitizer): the h2 path is otherwise the
       # one engine path never leak-checked.
-      ASAN_OPTIONS: ${{ runner.os == 'Linux' && 'detect_leaks=1:detect_container_overflow=0' || 'detect_leaks=0:detect_container_overflow=0' }}
+      ASAN_OPTIONS: ${{ startsWith(matrix.os, 'ubuntu') && 'detect_leaks=1:detect_container_overflow=0' || 'detect_leaks=0:detect_container_overflow=0' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - if: runner.os == 'Linux'

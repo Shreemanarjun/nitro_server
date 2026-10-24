@@ -17,7 +17,7 @@ docker run --rm -p 8080:8080 nitro-server
 ```
 
 The multi-stage [`Dockerfile`](../Dockerfile) builds the native engine with
-cmake (**TLS, brotli and HTTP/2 on**, dependencies linked statically, no
+cmake (**TLS, brotli and HTTP/2 on**, deps as Debian shared libraries, no
 `-march=native` so the image runs on any CPU of its arch), then AOT-compiles
 [`bin/server.dart`](../bin/server.dart) with `dart build cli` — the only build
 that runs the package hook, so the engine ships inside the bundle as a code

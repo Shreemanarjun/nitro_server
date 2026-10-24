@@ -5,6 +5,7 @@ library;
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'context.dart';
@@ -242,11 +243,16 @@ class EventLoopLagProbe {
 
   Timer? _timer;
   int _holders = 0;
-  int _lastLagMicros = 0;
+  // The last ten ticks' lateness (one second). The gauge is the worst of
+  // them: after the loop was blocked, Dart fires the missed periodic ticks
+  // back to back and those catch-up ticks measure ~0 — reporting only the
+  // latest tick would hide the stall that was just measured.
+  final _recentLagMicros = List<int>.filled(10, 0);
+  int _tick = 0;
   late DateTime _expected;
 
   /// Lateness of the most recent tick, in microseconds (0 before the first).
-  int get lastLagMicros => _lastLagMicros;
+  int get lastLagMicros => _recentLagMicros.reduce(max);
 
   /// Whether the probe timer is running.
   bool get running => _timer != null;
@@ -259,7 +265,7 @@ class EventLoopLagProbe {
       _timer = Timer.periodic(_period, (_) {
         final now = DateTime.now();
         final lag = now.difference(_expected).inMicroseconds;
-        _lastLagMicros = lag < 0 ? 0 : lag;
+        _recentLagMicros[_tick++ % _recentLagMicros.length] = lag < 0 ? 0 : lag;
         _expected = now.add(_period);
       });
     }
@@ -270,7 +276,7 @@ class EventLoopLagProbe {
     if (--_holders > 0) return;
     _timer?.cancel();
     _timer = null;
-    _lastLagMicros = 0;
+    _recentLagMicros.fillRange(0, _recentLagMicros.length, 0);
   }
 }
 

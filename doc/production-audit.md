@@ -682,8 +682,11 @@ re-soaked locally before re-tagging: echo-only traffic now holds ~9 000 small
 native blocks on the macOS heap where the released engine had accumulated
 2.1 M of them after 85 s (`heap` profile), and the full mix ran 150 s,
 3.5 M requests, 0 errors, RSS flat at 284.5 MB from the first minute on
-(−1.8% quarter→end). The same soak was then run inside a Linux container
-(glibc, as CI) — see the release step below for the nightly that gates it.
+(−1.8% quarter→end). Inside a Linux container (glibc, as CI): echo-only
+240 s, 2.07 M requests, RSS 230.4 → 227.7 MB (−1.1%); the full mix 300 s,
+5.47 M requests, 0 errors, 288.9 → 332.2 MB (+15.0%) with the curve flat from
+t+240 s on (311.5 → 332.1 → 332.2 MB): heap sizing that plateaus, not the
+nightly's linear slope. The 600 s nightly remains the gate.
 
 ## Remaining maintainer steps
 

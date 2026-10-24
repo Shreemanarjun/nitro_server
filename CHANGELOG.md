@@ -37,7 +37,7 @@ server for Dart/Flutter on a native C++ (libuv) engine over Nitro FFI.
 - Supply chain: SHA-pinned actions, `-Werror`, ASan/TSan/fuzz/clang-tidy/
   Trivy/h2spec/Autobahn in CI, nightly soak + long fuzz, release signed (Sigstore provenance,
   keyless cosign bundle, SPDX SBOM); the build hook verifies a prebuilt
-  against `hook/prebuilt_checksums.json` (shipped in the package) and,
+  against `prebuilt_checksums.json` (shipped in the package) and,
   with `NITRO_SERVER_VERIFY_SIGSTORE=1`, `cosign verify-blob`. Linux prebuilts
   are built on Ubuntu 22.04 with libstdc++ linked in (glibc 2.35 floor, gated
   in the release workflow); macOS prebuilts need macOS 14+.

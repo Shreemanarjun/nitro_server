@@ -92,7 +92,7 @@ enum HttpProtocol {
   http2,
 
   /// Up to HTTP/3 (QUIC). Not yet implemented — currently behaves as [http2]
-  /// (see doc/http3.md); reserved so configs are forward-compatible.
+  ///; reserved so configs are forward-compatible.
   http3,
 }
 

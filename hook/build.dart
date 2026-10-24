@@ -22,7 +22,7 @@ import 'package:code_assets/code_assets.dart';
 import 'package:crypto/crypto.dart';
 import 'package:hooks/hooks.dart';
 
-import 'prebuilt_lock.dart';
+import 'package:nitro_server/src/internal/prebuilt_lock.dart';
 
 const _repo = 'Shreemanarjun/nitro_server';
 
@@ -46,7 +46,7 @@ void main(List<String> args) async {
       );
       output.dependencies.add(input.packageRoot.resolve('pubspec.yaml'));
       output.dependencies.add(
-        input.packageRoot.resolve('hook/prebuilt_checksums.json'),
+        input.packageRoot.resolve('prebuilt_checksums.json'),
       );
       // Re-run when what the library was made from changes; without these the
       // hooks runner serves its cached output and a rebuilt `build/lib` (or an
@@ -120,7 +120,7 @@ Future<File?> _download(
   // the release page: a replaced asset + sidecar cannot pass. No entry means
   // this target has no verified prebuilt — fall back to a source build.
   final lockFile = File.fromUri(
-    input.packageRoot.resolve('hook/prebuilt_checksums.json'),
+    input.packageRoot.resolve('prebuilt_checksums.json'),
   );
   if (!await lockFile.exists()) return null;
   final lockJson = await lockFile.readAsString();
@@ -129,7 +129,7 @@ Future<File?> _download(
     // filled from the release's assets) and for an unsupported target.
     stderr.writeln(
       'nitro_server: no verified prebuilt locked for $version/$asset in '
-      'hook/prebuilt_checksums.json — building the engine from source',
+      'prebuilt_checksums.json — building the engine from source',
     );
     return null;
   }

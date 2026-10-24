@@ -50,7 +50,7 @@ dart pub add nitro_server
   libstdc++ too on Linux). Minimum hosts: Linux glibc 2.35 (Ubuntu 22.04,
   Debian 12 or newer), macOS 14, Windows 10 x64. Older hosts build from
   source.
-- Downloads are verified against `hook/prebuilt_checksums.json` (ships in the
+- Downloads are verified against `prebuilt_checksums.json` (ships in the
   package). `NITRO_SERVER_VERIFY_SIGSTORE=1` also runs `cosign verify-blob`.
   `NITRO_SERVER_PREBUILT_BASE_URL` points at a mirror.
 - Do not `dart compile exe` a nitro_server program (no build hook, no engine).
@@ -788,4 +788,3 @@ run-clang-tidy -p build/tidy src/engine/*.cpp              # .clang-tidy
 - README code is verified: every `dart` block above is copied verbatim into
   `test/readme/*.dart`, compiled by `dart analyze`/`dart test`, and
   `test/readme_snippets_test.dart` fails if a README line is missing there.
-- Audit record: [`doc/production-audit.md`](doc/production-audit.md).

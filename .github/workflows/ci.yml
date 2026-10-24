@@ -216,7 +216,7 @@ jobs:
             build/benchmark/table-${{ matrix.os }}.md
           if-no-files-found: warn
 
-  # Container gate (doc/production-audit.md P0-7): the image must build, start,
+  # Container gate (the production audit P0-7): the image must build, start,
   # and answer /readyz; then the runtime image is scanned for unfixed CRITICAL
   # vulnerabilities in the OS layer.
   docker:

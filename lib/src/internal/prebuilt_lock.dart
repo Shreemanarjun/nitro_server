@@ -4,10 +4,14 @@
 /// A compromised release page can replace the asset and its `.sha256`
 /// sidecar together; it cannot change what is already on pub.dev.
 ///
-/// `hook/prebuilt_checksums.json` maps `version -> asset file name -> hex
+/// `prebuilt_checksums.json` (package root) maps `version -> asset file name -> hex
 /// digest`; `tool/update_prebuilt_lock.sh` fills it from a finished release
 /// before the package is published. No entry means no prebuilt for that
 /// target: the hook builds from source instead of trusting the download.
+///
+/// This lives under `lib/` (not `hook/`) because pub.dev admits only
+/// `build.dart` and `link.dart` inside `hook/`; the hook imports it by
+/// package URI.
 library;
 
 import 'dart:convert';
@@ -102,7 +106,7 @@ Future<bool> fetchVerifiedPrebuilt({
   if (!digestMatches(actual, expected)) {
     throw StateError(
       'prebuilt $asset does not match the digest locked in '
-      'hook/prebuilt_checksums.json ($actual != $expected): refusing it',
+      'prebuilt_checksums.json ($actual != $expected): refusing it',
     );
   }
   await dest.create(recursive: true);

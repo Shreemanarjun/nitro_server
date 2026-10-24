@@ -23,7 +23,7 @@ option(NITRO_SERVER_NATIVE_TUNE "Optimize for the build host CPU (-march=native)
 # -fno-math-errno: sqrt/pow inline without the errno dance (the only FP in
 #   the engine is the JSON float writer, which reads sign bits itself — no
 #   -ffast-math: it would change float semantics for no parsing gain)
-# Hardening (doc/production-audit.md): -fstack-protector-strong,
+# Hardening (the production audit): -fstack-protector-strong,
 #   _FORTIFY_SOURCE=2, hidden default visibility (only NITRO_EXPORT symbols
 #   leave the library), and on Linux RELRO/NOW + a non-executable stack.
 #

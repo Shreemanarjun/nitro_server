@@ -195,7 +195,7 @@ void main() {
         expect((await client.get('/app.js')).text(), 'console.log(1)');
       });
 
-      group('containment (doc/production-audit.md P0-1)', () {
+      group('containment (the production audit P0-1)', () {
         late Directory outer;
         late Directory served;
 

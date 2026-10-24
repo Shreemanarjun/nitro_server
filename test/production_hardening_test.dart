@@ -1,5 +1,5 @@
 /// Real-socket checks for the P1 availability work in
-/// `doc/production-audit.md`: method-aware 405, the global in-flight budget,
+/// the production audit: method-aware 405, the global in-flight budget,
 /// WebSocket liveness, connection age, body-stall deadlines and helper-isolate
 /// supervision. Each test binds its own server with the knob under test.
 library;

@@ -15,7 +15,7 @@
 # <arch> in {arm64,x64} (Architecture.name), <ext> in {dylib,so,dll}.
 #
 # Consumers do not trust these assets by their sidecars: the hook verifies a
-# download against hook/prebuilt_checksums.json, which ships inside the pub
+# download against prebuilt_checksums.json (package root), which ships inside the pub
 # package. The `verify` job below fills it for the tag with
 # `tool/update_prebuilt_lock.sh` (cosign-verified bundles) and then pulls
 # every asset back through the hook's own verification path
@@ -189,7 +189,7 @@ jobs:
 
   # The consumer path, end to end, against the release just published: lock
   # the assets (sidecar cross-check + cosign bundle verification), then
-  # download each one through hook/prebuilt_lock.dart exactly as a consumer's
+  # download each one through lib/src/internal/prebuilt_lock.dart exactly as a consumer's
   # build hook would, in strict Sigstore mode. A tag whose assets a consumer
   # would refuse fails here. The lock is attached as an artifact to commit
   # before `dart pub publish`.
@@ -213,4 +213,4 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: prebuilt_checksums
-          path: hook/prebuilt_checksums.json
+          path: prebuilt_checksums.json

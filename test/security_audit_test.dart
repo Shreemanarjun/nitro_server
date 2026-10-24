@@ -1,4 +1,4 @@
-/// Executable form of `doc/production-audit.md`'s P0 findings, driven over real
+/// Executable form of the production audit's P0 findings, driven over real
 /// sockets against the native engine (the fakes cannot reproduce them). Each
 /// was reproduced on 2026-10-21 and fixed the same day; this suite is the
 /// regression gate. P0-5 (inflate cap) and P0-8 (proxy trust) are unit-tested

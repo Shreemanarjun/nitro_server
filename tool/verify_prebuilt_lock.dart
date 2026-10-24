@@ -16,7 +16,7 @@ import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
 
-import '../hook/prebuilt_lock.dart';
+import 'package:nitro_server/src/internal/prebuilt_lock.dart';
 
 /// `NITRO_SERVER_REPO` / `NITRO_SERVER_PREBUILT_LOCK` point the check at another
 /// release and lock (the strict path was proven against GoReleaser's and
@@ -32,7 +32,7 @@ Future<void> main(List<String> args) async {
   final version = args.single;
   final lockJson = File(
     Platform.environment['NITRO_SERVER_PREBUILT_LOCK'] ??
-        'hook/prebuilt_checksums.json',
+        'prebuilt_checksums.json',
   ).readAsStringSync();
   final assets = ((jsonDecode(lockJson) as Map)[version] as Map?)?.keys;
   if (assets == null || assets.isEmpty) {

@@ -1,4 +1,4 @@
-# Nightly soak + long fuzz (doc/production-audit.md). Soak: keep-alive HTTP,
+# Nightly soak + long fuzz (the production audit). Soak: keep-alive HTTP,
 # WebSocket, chunked streaming and SSE traffic against one server for 10
 # minutes, failing on any request error or on RSS growth past 25% between the
 # quarter mark and the end. Fuzz: 10 minutes per libFuzzer target (the PR

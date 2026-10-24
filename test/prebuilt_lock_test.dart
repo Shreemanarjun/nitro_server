@@ -12,9 +12,8 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
+import 'package:nitro_server/src/internal/prebuilt_lock.dart';
 import 'package:test/test.dart';
-
-import '../hook/prebuilt_lock.dart';
 
 const _asset = 'libnitro_server-linux-x64.so';
 const _repo = 'Example/nitro_server';
@@ -157,7 +156,7 @@ exit 0
       () async {
         // 1. tool/update_prebuilt_lock.sh against the mock release, with the
         //    cosign stand-in on PATH: produces the lock for 1.2.3.
-        final lockFile = File('${tmp.path}/hook/prebuilt_checksums.json')
+        final lockFile = File('${tmp.path}/prebuilt_checksums.json')
           ..createSync(recursive: true)
           ..writeAsStringSync('{"_comment": "test", "0.0.1": {}}');
         final repoRoot = Directory.current.path;

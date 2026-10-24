@@ -464,7 +464,7 @@ void main() {
       );
 
       test('a corpus of random compression bombs all close 1009, none is '
-          'delivered (doc/production-audit.md P0-5)', () async {
+          'delivered (the production audit P0-5)', () async {
         runner.wsMaxBufferBytesForTesting = 64 * 1024;
         for (var i = 0; i < 8; i++) {
           final id = 700 + i;
@@ -485,7 +485,7 @@ void main() {
       });
 
       test('a compressed message that inflates past wsMaxBufferBytes closes '
-          '1009 (doc/production-audit.md P0-5)', () async {
+          '1009 (the production audit P0-5)', () async {
         runner.wsMaxBufferBytesForTesting = 64 * 1024;
         final seen = <WsMessage>[];
         final session = await openSession(

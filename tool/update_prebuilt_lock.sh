@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Writes hook/prebuilt_checksums.json for one released version from the
+# Writes prebuilt_checksums.json (package root) for one released version from the
 # `.sha256` sidecars the release workflow attached — run AFTER the release
 # workflow finished for the tag and BEFORE `dart pub publish`, then commit the
 # file. The digests then ship inside the package, so consumers verify a
 # downloaded prebuilt against a value that never travelled through the
-# release channel (see hook/prebuilt_lock.dart).
+# release channel (see lib/src/internal/prebuilt_lock.dart).
 #
 #   tool/update_prebuilt_lock.sh 1.0.0
 #
@@ -16,7 +16,7 @@ VERSION="${1:?version, e.g. 1.0.0}"
 REPO="${NITRO_SERVER_REPO:-Shreemanarjun/nitro_server}"
 BASE="${NITRO_SERVER_PREBUILT_BASE_URL:-https://github.com/$REPO/releases/download/v$VERSION}"
 BASE="${BASE%/}"
-LOCK=hook/prebuilt_checksums.json
+LOCK=prebuilt_checksums.json
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 entries=""

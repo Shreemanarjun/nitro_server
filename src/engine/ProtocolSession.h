@@ -11,7 +11,7 @@
 // HTTP/3 (QUIC) session implements this same interface and slots into the
 // reactor unchanged above the Emitter seam — only the byte transport differs
 // (QUIC is UDP, so h3 feeds datagrams rather than a TLS bytestream). See
-// doc/http3.md. Because everything above the Emitter (routing, middleware,
+// the HTTP/3 note. Because everything above the Emitter (routing, middleware,
 // handlers, OpenAPI, the Dart runner) is protocol-agnostic, adding a protocol is
 // a new ProtocolSession subclass plus its ALPN branch — not a change to the
 // request model.

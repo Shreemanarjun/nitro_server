@@ -3201,7 +3201,7 @@ TEST(UvReactorTest, Http2cPriorKnowledgeServedOverTheReactor) {
 
 #endif  // NITRO_SERVER_LIBUV
 
-// ── Production-audit regressions (doc/production-audit.md P0-2/3/4, P1 conformance) ──
+// ── Production-audit regressions (the production audit P0-2/3/4, P1 conformance) ──
 
 RecordingEmitter::Answer statusAnswer(int status) {
   return [status](Method, const std::string&, const std::string&) {

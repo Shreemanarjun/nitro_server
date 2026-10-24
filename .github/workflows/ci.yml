@@ -1,7 +1,14 @@
 name: ci
 on:
   push:
+    branches: ['**']   # branch pushes only: a tag push runs release.yml, whose own test job covers it
   pull_request:
+
+# One CI run per ref at a time: a newer push cancels the superseded run instead
+# of queueing a second full matrix behind it.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:

@@ -27,6 +27,11 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+# A moved tag supersedes the run in flight for it.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: write      # create the release + upload assets
   id-token: write      # provenance attestation (Sigstore)

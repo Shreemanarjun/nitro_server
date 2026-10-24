@@ -16,9 +16,24 @@
 # ---- build stage: native engine + AOT bundle -------------------------------
 FROM dart:stable@sha256:efc6116982a4d178babd453b05555b37693316945fd6012a2d10232a940caa19 AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      cmake clang make pkg-config \
-      libuv1-dev libssl-dev libbrotli-dev libnghttp2-dev zlib1g-dev libzstd-dev \
+      cmake clang make pkg-config curl ca-certificates \
+      libssl-dev libbrotli-dev libnghttp2-dev zlib1g-dev libzstd-dev \
  && rm -rf /var/lib/apt/lists/*
+
+# libuv from source, static and position-independent: Debian's x86_64 libuv.a
+# is not PIC and cannot be linked into the engine's shared object (the arm64
+# archive happens to work, which is why this only showed up on amd64 CI).
+# Pinned by checksum; installs to /usr/local, where engine.cmake looks first.
+ARG LIBUV_VERSION=1.50.0
+ARG LIBUV_SHA256=b1ec56444ee3f1e10c8bd3eed16ba47016ed0b94fe42137435aaf2e0bd574579
+RUN set -eux; \
+    curl -fsSL -o /tmp/libuv.tar.gz "https://github.com/libuv/libuv/archive/refs/tags/v${LIBUV_VERSION}.tar.gz"; \
+    echo "${LIBUV_SHA256}  /tmp/libuv.tar.gz" | sha256sum -c -; \
+    mkdir -p /tmp/libuv && tar -xzf /tmp/libuv.tar.gz -C /tmp/libuv --strip-components=1; \
+    cmake -S /tmp/libuv -B /tmp/libuv/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+      -DLIBUV_BUILD_SHARED=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DCMAKE_INSTALL_PREFIX=/usr/local; \
+    cmake --build /tmp/libuv/build --parallel && cmake --install /tmp/libuv/build; \
+    rm -rf /tmp/libuv /tmp/libuv.tar.gz
 WORKDIR /app
 
 # Resolve dependencies on the pubspec layer. nitro_server is also a Flutter FFI

@@ -3510,7 +3510,10 @@ TEST(UvReactorTest, SlowBodyProgressIsNotIdleButAStallIs408) {
   Fixture f(echoAnswer());
   f.server->registerRoute(Method::Post, "", "/echo", -1);
   ServerConfig cfg;
-  cfg.keepAliveTimeoutMs = 300;  // the stall window (bodyTimeoutMs unset)
+  // The stall window (bodyTimeoutMs unset). 4x the drip interval below: the
+  // 100 ms sweep tick plus sanitizer/CI scheduling jitter must never turn
+  // steady progress into a stall (macOS TSan runners managed it at 2x).
+  cfg.keepAliveTimeoutMs = 600;
   const int64_t port = startWith(f, cfg);
   // Progress every 150 ms over 600 ms: each read restarts the window.
   const int slow = connectTo((int)port);

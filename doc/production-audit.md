@@ -32,7 +32,7 @@ was found and why each change exists.
 | P1 error logging | `handlerError` events (verb, path, error, stack) — the pluggable sink | `test_client_test` |
 | P1 HTTP/1.1 conformance | `Date`, no CL on 204/304/1xx, full reason table, 405 + `Allow` (h1 + h2), token `Connection` | `uv_reactor_test` ResponseHeadConformance / MethodMismatchIs405…, `router_test.cpp` (allowedMethods), `server_conformance_test`, `production_hardening_test` (405 + Allow), `security_audit_test` P1 |
 | P1 proxy / TLS | `trustedProxies`; `TLS_*` env; **PROXY protocol v1/v2** (`ServerConfig.proxyProtocol`: parsed ahead of TLS and h2, source address becomes `clientIp`, missing/malformed header closes + `clientError`); **mutual TLS** (`TlsConfig.clientCaPem/clientCaFile` → client certificate mandatory), `minVersion` (1.2/1.3), `ciphers` / `cipherSuites`; a rejected policy fails `bind` | `uv_reactor_test` ProxyProtocol…, `TlsTest` ProxyProtocolHeaderPrecedesTheHandshake / MutualTls… / MinimumVersionAndCipherPolicy, `production_hardening_test`, `context_test` |
-| P2 packaging | digest pins, `.dockerignore`, release gated on tests; every prebuilt gets Sigstore build provenance (`gh attestation verify`), a keyless cosign signature bundle (`<asset>.sigstore.json`, `cosign verify-blob --bundle`) and an SPDX SBOM (`<asset>.spdx.json`). Consumer side: the hook accepts a prebuilt only when it matches `hook/prebuilt_checksums.json`, a digest lock shipped inside the package, and with `NITRO_SERVER_VERIFY_SIGSTORE=1` only when `cosign verify-blob` also passes against the release workflow's identity; `tool/update_prebuilt_lock.sh` fills the lock, `tool/verify_prebuilt_lock.dart` drives the hook's path against a release, and the release workflow's `verify` job runs both with real cosign on every tag — first executed for `v1.0.0` in run 40073440905 (2026-10-24): all five prebuilts cosign-verified and accepted through the hook's path; the lock it produced is in the tree. Exercised end to end on 2026-10-22: a mock release (asset, sidecar, bundle, cosign stand-in) in `prebuilt_lock_test`, and the real `v1.0.0-rc.4` release from GitHub (5/5 assets accepted through the hook's path; a tampered lock refused the real asset). The strict Sigstore path was run with the real cosign 3.1.4 binary through the hook's own function: it accepted GoReleaser `v2.18.3` and Syft `v1.55.0` release assets signed by their GitHub Actions identities (`Verified OK`), refused the same bundles under this package's identity, and refused a tampered bundle (`NITRO_SERVER_REPO=goreleaser/goreleaser NITRO_SERVER_PREBUILT_LOCK=<lock> NITRO_SERVER_VERIFY_SIGSTORE=1 dart tool/verify_prebuilt_lock.dart 2.18.3` reproduces the positive case). The `1.0.0` entry was produced by that run's artifact (five digests); until a version's release exists its entry is empty and the hook builds from source, saying so | `prebuilt_lock_test`, `release.yml` |
+| P2 packaging | digest pins, `.dockerignore`, release gated on tests; every prebuilt gets Sigstore build provenance (`gh attestation verify`), a keyless cosign signature bundle (`<asset>.sigstore.json`, `cosign verify-blob --bundle`) and an SPDX SBOM (`<asset>.spdx.json`). Consumer side: the hook accepts a prebuilt only when it matches `hook/prebuilt_checksums.json`, a digest lock shipped inside the package, and with `NITRO_SERVER_VERIFY_SIGSTORE=1` only when `cosign verify-blob` also passes against the release workflow's identity; `tool/update_prebuilt_lock.sh` fills the lock, `tool/verify_prebuilt_lock.dart` drives the hook's path against a release, and the release workflow's `verify` job runs both with real cosign on every tag — executed for `v1.0.0` in runs 40073440905 and 40091053601 (2026-10-24, the second after the Linux portability rebuild): all five prebuilts cosign-verified and accepted through the hook's path each time; the lock from the final run is in the tree. Exercised end to end on 2026-10-22: a mock release (asset, sidecar, bundle, cosign stand-in) in `prebuilt_lock_test`, and the real `v1.0.0-rc.4` release from GitHub (5/5 assets accepted through the hook's path; a tampered lock refused the real asset). The strict Sigstore path was run with the real cosign 3.1.4 binary through the hook's own function: it accepted GoReleaser `v2.18.3` and Syft `v1.55.0` release assets signed by their GitHub Actions identities (`Verified OK`), refused the same bundles under this package's identity, and refused a tampered bundle (`NITRO_SERVER_REPO=goreleaser/goreleaser NITRO_SERVER_PREBUILT_LOCK=<lock> NITRO_SERVER_VERIFY_SIGSTORE=1 dart tool/verify_prebuilt_lock.dart 2.18.3` reproduces the positive case). The `1.0.0` entry was produced by that run's artifact (five digests); until a version's release exists its entry is empty and the hook builds from source, saying so | `prebuilt_lock_test`, `release.yml` |
 | P2 CI | `docker`+Trivy, `fuzz`, `tidy` (`.clang-tidy`), ASan `detect_leaks=1` on Linux, `-Werror` | `ci.yml` |
 | P2 build hardening | stack protector, `_FORTIFY_SOURCE=2`, hidden visibility, RELRO/NOW/noexecstack, `-Wall -Wextra`, no `-ffast-math` | `src/CMakeLists.txt` |
 | P2 docs | README/deployment/CHANGELOG updated (static/WS bypass, h2 buffering, proxy trust, budgets) | — |
@@ -715,16 +715,21 @@ nightly's linear slope. The 600 s nightly remains the gate.
    layout, no local engine) built with `dart build cli` in strict mode: the
    hook downloaded the signed macOS asset byte-for-byte, and both the AOT
    bundle and `dart run` served.
-3. **Portability rebuild, re-tag pending.** Inspecting the released Linux
-   assets showed they were linked on Ubuntu 24.04 and need glibc 2.38 and
-   GLIBCXX 3.4.29: Debian 12 and Ubuntu 22.04 hosts could download and verify
-   them and then fail at load. The release now builds Linux prebuilts on
-   Ubuntu 22.04 with libstdc++ linked in and gates every Linux asset (max
-   glibc symbol ≤ 2.35, no GLIBCXX/CXXABI need); the hook skips the prebuilt
-   on a Linux host below the floor and builds from source, saying so. After
-   committing, move the tag (`git tag -f v1.0.0 && git push -f origin
-   v1.0.0`), take the new run's lock artifact, commit it, then
-   `dart pub publish`.
+3. **Done (2026-10-24, re-tag at `3898775`, run 40091053601).** Inspecting
+   the first release's Linux assets showed they were linked on Ubuntu 24.04
+   and needed glibc 2.38 and GLIBCXX 3.4.29: Debian 12 and Ubuntu 22.04 hosts
+   could download and verify them and then fail at load. The release now
+   builds Linux prebuilts on Ubuntu 22.04 with libstdc++ linked in and gates
+   every Linux asset (max glibc symbol ≤ 2.35, no GLIBCXX/CXXABI need); the
+   hook skips the prebuilt on a Linux host below the floor and builds from
+   source, saying so. The re-tagged run passed every job including `verify`;
+   the rebuilt Linux x64 and arm64 assets need GLIBC_2.34 at most and depend
+   only on libm, libc and the loader; all five rebuilt assets were verified
+   locally in strict mode (cosign 3.1.4: 5/5 accepted) and the run's lock
+   artifact replaced `hook/prebuilt_checksums.json` (all five `1.0.0` digests
+   changed, rc.4 kept). The nightly soak that found the payload-log leak
+   (section above) was fixed before this re-tag, so the published engine
+   carries that fix. Commit the lock, then `dart pub publish`.
 
 ## Out of scope
 

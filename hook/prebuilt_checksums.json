@@ -1,11 +1,11 @@
 {
   "_comment": "version -> asset -> sha256. Filled by tool/update_prebuilt_lock.sh from a finished GitHub Release, committed before `dart pub publish`. A target without an entry builds from source.",
   "1.0.0": {
-    "libnitro_server-macos-arm64.dylib": "60b43cb4c7536c6414014a47604e093e589d6e802390367fcf262346050fd1b1",
-    "libnitro_server-macos-x64.dylib": "252005f0be961a4311e671c299cfa53bf0f730020b14cdc2fe0c4f20586d8c24",
-    "libnitro_server-linux-arm64.so": "457f6c4e519823d6cc557cbea2fabc80ebcf31fbfdc44983c422f21e72b55218",
-    "libnitro_server-linux-x64.so": "1ba0abd41d1fbe9559bcdb37c7dea5054c1b74f7f8a5afa90ad41ff290ef27ae",
-    "libnitro_server-windows-x64.dll": "1238609f10d1aa2a0e3ce91b898d3bed4f37732f06edde4f4660d2b7b15a9732"
+    "libnitro_server-macos-arm64.dylib": "f7ebf51799cdb8f450f73428f21157a0d96e813ed8ea12f12d3885599f329758",
+    "libnitro_server-macos-x64.dylib": "0adc48cb69f40ac2e934fdc30add5af98a45818dff94b9b470a82aa9e4b4a20d",
+    "libnitro_server-linux-arm64.so": "547bd85d1cad505328b9ccc01f01e8924a79335dfee56244d20fa7a6e133441f",
+    "libnitro_server-linux-x64.so": "59114bbaef46e7c4b24345e04a73168ed8d91631dadafa5d64b9e60309a6b02d",
+    "libnitro_server-windows-x64.dll": "871c1429f9eaf2d51bb79ef4c58225d53d397bb2953a8de659cc77161c6955cd"
   },
   "1.0.0-rc.4": {
     "libnitro_server-macos-arm64.dylib": "dd2663780f0ba557694c93ec349dc65af57fafdd7418893d108df2db21b2d45e",

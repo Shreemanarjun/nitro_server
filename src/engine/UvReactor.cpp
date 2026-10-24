@@ -1139,6 +1139,7 @@ void UvReactor::onCloseConn(uv_handle_t* h) {
 #ifdef NITRO_SERVER_HTTP2
             self->h2StreamAccum_.erase(it->first);
 #endif
+            self->pending_.erase(it->first);  // same reaping as lookupReq
             it = self->reqLoc_.erase(it);
           } else {
             ++it;
@@ -1945,7 +1946,15 @@ bool UvReactor::lookupReq(int64_t id, ReqLoc& out, bool erase) {
   auto it = reqLoc_.find(id);
   if (it == reqLoc_.end()) return false;
   out = it->second;
-  if (erase) reqLoc_.erase(it);
+  if (erase) {
+    reqLoc_.erase(it);
+    // The request is over for the engine: orphan its payload log so it is
+    // reaped the moment Dart's acks catch up (or now, if they already have).
+    // Without this every request that carried a body left its log behind —
+    // ~100 bytes per POST, forever (the nightly soak caught it as linear RSS
+    // growth).
+    pending_.erase(id);
+  }
   return true;
 }
 

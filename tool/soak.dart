@@ -18,11 +18,14 @@ import 'package:nitro_server/nitro_server.dart';
 Future<void> main(List<String> args) async {
   var seconds = 300;
   var maxGrowth = 25.0;
+  // --only hello,echo,stream,events,ws : run a subset (leak bisection).
+  var only = const {'hello', 'echo', 'stream', 'events', 'ws'};
   for (var i = 0; i + 1 < args.length; i += 2) {
     if (args[i] == '--seconds') seconds = int.parse(args[i + 1]);
     if (args[i] == '--max-growth-percent') {
       maxGrowth = double.parse(args[i + 1]);
     }
+    if (args[i] == '--only') only = args[i + 1].split(',').toSet();
   }
   final server = await NitroServer.bind(
     const ServerConfig(wsIdleTimeout: Duration(seconds: 30)),
@@ -112,11 +115,16 @@ Future<void> main(List<String> args) async {
     );
   });
   await Future.wait([
-    for (var i = 0; i < 4; i++) httpLoop('/hello'),
-    for (var i = 0; i < 2; i++) httpLoop('/echo', body: List.filled(4096, 65)),
-    for (var i = 0; i < 2; i++) httpLoop('/stream'),
-    httpLoop('/events'),
-    for (var i = 0; i < 2; i++) wsLoop(),
+    if (only.contains('hello'))
+      for (var i = 0; i < 4; i++) httpLoop('/hello'),
+    if (only.contains('echo'))
+      for (var i = 0; i < 2; i++)
+        httpLoop('/echo', body: List.filled(4096, 65)),
+    if (only.contains('stream'))
+      for (var i = 0; i < 2; i++) httpLoop('/stream'),
+    if (only.contains('events')) httpLoop('/events'),
+    if (only.contains('ws'))
+      for (var i = 0; i < 2; i++) wsLoop(),
   ]);
   sampler.cancel();
   await server.close();

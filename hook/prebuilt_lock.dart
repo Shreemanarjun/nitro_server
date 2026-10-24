@@ -128,3 +128,16 @@ Future<bool> fetchVerifiedPrebuilt({
   }
   return true;
 }
+
+/// The glibc floor the Linux prebuilts are built against (Ubuntu 22.04).
+const (int, int) linuxPrebuiltMinGlibc = (2, 35);
+
+/// Parses `getconf GNU_LIBC_VERSION` output (`glibc 2.36`) and tells whether
+/// it is at least [min]. Unknown output counts as "new enough" (best effort:
+/// the prebuilt is then tried and a too-old host fails at load, loudly).
+bool glibcAtLeast(String getconfOutput, (int, int) min) {
+  final m = RegExp(r'(\d+)\.(\d+)').firstMatch(getconfOutput);
+  if (m == null) return true;
+  final major = int.parse(m.group(1)!), minor = int.parse(m.group(2)!);
+  return major > min.$1 || (major == min.$1 && minor >= min.$2);
+}

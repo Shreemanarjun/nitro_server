@@ -131,3 +131,11 @@ if(NITRO_SERVER_BUILD_TESTS)
   add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../test/cpp"
                    "${CMAKE_CURRENT_BINARY_DIR}/nitro_server_tests")
 endif()
+
+# Prebuilt portability (Linux): a distributed engine must not require the
+# consumer's libstdc++ to be at least the builder's. With static deps on, fold
+# libstdc++/libgcc into the library (its symbols stay hidden — see the
+# visibility flags above), so the only runtime requirement left is glibc.
+if(NITRO_SERVER_STATIC_DEPS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_link_options(nitro_server PRIVATE -static-libstdc++ -static-libgcc)
+endif()

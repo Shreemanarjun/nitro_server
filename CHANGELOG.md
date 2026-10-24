@@ -38,10 +38,18 @@ server for Dart/Flutter on a native C++ (libuv) engine over Nitro FFI.
   Trivy/h2spec/Autobahn in CI, nightly soak + long fuzz, release signed (Sigstore provenance,
   keyless cosign bundle, SPDX SBOM); the build hook verifies a prebuilt
   against `hook/prebuilt_checksums.json` (shipped in the package) and,
-  with `NITRO_SERVER_VERIFY_SIGSTORE=1`, `cosign verify-blob`.
+  with `NITRO_SERVER_VERIFY_SIGSTORE=1`, `cosign verify-blob`. Linux prebuilts
+  are built on Ubuntu 22.04 with libstdc++ linked in (glibc 2.35 floor, gated
+  in the release workflow); macOS prebuilts need macOS 14+.
 - Breaking vs. the release candidates: `ServerConfig` validates in `bind`
   (`validate()`), not `assert`; the default 500 body is generic; a method
   mismatch is 405; `ServerEventKind.handlerError` added; the example server
   has no built-in credentials.
+- Build hook: a `build/lib` engine built in the package tree is used ahead of
+  a prebuilt (tests in the repo and in CI run the tree's engine); a Linux host
+  below the prebuilt's glibc floor builds from source instead.
+- Fixed before publishing, found by the nightly soak: a per-request payload-log
+  leak in the engine for requests with bodies, and an unbounded set of
+  WebSocket connection ids.
 - Quality gates: 100% Dart line coverage, ≥90% C++ coverage, blackbox
   benchmark (`benchmark/blackbox/run.sh`, `--base <ref>` for A/B).

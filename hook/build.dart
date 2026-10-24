@@ -81,16 +81,10 @@ Future<File?> _provision(BuildInput input, OS os, Architecture arch) async {
   if (fromSource == '1' || fromSource == 'true') {
     return _buildFromSource(input, os, dest);
   }
-  // NITRO_SERVER_NO_DOWNLOAD=1 skips the prebuilt lookup (an offline or
-  // air-gapped build, a container that already built the engine).
-  final noDownload = Platform.environment['NITRO_SERVER_NO_DOWNLOAD'];
-  if (noDownload != '1' && noDownload != 'true') {
-    final downloaded = await _download(input, os, arch, dest);
-    if (downloaded != null) return downloaded;
-  }
-  // Reuse a library the package already built at `build/lib` (the repo's own
-  // dev/CI flow) so the hook adds no rebuild there. Absent for a pub-cache
-  // consumer (read-only package root, no build/lib).
+  // A library the package itself built at `build/lib` wins over any
+  // download: that is the repo's own dev/CI flow, and its tests must run
+  // against the engine in the tree, never against a released one. A
+  // pub-cache consumer has no build/lib and goes straight to the prebuilt.
   final existing = File.fromUri(
     input.packageRoot.resolve('build/lib/${_libFileName(os)}'),
   );
@@ -98,6 +92,13 @@ Future<File?> _provision(BuildInput input, OS os, Architecture arch) async {
     await dest.create(recursive: true);
     await existing.copy(dest.path);
     return dest;
+  }
+  // NITRO_SERVER_NO_DOWNLOAD=1 skips the prebuilt lookup (an offline or
+  // air-gapped build, a container that already built the engine).
+  final noDownload = Platform.environment['NITRO_SERVER_NO_DOWNLOAD'];
+  if (noDownload != '1' && noDownload != 'true') {
+    final downloaded = await _download(input, os, arch, dest);
+    if (downloaded != null) return downloaded;
   }
   // No matching prebuilt (unreleased version / exotic target): build from src.
   return _buildFromSource(input, os, dest);
@@ -131,6 +132,21 @@ Future<File?> _download(
       'hook/prebuilt_checksums.json — building the engine from source',
     );
     return null;
+  }
+  // A Linux host older than the prebuilt's glibc floor cannot load it: say
+  // so and build from source rather than bundle something that fails at
+  // startup. Best effort — no getconf, no opinion.
+  if (os == OS.linux && await _exists('getconf')) {
+    final r = await Process.run('getconf', ['GNU_LIBC_VERSION']);
+    final out = '${r.stdout}'.trim();
+    if (r.exitCode == 0 && !glibcAtLeast(out, linuxPrebuiltMinGlibc)) {
+      stderr.writeln(
+        'nitro_server: this host has $out; the prebuilt engine needs glibc '
+        '${linuxPrebuiltMinGlibc.$1}.${linuxPrebuiltMinGlibc.$2}+ — building '
+        'from source',
+      );
+      return null;
+    }
   }
   final env = Platform.environment;
   final strict = env['NITRO_SERVER_VERIFY_SIGSTORE'];

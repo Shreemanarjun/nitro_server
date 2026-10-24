@@ -206,7 +206,10 @@ class ServerRunner {
   /// Live WebSocket sessions by connection id.
   final _wsSessions = <int, _WsSessionImpl>{};
 
-  /// Every WebSocket connection id ever opened (test seam backing).
+  /// Recently opened WebSocket connection ids (the last 1024): tells a stale
+  /// post-close frame from one that beat its open. Ids only grow, so FIFO
+  /// eviction keeps the recent ones; an evicted id's late frame is parked in
+  /// [_wsEarly] (bounded) and dropped with it.
   final _wsOpened = <int>{};
 
   /// Cumulative ack count per WebSocket connection id. The engine's `ackBody`
@@ -1425,6 +1428,7 @@ class ServerRunner {
     session.maxInbound = _wsMaxBufferBytes;
     _wsSessions[connectionId] = session;
     _wsOpened.add(connectionId);
+    if (_wsOpened.length > 1024) _wsOpened.remove(_wsOpened.first);
     if (identical(gate, _identity)) {
       _runWs(connectionId, session, handler);
       return;

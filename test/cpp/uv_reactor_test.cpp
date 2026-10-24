@@ -4330,3 +4330,54 @@ TEST(UvReactorTest, ProxyProtocolV2AcceptsTlvsUpToTheProtocolMaximum) {
   ASSERT_TRUE(f.waitForSeen(1));
   EXPECT_EQ(f.emitter.seen()[0].clientIp, "198.51.100.7");
 }
+
+// Nightly-soak regression: every POST left its payload log in the engine
+// (~100 B each, linear RSS growth). After the answer and Dart's ack, nothing
+// may remain.
+TEST(UvReactorTest, AnsweredAndAckedBodiesLeaveNoPayloadLogBehind) {
+  Fixture f(echoAnswer());
+  f.server->registerRoute(Method::Post, "", "/echo", -1);
+  ServerConfig cfg;
+  const int64_t port = startWith(f, cfg);
+  for (int i = 0; i < 40; i++) {
+    const int fd = connectTo((int)port);
+    ASSERT_GE(fd, 0);
+    sendStr(fd, "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n"
+                "Connection: close\r\n\r\nabcd");
+    EXPECT_EQ(statusOf(readAll(fd)), 200);
+    close(fd);
+  }
+  ASSERT_TRUE(f.waitForSeen(40));
+  // Dart acks each request's single body payload once it has consumed it.
+  for (const auto& seen : f.emitter.seen()) f.server->ackBody(seen.requestId, 1);
+  EXPECT_EQ(f.server->payloadLogCountForTesting(), 0u);
+  EXPECT_EQ(f.server->requestTableCountForTesting(), 0u);
+}
+
+// Same for the other soak kinds: keep-alive GETs, chunked streams and SSE
+// must leave neither request entries nor payload logs behind.
+TEST(UvReactorTest, StreamedAnswersLeaveNoRequestStateBehind) {
+  Fixture f(echoAnswer());
+  f.holding.store(true);
+  f.server->registerRoute(Method::Get, "", "/s", -1);
+  ServerConfig cfg;
+  const int64_t port = startWith(f, cfg);
+  for (int i = 0; i < 20; i++) {
+    const int fd = connectTo((int)port);
+    ASSERT_GE(fd, 0);
+    sendStr(fd, "GET /s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    ASSERT_TRUE(f.waitForSeen(static_cast<size_t>(i + 1)));
+    const int64_t id = f.emitter.seen()[static_cast<size_t>(i)].requestId;
+    f.server->startStream(id, 200, {{"Content-Type", "text/plain"}});
+    const char* a = "data: x\n\n";
+    f.server->sendStreamChunk(id, (const uint8_t*)a, 9, false);
+    f.server->sendStreamChunk(id, (const uint8_t*)a, 9, true);
+    EXPECT_EQ(statusOf(readAll(fd)), 200);
+    close(fd);
+  }
+  // Closing sockets are reaped by the loop; give it a moment.
+  for (int i = 0; i < 200 && f.server->requestTableCountForTesting() != 0; i++)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  EXPECT_EQ(f.server->requestTableCountForTesting(), 0u);
+  EXPECT_EQ(f.server->payloadLogCountForTesting(), 0u);
+}

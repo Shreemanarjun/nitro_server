@@ -212,6 +212,28 @@ void main() {
       }
 
       test(
+        'the opened-id set is bounded (soak: it grew per connection)',
+        () async {
+          runner.addWsRoute('/short', (session) async {});
+          for (var i = 0; i < 1100; i++) {
+            fake.heads.add(
+              fakeHead(
+                requestId: 20000 + i,
+                path: '/short',
+                routePattern: '/short',
+              ),
+            );
+            if (i % 100 == 99) await Future<void>.delayed(Duration.zero);
+          }
+          await Future<void>.delayed(const Duration(milliseconds: 20));
+          final opened = runner.wsOpenedIdsForTesting;
+          expect(opened.length, lessThanOrEqualTo(1024));
+          expect(opened, contains(20000 + 1099)); // the newest is kept
+          expect(opened, isNot(contains(20000))); // the oldest was evicted
+        },
+      );
+
+      test(
         'session seams: live ids, close code, shutdown on runner close',
         () async {
           final session = await openSession(590);

@@ -5,6 +5,12 @@
 # libraries on the consumer. `hook/build.dart` downloads the matching asset by
 # `libnitro_server-<os>-<arch>.<ext>` and verifies the `.sha256` sidecar.
 #
+# Linux prebuilts are built on Ubuntu 22.04 (glibc 2.35) with libstdc++ linked
+# in, and a gate below refuses one that would need newer glibc or the host's
+# libstdc++: a consumer on Ubuntu 22.04+ / Debian 12+ can always load them.
+# macOS prebuilts need macOS 14+ (the macos-14 builders), Windows x64 needs
+# Windows 10+.
+#
 # Asset names MUST match hook/build.dart: <os> in {macos,linux,windows},
 # <arch> in {arm64,x64} (Architecture.name), <ext> in {dylib,so,dll}.
 #
@@ -69,8 +75,8 @@ jobs:
         include:
           - { os: macos-14,        tag: macos-arm64,  deps: brew, lib: libnitro_server.dylib, out: libnitro_server-macos-arm64.dylib }
           - { os: macos-14,        tag: macos-x64,    deps: vcpkg, triplet: x64-osx,              lib: libnitro_server.dylib, out: libnitro_server-macos-x64.dylib }
-          - { os: ubuntu-24.04-arm, tag: linux-arm64, deps: apt,  lib: libnitro_server.so,    out: libnitro_server-linux-arm64.so }
-          - { os: ubuntu-24.04,    tag: linux-x64,    deps: vcpkg, triplet: x64-linux,            lib: libnitro_server.so,  out: libnitro_server-linux-x64.so }
+          - { os: ubuntu-22.04-arm, tag: linux-arm64, deps: apt,  lib: libnitro_server.so,    out: libnitro_server-linux-arm64.so }
+          - { os: ubuntu-22.04,    tag: linux-x64,    deps: vcpkg, triplet: x64-linux,            lib: libnitro_server.so,  out: libnitro_server-linux-x64.so }
           - { os: windows-latest,  tag: windows-x64,  deps: vcpkg, triplet: x64-windows-static-md, lib: nitro_server.dll,    out: libnitro_server-windows-x64.dll }
     runs-on: ${{ matrix.os }}
     steps:
@@ -122,6 +128,17 @@ jobs:
           SRC=$(find build/rel -name '${{ matrix.lib }}' -type f | head -1)
           test -n "$SRC" || { echo "library ${{ matrix.lib }} not found"; exit 1; }
           cp "$SRC" "dist/${{ matrix.out }}"
+          # Portability gate (Linux): the prebuilt must load on glibc 2.35
+          # hosts (Ubuntu 22.04, Debian 12) and must not need the host's
+          # libstdc++ at all. A newer builder image would silently raise both.
+          if [[ "${{ matrix.tag }}" == linux-* ]]; then
+            syms=$(readelf --dyn-syms "dist/${{ matrix.out }}")
+            maxglibc=$(echo "$syms" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -t_ -k2 -V | uniq | tail -1)
+            echo "max glibc symbol version: $maxglibc"
+            [ "$(printf '%s\n' "${maxglibc#GLIBC_}" 2.35 | sort -V | tail -1)" = "2.35" ] || { echo "prebuilt needs glibc > 2.35"; exit 1; }
+            if echo "$syms" | grep -qE 'GLIBCXX_|CXXABI_'; then echo "prebuilt still needs the host libstdc++"; exit 1; fi
+            readelf -d "dist/${{ matrix.out }}" | grep NEEDED
+          fi
           cd dist
           if command -v shasum >/dev/null; then
             shasum -a 256 "${{ matrix.out }}" > "${{ matrix.out }}.sha256"

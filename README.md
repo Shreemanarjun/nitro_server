@@ -46,7 +46,10 @@ dart pub add nitro_server
 
 - Released versions need no toolchain: the build hook downloads the prebuilt
   engine for your OS/arch and `dart build cli` bundles it.
-- Prebuilts are self-contained (libuv, OpenSSL, brotli, nghttp2 linked in).
+- Prebuilts are self-contained (libuv, OpenSSL, brotli, nghttp2 linked in;
+  libstdc++ too on Linux). Minimum hosts: Linux glibc 2.35 (Ubuntu 22.04,
+  Debian 12 or newer), macOS 14, Windows 10 x64. Older hosts build from
+  source.
 - Downloads are verified against `hook/prebuilt_checksums.json` (ships in the
   package). `NITRO_SERVER_VERIFY_SIGSTORE=1` also runs `cosign verify-blob`.
   `NITRO_SERVER_PREBUILT_BASE_URL` points at a mirror.
@@ -772,6 +775,9 @@ run-clang-tidy -p build/tidy src/engine/*.cpp              # .clang-tidy
 
 - Bridge spec: `lib/src/nitro_server.native.dart`; regenerate with
   `dart run build_runner build` + `nitrogen link`. Never edit `*.g.*`.
+- In this repository the hook stages `build/lib/libnitro_server.*` (your
+  cmake build) ahead of any prebuilt, so `dart test` always runs the engine in
+  the tree; remove `build/lib` to exercise the download path.
 - CI (`ci.yml`): suites, both coverage gates, ASan/TSan (leak detection on
   Linux), fuzz smoke, clang-tidy, Docker build + `/readyz` + Trivy, h2spec
   (floor 136/146), Autobahn (0 FAILED). `soak.yml`: nightly 10-minute memory
@@ -779,4 +785,7 @@ run-clang-tidy -p build/tidy src/engine/*.cpp              # .clang-tidy
   cosign bundle, SPDX SBOM → `verify` job locks and re-verifies them
   (`tool/update_prebuilt_lock.sh`, `tool/verify_prebuilt_lock.dart`); commit
   the lock before `dart pub publish`.
+- README code is verified: every `dart` block above is copied verbatim into
+  `test/readme/*.dart`, compiled by `dart analyze`/`dart test`, and
+  `test/readme_snippets_test.dart` fails if a README line is missing there.
 - Audit record: [`doc/production-audit.md`](doc/production-audit.md).

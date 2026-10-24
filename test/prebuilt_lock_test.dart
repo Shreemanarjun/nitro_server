@@ -41,6 +41,15 @@ void main() {
     expect(expectedDigest('{"1.2.3": []}', '1.2.3', 'x'), isNull);
   });
 
+  test('glibcAtLeast reads getconf output against the prebuilt floor', () {
+    expect(glibcAtLeast('glibc 2.35', linuxPrebuiltMinGlibc), isTrue);
+    expect(glibcAtLeast('glibc 2.39', linuxPrebuiltMinGlibc), isTrue);
+    expect(glibcAtLeast('glibc 3.0', linuxPrebuiltMinGlibc), isTrue);
+    expect(glibcAtLeast('glibc 2.34', linuxPrebuiltMinGlibc), isFalse);
+    expect(glibcAtLeast('glibc 2.28', linuxPrebuiltMinGlibc), isFalse);
+    expect(glibcAtLeast('', linuxPrebuiltMinGlibc), isTrue); // unknown: try
+  });
+
   test('digestMatches compares whole digests, case-insensitively', () {
     expect(digestMatches('ab' * 32, 'AB' * 32), isTrue);
     expect(digestMatches('ab' * 32, '${'ab' * 31}ac'), isFalse);

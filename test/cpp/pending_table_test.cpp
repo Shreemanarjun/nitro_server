@@ -102,3 +102,24 @@ TEST(PendingTableTest, AbortAllAnswersParkedAndFreesPayloads) {
 }
 
 }  // namespace
+
+// A request's payload log must not outlive the request once Dart has acked
+// its payloads — in either order of "answered" and "acked".
+TEST(PendingTableTest, PayloadLogIsReapedOnceAnsweredAndAcked) {
+  PendingTable t;
+  for (int order = 0; order < 2; ++order) {
+    const int64_t id = 100 + order;
+    t.trackPayload(id, static_cast<uint8_t*>(std::malloc(8)));
+    t.trackPayload(id, static_cast<uint8_t*>(std::malloc(8)));
+    EXPECT_EQ(t.payloadLogCountForTesting(), 1u);
+    if (order == 0) {
+      t.ack(id, 2);    // Dart consumed both, then the engine answered
+      t.erase(id);
+    } else {
+      t.erase(id);     // answered first (orphaned log), acks arrive later
+      EXPECT_EQ(t.payloadLogCountForTesting(), 1u);
+      t.ack(id, 2);
+    }
+    EXPECT_EQ(t.payloadLogCountForTesting(), 0u) << "order " << order;
+  }
+}

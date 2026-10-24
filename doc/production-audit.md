@@ -658,6 +658,33 @@ which builds the tree at `<ref>` into the same image and measures it
 interleaved with the working tree, so two builds can be compared the only way
 the methodology allows (see "Performance after hardening").
 
+## Nightly soak finding (2026-10-24)
+
+The first nightly `soak.yml` run on the released tree (run 40077070243)
+failed its gate: 5.47 M requests, 0 errors, 11 steady connections, and RSS
+growing linearly from 291.9 MB at the quarter mark to 373.0 MB at the end
+(27.8%, limit 25%). The slope was ~16 bytes per request. Two causes, both
+fixed with tests:
+
+| # | Finding | Fix | Test |
+|---|---------|-----|------|
+| 1 | Every request that carried a body left its payload log in the engine's `PendingTable` forever: payload bytes are freed on Dart's ack, but the per-request log record is reaped only by `erase()`, which the libuv reactor never called (~100 B per POST; the soak's `/echo` loop alone accounts for the growth) | the reactor orphans the log whenever it retires a request (`lookupReq(erase)` and the connection-close sweep), so it is reaped as soon as acks catch up, or at once if they already have | `pending_table_test` PayloadLogIsReapedOnceAnsweredAndAcked (both orders); `uv_reactor_test` AnsweredAndAckedBodiesLeaveNoPayloadLogBehind |
+| 2 | `_wsOpened` ("every WebSocket connection id ever opened") grew by one entry per WebSocket connection for the life of the isolate | bounded to the most recent 1024 ids (ids only grow; an evicted id's late frame lands in the bounded `_wsEarly`) | `ws_test` "the opened-id set is bounded" |
+
+The 120 s local soak used earlier (7.3% growth) was too short to separate
+this slope from warm-up; the 600 s nightly is the gate that matters. Bisecting
+it also exposed a tooling hazard: once the lock carried a `1.0.0` entry, the
+build hook preferred the *released* prebuilt over the repository's own
+`build/lib`, so local `dart test` runs and CI's test jobs were exercising the
+published engine rather than the tree's. The hook now stages `build/lib`
+first (a pub consumer has none and still downloads), and the fixed engine was
+re-soaked locally before re-tagging: echo-only traffic now holds ~9 000 small
+native blocks on the macOS heap where the released engine had accumulated
+2.1 M of them after 85 s (`heap` profile), and the full mix ran 150 s,
+3.5 M requests, 0 errors, RSS flat at 284.5 MB from the first minute on
+(−1.8% quarter→end). The same soak was then run inside a Linux container
+(glibc, as CI) — see the release step below for the nightly that gates it.
+
 ## Remaining maintainer steps
 
 1. **Done (2026-10-24).** `v1.0.0` was tagged at `da1002b`; release run
@@ -679,10 +706,22 @@ the methodology allows (see "Performance after hardening").
    pipelined answers assuming two reads, the h2spec gate's `grep` saw escape
    bytes, the Trivy pin referenced a vanished tag, and the Dockerfile copied
    an uncommitted lock file.
-2. **Done; commit pending.** The run's `prebuilt_checksums` artifact is
-   installed as `hook/prebuilt_checksums.json` (five `1.0.0` digests, rc.4
-   entries kept). Commit it.
-3. `dart pub publish`.
+2. **Done.** The run's `prebuilt_checksums` artifact was committed as
+   `hook/prebuilt_checksums.json` (five `1.0.0` digests, rc.4 entries kept),
+   and a consumer project depending on the package from git (pub-cache
+   layout, no local engine) built with `dart build cli` in strict mode: the
+   hook downloaded the signed macOS asset byte-for-byte, and both the AOT
+   bundle and `dart run` served.
+3. **Portability rebuild, re-tag pending.** Inspecting the released Linux
+   assets showed they were linked on Ubuntu 24.04 and need glibc 2.38 and
+   GLIBCXX 3.4.29: Debian 12 and Ubuntu 22.04 hosts could download and verify
+   them and then fail at load. The release now builds Linux prebuilts on
+   Ubuntu 22.04 with libstdc++ linked in and gates every Linux asset (max
+   glibc symbol ≤ 2.35, no GLIBCXX/CXXABI need); the hook skips the prebuilt
+   on a Linux host below the floor and builds from source, saying so. After
+   committing, move the tag (`git tag -f v1.0.0 && git push -f origin
+   v1.0.0`), take the new run's lock artifact, commit it, then
+   `dart pub publish`.
 
 ## Out of scope
 

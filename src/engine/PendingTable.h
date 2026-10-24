@@ -227,6 +227,16 @@ class PendingTable {
     return n;
   }
 
+  /// Payload logs still held (test seam): every request that carried a body
+  /// has one until it is reaped — erased once answered and fully acked.
+  size_t payloadLogCountForTesting() const {
+    size_t n = 0;
+    for (int i = 0; i < kShardCount; ++i) {
+      std::lock_guard<std::mutex> lk(shards_[i].mutex);
+      n += shards_[i].payloads.size();
+    }
+    return n;
+  }
   /// Test seam.
   size_t pendingPayloadsForTesting(int64_t requestId) {
     auto& s = shard(requestId);

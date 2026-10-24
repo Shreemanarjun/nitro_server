@@ -53,6 +53,15 @@ class UvReactor {
   /// it was bound.
   bool removeEmitter(Emitter* e);
   size_t emitterCountForTesting();
+  /// Payload logs the engine still holds (every answered + acked request's
+  /// log must be gone).
+  size_t payloadLogCountForTesting() { return pending_.payloadLogCountForTesting(); }
+  /// Live request-location entries (every answered request's entry must be
+  /// gone).
+  size_t requestTableCountForTesting() {
+    std::lock_guard<std::mutex> lk(reqMutex_);
+    return reqLoc_.size();
+  }
   // Number of event loops (threads) the server started with. Test seam for the
   // workerThreads loop-count cap.
   size_t loopCountForTesting() const { return loops_.size(); }

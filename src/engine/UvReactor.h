@@ -264,6 +264,11 @@ class UvReactor {
   // thread, written from start() and (in tests) another thread, so atomic.
   std::atomic<bool> ctlEnabled_{true};
   ServerConfig cfg_;
+  // Seconds for `Keep-Alive: timeout=N`, or -1 to omit the line
+  // (ServerConfig::keepAliveHeader off).
+  int64_t keepAliveHeaderSecs() const {
+    return cfg_.keepAliveHeader ? (cfg_.keepAliveTimeoutMs + 999) / 1000 : -1;
+  }
   Router router_;                        // writer: registration; reader: match
   std::atomic<int64_t> boundPort_{0};
   int reservedPort_ = 0;  // app-level port claim, released on stop()

@@ -5,7 +5,7 @@
 #
 #   benchmark/blackbox/run.sh [--cpus 0-3] [--mem 4g] [--reps 5] \
 #                             [--duration 10s] [--connections 64] \
-#                             [--frameworks "nitro-native nitro-dylib go node dartio shelf"]
+#                             [--frameworks "nitro-native nitro-dylib go node dartio shelf ion"]
 #                             [--base <git-ref>]
 #
 # --base <ref> is the A/B mode: the tree at <ref> is exported, built the same
@@ -23,7 +23,7 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
 CPUS="0-3"; MEM="4g"; REPS=5; DURATION="10s"; CONNECTIONS=64
-FRAMEWORKS="nitro-native nitro-dylib go node dartio shelf"
+FRAMEWORKS="nitro-native nitro-dylib go node dartio shelf ion"
 BASE=""
 while [ $# -gt 0 ]; do case "$1" in
   --base) BASE="$2"; shift 2 ;;

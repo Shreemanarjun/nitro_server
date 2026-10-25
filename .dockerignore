@@ -21,3 +21,4 @@ doc/
 .git/
 .github/
 *.iml
+benchmark/ion_server/.dart_tool/

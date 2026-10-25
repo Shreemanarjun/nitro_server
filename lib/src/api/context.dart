@@ -5,9 +5,12 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'defaults.dart';
 import 'http_method.dart';
 import 'json_writer.dart';
 import 'multipart.dart';
+
+export 'defaults.dart';
 
 /// The lowest TLS protocol version a server accepts.
 enum TlsVersion { v12, v13 }
@@ -102,33 +105,36 @@ class ServerConfig {
   /// or an IPv6 literal (`'::1'`, or `'::'` for dual-stack: one socket
   /// serving both v4-mapped and v6 clients).
   const ServerConfig({
-    this.host = '127.0.0.1',
-    this.port = 0,
-    this.backlog = 128,
-    this.maxBodyBytes = 10 * 1024 * 1024,
-    this.defaultTimeout = const Duration(seconds: 30),
-    this.keepAliveTimeout = const Duration(seconds: 5),
-    this.maxRequestsPerConnection = 100,
-    this.workerThreads = 0,
-    this.isolates = 1,
-    this.maxConnections = 0,
-    this.maxConnectionsPerIp = 0,
-    this.headerTimeout = Duration.zero,
-    this.writeTimeout = const Duration(seconds: 30),
-    this.wsMaxBufferBytes = 1024 * 1024,
-    this.wsCompression = true,
-    this.protocol = HttpProtocol.http2,
-    this.responseTiming = true,
+    this.host = ServerDefaults.host,
+    this.port = ServerDefaults.port,
+    this.backlog = ServerDefaults.backlog,
+    this.maxBodyBytes = ServerDefaults.maxBodyBytes,
+    this.defaultTimeout = ServerDefaults.defaultTimeout,
+    this.keepAliveTimeout = ServerDefaults.keepAliveTimeout,
+    this.maxRequestsPerConnection = ServerDefaults.maxRequestsPerConnection,
+    this.workerThreads = ServerDefaults.workerThreads,
+    this.isolates = ServerDefaults.isolates,
+    this.maxConnections = ServerDefaults.maxConnections,
+    this.maxConnectionsPerIp = ServerDefaults.maxConnectionsPerIp,
+    this.headerTimeout = ServerDefaults.headerTimeout,
+    this.writeTimeout = ServerDefaults.writeTimeout,
+    this.wsMaxBufferBytes = ServerDefaults.wsMaxBufferBytes,
+    this.wsCompression = ServerDefaults.wsCompression,
+    this.protocol = ServerDefaults.protocol,
+    this.responseTiming = ServerDefaults.responseTiming,
     this.tls = const TlsConfig(),
-    this.exposeErrorDetails = false,
-    this.bodyTimeout = Duration.zero,
-    this.wsIdleTimeout = const Duration(seconds: 60),
-    this.maxConnectionAge = Duration.zero,
-    this.maxInFlightRequests = 0,
-    this.proxyProtocol = false,
-    this.streamIdleTimeout = const Duration(minutes: 5),
-    this.streamMaxBufferBytes = 4 * 1024 * 1024,
-    this.maxBufferedBodyBytes = 64 * 1024 * 1024,
+    this.exposeErrorDetails = ServerDefaults.exposeErrorDetails,
+    this.bodyTimeout = ServerDefaults.bodyTimeout,
+    this.wsIdleTimeout = ServerDefaults.wsIdleTimeout,
+    this.maxConnectionAge = ServerDefaults.maxConnectionAge,
+    this.maxInFlightRequests = ServerDefaults.maxInFlightRequests,
+    this.proxyProtocol = ServerDefaults.proxyProtocol,
+    this.streamIdleTimeout = ServerDefaults.streamIdleTimeout,
+    this.streamMaxBufferBytes = ServerDefaults.streamMaxBufferBytes,
+    this.maxBufferedBodyBytes = ServerDefaults.maxBufferedBodyBytes,
+    this.serverHeader = ServerDefaults.serverHeader,
+    this.keepAliveHeader = ServerDefaults.keepAliveHeader,
+    this.collectMetrics = ServerDefaults.collectMetrics,
   });
 
   final String host;
@@ -281,6 +287,20 @@ class ServerConfig {
   /// proxy that sends it — a direct client could otherwise name any address.
   final bool proxyProtocol;
 
+  /// Value of the `x-server` header stamped on every response (a handler's
+  /// own `x-server` wins). `null` sends no `x-server` header.
+  final String? serverHeader;
+
+  /// Send `Keep-Alive: timeout=N` next to `Connection: keep-alive` on
+  /// HTTP/1.1. Optional per RFC 9112: connections persist without it, it only
+  /// tells clients the idle deadline. Default on.
+  final bool keepAliveHeader;
+
+  /// Record per-route request counts, status classes and latency for
+  /// `/metrics` and the dashboard (one accumulator update per answer). Off
+  /// skips that work; `/metrics` then reports zero requests. Default on.
+  final bool collectMetrics;
+
   /// Checks every range constraint and throws [ArgumentError] on the first
   /// violation. `bind` calls it, so a bad value fails loudly in AOT builds
   /// too (an `assert` would be compiled out, and a negative [maxBodyBytes]
@@ -369,6 +389,10 @@ class ServerConfig {
     Duration? maxConnectionAge,
     int? maxInFlightRequests,
     bool? proxyProtocol,
+    String? serverHeader,
+    bool clearServerHeader = false,
+    bool? keepAliveHeader,
+    bool? collectMetrics,
     Duration? streamIdleTimeout,
     int? streamMaxBufferBytes,
     int? maxBufferedBodyBytes,
@@ -399,6 +423,11 @@ class ServerConfig {
       maxConnectionAge: maxConnectionAge ?? this.maxConnectionAge,
       maxInFlightRequests: maxInFlightRequests ?? this.maxInFlightRequests,
       proxyProtocol: proxyProtocol ?? this.proxyProtocol,
+      serverHeader: clearServerHeader
+          ? null
+          : (serverHeader ?? this.serverHeader),
+      keepAliveHeader: keepAliveHeader ?? this.keepAliveHeader,
+      collectMetrics: collectMetrics ?? this.collectMetrics,
       streamIdleTimeout: streamIdleTimeout ?? this.streamIdleTimeout,
       streamMaxBufferBytes: streamMaxBufferBytes ?? this.streamMaxBufferBytes,
       maxBufferedBodyBytes: maxBufferedBodyBytes ?? this.maxBufferedBodyBytes,

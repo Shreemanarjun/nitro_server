@@ -124,7 +124,14 @@ class ServerRunner {
 
   /// When true, every handler answer carries a `Server-Timing` header with
   /// the dispatch-to-answer time. Set from [ServerConfig.responseTiming].
-  bool _responseTiming = true;
+  bool _responseTiming = ServerDefaults.responseTiming;
+
+  /// `x-server` value stamped on responses; null sends none. Set from
+  /// [ServerConfig.serverHeader].
+  String? _serverHeader = ServerDefaults.serverHeader;
+
+  /// Per-route metrics on/off. Set from [ServerConfig.collectMetrics].
+  bool _collectMetrics = ServerDefaults.collectMetrics;
   final _pending = <int, _Pending>{};
 
   /// Per-route metrics, keyed by pattern (`*unmatched*` for not-found).
@@ -236,7 +243,7 @@ class ServerRunner {
   /// Whether the default 500 names the thrown error (see
   /// [ServerConfig.exposeErrorDetails]). Off: a fixed generic body, and the
   /// error goes to [events] as [ServerEventKind.handlerError] instead.
-  bool _exposeErrorDetails = false;
+  bool _exposeErrorDetails = ServerDefaults.exposeErrorDetails;
 
   /// The 500 answer before any override.
   ResponseContext _defaultError(Object error, RequestContext _) =>
@@ -613,18 +620,20 @@ class ServerRunner {
 
   /// Whether the engine negotiates permessage-deflate (mirrors the config
   /// the engine was started with; helpers inherit it via [prepareHelper]).
-  bool _wsCompression = true;
+  bool _wsCompression = ServerDefaults.wsCompression;
 
   /// Cap on one inflated WebSocket message (mirrors
   /// [ServerConfig.wsMaxBufferBytes], which the engine applies to the wire
   /// frame; this applies it to what the frame expands to).
-  int _wsMaxBufferBytes = 1024 * 1024;
+  int _wsMaxBufferBytes = ServerDefaults.wsMaxBufferBytes;
 
   int start(ServerConfig config) {
     _ensureListening();
     _fast ??= _bindFast();
     _wsCompression = config.wsCompression;
     _responseTiming = config.responseTiming;
+    _serverHeader = config.serverHeader;
+    _collectMetrics = config.collectMetrics;
     _exposeErrorDetails = config.exposeErrorDetails;
     _wsMaxBufferBytes = config.wsMaxBufferBytes;
     _native.configureServer(
@@ -651,6 +660,7 @@ class ServerRunner {
         maxConnectionAgeMs: config.maxConnectionAge.inMilliseconds,
         maxInFlightRequests: config.maxInFlightRequests,
         proxyProtocol: config.proxyProtocol,
+        keepAliveHeader: config.keepAliveHeader,
         // HTTP/1.1 is always served; the engine's h2 path turns on for http2
         // and above (h3 is not implemented yet, so it caps at h2).
         http2: config.protocol != HttpProtocol.http1,
@@ -708,15 +718,19 @@ class ServerRunner {
   /// a server another isolate started: subscribe the streams and bind the
   /// fast path, so the first dealt request finds everything in place.
   void prepareHelper({
-    bool wsCompression = true,
-    bool responseTiming = true,
-    bool exposeErrorDetails = false,
-    int wsMaxBufferBytes = 1024 * 1024,
+    bool wsCompression = ServerDefaults.wsCompression,
+    bool responseTiming = ServerDefaults.responseTiming,
+    String? serverHeader = ServerDefaults.serverHeader,
+    bool collectMetrics = ServerDefaults.collectMetrics,
+    bool exposeErrorDetails = ServerDefaults.exposeErrorDetails,
+    int wsMaxBufferBytes = ServerDefaults.wsMaxBufferBytes,
   }) {
     _ensureListening();
     _fast ??= _bindFast();
     _wsCompression = wsCompression;
     _responseTiming = responseTiming;
+    _serverHeader = serverHeader;
+    _collectMetrics = collectMetrics;
     _exposeErrorDetails = exposeErrorDetails;
     _wsMaxBufferBytes = wsMaxBufferBytes;
   }
@@ -1027,7 +1041,8 @@ class ServerRunner {
     // (a reflected request header is the classic route): that answer is
     // replaced by a 500 and reported, never sent. One place covers the
     // one-shot, stream and file answer paths. copyWith keeps the body.
-    final headers = <String, String>{'x-server': 'Nitro Dart Server'};
+    final serverHeader = _serverHeader;
+    final headers = <String, String>{'x-server': ?serverHeader};
     for (final e in response.headers.entries) {
       final name = e.key.toLowerCase();
       if (_engineOwnedHeaders.contains(name) || name.startsWith('proxy-')) {
@@ -1045,7 +1060,7 @@ class ServerRunner {
         );
         response = _genericError;
         headers.clear();
-        headers['x-server'] = 'Nitro Dart Server';
+        if (serverHeader != null) headers['x-server'] = serverHeader;
         break;
       }
       headers[name] = e.value;
@@ -1064,13 +1079,12 @@ class ServerRunner {
         ),
       );
       response = _genericError;
-      headers
-        ..clear()
-        ..['x-server'] = 'Nitro Dart Server';
+      headers.clear();
+      if (serverHeader != null) headers['x-server'] = serverHeader;
       break;
     }
     response = response.copyWith(headers: headers);
-    _record(requestId, response.status);
+    if (_collectMetrics) _record(requestId, response.status);
     // Dispatch-to-answer time, emitted as `Server-Timing`. Computed once here
     // (the pending entry is still live) and reused by whichever answer path
     // runs. -1 when timing is off or the request is already gone.

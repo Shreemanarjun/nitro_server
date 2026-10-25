@@ -8,6 +8,7 @@
 #   * compare.dart AOT, _dylib bridge                 -> compare_dylib    (nitro over DynamicLibrary.open)
 #   * Go net/http server                              -> compare_go_server
 #   * Node http server                                -> run via `node`
+#   * ion_web (pure-Dart HTTP/1.1 on dart:io sockets) -> ion_server_bin
 #
 # Dart base: nitro is Dart-only, so pub resolves without the Flutter SDK. We
 # only strip nitro_server's own `flutter:` ENV constraint (it exists solely to
@@ -69,6 +70,10 @@ RUN if [ -f benchmark/blackbox/base/pubspec.yaml ]; then set -e; cd benchmark/bl
       sed -i '/options:/d; /native_assets: true/d' build.yaml; dart run build_runner build; \
       dart compile exe benchmark/compare.dart -o /app/compare_dylib_base; \
       cp build/lib/libnitro_server.so /app/libnitro_server_base.so; fi
+
+# 4a. ion_web server (its own package, so ion_web never enters nitro_server's
+# dependency graph): AOT, same routes and bytes as the other sides.
+RUN cd benchmark/ion_server && dart pub get && dart compile exe bin/server.dart -o /app/ion_server_bin
 
 # 4. Go server + 4 KiB POST body for /echo
 RUN go build -o compare_go_server benchmark/compare_go_server.go

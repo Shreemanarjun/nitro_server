@@ -6,54 +6,140 @@ over FFI. So it deploys to anything that runs a long-lived container or VM —
 **not** to serverless/function platforms, which spin up ephemeral workers with no
 place for the native library or the event-loop threads.
 
-The universal artifact is the **Docker image**; everything else wraps it.
+The universal artifact is the **Docker image**; everything else wraps it, and
+`nitro deploy` writes what each host needs.
 
-## Docker (the base artifact)
+## One command per host: `nitro deploy`
 
 ```sh
-docker build -t nitro-server .
-docker run --rm -p 8080:8080 nitro-server
-# → http://localhost:8080  (/, /hello/:name, /metrics, /healthz, /readyz, /docs)
+dart run nitro_server:nitro deploy <docker|cloudflare|netlify|vercel> [options]
 ```
 
-The multi-stage [`Dockerfile`](../Dockerfile) builds the native engine with
-cmake (**TLS, brotli and HTTP/2 on**, deps as Debian shared libraries, no
-`-march=native` so the image runs on any CPU of its arch), then AOT-compiles
-[`bin/server.dart`](../bin/server.dart) with `dart build cli` — the only build
-that runs the package hook, so the engine ships inside the bundle as a code
-asset — and copies the bundle into a slim, non-root, digest-pinned
-`debian:stable-slim` runtime (no libuv/OpenSSL/brotli/nghttp2 needed there). It
-exposes `8080` and adds a `HEALTHCHECK` hitting `/readyz`.
+It writes the files the host needs next to your project and prints the
+commands that finish the deployment; `--run` executes them. Existing files
+are kept (`--force` overwrites), so you can hand-edit a generated config and
+re-run safely. Options and defaults: `nitro --help`.
 
-- Config via env: `HOST` (default `0.0.0.0`), `PORT` (default `8080`), plus
-  every `ServerConfig.fromEnv` variable (body/idle/age timeouts, in-flight
-  budget, TLS as `TLS_CERT_FILE`+`TLS_KEY_FILE` or `TLS_CERT_PEM`+`TLS_KEY_PEM`,
-  …) — see the README's "From the environment".
-- **Operational endpoints are guarded.** `/metrics`, `/dashboard*`,
-  `/openapi.json` and `/docs` require HTTP basic auth when `ADMIN_USER` and
-  `ADMIN_PASSWORD` are set, and are **loopback-only otherwise** (403 from any
-  other address). `/healthz` and `/readyz` stay open for probes. The example's
-  protected API routes have no built-in credentials: they answer 401 to
-  everyone until `API_TOKEN`, `API_KEY` and `BASIC_USER`+`BASIC_PASSWORD` are
-  set (the server prints a warning while any is unset).
-- Serving TLS directly: set the `TLS_*` variables (the engine in the image has
-  OpenSSL) — `TLS_MIN_VERSION=1.3`, `TLS_CIPHERS`/`TLS_CIPHER_SUITES`, and
-  `TLS_CLIENT_CA_FILE` for mutual TLS; otherwise terminate TLS at the proxy.
-  Behind an L4 balancer set `PROXY_PROTOCOL=1` so the real client address
-  reaches rate limits and logs (the listener must then be reachable only
-  through the balancer); behind an HTTP proxy use
-  `rateLimit(trustedProxies: [...])`.
-- Prebuilt engines on GitHub Releases carry a SHA-256 sidecar, Sigstore build
-  provenance (`gh attestation verify <asset> --repo <owner>/<repo>`), a keyless
-  signature bundle (`cosign verify-blob --bundle <asset>.sigstore.json
-  --certificate-identity-regexp 'github.com/<owner>/<repo>/'
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com <asset>`)
-  and an SPDX SBOM.
-- CI builds this image, starts it, checks `/readyz` and scans the runtime
-  layer with Trivy (unfixed CRITICAL fails) on every push (`docker` job).
+| target | writes | runs the server? |
+| --- | --- | --- |
+| `docker` | `Dockerfile`, `.dockerignore` | yes — the image for Fly.io, Render, Railway, Cloud Run, Kubernetes, any VM |
+| `cloudflare` | the same + `worker.js`, `wrangler.jsonc`, `package.json` | yes — Cloudflare Containers behind a Worker |
+| `netlify` | `netlify.toml` | no — static site, `/api/*` and `/ws` proxied to `--backend` |
+| `vercel` | `vercel.json` | no — static site, `/api/*` rewritten to `--backend` |
 
-[`docker-compose.yml`](../docker-compose.yml) runs it locally with a
-`stop_grace_period` longer than the drain window so graceful shutdown completes.
+## Docker (`nitro deploy docker`)
+
+```sh
+dart run nitro_server:nitro deploy docker --name my-api        # writes Dockerfile + .dockerignore
+docker build --platform linux/amd64 -t my-api .                  # or: nitro deploy docker --run
+docker run --rm -p 8080:8080 my-api
+curl -i http://localhost:8080/readyz
+```
+
+What the generated image does:
+
+- **Build stage** (`dart:stable`): `dart pub get`, then `dart build cli -t
+  bin/server.dart`. The nitro_server build hook downloads the prebuilt engine
+  for the image's platform from the GitHub release and verifies it against the
+  digest lock shipped in the package, so the image needs **no cmake and no
+  C++ toolchain**. Set `NITRO_SERVER_VERIFY_SIGSTORE=1` in the build stage to
+  also require a passing `cosign verify-blob`.
+- **Flutter stub.** nitro_server also carries a Flutter FFI-plugin block, and
+  pub refuses to resolve such a package unless a Flutter SDK is visible. The
+  build stage points `FLUTTER_ROOT` at a two-line stub (the version file pub
+  reads); nothing from Flutter is used. The same trick works on a developer
+  machine with a standalone Dart SDK, or use the `dart` that ships with
+  Flutter.
+- **Runtime stage** (`debian:stable-slim`): the AOT bundle, `ca-certificates`
+  and `curl` (for the `HEALTHCHECK`), a non-root user, `HOST=0.0.0.0`,
+  `PORT=8080`. The prebuilt engine is static (libuv, OpenSSL, brotli, nghttp2
+  and libstdc++ linked in) and runs on glibc 2.35+.
+- **Static files.** Directories named `public`, `assets` or `web` next to the
+  pubspec are copied into the runtime image (`--assets dir1,dir2` to choose),
+  so `staticFiles('public')` and `ResponseContext.file('public/…')` work in
+  the container exactly as they do locally.
+- Options: `--entry bin/other.dart`, `--port 9000`, `--health /healthz`,
+  `--platform host` (build for the machine you are on; the default
+  `linux/amd64` is what the hosts below run, and on Apple Silicon needs Docker
+  Desktop or another Docker with BuildKit).
+
+Configure the container with environment variables: `HOST`, `PORT` and every
+`ServerConfig.fromEnv` variable (timeouts, budgets, `TLS_*`, `PROXY_PROTOCOL`;
+see the README). `bin/server.dart` guards `/metrics`, `/dashboard`, `/docs`
+with `ADMIN_USER`/`ADMIN_PASSWORD` (loopback-only when unset) and keeps its
+example API routes closed until `API_TOKEN`, `API_KEY` and
+`BASIC_USER`+`BASIC_PASSWORD` are set.
+
+The repository's own [`Dockerfile`](../Dockerfile) is different: it compiles
+the engine from source for CI. Applications should use the generated one.
+
+## Cloudflare Containers (`nitro deploy cloudflare`)
+
+Cloudflare runs your Docker image on its network; a tiny Worker is the
+ingress and forwards requests to the container through a Durable Object.
+Workers and Pages alone cannot run nitro (no native code, no sockets).
+
+```sh
+dart run nitro_server:nitro deploy cloudflare --name my-api --instance-type basic --instances 3
+npm install                      # @cloudflare/containers + wrangler
+npx wrangler dev                  # optional: Worker + container on your machine, http://localhost:8787
+npx wrangler login                # once
+npx wrangler deploy               # builds the linux/amd64 image, pushes it, deploys the Worker
+curl -i https://my-api.<your-subdomain>.workers.dev/readyz
+```
+
+Wrangler builds the image with Docker's BuildKit (`docker buildx`). Docker
+Desktop ships it; with colima run `brew install docker-buildx` and link
+`$(brew --prefix)/lib/docker/cli-plugins/docker-buildx` into
+`~/.docker/cli-plugins/`. On an Apple Silicon machine the amd64 image builds
+under emulation (about a minute for the Dart build; `wrangler deploy --dry-run`
+runs the whole build without uploading).
+
+What you get and what to know:
+
+- `worker.js` spreads requests over `--instances` container instances
+  (`getByName`), proxies WebSockets through `fetch()`, and sets `sleepAfter`
+  (`--sleep-after`, default 15 m). A sleeping instance cold-starts in 1–3 s;
+  if that first connection is dropped (the helper answers 500), the Worker
+  retries a bodyless request once, so the caller sees the 200.
+- TLS, HTTP/2 and HTTP/3 terminate at Cloudflare; the container receives
+  HTTP/1.1, so the `TLS_*` variables and `HTTP_PROTOCOL` do not matter there.
+- The client address inside the container is Cloudflare's. Rate-limit on the
+  header it sets: `rateLimit(keyExtractor: (r) => r.header('cf-connecting-ip') ?? r.clientIp)`.
+- Instances are stopped when idle, so in-process state (the default rate-limit
+  store, per-instance `metrics`) is per instance and not durable; use a shared
+  `RateLimitStore` and scrape `/metrics` per instance.
+- Sizing: `--instance-type lite|basic|standard-1|standard-2|standard-3|standard-4`
+  (1/16 vCPU · 256 MiB up to 4 vCPU · 12 GiB). A nitro container idles around
+  150 MB with three isolates; `basic` (1/4 vCPU, 1 GiB) fits a small API.
+- Only HTTP and WebSocket reach the container; no raw TCP/UDP.
+
+## Netlify (`nitro deploy netlify`)
+
+Netlify hosts your static site and proxies API and WebSocket traffic to a
+nitro backend running on a container host (any of the above).
+
+```sh
+dart run nitro_server:nitro deploy netlify --backend https://my-api.fly.dev --publish dist
+npx netlify deploy --prod --dir dist          # or: nitro deploy netlify ... --run
+```
+
+`netlify.toml` proxies `--api-prefix` (default `/api`) with `status = 200`
+(a transparent proxy, not a redirect) and the WebSocket path (`--ws-path`,
+default `/ws`) to the `wss://` form of the backend.
+
+## Vercel (`nitro deploy vercel`)
+
+Same pattern as Netlify; Vercel Functions cannot run the native server.
+
+```sh
+dart run nitro_server:nitro deploy vercel --backend https://my-api.fly.dev
+npx vercel --prod                            # or: nitro deploy vercel ... --run
+```
+
+`vercel.json` rewrites `--api-prefix` (default `/api`) to the backend.
+Vercel rewrites do not carry WebSocket upgrades: connect WebSocket clients to
+the backend URL directly.
 
 ## Graceful shutdown (containers/orchestrators)
 
@@ -86,7 +172,8 @@ rotated out rather than served at reduced capacity for ever.
 ## Fly.io
 
 ```sh
-fly launch --dockerfile Dockerfile   # or use the committed fly.toml
+dart run nitro_server:nitro deploy docker --name my-api   # Dockerfile
+fly launch --dockerfile Dockerfile                        # or use the committed fly.toml
 fly deploy
 ```
 
@@ -121,15 +208,6 @@ spec:
 ```
 
 A Prometheus `ServiceMonitor` scraping `/metrics` completes the picture.
-
-## Netlify (static frontend + proxied backend)
-
-Netlify can't host the persistent native server, so the pattern is: **Netlify
-serves your static frontend and proxies API/WebSocket calls to nitro running on a
-container host** (Fly.io/Render/Cloud Run above). [`netlify.toml`](../netlify.toml)
-rewrites `/api/*` → your backend and `/ws` → its WebSocket; set the backend URL
-there. The same applies to any static/CDN host (Vercel, Cloudflare Pages) fronting
-a nitro backend.
 
 ## Scaling notes
 

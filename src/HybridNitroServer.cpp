@@ -212,6 +212,7 @@ class HybridNitroServerImpl final : public HybridNitroServerNative {
     cfg.maxBodyBytes = raw.maxBodyBytes;
     cfg.defaultTimeoutMs = raw.defaultTimeoutMs;
     cfg.keepAliveTimeoutMs = raw.keepAliveTimeoutMs;
+    cfg.keepAliveHeader = raw.keepAliveHeader;
     cfg.maxRequestsPerConn = raw.maxRequestsPerConn;
     cfg.workerThreads = raw.workerThreads;
     cfg.maxConnections = raw.maxConnections;

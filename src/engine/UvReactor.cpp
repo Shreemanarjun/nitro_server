@@ -250,7 +250,9 @@ std::string uvBuildHead(int64_t status, const std::vector<Header>& headers,
     out.append(std::to_string(contentLength));
     out.append("\r\n");
   }
-  if (keepAlive) {
+  if (keepAlive && keepAliveSecs < 0) {
+    out.append("Connection: keep-alive\r\n\r\n");  // keepAliveHeader off
+  } else if (keepAlive) {
     out.append("Connection: keep-alive\r\nKeep-Alive: timeout=");
     out.append(std::to_string(keepAliveSecs));
     out.append("\r\n\r\n");
@@ -281,7 +283,9 @@ std::string uvBuildStreamHead(int64_t status, const std::vector<Header>& headers
     out.append("\r\n");
   }
   out.append("Transfer-Encoding: chunked\r\n");
-  if (keepAlive) {
+  if (keepAlive && keepAliveSecs < 0) {
+    out.append("Connection: keep-alive\r\n\r\n");  // keepAliveHeader off
+  } else if (keepAlive) {
     out.append("Connection: keep-alive\r\nKeep-Alive: timeout=");
     out.append(std::to_string(keepAliveSecs));
     out.append("\r\n\r\n");
@@ -784,7 +788,7 @@ void UvReactor::respondFile(int64_t id, int64_t status,
     return;
   }
   completions_.fetch_add(1, std::memory_order_release);
-  const int64_t kaSecs = (cfg_.keepAliveTimeoutMs + 999) / 1000;
+  const int64_t kaSecs = keepAliveHeaderSecs();
   Loop* lp = loops_[loc.loopIdx].get();
   Loop::Pending p;
   p.connId = loc.connId;
@@ -1717,7 +1721,7 @@ void UvReactor::processConn(Conn* c) {
     const bool keepAlive = uvClientWantsKeepAlive(head) &&
                            cfg_.keepAliveTimeoutMs > 0 && !draining_.load() &&
                            underBudget && !c->ageExpired;
-    const int64_t kaSecs = (cfg_.keepAliveTimeoutMs + 999) / 1000;
+    const int64_t kaSecs = keepAliveHeaderSecs();
     c->buf.erase(0, reqEnd);  // consume this request
     c->bodyPending = false;
     c->lastActive = Clock::now();
@@ -1997,7 +2001,7 @@ void UvReactor::respond(int64_t id, int64_t status,
     return;
   }
 #endif
-  const int64_t kaSecs = (cfg_.keepAliveTimeoutMs + 999) / 1000;
+  const int64_t kaSecs = keepAliveHeaderSecs();
   std::string out = uvBuildHead(status, headers, (int64_t)bodyLen, loc.keepAlive,
                                 kaSecs);
   // RFC 9110 §6.4.1: 1xx/204/304 have no content — a handler body is dropped
@@ -2046,7 +2050,7 @@ void UvReactor::startStream(int64_t id, int64_t status,
     return;
   }
 #endif
-  const int64_t kaSecs = (cfg_.keepAliveTimeoutMs + 999) / 1000;
+  const int64_t kaSecs = keepAliveHeaderSecs();
   std::string out = uvBuildStreamHead(status, headers, loc.keepAlive, kaSecs);
   // HEAD: headers only; the terminal chunk finishes it with no body.
   pushWrite(loc, std::move(out), /*finish=*/loc.isHead);

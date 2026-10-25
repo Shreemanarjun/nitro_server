@@ -55,3 +55,5 @@ ios/FlutterFramework
 macos/FlutterFramework
 # blackbox A/B baseline export (run.sh --base), rebuilt per run
 benchmark/blackbox/base/
+benchmark/ion_server/.dart_tool/
+benchmark/ion_server/pubspec.lock

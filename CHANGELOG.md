@@ -1,3 +1,17 @@
+## Unreleased
+
+- `nitro deploy <docker|cloudflare|netlify|vercel>`: writes what the host
+  needs (Dockerfile with the prebuilt engine; Cloudflare Containers Worker +
+  `wrangler.jsonc`; `netlify.toml` / `vercel.json` static-site proxies) and
+  with `--run` runs the deploy commands; `public`, `assets` and `web`
+  directories are copied into the image (`--assets`). Guides:
+  `doc/deployment.md`.
+- The generated Dockerfile builds on `dart:stable`: it points `FLUTTER_ROOT` at
+  a stub because pub resolves this package only when a Flutter SDK is visible
+  (the `flutter.plugin` block requires the constraint).
+- `netlify.toml`: the WebSocket proxy rule is gone; Netlify's proxy does not
+  carry upgrades and ends proxied requests after 26 s.
+
 ## 1.0.0
 
 First stable release: HTTP/1.1 + WebSocket (+ optional HTTP/2, TLS, brotli)

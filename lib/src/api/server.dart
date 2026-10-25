@@ -130,6 +130,8 @@ class NitroServer with RouteRegistrar<NitroServer> {
         dylibPath: loadedNitroServerNativePath,
         wsCompression: config.wsCompression,
         responseTiming: config.responseTiming,
+        serverHeader: config.serverHeader,
+        collectMetrics: config.collectMetrics,
         exposeErrorDetails: config.exposeErrorDetails,
         wsMaxBufferBytes: config.wsMaxBufferBytes,
         detach: runner.detachEmitter,
@@ -585,6 +587,8 @@ class _Helper {
     required String? dylibPath,
     required bool wsCompression,
     required bool responseTiming,
+    required String? serverHeader,
+    required bool collectMetrics,
     required bool exposeErrorDetails,
     required int wsMaxBufferBytes,
     required bool Function(int emitterId) detach,
@@ -610,6 +614,8 @@ class _Helper {
             replies.sendPort,
             wsCompression,
             responseTiming,
+            serverHeader,
+            collectMetrics,
             exposeErrorDetails,
             wsMaxBufferBytes,
           ),
@@ -773,6 +779,8 @@ class _HelperBoot {
     this.reply,
     this.wsCompression,
     this.responseTiming,
+    this.serverHeader,
+    this.collectMetrics,
     this.exposeErrorDetails,
     this.wsMaxBufferBytes,
   );
@@ -786,6 +794,8 @@ class _HelperBoot {
   final SendPort reply;
   final bool wsCompression;
   final bool responseTiming;
+  final String? serverHeader;
+  final bool collectMetrics;
   final bool exposeErrorDetails;
   final int wsMaxBufferBytes;
 }
@@ -804,6 +814,8 @@ Future<void> _helperMain(_HelperBoot boot) async {
   runner.prepareHelper(
     wsCompression: boot.wsCompression,
     responseTiming: boot.responseTiming,
+    serverHeader: boot.serverHeader,
+    collectMetrics: boot.collectMetrics,
     exposeErrorDetails: boot.exposeErrorDetails,
     wsMaxBufferBytes: boot.wsMaxBufferBytes,
   );

@@ -629,17 +629,32 @@ Future<NitroServer> _startNitroServer() async {
   // dart:io and shelf never cap requests per connection, so metering
   // reconnects into only nitro's numbers would punish it for a limit the
   // others don't have.
-  final config = _keepAlive
-      ? ServerConfig(
-          maxRequestsPerConnection: 0,
-          workerThreads: _workers,
-          isolates: _isolates,
-        )
-      : ServerConfig(
-          keepAliveTimeout: Duration.zero,
-          workerThreads: _workers,
-          isolates: _isolates,
-        );
+  // One benchmark config, built from ServerConfig's defaults, with only the
+  // switches that make nitro's wire behaviour match the other servers:
+  //   * no per-request metrics recording (the other sides keep none);
+  //   * no `Server-Timing`, no `x-server`, no `Keep-Alive: timeout=N` line —
+  //     the other sides send none of them (equal header bytes, not only bodies);
+  //   * no per-request timeout timer — the other sides arm none;
+  //   * HTTP/1.1 only — the other sides do not also accept h2c on the port.
+  final config = ServerConfig(
+    workerThreads: _workers,
+    isolates: _isolates,
+    responseTiming: false,
+    serverHeader: null,
+    keepAliveHeader: false,
+    // No per-route metrics accumulator: the other sides record nothing.
+    collectMetrics: false,
+    defaultTimeout: Duration.zero,
+    protocol: HttpProtocol.http1,
+    // Keep-alive mode lifts the per-connection request cap (the others have
+    // none); without it every response closes, matching dart:io and shelf.
+    maxRequestsPerConnection: _keepAlive
+        ? 0
+        : ServerDefaults.maxRequestsPerConnection,
+    keepAliveTimeout: _keepAlive
+        ? ServerDefaults.keepAliveTimeout
+        : Duration.zero,
+  );
   return NitroServer.bind(config, _nitroSetup);
 }
 
@@ -1414,7 +1429,13 @@ Future<void> main(List<String> args) async {
     final int servedPort;
     switch (serve) {
       case 'nitro':
-        servedPort = (await _startNitroServer()).port;
+        final nitro = await _startNitroServer();
+        servedPort = nitro.port;
+        // On the record, from the live server: isolates actually running and
+        // the engine loop count it was given.
+        stderr.writeln(
+          'nitro isolates=${nitro.isolates} workerThreads=${nitro.config.workerThreads}',
+        );
       case 'dartio':
         // dart:io scales with `shared: true` isolates (SO_REUSEPORT), the same
         // equal-CPU budget as nitro's isolates / Go's GOMAXPROCS, so /work is a

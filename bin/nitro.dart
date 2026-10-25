@@ -18,6 +18,7 @@ library;
 import 'dart:io';
 
 import 'package:nitro_server/nitro_server.dart' show nitroServerLibraryName;
+import 'package:nitro_server/src/deploy/targets.dart';
 
 const _usage = '''
 nitro — dev CLI for nitro_server
@@ -25,6 +26,9 @@ nitro — dev CLI for nitro_server
 usage:
   nitro serve [entry] [--aot]            run a server (default: JIT + hot reload)
   nitro build [entry] [--jit] [--bundle-deps] [-o out]   compile a server
+  nitro deploy <docker|cloudflare|netlify|vercel> [options]
+          write what the target needs (Dockerfile, wrangler.jsonc + worker.js,
+          netlify.toml, vercel.json); --run also runs the deploy commands
 
   entry   defaults to bin/server.dart
   --aot   serve: compile then run the native exe (no hot reload)
@@ -32,6 +36,24 @@ usage:
   --bundle-deps  build: copy native deps next to the exe + rewrite install
                  names, for a cross-machine-portable bundle (macOS/Linux)
   -o,--output   build output path (default build/<entry-basename>[.exe])
+
+deploy options:
+  --name <n>            image / Worker name (default nitro-app)
+  --entry <file>        Dart entrypoint (default bin/server.dart)
+  --port <p>            container port (default 8080)
+  --health <path>       HEALTHCHECK path (default /readyz)
+  --instance-type <t>   cloudflare: lite|basic|standard-1.. (default basic)
+  --instances <n>       cloudflare: instances the Worker spreads over (default 3)
+  --sleep-after <d>     cloudflare: idle time before sleep (default 15m)
+  --backend <url>       netlify|vercel: the running nitro_server to proxy to
+  --api-prefix <path>   netlify|vercel: proxied prefix (default /api)
+  --publish <dir>       netlify: static dir to publish (default public)
+  --platform <p>        docker: image platform (default linux/amd64; host = this machine)
+  --assets <dirs>       docker: comma-separated dirs copied into the image
+                        (default: whichever of public, assets, web exist)
+  --out <dir>           where to write (default .)
+  --force               overwrite files that already exist
+  --run                 run the deploy commands after writing the files
 ''';
 
 Future<void> main(List<String> args) async {
@@ -46,6 +68,8 @@ Future<void> main(List<String> args) async {
       exit(await _serve(rest));
     case 'build':
       exit(await _build(rest));
+    case 'deploy':
+      exit(await _deploy(rest));
     default:
       stderr.writeln('nitro: unknown command "$command"\n');
       stderr.write(_usage);
@@ -293,4 +317,96 @@ Future<int> _run(String exe, List<String> args) async {
   final code = await proc.exitCode;
   await sigint.cancel();
   return code;
+}
+
+/// `nitro deploy <target>`: render the target's files, then (with --run) the
+/// commands that finish the deployment. Existing files are kept unless
+/// --force, so a hand-edited config survives a re-run.
+Future<int> _deploy(List<String> args) async {
+  final targetName = args.where((a) => !a.startsWith('-')).firstOrNull;
+  final target = targetName == null ? null : DeployTarget.parse(targetName);
+  if (target == null) {
+    stderr.writeln(
+      'nitro deploy: target must be one of '
+      '${DeployTarget.values.map((t) => t.name).join(', ')}\n',
+    );
+    stderr.write(_usage);
+    return 2;
+  }
+  int intOpt(String name, int fallback) {
+    final v = _option(args, [name]);
+    return v == null ? fallback : (int.tryParse(v) ?? -1);
+  }
+
+  final out = _option(args, ['--out']) ?? '.';
+  final assetsArg = _option(args, ['--assets']);
+  final assets = assetsArg != null
+      ? assetsArg
+            .split(',')
+            .map((a) => a.trim())
+            .where((a) => a.isNotEmpty)
+            .toList()
+      : [
+          for (final d in const ['public', 'assets', 'web'])
+            if (Directory('$out/$d').existsSync()) d,
+        ];
+  final options = DeployOptions(
+    name: _option(args, ['--name']) ?? 'nitro-app',
+    entry: _option(args, ['--entry']) ?? 'bin/server.dart',
+    port: intOpt('--port', 8080),
+    healthPath: _option(args, ['--health']) ?? '/readyz',
+    instanceType: _option(args, ['--instance-type']) ?? 'basic',
+    instances: intOpt('--instances', 3),
+    sleepAfter: _option(args, ['--sleep-after']) ?? '15m',
+    backend: _option(args, ['--backend']),
+    apiPrefix: _option(args, ['--api-prefix']) ?? '/api',
+    publishDir: _option(args, ['--publish']) ?? 'public',
+    platform: _option(args, ['--platform']) ?? 'linux/amd64',
+    assets: assets,
+  );
+  final problem = validateDeploy(target, options);
+  if (problem != null) {
+    stderr.writeln('nitro deploy ${target.name}: $problem');
+    return 2;
+  }
+  final force = _hasFlag(args, '--force');
+  for (final entry in renderDeploy(target, options).entries) {
+    final file = File('$out/${entry.key}');
+    if (file.existsSync() && !force) {
+      stdout.writeln('  kept     ${file.path} (exists; --force to overwrite)');
+      continue;
+    }
+    file.parent.createSync(recursive: true);
+    file.writeAsStringSync(entry.value);
+    stdout.writeln('  wrote    ${file.path}');
+  }
+  final commands = deployCommands(target, options);
+  if (needsBackend(target)) {
+    stdout.writeln(
+      '  note     ${target.name} hosts the static site only; '
+      '${options.apiPrefix}/* is proxied to ${options.backend}',
+    );
+  }
+  if (!_hasFlag(args, '--run')) {
+    stdout.writeln(
+      '  next     (cd $out && ${commands.map((c) => c.join(' ')).join(' && ')})',
+    );
+    return 0;
+  }
+  for (final c in commands) {
+    stdout.writeln('  run      ${c.join(' ')}');
+    final code = await _runIn(out, c.first, c.sublist(1));
+    if (code != 0) return code;
+  }
+  return 0;
+}
+
+Future<int> _runIn(String dir, String exe, List<String> args) async {
+  final p = await Process.start(
+    exe,
+    args,
+    workingDirectory: dir,
+    mode: ProcessStartMode.inheritStdio,
+  );
+  return p.exitCode;
 }

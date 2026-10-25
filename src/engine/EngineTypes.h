@@ -21,6 +21,9 @@ struct ServerConfig {
   int64_t maxBodyBytes = 10 * 1024 * 1024;
   int64_t defaultTimeoutMs = 30000;
   int64_t keepAliveTimeoutMs = 5000;
+  // Write `Keep-Alive: timeout=N` next to `Connection: keep-alive` (RFC 9112
+  // makes it optional; HTTP/1.1 connections persist without it).
+  bool keepAliveHeader = true;
   int64_t maxRequestsPerConn = 100;
   /// libuv event-loop count / worker cap (engine-specific). `<= 0`: auto.
   int64_t workerThreads = 0;

@@ -247,6 +247,9 @@ class RawServerConfig {
   /// when the engine was built with it. Default on; set false to force
   /// HTTP/1.1 without rebuilding. A no-op in an engine built without HTTP/2.
   final bool http2;
+
+  /// Send `Keep-Alive: timeout=N` with `Connection: keep-alive`. Default on.
+  final bool keepAliveHeader;
   final RawTlsConfig tls;
 
   const RawServerConfig({
@@ -273,6 +276,7 @@ class RawServerConfig {
     this.maxInFlightRequests = 0,
     this.proxyProtocol = false,
     this.http2 = true,
+    this.keepAliveHeader = true,
     this.tls = const RawTlsConfig(),
   });
 }

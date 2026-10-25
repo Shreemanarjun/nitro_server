@@ -46,6 +46,10 @@ dart pub add nitro_server
 
 - Released versions need no toolchain: the build hook downloads the prebuilt
   engine for your OS/arch and `dart build cli` bundles it.
+- pub resolves the package only when a Flutter SDK is visible (it is also a
+  Flutter FFI plugin, and pub demands that for the plugin block): use the
+  `dart` that ships with Flutter, or set `FLUTTER_ROOT` to a Flutter SDK. The
+  Dockerfile from `nitro deploy docker` handles this with a stub.
 - Prebuilts are self-contained (libuv, OpenSSL, brotli, nghttp2 linked in;
   libstdc++ too on Linux). Minimum hosts: Linux glibc 2.35 (Ubuntu 22.04,
   Debian 12 or newer), macOS 14, Windows 10 x64. Older hosts build from
@@ -115,6 +119,7 @@ TLS is requested on an engine without OpenSSL.
 | `build --jit` | kernel snapshot → `build/<name>.dill` |
 | `build -o <path>` | output path |
 | `build --bundle-deps` | copy native deps beside the exe |
+| `deploy <target>` | write what a host needs: `docker` (Dockerfile), `cloudflare` (Dockerfile + Worker + `wrangler.jsonc`), `netlify`/`vercel` (static site + API proxy config); `--run` also runs the deploy commands |
 
 ```sh
 dart run nitro_server:nitro serve                 # dev
@@ -122,8 +127,21 @@ dart run nitro_server:nitro build                 # prod: ./build/server/bundle/
 docker build -t myapp . && docker run -p 8080:8080 -e ADMIN_USER=ops -e ADMIN_PASSWORD=... myapp
 ```
 
-Deploy recipes (Fly.io, Render, Railway, Cloud Run, Kubernetes, Netlify):
-[`doc/deployment.md`](doc/deployment.md).
+Deploy:
+
+```sh
+dart run nitro_server:nitro deploy docker                      # Dockerfile (prebuilt engine, no cmake) -> any container host
+dart run nitro_server:nitro deploy cloudflare --name my-api    # + worker.js, wrangler.jsonc; then: npm install && npx wrangler deploy
+dart run nitro_server:nitro deploy netlify --backend https://api.example.com   # netlify.toml: static site, /api/* + /ws proxied
+dart run nitro_server:nitro deploy vercel  --backend https://api.example.com   # vercel.json: static site, /api/* rewritten
+```
+
+- Only container hosts run the server (Docker, Cloudflare Containers, Fly.io,
+  Render, Cloud Run, Kubernetes); Netlify and Vercel host a static site and
+  proxy to a running backend, hence `--backend`.
+- Add `--run` to execute the deploy commands; `--platform host` builds the
+  Docker image for your own machine (default `linux/amd64`, what hosts run).
+- Step-by-step guides per host: [`doc/deployment.md`](doc/deployment.md).
 
 ## Routes
 

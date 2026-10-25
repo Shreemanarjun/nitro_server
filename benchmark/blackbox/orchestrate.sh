@@ -35,25 +35,27 @@ export DYLD_LIBRARY_PATH="/opt/homebrew/lib:${DYLD_LIBRARY_PATH:-}" # harmless o
 # shelf carry no nitro FFI, so they ride the _dylib binary. nitro-native is the
 # dart-build-cli bundle. Every CPU-scaling side is given SRV_N cores.
 declare -A LAUNCH=(
-  [nitro-native]="build/native_cli/bundle/bin/compare --keep-alive --isolates $SRV_N --serve nitro"
-  [nitro-dylib]="env NITRO_SERVER_DYLIB=/app/build/lib/libnitro_server.so ./compare_dylib --keep-alive --isolates $SRV_N --serve nitro"
-  [nitro-base]="env NITRO_SERVER_DYLIB=/app/libnitro_server_base.so ./compare_dylib_base --keep-alive --isolates $SRV_N --serve nitro"
+  [nitro-native]="build/native_cli/bundle/bin/compare --keep-alive --isolates $SRV_N --workers $SRV_N --serve nitro"
+  [nitro-dylib]="env NITRO_SERVER_DYLIB=/app/build/lib/libnitro_server.so ./compare_dylib --keep-alive --isolates $SRV_N --workers $SRV_N --serve nitro"
+  [nitro-base]="env NITRO_SERVER_DYLIB=/app/libnitro_server_base.so ./compare_dylib_base --keep-alive --isolates $SRV_N --workers $SRV_N --serve nitro"
   [dartio]="./compare_dylib --keep-alive --isolates $SRV_N --serve dartio"
   [shelf]="./compare_dylib --keep-alive --isolates $SRV_N --serve shelf"
   [go]="env GOMAXPROCS=$SRV_N ./compare_go_server"
   [node]="env NODE_PROCS=$SRV_N node benchmark/compare_node_server.js"
+  [ion]="./ion_server_bin --isolates $SRV_N"
 )
 # Config disclosure for the report.
 declare -A CONFIG=(
-  [nitro-native]="@Native code asset; isolates=$SRV_N (engine fans CPU work across them)"
+  [nitro-native]="@Native code asset; isolates=$SRV_N, engine event loops=$SRV_N; parity config: no Server-Timing/x-server/Keep-Alive line, no per-request timeout, HTTP/1.1 only, no metrics recording"
   [nitro-dylib]="DynamicLibrary; isolates=$SRV_N (engine fans CPU work across them)"
   [nitro-base]="A/B baseline — the tree at ${BASE_REF:-?}, same build as nitro-dylib; isolates=$SRV_N"
   [dartio]="dart:io HttpServer; shared isolates=$SRV_N (SO_REUSEPORT)"
   [shelf]="shelf_io.serve; shared isolates=$SRV_N (SO_REUSEPORT, dart:io underneath)"
   [go]="net/http; GOMAXPROCS=$SRV_N"
   [node]="http + cluster; NODE_PROCS=$SRV_N workers"
+  [ion]="ion_web 0.1.2 + ion_router 0.1.1; shared isolates=$SRV_N (SO_REUSEPORT, pure-Dart HTTP/1.1 over dart:io sockets)"
 )
-FRAMEWORKS="${FRAMEWORKS:-nitro-native nitro-dylib go node dartio shelf}"
+FRAMEWORKS="${FRAMEWORKS:-nitro-native nitro-dylib go node dartio shelf ion}"
 
 # route -> oha args. SSE(/events) + WS are EXCLUDED (oha measures req/resp, not
 # open streams). /static is EQUAL-WORK only for the handler sides; nitro answers
@@ -71,7 +73,7 @@ ROUTES="${ROUTES:-/hello /json /static /q?a=1&b=two /users/42 /files/x /mw /work
   echo "- generator: oha $(oha --version 2>/dev/null | awk '{print $2}') — run IN-container, pinned to cores $CLI_CORES (disjoint from the server's $SRV_CORES)"
   echo "- container: $(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-linux}") on $(uname -m); VM cores visible=$(nproc)"
   echo "- server cores=$SRV_CORES ($SRV_N), client cores=$CLI_CORES; memory cap=$( (awk '/MemTotal/{printf "%.1f GiB", $2/1048576}' /proc/meminfo) )"
-  echo "- load: $CONNECTIONS connections, ${DURATION}/route, $REPS reps interleaved, keep-alive; median reported"
+  echo "- load: $CONNECTIONS connections, ${DURATION}/route, $REPS reps interleaved (order reversed on even reps), keep-alive; median reported"
   echo "- host: docker --cpuset-cpus pin inside colima VM (Apple Silicon). For a cross-machine matrix, rerun run.sh on each host."
   echo ""
   echo "## Per-framework configuration (equal CPU budget = $SRV_N cores)"
@@ -120,23 +122,29 @@ validate() { # $1=fw $2=port -> append rows to validation.csv (status, content-t
     path="${rspec%%|*}"
     if [[ "$rspec" == *"|POST|"* ]]; then
       hdrs=$(curl -s -m5 -D - -o /tmp/vb -X POST --data-binary @/app/benchmark/blackbox/echo4k.bin "http://127.0.0.1:$port$path")
+      hbytes=$(curl -s -m5 -o /dev/null -w "%{size_header}" -X POST --data-binary @/app/benchmark/blackbox/echo4k.bin "http://127.0.0.1:$port$path")
     else
       hdrs=$(curl -s -m5 -D - -o /tmp/vb "http://127.0.0.1:$port$path")
+      hbytes=$(curl -s -m5 -o /dev/null -w "%{size_header}" "http://127.0.0.1:$port$path")
     fi
     status=$(echo "$hdrs" | awk 'NR==1{print $2}')
     ctype=$(echo "$hdrs" | awk -F': ' 'tolower($1)=="content-type"{gsub(/\r/,"",$2);print $2}' | head -1)
     len=$(wc -c < /tmp/vb | tr -d ' ')
-    echo "$fw,$rspec,${status:-ERR},${ctype:-none},$len" >> "$OUT/raw/validation.csv"
+    echo "$fw,$rspec,${status:-ERR},${ctype:-none},$len,${hbytes:-0}" >> "$OUT/raw/validation.csv"
   done
 }
 
 # ── measure ───────────────────────────────────────────────────────────────────
 echo "blackbox: frameworks=[$FRAMEWORKS] reps=$REPS dur=$DURATION conns=$CONNECTIONS srv=$SRV_CORES cli=$CLI_CORES" | tee "$OUT/run.log"
 echo "rep,framework,route,p50_ms,p90_ms,p95_ms,p99_ms,rps,rss_mb" > "$OUT/raw/samples.csv"
-echo "framework,route,status,content_type,body_bytes" > "$OUT/raw/validation.csv"
+echo "framework,route,status,content_type,body_bytes,header_bytes" > "$OUT/raw/validation.csv"
 
 for rep in $(seq 1 "$REPS"); do
-  for fw in $FRAMEWORKS; do
+  # Alternate the order every rep so in-rep drift (heat, VM noise) never
+  # always lands on the same framework.
+  order="$FRAMEWORKS"
+  if [ $((rep % 2)) -eq 0 ]; then order=$(echo $FRAMEWORKS | tr ' ' '\n' | tac | tr '\n' ' '); fi
+  for fw in $order; do
     read -r pid port < <(start_server "$fw")
     if [ -z "$port" ]; then echo "rep$rep $fw: FAILED TO START" | tee -a "$OUT/run.log"; kill -9 "$pid" 2>/dev/null; continue; fi
     taskset -c "$CLI_CORES" oha -c "$CONNECTIONS" -z 3s --no-tui "http://127.0.0.1:$port/hello" >/dev/null 2>&1 # warmup
@@ -174,8 +182,10 @@ def med(fw,rt,k):
     v=num[(fw,rt)][k]; return st.median(v) if v else None
 
 # cross-framework body-length agreement per route (equal-bytes validation)
-blen=defaultdict(dict)
-for v in val: blen[v["route"]][v["framework"]]=v["body_bytes"]
+blen=defaultdict(dict); hlen=defaultdict(dict)
+for v in val:
+    blen[v["route"]][v["framework"]]=v["body_bytes"]
+    hlen[v["route"]][v["framework"]]=v.get("header_bytes","")
 
 EQUAL=[r for r in routes if r!="/static"]   # /static is nitro engine fast-path
 def table(title, rts, note=""):
@@ -323,11 +333,13 @@ doc=[ "# Blackbox cross-framework benchmark", "",
       "", mem_table(),
       "", "## Response validation (rep 1)", "",
       "Body-byte length per route must agree across frameworks (equal bytes = fair). Mismatches flagged.",
-      "", "| route | agree? | bytes (by framework) |", "|---|---|---|" ]
+      "Header bytes include the Date line (fixed length), so equal header bytes = equal wire overhead.",
+      "", "| route | bodies agree? | body bytes | headers agree? | header bytes |", "|---|---|---|---|---|" ]
 for rt in routes:
     bl=blen.get(rt,{}); vals=set(bl.values())
     agree="✅" if len(vals)<=1 else "⚠️ MISMATCH"
-    doc.append(f"| {rt} | {agree} | " + ", ".join(f"{f}={bl.get(f,'—')}" for f in fws) + " |")
+    hl=hlen.get(rt,{}); hagree="✅" if len(set(hl.values()))<=1 else "⚠️ differ"
+    doc.append(f"| {rt} | {agree} | " + ", ".join(f"{f}={bl.get(f,'—')}" for f in fws) + f" | {hagree} | " + ", ".join(f"{f}={hl.get(f,'—')}" for f in fws) + " |")
 # status check
 bad=[v for v in val if v["status"]!="200"]
 doc+=["", f"All sampled responses returned HTTP 200." if not bad else

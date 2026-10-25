@@ -1,0 +1,8 @@
+name: ion_server_bench
+description: ion_web side of the blackbox benchmark (same routes, byte-identical bodies as compare.dart / compare_go_server.go).
+publish_to: none
+environment:
+  sdk: ^3.12.2
+dependencies:
+  ion_web: ^0.1.2
+  ion_router: ^0.1.1

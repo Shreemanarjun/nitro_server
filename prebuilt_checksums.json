@@ -20,5 +20,12 @@
     "libnitro_server-linux-arm64.so": "e1a33c4a1d7d46d87c352717206a756e54d92c3069f4aac182179e1e37e71b70",
     "libnitro_server-linux-x64.so": "fd29e76d537770a1ec069230d23c5ca6078d97f3378d1ac608a7a8da1de04dbd",
     "libnitro_server-windows-x64.dll": "1667d0785e62df183b4f896b2bae0d419e51f98cc05609e6ea3ded3528f98c19"
+  },
+  "1.1.0": {
+    "libnitro_server-macos-arm64.dylib": "2a89fca55596e86e814ce2f36b9e247e8f442b09c81ab0863008ca2ba039d5f7",
+    "libnitro_server-macos-x64.dylib": "15f971f67428b446dc9a3cfb12b2c3baed97e7dd0e036a6fb70cd3e47c1f3d2e",
+    "libnitro_server-linux-arm64.so": "e1a33c4a1d7d46d87c352717206a756e54d92c3069f4aac182179e1e37e71b70",
+    "libnitro_server-linux-x64.so": "97aa234e5e5aa15c36a6d1bf5995a85c08cec06633034ac67d691fb9f52ad145",
+    "libnitro_server-windows-x64.dll": "2b03ef0f93fa06925a47ef7b81af11c9b95a3e46b66b7e6ef82290a75913abfb"
   }
 }

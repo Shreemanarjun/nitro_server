@@ -8,7 +8,8 @@
 - Fixes: `bind()` on Android/iOS, `jsonWriter` on Android, JSON doubles on
   iOS < 16.3, source build without nghttp2.
 - `handlerTimeout` events name the request (`GET /slow after 1002 ms`).
-- Example app: every route type, `tool/smoke.dart`, autostart flag.
+- Example app: every route type, `tool/smoke.dart`, autostart/port flags.
+- CI: iOS simulator and Android emulator jobs run the smoke test.
 
 ## 1.0.1
 

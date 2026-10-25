@@ -134,7 +134,11 @@ class _DemoPageState extends State<_DemoPage> with WidgetsBindingObserver {
       _log.clear();
     });
     try {
-      final server = await NitroServer.bind();
+      // `--dart-define=NITRO_EXAMPLE_PORT=8080` pins the port (CI smoke tests);
+      // the default 0 picks a free one.
+      final server = await NitroServer.bind(
+        const ServerConfig(port: int.fromEnvironment('NITRO_EXAMPLE_PORT')),
+      );
       await server.route(
         HttpMethod.get,
         '/hello',

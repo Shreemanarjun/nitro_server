@@ -19,9 +19,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      # This is a Flutter FFI plugin, so it declares a Flutter SDK constraint
-      # (required to publish flutter.plugin.platforms). Use the Flutter SDK,
-      # which bundles the Dart CLI the rest of the steps call.
+      # The Flutter SDK bundles the Dart CLI the steps call (and the example
+      # app's Flutter dependencies resolve with the root `pub get`).
       - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
         with:
           channel: stable
@@ -276,6 +275,50 @@ jobs:
           cmake -S src -B build/tidy -DCMAKE_BUILD_TYPE=Debug -DNITRO_SERVER_HTTP2=ON
           -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang
       - run: run-clang-tidy -p build/tidy -quiet $(ls src/engine/*.cpp) src/HybridNitroServer.cpp
+
+  # Mobile: the example app on a real iOS simulator / Android emulator, built
+  # through the package's build hook (engine + vendored libuv compiled for the
+  # device), then tool/smoke.dart over the network: every route type, SSE,
+  # WebSocket text + binary, gzip, multipart, timeouts, 50 concurrent requests.
+  ios:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: stable
+      - run: flutter pub get
+        working-directory: example
+      - run: bash example/tool/ci_ios_smoke.sh
+
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: stable
+      - name: Enable KVM (hardware-accelerated emulator)
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - run: flutter pub get
+        working-directory: example
+      - run: >
+          flutter build apk --debug --target-platform android-x64
+          --dart-define=NITRO_EXAMPLE_AUTOSTART=true --dart-define=NITRO_EXAMPLE_PORT=8765
+        working-directory: example
+      - uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot
+          script: bash example/tool/ci_android_smoke.sh
 
   # Autobahn WebSocket conformance, a gate: any FAILED case fails the job
   # (NON-STRICT — the server echoed a frame before failing a bad connection —

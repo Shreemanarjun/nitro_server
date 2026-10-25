@@ -19,6 +19,9 @@ analyzer:
     - lib/src/**.g.dart
     # Blackbox benchmark outputs (generated reports), never analyzed here.
     - benchmark/blackbox/out/**
+    # Benchmark-only package with its own pubspec/deps (ion_web side of the
+    # blackbox harness); analyzed from its own folder, not from here.
+    - benchmark/ion_server/**
 
 linter:
   rules:

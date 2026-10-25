@@ -55,6 +55,17 @@ void main() {
       ),
       contains('asset'),
     );
+    expect(
+      validateDeploy(
+        DeployTarget.docker,
+        const DeployOptions(assets: ['my dir']),
+      ),
+      contains('asset'),
+    );
+    expect(
+      validateDeploy(DeployTarget.docker, const DeployOptions(assets: [''])),
+      contains('asset'),
+    );
     expect(d, contains('USER nitro'));
     expect(files['.dockerignore'], contains('.dart_tool/'));
     expect(

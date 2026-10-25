@@ -334,7 +334,7 @@ Future<void> main() async {
   stdout.writeln(
     serverBanner(
       title: 'nitro_server',
-      version: '1.0.0',
+      version: '1.0.1',
       logo: nitroServerAsciiLogo,
       uri: server.uri,
       isolates: server.config.isolates,

@@ -1,0 +1,3 @@
+# Benchmark-only package (ion_web side of the blackbox harness): its own
+# pubspec and deps, never part of the published nitro_server archive.
+*

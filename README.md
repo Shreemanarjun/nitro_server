@@ -132,7 +132,7 @@ Deploy:
 ```sh
 dart run nitro_server:nitro deploy docker                      # Dockerfile (prebuilt engine, no cmake) -> any container host
 dart run nitro_server:nitro deploy cloudflare --name my-api    # + worker.js, wrangler.jsonc; then: npm install && npx wrangler deploy
-dart run nitro_server:nitro deploy netlify --backend https://api.example.com   # netlify.toml: static site, /api/* + /ws proxied
+dart run nitro_server:nitro deploy netlify --backend https://api.example.com   # netlify.toml: static site, /api/* proxied
 dart run nitro_server:nitro deploy vercel  --backend https://api.example.com   # vercel.json: static site, /api/* rewritten
 ```
 
@@ -477,6 +477,9 @@ final server = await NitroServer.bind(
 | `exposeErrorDetails` | `false` | `true` puts the error text in the 500 body (dev only); details always go to `events` |
 | `proxyProtocol` | `false` | expect a HAProxy PROXY v1/v2 header first; its address becomes `clientIp` |
 | `responseTiming` | `true` | `Server-Timing: app;dur=<ms>` on handler answers |
+| `serverHeader` | `'Nitro Dart Server'` | `x-server` value on every answer (a handler's own wins); `null` sends none |
+| `keepAliveHeader` | `true` | `Keep-Alive: timeout=N` next to `Connection: keep-alive`; `false` omits the line |
+| `collectMetrics` | `true` | per-route counts / status classes / latency for `/metrics`; `false` skips that per-request work |
 | `tls` | none | `TlsConfig(certPem:/keyPem:` or `certFile:/keyFile:)`; `minVersion`, `ciphers`, `cipherSuites`, `clientCaPem:/clientCaFile:` (mutual TLS) |
 | `protocol` | `HttpProtocol.http2` | `http1`, `http2` (ALPN `h2` + h2c, falls back to 1.1), `http3` (reserved) |
 
@@ -484,7 +487,23 @@ Memory per connection: one body (h1) or `maxBufferedBodyBytes` (h2) +
 `streamMaxBufferBytes` / `wsMaxBufferBytes` + 64 KiB parse buffer. Multiply by
 `maxConnections` for the server bound.
 
-`config.copyWith(...)`; `bind` runs `config.validate()` (`ArgumentError`).
+Every default lives in `ServerDefaults`, so configs can be built relative to
+them. A minimal-overhead config (no optional headers, timers or metrics):
+
+```dart
+final lean = ServerConfig(
+  maxBodyBytes: ServerDefaults.maxBodyBytes * 4,
+  responseTiming: false,      // no Server-Timing
+  serverHeader: null,         // no x-server
+  keepAliveHeader: false,     // no Keep-Alive: timeout=N
+  collectMetrics: false,      // /metrics reports zero requests
+  defaultTimeout: Duration.zero,
+  protocol: HttpProtocol.http1,
+);
+```
+
+`config.copyWith(...)` (`clearServerHeader: true` drops `x-server`); `bind`
+runs `config.validate()` (`ArgumentError`).
 
 Environment:
 
@@ -777,6 +796,32 @@ Peak RSS (whole workload; **bold** = lowest):
 nitro = 3 isolate heaps + the engine; a single-isolate server is ~30–50 MB.
 Full report of this run: `benchmark/blackbox/REPORT.md`. A/B of two nitro
 builds: `run.sh --base <git-ref>` (see `benchmark/BENCHMARKING.md`).
+
+### vs ion_web
+
+[ion_web](https://pub.dev/packages/ion_web) 0.1.2 + ion_router 0.1.1 (a pure-Dart
+HTTP/1.1 server on `dart:io` sockets), same harness, 2026-10-25, 5 reps,
+order alternated per rep. Configurations match: 3 isolates each on the same 3
+pinned cores, AOT, keep-alive without a request cap, HTTP/1.1 only, a router +
+one middleware layer, synchronous handlers, no per-request timeout, no metrics,
+and byte-identical bodies **and** headers on every route (validated). nitro
+runs with `responseTiming`, `serverHeader`, `keepAliveHeader` and
+`collectMetrics` off so it sends exactly ion's headers.
+
+| route | nitro req/s | ion req/s | nitro p99 | ion p99 |
+|-------|------------:|----------:|----------:|--------:|
+| `/json` | **205k** | 108k | **0.93 ms** | 6.05 ms |
+| `/users/42` | **206k** | 119k | **1.04 ms** | 4.37 ms |
+| `/work` | **51k** | 25k | **3.54 ms** | 7.34 ms |
+| `/echo` (4 KB body) | **119k** | 73k | **1.16 ms** | 5.88 ms |
+| peak RSS | **49 MB** | 78 MB | | |
+
+Light routes are 1.7–1.9×, p50 within 0.1 ms; the gap is the tail. Full
+report: `benchmark/blackbox/REPORT-ion.md`. Rerun:
+
+```sh
+benchmark/blackbox/run.sh --cpus 0-5 --mem 7g --reps 5 --frameworks "nitro-native ion"
+```
 
 ## Developing
 

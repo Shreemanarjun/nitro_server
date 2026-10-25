@@ -1,16 +1,22 @@
-## Unreleased
+## 1.0.1
 
+- `ServerDefaults`: every `ServerConfig` default in one exported class;
+  `ServerConfig`, the runner and helper isolates all read from it.
+- New `ServerConfig` switches, all defaulting to the 1.0.0 behaviour:
+  `serverHeader` (`x-server` value; `null` sends none), `keepAliveHeader`
+  (`Keep-Alive: timeout=N` line; the engine change needs the 1.0.1 prebuilts),
+  `collectMetrics` (per-route metrics; off skips the per-request bookkeeping).
 - `nitro deploy <docker|cloudflare|netlify|vercel>`: writes what the host
-  needs (Dockerfile with the prebuilt engine; Cloudflare Containers Worker +
-  `wrangler.jsonc`; `netlify.toml` / `vercel.json` static-site proxies) and
-  with `--run` runs the deploy commands; `public`, `assets` and `web`
-  directories are copied into the image (`--assets`). Guides:
-  `doc/deployment.md`.
-- The generated Dockerfile builds on `dart:stable`: it points `FLUTTER_ROOT` at
-  a stub because pub resolves this package only when a Flutter SDK is visible
-  (the `flutter.plugin` block requires the constraint).
-- `netlify.toml`: the WebSocket proxy rule is gone; Netlify's proxy does not
-  carry upgrades and ends proxied requests after 26 s.
+  needs (Dockerfile with the prebuilt engine, Cloudflare Containers Worker +
+  `wrangler.jsonc`, `netlify.toml`, `vercel.json`); `--run` runs the deploy
+  commands; `public`/`assets`/`web` are copied into the image (`--assets`).
+  The generated Dockerfile builds on `dart:stable` via a `FLUTTER_ROOT` stub.
+  Guides in `doc/deployment.md`.
+- `netlify.toml`: WebSocket proxy rule removed (Netlify's proxy does not carry
+  upgrades and ends proxied requests after 26 s).
+- Benchmarks: ion_web joins the blackbox harness (`benchmark/ion_server`);
+  reports validate header bytes as well as bodies, alternate framework order
+  per rep, and record the image and rerun command.
 
 ## 1.0.0
 

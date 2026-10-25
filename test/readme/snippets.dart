@@ -358,3 +358,15 @@ Future<void> fragment26(NitroServer server) async {
     print('TLS unavailable: ${e.message}');
   }
 }
+
+Future<void> fragment27(NitroServer server) async {
+  final lean = ServerConfig(
+    maxBodyBytes: ServerDefaults.maxBodyBytes * 4,
+    responseTiming: false,      // no Server-Timing
+    serverHeader: null,         // no x-server
+    keepAliveHeader: false,     // no Keep-Alive: timeout=N
+    collectMetrics: false,      // /metrics reports zero requests
+    defaultTimeout: Duration.zero,
+    protocol: HttpProtocol.http1,
+  );
+}

@@ -1,6 +1,6 @@
 name: nitro_server
 description: Fast HTTP/1.1 and WebSocket server for Dart and Flutter, backed by a native multithreaded C++ engine over Nitro FFI, with trie routing and per-route timeouts.
-version: 1.0.0
+version: 1.0.1
 homepage: https://github.com/Shreemanarjun/nitro_server
 repository: https://github.com/Shreemanarjun/nitro_server
 issue_tracker: https://github.com/Shreemanarjun/nitro_server/issues

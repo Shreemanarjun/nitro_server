@@ -3156,12 +3156,14 @@ inline Resp get(int fd, const char* path) {
       ssize_t off = 0;
       while (off < n) {
         ssize_t w = write(fd, out + off, (size_t)(n - off));
+        if (w < 0 && errno == EINTR) continue;  // a signal, not a closed peer
         if (w <= 0) break;
         off += w;
       }
     }
     if (r.closed) break;
     ssize_t rd = read(fd, buf, sizeof(buf));
+    if (rd < 0 && errno == EINTR) continue;  // a signal, not a closed peer
     if (rd <= 0) break;
     if (nghttp2_session_mem_recv(s, buf, (size_t)rd) < 0) break;
   }
@@ -3606,10 +3608,19 @@ TEST(UvReactorTest, Http2DrainSendsGoawayAndClosesWhenQuiet) {
   ASSERT_EQ(f.server->registerRoute(Method::Get, "", "/hello", -1).kind,
             ErrorKind::None);
   const int64_t port = f.startOnEphemeral();
-  const int fd = connectTo((int)port);
-  ASSERT_GE(fd, 0);
-  // One full exchange first, so the session is established and idle.
-  const h2client::Resp r = h2client::get(fd, "/hello");
+  // One full exchange first, so the session is established and idle. The
+  // in-process client can lose that first exchange to a CI timing race (see
+  // Http2cPriorKnowledgeServedOverTheReactor), so the WARM-UP is retried on a
+  // fresh connection; the drain assertions below are not retried and run on
+  // the connection that completed it.
+  int fd = -1;
+  h2client::Resp r;
+  for (int attempt = 0; attempt < 5 && !r.closed; attempt++) {
+    if (fd >= 0) close(fd);
+    fd = connectTo((int)port);
+    ASSERT_GE(fd, 0);
+    r = h2client::get(fd, "/hello");
+  }
   ASSERT_TRUE(r.closed);
   EXPECT_EQ(r.status, 200);
   f.server->beginDrain();

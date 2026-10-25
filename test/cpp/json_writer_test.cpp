@@ -182,3 +182,50 @@ TEST(JsonWriter, AllocScratchRoundTrips) {
   nitro_server_jw_free(w);
   nitro_server_jw_free_buf(p);
 }
+
+#include <charconv>
+#include <cmath>
+#include <random>
+
+#include "../../src/engine/Dtoa.h"
+
+// The iOS < 16.3 fallback must pick the same digits as std::to_chars (the
+// formatter every other platform uses), or JSON output would differ by device.
+// Compares significand digits and exponent across edge cases and 200k random
+// doubles spanning the whole exponent range.
+TEST(JsonWriter, PortableDtoaMatchesToChars) {
+  auto parts = [](const char* s, int n, std::string* digits, int* exp) {
+    digits->clear();
+    int i = 0;
+    for (; i < n && s[i] != 'e'; i++)
+      if (s[i] != '.') digits->push_back(s[i]);
+    *exp = std::atoi(s + i + 1);
+  };
+  auto check = [&](double v) {
+    char a[40], b[40];
+    const auto r =
+        std::to_chars(a, a + sizeof a - 1, v, std::chars_format::scientific);
+    *r.ptr = '\0';  // to_chars does not terminate; atoi below needs it
+    const int bn = nitroserver::sciShortestPortable(b, sizeof b, v);
+    std::string da, db;
+    int ea = 0, eb = 0;
+    parts(a, (int)(r.ptr - a), &da, &ea);
+    parts(b, bn, &db, &eb);
+    ASSERT_EQ(da, db) << "value " << v;
+    ASSERT_EQ(ea, eb) << "value " << v;
+  };
+  for (double v : {1.0, 1.5, 0.1, 0.2, 0.3, 1e-7, 1e21, 123456789.0, 5e-324,
+                   2.2250738585072014e-308, 1.7976931348623157e308,
+                   0.1 + 0.2, 9007199254740993.0, 298.5, 1e23, 4.35})
+    check(v);
+  std::mt19937_64 rng(42);
+  for (int i = 0; i < 200000; i++) {
+    double v;
+    uint64_t bits = rng();
+    std::memcpy(&v, &bits, sizeof v);
+    v = std::fabs(v);
+    if (!std::isfinite(v) || v == 0.0) continue;
+    check(v);
+  }
+  for (int i = 0; i < 1000; i++) check(i * 1.5);
+}

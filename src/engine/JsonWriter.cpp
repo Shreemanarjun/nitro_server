@@ -17,10 +17,26 @@
 // ─────────────────────────────────────────────────────────────────────────────
 #include <charconv>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
+// Apple's libc++ ships floating-point std::to_chars only from iOS 16.3; a
+// Flutter app targets iOS 13. Below that floor the engine formats doubles
+// with the portable shortest-round-trip search (sciShortestPortable), which
+// yields the same digits. NITRO_SERVER_PORTABLE_DTOA forces it anywhere (tests).
+#if !defined(NITRO_SERVER_PORTABLE_DTOA) && defined(__APPLE__) && \
+    TARGET_OS_IPHONE && defined(__IPHONE_OS_VERSION_MIN_REQUIRED) &&   \
+    __IPHONE_OS_VERSION_MIN_REQUIRED < 160300
+#define NITRO_SERVER_PORTABLE_DTOA 1
+#endif
+
 #include "../nitro.h"  // NITRO_EXPORT
+#include "Dtoa.h"
 
 namespace {
 
@@ -122,9 +138,13 @@ inline void writeDouble(NitroJsonWriter* w, double v) {
   }
   const double av = neg ? -v : v;
   char sci[40];
+#if defined(NITRO_SERVER_PORTABLE_DTOA)
+  const int slen = nitroserver::sciShortestPortable(sci, sizeof(sci), av);
+#else
   const auto res =
       std::to_chars(sci, sci + sizeof(sci), av, std::chars_format::scientific);
   const int slen = static_cast<int>(res.ptr - sci);
+#endif
   // Parse "d[.ddd]e±xx" into significant digits and the scientific exponent E.
   char digits[24];
   int k = 0, i = 0;

@@ -41,15 +41,17 @@ metrics, dashboard, drain, hot reload, env config).
 ## Install
 
 ```sh
-dart pub add nitro_server
+dart pub add nitro_server      # Dart CLI / server
+flutter pub add nitro_server   # Flutter app (same package)
 ```
 
-- Released versions need no toolchain: the build hook downloads the prebuilt
-  engine for your OS/arch and `dart build cli` bundles it.
-- pub resolves the package only when a Flutter SDK is visible (it is also a
-  Flutter FFI plugin, and pub demands that for the plugin block): use the
-  `dart` that ships with Flutter, or set `FLUTTER_ROOT` to a Flutter SDK. The
-  Dockerfile from `nitro deploy docker` handles this with a stub.
+- Plain Dart package: no Flutter SDK needed.
+- macOS, Linux, Windows (Dart or Flutter): the build hook downloads the
+  verified prebuilt engine; `dart build cli` / the Flutter build bundles it.
+- Android and iOS (Flutter): the build hook compiles the engine and a vendored
+  libuv with the toolchain Flutter provides (NDK / Xcode); nothing to install.
+  TLS, brotli and HTTP/2 are not compiled in on mobile (terminate TLS at a
+  proxy, or serve plain HTTP on the device).
 - Prebuilts are self-contained (libuv, OpenSSL, brotli, nghttp2 linked in;
   libstdc++ too on Linux). Minimum hosts: Linux glibc 2.35 (Ubuntu 22.04,
   Debian 12 or newer), macOS 14, Windows 10 x64. Older hosts build from
@@ -728,8 +730,9 @@ try {
 
 ## Limits
 
-- Platforms: iOS (foreground), Android (foreground service), macOS, Linux,
-  Windows. No web.
+- Platforms: macOS, Linux, Windows (Dart and Flutter), iOS and Android
+  (Flutter; iOS serves only in the foreground, Android needs a foreground
+  service to keep serving in the background). No web.
 - HTTP/3 not implemented; terminate it at a proxy.
 - TLS/brotli are build-time (prebuilts have both).
 - Not serverless: a persistent process.

@@ -29,6 +29,7 @@ library;
 
 import 'dart:convert';
 import 'dart:ffi';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'native_loader.dart';
@@ -179,7 +180,15 @@ final class _JwNative {
     // (Flutter) there is no path and the symbols are already in the process.
     final path = loadedNitroServerNativePath;
     if (path != null) return _JwNative._(DynamicLibrary.open(path));
-    return _JwNative._(DynamicLibrary.process()); // coverage:ignore-line
+    // coverage:ignore-start
+    // Android's linker hides locally-loaded libraries from process-wide
+    // lookup, and Dart loads the bundled engine locally; opening it by name
+    // returns that same already-loaded image (no second copy).
+    if (Platform.isAndroid) {
+      return _JwNative._(DynamicLibrary.open('libnitro_server.so'));
+    }
+    return _JwNative._(DynamicLibrary.process());
+    // coverage:ignore-end
   }
 }
 

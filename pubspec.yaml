@@ -1,6 +1,6 @@
 name: nitro_server
 description: Fast HTTP/1.1 and WebSocket server for Dart and Flutter, backed by a native multithreaded C++ engine over Nitro FFI, with trie routing and per-route timeouts.
-version: 1.0.1
+version: 1.1.0
 homepage: https://github.com/Shreemanarjun/nitro_server
 repository: https://github.com/Shreemanarjun/nitro_server
 issue_tracker: https://github.com/Shreemanarjun/nitro_server/issues
@@ -13,9 +13,6 @@ topics:
 
 environment:
   sdk: ^3.12.2
-  # Required by pub to publish the flutter.plugin.platforms block below.
-  # The Dart code stays Flutter-free (see the note above `flutter:`).
-  flutter: '>=3.10.0'
 
 dependencies:
   meta: ^1.9.0
@@ -24,6 +21,8 @@ dependencies:
   hotreloader: ^4.4.0
   hooks: ^1.0.3
   code_assets: ^1.0.0
+  # Cross-compiles the engine for Android/iOS in the build hook.
+  native_toolchain_c: ^0.18.0
   crypto: ^3.0.7
 
 # `dart run nitro_server:nitro <serve|build>` (or `nitro …` once globally
@@ -39,39 +38,9 @@ dev_dependencies:
   test: ^1.25.0
   benchmark_harness: ^2.4.0
 
-# For information on the generic Dart part of this file, see the
-# following page: https://dart.dev/tools/pub/pubspec
-
-# The following section is specific to Flutter packages.
-#
-# The Dart code itself is Flutter-free (`dart pub get` / `dart test` /
-# `dart run` all work — this package has no `flutter` SDK dependency), so
-# Dart CLI programs can use it by building the native library with cmake and
-# calling `loadNitroServerNative()` once at startup (see
-# `lib/src/api/native_loader.dart`). The `ffiPlugin` block below is ignored
-# by the Dart tool and exists so Flutter apps keep getting the native
-# library built and bundled automatically.
-flutter:
-  # nitro_server is an FFI-only plugin on all five platforms: the Nitro spec
-  # declares AppleNativeImpl.cpp / AndroidNativeImpl.cpp / NativeImpl.cpp, so
-  # there is no Swift, Kotlin or Objective-C class to register. `ffiPlugin`
-  # alone tells the tooling to build and bundle the native code; declaring a
-  # plugin class here would make Flutter emit a registrant call to a class
-  # that does not exist.
-  #
-  # Web is intentionally unsupported: browsers cannot bind raw sockets.
-  plugin:
-    platforms:
-      android:
-        ffiPlugin: true
-      ios:
-        ffiPlugin: true
-      macos:
-        ffiPlugin: true
-      windows:
-        ffiPlugin: true
-      linux:
-        ffiPlugin: true
+# Plain Dart package: Dart CLIs, servers and Flutter apps (every platform) all
+# get the engine from hook/build.dart — a verified prebuilt on macOS, Linux and
+# Windows, and a from-source build (engine + vendored libuv) on Android and iOS.
 
 # Self-signed TLS fixtures for the engine/Dart TLS tests — not real secrets.
 # https://dart.dev/tools/pub/pubspec#false_secrets

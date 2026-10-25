@@ -5,6 +5,8 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:nitro_server/nitro_server.dart';
 
+import 'feature_routes.dart';
+
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const MyApp());
@@ -53,6 +55,9 @@ class _DemoPageState extends State<_DemoPage> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
+    // `--dart-define=NITRO_EXAMPLE_AUTOSTART=true` starts the server at launch
+    // and prints its port: a smoke test for platforms with no UI driver.
+    if (const bool.fromEnvironment('NITRO_EXAMPLE_AUTOSTART')) _start();
     WidgetsBinding.instance.addObserver(this);
   }
 
@@ -70,6 +75,8 @@ class _DemoPageState extends State<_DemoPage> with WidgetsBindingObserver {
     // the server silently die, surface it: the user restarts it in the
     // foreground. Android needs a foreground service for the same reason —
     // the engine cannot keep the process alive by itself.
+    // Desktop apps keep serving when they lose focus; only mobile suspends.
+    if (!Platform.isIOS && !Platform.isAndroid) return;
     if (state != AppLifecycleState.resumed && _server != null) {
       _eventsSub?.cancel();
       _server?.close();
@@ -80,13 +87,24 @@ class _DemoPageState extends State<_DemoPage> with WidgetsBindingObserver {
     }
   }
 
-  RequestHandler _logged(String name, RequestHandler inner) {
+  /// [timeout] is the route's deadline: a handler that overruns it is logged
+  /// as the 408 the client actually received at the deadline, not as the
+  /// response it built afterwards (which the server discards).
+  RequestHandler _logged(
+    String name,
+    RequestHandler inner, {
+    Duration? timeout,
+  }) {
     return (request) async {
       final stopwatch = Stopwatch()..start();
       try {
         final response = await inner(request);
         stopwatch.stop();
-        _appendLog(request, response.status, stopwatch.elapsed);
+        if (timeout != null && stopwatch.elapsed > timeout) {
+          _appendLog(request, 408, timeout);
+        } else {
+          _appendLog(request, response.status, stopwatch.elapsed);
+        }
         return response;
       } catch (_) {
         stopwatch.stop();
@@ -110,6 +128,10 @@ class _DemoPageState extends State<_DemoPage> with WidgetsBindingObserver {
     setState(() {
       _busy = true;
       _error = null;
+      // A fresh server starts with empty lists: entries from the previous
+      // run (e.g. the intentional /slow timeouts) would look like new ones.
+      _events.clear();
+      _log.clear();
     });
     try {
       final server = await NitroServer.bind();
@@ -142,9 +164,10 @@ class _DemoPageState extends State<_DemoPage> with WidgetsBindingObserver {
         _logged('slow', (_) async {
           await Future<void>.delayed(const Duration(seconds: 5));
           return ResponseContext.text('too late');
-        }),
+        }, timeout: const Duration(seconds: 1)),
         timeout: const Duration(seconds: 1),
       );
+      await registerFeatureRoutes(server);
       _eventsSub = server.events.listen((event) {
         setState(() {
           _events.insert(0, event);
@@ -152,7 +175,9 @@ class _DemoPageState extends State<_DemoPage> with WidgetsBindingObserver {
         });
       });
       setState(() => _server = server);
-    } on NitroServerException catch (e) {
+      debugPrint('NITRO_EXAMPLE_LISTENING ${server.port}');
+    } catch (e, st) {
+      debugPrint('NITRO_EXAMPLE_ERROR $e\n$st');
       setState(() => _error = e.toString());
     } finally {
       setState(() => _busy = false);

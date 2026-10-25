@@ -44,12 +44,11 @@ What the generated image does:
   digest lock shipped in the package, so the image needs **no cmake and no
   C++ toolchain**. Set `NITRO_SERVER_VERIFY_SIGSTORE=1` in the build stage to
   also require a passing `cosign verify-blob`.
-- **Flutter stub.** nitro_server also carries a Flutter FFI-plugin block, and
-  pub refuses to resolve such a package unless a Flutter SDK is visible. The
-  build stage points `FLUTTER_ROOT` at a two-line stub (the version file pub
-  reads); nothing from Flutter is used. The same trick works on a developer
-  machine with a standalone Dart SDK, or use the `dart` that ships with
-  Flutter.
+- **Flutter stub.** Only nitro_server below 1.1.0 needs it: those versions
+  carried a Flutter plugin block, and pub resolves such a package only when a
+  Flutter SDK is visible. The build stage points `FLUTTER_ROOT` at a two-line
+  stub (the version file pub reads) so a project pinned to an older version
+  still builds; from 1.1.0 it is unused and harmless.
 - **Runtime stage** (`debian:stable-slim`): the AOT bundle, `ca-certificates`
   and `curl` (for the `HEALTHCHECK`), a non-root user, `HOST=0.0.0.0`,
   `PORT=8080`. The prebuilt engine is static (libuv, OpenSSL, brotli, nghttp2

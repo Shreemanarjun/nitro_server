@@ -915,6 +915,24 @@ class ServerRunner {
   void _onEvent(RawServerEvent event) {
     if (_closed) return;
     final kind = ServerEventKind.values[event.kind];
+    // Name the request in a timeout before it is released below: the engine
+    // only knows "handler timed out", which says nothing about which route.
+    var message = event.message;
+    final timedOut = kind == ServerEventKind.handlerTimeout
+        ? _pending[event.requestId]
+        : null;
+    if (timedOut != null) {
+      final head = timedOut.head;
+      final verb = head.customMethod.isNotEmpty
+          ? head.customMethod
+          : head.method.name.toUpperCase();
+      final ms = timedOut.dispatched
+          ? (_clock.elapsedMicroseconds - timedOut.startedUs) ~/ 1000
+          : null;
+      message =
+          '$message: $verb ${head.path}'
+          '${ms == null ? '' : ' after $ms ms'}';
+    }
     if (kind == ServerEventKind.clientDisconnect ||
         kind == ServerEventKind.handlerTimeout) {
       // The client went away mid-request, or the engine answered 408 for a
@@ -927,11 +945,7 @@ class ServerRunner {
       _complete(event.requestId);
     }
     _events.add(
-      ServerEvent(
-        kind: kind,
-        requestId: event.requestId,
-        message: event.message,
-      ),
+      ServerEvent(kind: kind, requestId: event.requestId, message: message),
     );
   }
 

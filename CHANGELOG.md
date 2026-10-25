@@ -1,3 +1,15 @@
+## 1.1.0
+
+- Plain Dart package: works without Flutter (`dart pub add nitro_server`);
+  Flutter apps keep the same dependency.
+- Android and iOS supported: the build hook compiles the engine with a vendored
+  libuv (no TLS, brotli or HTTP/2 on mobile).
+- Desktop Flutter loads a single engine copy.
+- Fixes: `bind()` on Android/iOS, `jsonWriter` on Android, JSON doubles on
+  iOS < 16.3, source build without nghttp2.
+- `handlerTimeout` events name the request (`GET /slow after 1002 ms`).
+- Example app: every route type, `tool/smoke.dart`, autostart flag.
+
 ## 1.0.1
 
 - `ServerDefaults`: every `ServerConfig` default in one exported class;

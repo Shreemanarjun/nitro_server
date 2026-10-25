@@ -13,6 +13,11 @@
 // (libuv/OpenSSL/brotli/nghttp2 statically linked, all protocols compiled in),
 // so a consumer needs no toolchain and no system libraries.
 //
+// Android and iOS (Flutter apps) have no prebuilts: there the engine and a
+// vendored libuv (third_party/libuv) are compiled from source with the
+// toolchain the Flutter tool hands the hook (NDK clang / Xcode clang), see
+// [_buildMobile]. TLS, brotli and HTTP/2 are not compiled in on mobile.
+//
 // The hook never throws out of `build`: if it cannot provision a library it
 // emits a hint and no asset, and the package's runtime loader
 // (`loadNitroServerNative`) still finds a manually-built `build/lib/<lib>`.
@@ -21,6 +26,7 @@ import 'dart:io';
 import 'package:code_assets/code_assets.dart';
 import 'package:crypto/crypto.dart';
 import 'package:hooks/hooks.dart';
+import 'package:native_toolchain_c/native_toolchain_c.dart';
 
 import 'package:nitro_server/src/internal/prebuilt_lock.dart';
 
@@ -32,6 +38,12 @@ void main(List<String> args) async {
     if (!input.config.buildCodeAssets) return;
     final os = input.config.code.targetOS;
     final arch = input.config.code.targetArchitecture;
+    if (os == OS.android || os == OS.iOS) {
+      // Errors propagate: a Flutter mobile build without the engine would
+      // only fail later, at run time, with a missing-symbol error.
+      await _buildMobile(input, output);
+      return;
+    }
     try {
       final lib = await _provision(input, os, arch);
       // Couldn't provision; the package's manual loader still applies.
@@ -206,12 +218,26 @@ Future<File?> _buildFromSource(BuildInput input, OS os, File dest) async {
     );
     return null;
   }
-  final configure = await Process.run('cmake', [
-    '-S', src,
-    '-B', buildDir,
-    '-DCMAKE_BUILD_TYPE=Release',
-    '-DNITRO_SERVER_HTTP2=ON', // ship all protocols; disable per-server at runtime
-  ]);
+  Future<ProcessResult> configureWith({required bool http2}) =>
+      Process.run('cmake', [
+        '-S',
+        src,
+        '-B',
+        buildDir,
+        '-DCMAKE_BUILD_TYPE=Release',
+        '-DNITRO_SERVER_HTTP2=${http2 ? 'ON' : 'OFF'}',
+      ]);
+  // Ship every protocol when the host has nghttp2; without it HTTP/2 is
+  // simply not compiled in (like TLS and brotli, which are auto-detected)
+  // instead of failing the whole engine build.
+  var configure = await configureWith(http2: true);
+  if (configure.exitCode != 0) {
+    stderr.writeln(
+      'nitro_server: building without HTTP/2 (nghttp2 not found); '
+      'install libnghttp2 for h2.',
+    );
+    configure = await configureWith(http2: false);
+  }
   if (configure.exitCode != 0) {
     stderr.writeln(
       'nitro_server: cmake configure failed:\n${configure.stderr}',
@@ -273,3 +299,115 @@ String _ext(OS os) => switch (os) {
   OS.macOS => 'dylib',
   _ => 'so',
 };
+
+/// libuv sources (third_party/libuv, from its CMakeLists.txt) for [os].
+List<String> _libuvSources(OS os) => [
+  for (final f in const [
+    'fs-poll',
+    'idna',
+    'inet',
+    'random',
+    'strscpy',
+    'strtok',
+    'thread-common',
+    'threadpool',
+    'timer',
+    'uv-common',
+    'uv-data-getter-setters',
+    'version',
+  ])
+    'third_party/libuv/src/$f.c',
+  for (final f in [
+    'async',
+    'core',
+    'dl',
+    'fs',
+    'getaddrinfo',
+    'getnameinfo',
+    'loop-watcher',
+    'loop',
+    'pipe',
+    'poll',
+    'process',
+    'random-devurandom',
+    'signal',
+    'stream',
+    'tcp',
+    'thread',
+    'tty',
+    'udp',
+    'proctitle',
+    if (os == OS.android) ...[
+      'linux',
+      'procfs-exepath',
+      'random-getentropy',
+      'random-getrandom',
+      'random-sysctl-linux',
+    ] else ...[
+      'bsd-ifaddrs',
+      'kqueue',
+      'random-getentropy',
+      'darwin-proctitle',
+      'darwin',
+      'fsevents',
+    ],
+  ])
+    'third_party/libuv/src/unix/$f.c',
+];
+
+/// Android / iOS: compiles libuv + the Dart DL shim (C) into a private
+/// static archive, then the engine (C++17) into the shared library declared
+/// as `package:nitro_server/nitro_server`, the asset id the generated
+/// `@Native` bindings resolve. The C step runs into a throwaway output so the
+/// archive is linked, never shipped.
+Future<void> _buildMobile(BuildInput input, BuildOutputBuilder output) async {
+  final os = input.config.code.targetOS;
+  final cLib = CBuilder.library(
+    name: 'nitro_server_c',
+    assetName: 'nitro_server_c',
+    sources: [..._libuvSources(os), 'src/dart_api_dl.c'],
+    includes: [
+      'third_party/libuv/include',
+      'third_party/libuv/src',
+      'src/native',
+    ],
+    defines: {
+      '_FILE_OFFSET_BITS': '64',
+      '_LARGEFILE_SOURCE': null,
+      if (os == OS.android) '_GNU_SOURCE': null,
+      if (os == OS.iOS) ...{
+        '_DARWIN_UNLIMITED_SELECT': '1',
+        '_DARWIN_USE_64_BIT_INODE': '1',
+      },
+    },
+    flags: const ['-w'], // third-party C: its warnings are not ours to fix
+    linkModePreference: LinkModePreference.static,
+    optimizationLevel: OptimizationLevel.o2,
+  );
+  await cLib.run(input: input, output: BuildOutputBuilder());
+  final engine = CBuilder.library(
+    name: 'nitro_server',
+    assetName: 'nitro_server',
+    language: Language.cpp,
+    std: 'c++17',
+    cppLinkStdLib: os == OS.android ? 'c++_static' : null,
+    sources: const [
+      'src/nitro_server.cpp',
+      'src/HybridNitroServer.cpp',
+      'lib/src/generated/cpp/nitro_server.bridge.g.cpp',
+    ],
+    includes: const [
+      'src',
+      'src/native',
+      'lib/src/generated/cpp',
+      'third_party/libuv/include',
+    ],
+    defines: const {'NITRO_SERVER_LIBUV': '1', 'DART_SHARED_LIB': null},
+    libraries: ['nitro_server_c', if (os == OS.android) 'dl'],
+    libraryDirectories: [input.outputDirectory.toFilePath()],
+    linkModePreference: LinkModePreference.dynamic,
+    optimizationLevel: OptimizationLevel.o2,
+  );
+  await engine.run(input: input, output: output);
+  output.dependencies.add(input.packageRoot.resolve('third_party/libuv/'));
+}

@@ -39,6 +39,11 @@ const _libraryNames = {
   'macos': 'libnitro_server.dylib',
   'linux': 'libnitro_server.so',
   'windows': 'nitro_server.dll',
+  // Mobile apps get the engine from the build hook (a bundled code asset the
+  // @Native bindings resolve); there is no file to open, so the search below
+  // finds nothing and NitroServer.bind proceeds with the bundled library.
+  'android': 'libnitro_server.so',
+  'ios': 'nitro_server.framework/nitro_server',
 };
 
 /// Platform file name of the built native library, for [operatingSystem]

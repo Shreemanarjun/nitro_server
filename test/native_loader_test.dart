@@ -15,6 +15,12 @@ void main() {
       endsWith('.dylib'),
     );
     expect(nitroServerLibraryName(operatingSystem: 'linux'), endsWith('.so'));
+    // Mobile: named so the search reports not-found (bundled code asset).
+    expect(nitroServerLibraryName(operatingSystem: 'android'), endsWith('.so'));
+    expect(
+      nitroServerLibraryName(operatingSystem: 'ios'),
+      'nitro_server.framework/nitro_server',
+    );
     expect(
       nitroServerLibraryName(operatingSystem: 'windows'),
       endsWith('.dll'),

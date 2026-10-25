@@ -1398,6 +1398,40 @@ void main() {
       expect((await _get(server!.port, '/slow')).status, 408);
       await Future<void>.delayed(const Duration(milliseconds: 100));
       expect(timeouts, hasLength(1));
+      // The event names the request, not just "handler timed out".
+      expect(
+        timeouts.single.message,
+        matches(RegExp(r'^handler timed out: GET /slow after \d+ ms$')),
+      );
+
+      // A custom verb is named as sent.
+      await server!.route(
+        HttpMethod.custom,
+        '/slow-report',
+        (_) async {
+          await Future<void>.delayed(const Duration(seconds: 5));
+          return ResponseContext.text('late');
+        },
+        customMethod: 'REPORT',
+        timeout: const Duration(milliseconds: 200),
+      );
+      final client = HttpClient();
+      addTearDown(() => client.close(force: true));
+      final req = await client.openUrl(
+        'REPORT',
+        Uri.parse('http://127.0.0.1:${server!.port}/slow-report'),
+      );
+      final res = await req.close();
+      await res.drain<void>();
+      expect(res.statusCode, 408);
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      expect(timeouts, hasLength(2));
+      expect(
+        timeouts.last.message,
+        matches(
+          RegExp(r'^handler timed out: REPORT /slow-report after \d+ ms$'),
+        ),
+      );
     }, skip: skipReason);
 
     test('a shared client reuses keep-alive connections', () async {

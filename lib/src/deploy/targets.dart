@@ -195,9 +195,9 @@ String renderDockerfile(DeployOptions o) =>
 # platform and verifies it against the lock shipped in the package; the
 # runtime stage needs only libc.
 FROM dart:stable AS build
-# nitro_server is also a Flutter FFI plugin, so pub refuses to resolve it
-# unless a Flutter SDK is visible. The server is plain Dart and uses nothing
-# from Flutter; this stub only satisfies pub's version check.
+# Only nitro_server < 1.1.0 needs this: those versions carried a Flutter
+# plugin block, so pub resolved them only with a Flutter SDK visible. The stub
+# satisfies that check; from 1.1.0 (plain Dart) it is unused and harmless.
 RUN mkdir -p /opt/flutter-stub/bin/cache \\
  && echo '{"flutterVersion":"3.47.5"}' > /opt/flutter-stub/bin/cache/flutter.version.json
 ENV FLUTTER_ROOT=/opt/flutter-stub

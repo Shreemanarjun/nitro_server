@@ -60,11 +60,16 @@ mkdir -p benchmark/blackbox/out
 echo "running: cpus=$CPUS (srv=$SRV cli=$CLI) mem=$MEM reps=$REPS dur=$DURATION conns=$CONNECTIONS"
 echo "frameworks: $FRAMEWORKS"
 # --cpuset-cpus pins cores; --memory==--memory-swap disables swap surprises.
+# Recorded in the report's Machine section: the exact command that reproduces
+# this run, and which image/tree produced it.
+RERUN="benchmark/blackbox/run.sh --cpus $CPUS --mem $MEM --reps $REPS --duration $DURATION --connections $CONNECTIONS --frameworks \"$FRAMEWORKS\"${BASE:+ --base $BASE}"
+IMAGE="nitro-blackbox $(docker image inspect nitro-blackbox --format '{{.Id}}' | cut -c8-19), tree $(git rev-parse --short HEAD)$(git diff --quiet HEAD -- . 2>/dev/null || echo ' + uncommitted changes')"
 docker run --rm \
   --cpuset-cpus="$CPUS" --memory="$MEM" --memory-swap="$MEM" \
   -e SRV_CORES="$SRV" -e CLI_CORES="$CLI" -e REPS="$REPS" \
   -e DURATION="$DURATION" -e CONNECTIONS="$CONNECTIONS" \
   -e FRAMEWORKS="$FRAMEWORKS" \
+  -e RERUN="$RERUN" -e IMAGE="$IMAGE" \
   -v "$ROOT/benchmark/blackbox/out:/out" \
   nitro-blackbox
 

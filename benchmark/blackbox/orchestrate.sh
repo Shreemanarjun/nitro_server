@@ -75,6 +75,12 @@ ROUTES="${ROUTES:-/hello /json /static /q?a=1&b=two /users/42 /files/x /mw /work
   echo "- server cores=$SRV_CORES ($SRV_N), client cores=$CLI_CORES; memory cap=$( (awk '/MemTotal/{printf "%.1f GiB", $2/1048576}' /proc/meminfo) )"
   echo "- load: $CONNECTIONS connections, ${DURATION}/route, $REPS reps interleaved (order reversed on even reps), keep-alive; median reported"
   echo "- host: docker --cpuset-cpus pin inside colima VM (Apple Silicon). For a cross-machine matrix, rerun run.sh on each host."
+  echo "- image: ${IMAGE:-nitro-blackbox (built by run.sh)}"
+  echo "- rerun (from the repo root; builds the same image, then runs this exact configuration):"
+  echo ""
+  echo '  ```sh'
+  echo "  ${RERUN:-benchmark/blackbox/run.sh}"
+  echo '  ```'
   echo ""
   echo "## Per-framework configuration (equal CPU budget = $SRV_N cores)"
   for fw in $FRAMEWORKS; do echo "- **$fw**: ${CONFIG[$fw]}"; done

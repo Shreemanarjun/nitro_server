@@ -30,7 +30,8 @@ std::vector<uint8_t> encodeIndexed(
     offset += (int64_t)item.size();
   }
   for (const auto& item : items) out.writeBytes(item.data(), item.size());
-  return std::move(out._buf);
+  const NitroCppBuffer payload = out.toBuffer();
+  return {payload.data, payload.data + payload.size};
 }
 
 TEST(WireTest, DecodesIndexedHeaderList) {

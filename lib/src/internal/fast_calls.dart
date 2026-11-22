@@ -21,101 +21,86 @@ import 'package:nitro/nitro.dart';
 import '../api/json_writer.dart';
 import '../nitro_server.native.dart';
 
-typedef _RespondNative =
-    Void Function(
-      Int64 instanceId,
-      Int64 requestId,
-      Int64 status,
-      Pointer<Uint8> headers,
-      Pointer<Uint8> body,
-      Size bodyLength,
-      Pointer<NitroErrorFfi> err,
-    );
-typedef _RespondDart =
-    void Function(
-      int instanceId,
-      int requestId,
-      int status,
-      Pointer<Uint8> headers,
-      Pointer<Uint8> body,
-      int bodyLength,
-      Pointer<NitroErrorFfi> err,
-    );
-typedef _StartStreamNative =
-    Void Function(
-      Int64 instanceId,
-      Int64 requestId,
-      Int64 status,
-      Pointer<Uint8> headers,
-      Pointer<NitroErrorFfi> err,
-    );
-typedef _StartStreamDart =
-    void Function(
-      int instanceId,
-      int requestId,
-      int status,
-      Pointer<Uint8> headers,
-      Pointer<NitroErrorFfi> err,
-    );
-typedef _SendChunkNative =
-    Void Function(
-      Int64 instanceId,
-      Int64 requestId,
-      Pointer<Uint8> chunk,
-      Size chunkLength,
-      Int8 last,
-      Pointer<NitroErrorFfi> err,
-    );
-typedef _SendChunkDart =
-    void Function(
-      int instanceId,
-      int requestId,
-      Pointer<Uint8> chunk,
-      int chunkLength,
-      int last,
-      Pointer<NitroErrorFfi> err,
-    );
+// Bound like the generated bindings (same code asset), so they resolve to the
+// engine image the runtime loaded, wherever the SDK staged it. A by-name or
+// by-path open can map a second engine copy with no server registered.
+@Native<
+  Void Function(
+    Int64,
+    Int64,
+    Int64,
+    Pointer<Uint8>,
+    Pointer<Uint8>,
+    Size,
+    Pointer<NitroErrorFfi>,
+  )
+>(
+  symbol: 'nitro_server_respond',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external void _respond(
+  int instanceId,
+  int requestId,
+  int status,
+  Pointer<Uint8> headers,
+  Pointer<Uint8> body,
+  int bodyLength,
+  Pointer<NitroErrorFfi> err,
+);
+
+@Native<
+  Void Function(Int64, Int64, Int64, Pointer<Uint8>, Pointer<NitroErrorFfi>)
+>(
+  symbol: 'nitro_server_start_stream',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external void _startStream(
+  int instanceId,
+  int requestId,
+  int status,
+  Pointer<Uint8> headers,
+  Pointer<NitroErrorFfi> err,
+);
+
+@Native<
+  Void Function(
+    Int64,
+    Int64,
+    Pointer<Uint8>,
+    Size,
+    Int8,
+    Pointer<NitroErrorFfi>,
+  )
+>(
+  symbol: 'nitro_server_send_stream_chunk',
+  assetId: 'package:nitro_server/nitro_server',
+  isLeaf: true,
+)
+external void _sendChunk(
+  int instanceId,
+  int requestId,
+  Pointer<Uint8> chunk,
+  int chunkLength,
+  int last,
+  Pointer<NitroErrorFfi> err,
+);
 
 final class FastCalls {
-  FastCalls._(
-    this._instanceId,
-    this._respond,
-    this._startStream,
-    this._sendChunk,
-  ) {
+  FastCalls._(this._instanceId) {
     _headerView = _headers.asTypedList(_headerCap);
     _headerData = ByteData.sublistView(_headerView);
     _bodyView = _body.asTypedList(_bodyCap);
   }
 
-  /// Binds against the library the generated code loaded. Throws when the
-  /// native side is not a real engine (fakes in tests): callers fall back
-  /// to the generated bindings.
-  factory FastCalls.bind(NitroServerNative native) {
-    final instanceId = native.asAnyNativeObject.instanceId;
-    final lib = NitroRuntime.loadLib('nitro_server');
-    return FastCalls._(
-      instanceId,
-      lib
-          .lookup<NativeFunction<_RespondNative>>('nitro_server_respond')
-          .asFunction<_RespondDart>(isLeaf: true),
-      lib
-          .lookup<NativeFunction<_StartStreamNative>>(
-            'nitro_server_start_stream',
-          )
-          .asFunction<_StartStreamDart>(isLeaf: true),
-      lib
-          .lookup<NativeFunction<_SendChunkNative>>(
-            'nitro_server_send_stream_chunk',
-          )
-          .asFunction<_SendChunkDart>(isLeaf: true),
-    );
-  }
+  /// Binds to [native]'s engine instance. Throws when the native side is not
+  /// a real engine (fakes in tests): callers fall back to the generated
+  /// bindings.
+  factory FastCalls.bind(NitroServerNative native) =>
+      FastCalls._(native.asAnyNativeObject.instanceId);
 
   final int _instanceId;
-  final _RespondDart _respond;
-  final _StartStreamDart _startStream;
-  final _SendChunkDart _sendChunk;
   final Pointer<NitroErrorFfi> _err = calloc<NitroErrorFfi>();
 
   Pointer<Uint8> _headers = malloc<Uint8>(_initialHeaderBytes);

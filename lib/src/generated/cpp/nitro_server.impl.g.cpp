@@ -77,6 +77,105 @@ public:
         // return { nullptr, 0 };
     }
 
+    void* jsonCreate() override {
+        // TODO: implement jsonCreate
+        throw std::runtime_error("Not implemented: jsonCreate");
+        // return nullptr;
+    }
+
+    void jsonFree(void* writer) override {
+        // TODO: implement jsonFree
+        throw std::runtime_error("Not implemented: jsonFree");
+    }
+
+    void* jsonAlloc(int64_t bytes) override {
+        // TODO: implement jsonAlloc
+        throw std::runtime_error("Not implemented: jsonAlloc");
+        // return nullptr;
+    }
+
+    void jsonFreeBuffer(void* buffer) override {
+        // TODO: implement jsonFreeBuffer
+        throw std::runtime_error("Not implemented: jsonFreeBuffer");
+    }
+
+    void jsonReset(void* writer) override {
+        // TODO: implement jsonReset
+        throw std::runtime_error("Not implemented: jsonReset");
+    }
+
+    void jsonBeginObject(void* writer) override {
+        // TODO: implement jsonBeginObject
+        throw std::runtime_error("Not implemented: jsonBeginObject");
+    }
+
+    void jsonEndObject(void* writer) override {
+        // TODO: implement jsonEndObject
+        throw std::runtime_error("Not implemented: jsonEndObject");
+    }
+
+    void jsonBeginArray(void* writer) override {
+        // TODO: implement jsonBeginArray
+        throw std::runtime_error("Not implemented: jsonBeginArray");
+    }
+
+    void jsonEndArray(void* writer) override {
+        // TODO: implement jsonEndArray
+        throw std::runtime_error("Not implemented: jsonEndArray");
+    }
+
+    void jsonKey(void* writer, void* bytes, int64_t length) override {
+        // TODO: implement jsonKey
+        throw std::runtime_error("Not implemented: jsonKey");
+    }
+
+    void jsonInt(void* writer, int64_t value) override {
+        // TODO: implement jsonInt
+        throw std::runtime_error("Not implemented: jsonInt");
+    }
+
+    void jsonDouble(void* writer, double value) override {
+        // TODO: implement jsonDouble
+        throw std::runtime_error("Not implemented: jsonDouble");
+    }
+
+    void jsonString(void* writer, void* bytes, int64_t length) override {
+        // TODO: implement jsonString
+        throw std::runtime_error("Not implemented: jsonString");
+    }
+
+    void jsonBool(void* writer, bool value) override {
+        // TODO: implement jsonBool
+        throw std::runtime_error("Not implemented: jsonBool");
+    }
+
+    void jsonNull(void* writer) override {
+        // TODO: implement jsonNull
+        throw std::runtime_error("Not implemented: jsonNull");
+    }
+
+    void jsonRaw(void* writer, void* bytes, int64_t length) override {
+        // TODO: implement jsonRaw
+        throw std::runtime_error("Not implemented: jsonRaw");
+    }
+
+    void jsonEmitTemplate(void* writer, int64_t records, int64_t columns, void* segments, void* segmentLengths, void* columnTypes, void* columnData) override {
+        // TODO: implement jsonEmitTemplate
+        throw std::runtime_error("Not implemented: jsonEmitTemplate");
+    }
+
+    void* jsonBytes(void* writer) override {
+        // TODO: implement jsonBytes
+        throw std::runtime_error("Not implemented: jsonBytes");
+        // return nullptr;
+    }
+
+    int64_t jsonLength(void* writer) override {
+        // TODO: implement jsonLength
+        throw std::runtime_error("Not implemented: jsonLength");
+        // return 0;
+    }
+
     void configureServer(NitroCppBuffer config) override {
         // TODO: implement configureServer
         throw std::runtime_error("Not implemented: configureServer");

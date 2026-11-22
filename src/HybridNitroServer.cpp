@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "engine/Brotli.h"
+#include "engine/JsonWriter.h"
 #include "engine/Common.h"
 #include "engine/EngineRegistry.h"
 #include "engine/EngineTypes.h"
@@ -184,6 +185,45 @@ class HybridNitroServerImpl final : public HybridNitroServerNative {
   void resetNative() override { EngineRegistry::resetAll(); }
 
   bool supportsBrotli() override { return nitro_brotli::available(); }
+
+  // JSON writer: thin forwards to the engine's writer (engine/JsonWriter.h).
+  void* jsonCreate() override { return jw::create(); }
+  void jsonFree(void* w) override { jw::destroy(w); }
+  void* jsonAlloc(int64_t bytes) override { return jw::alloc(bytes); }
+  void jsonFreeBuffer(void* p) override { jw::freeBuffer(p); }
+  void jsonReset(void* w) override { jw::reset(w); }
+  void jsonBeginObject(void* w) override { jw::beginObject(w); }
+  void jsonEndObject(void* w) override { jw::endObject(w); }
+  void jsonBeginArray(void* w) override { jw::beginArray(w); }
+  void jsonEndArray(void* w) override { jw::endArray(w); }
+  void jsonKey(void* w, void* bytes, int64_t length) override {
+    jw::key(w, static_cast<const uint8_t*>(bytes), length);
+  }
+  void jsonInt(void* w, int64_t value) override { jw::writeInt(w, value); }
+  void jsonDouble(void* w, double value) override {
+    jw::writeDouble(w, value);
+  }
+  void jsonString(void* w, void* bytes, int64_t length) override {
+    jw::writeString(w, static_cast<const uint8_t*>(bytes), length);
+  }
+  void jsonBool(void* w, bool value) override { jw::writeBool(w, value); }
+  void jsonNull(void* w) override { jw::writeNull(w); }
+  void jsonRaw(void* w, void* bytes, int64_t length) override {
+    jw::writeRaw(w, static_cast<const uint8_t*>(bytes), length);
+  }
+  void jsonEmitTemplate(void* w, int64_t records, int64_t columns,
+                        void* segments, void* segmentLengths,
+                        void* columnTypes, void* columnData) override {
+    jw::emitTemplate(w, records, columns,
+                     static_cast<const uint8_t* const*>(segments),
+                     static_cast<const int32_t*>(segmentLengths),
+                     static_cast<const uint8_t*>(columnTypes),
+                     static_cast<const void* const*>(columnData));
+  }
+  void* jsonBytes(void* w) override {
+    return const_cast<uint8_t*>(jw::bytes(w));
+  }
+  int64_t jsonLength(void* w) override { return jw::length(w); }
 
   // brotliEncode/Decode return a @zeroCopy Uint8List: the bridge takes the
   // malloc'd buffer and frees it after copying to Dart (see

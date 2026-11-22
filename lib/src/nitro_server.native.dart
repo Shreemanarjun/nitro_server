@@ -502,6 +502,97 @@ abstract class NitroServerNative extends HybridObject {
   @zeroCopy
   Uint8List brotliDecode(@zeroCopy Uint8List data);
 
+  // ── JSON writer (valid on any instance; `JsonWriter` uses `engine`) ────────
+  // The writer is an opaque handle and byte arguments point at native memory
+  // Dart reuses (tokens, scratch), so the per-token calls are leaf calls that
+  // neither copy nor allocate.
+
+  /// A new, empty writer; free it with [jsonFree]. (Not `@NitroOwned`: an
+  /// owned handle takes the whole module off native assets.)
+  NativeHandle<Void> jsonCreate();
+
+  @nitroFast
+  void jsonFree(NativeHandle<Void> writer);
+
+  /// A native buffer of [bytes] bytes (token storage, scratch, template
+  /// arrays); free it with [jsonFreeBuffer].
+  NativeHandle<Uint8> jsonAlloc(int bytes);
+
+  @nitroFast
+  void jsonFreeBuffer(NativeHandle<Uint8> buffer);
+
+  @nitroFast
+  void jsonReset(NativeHandle<Void> writer);
+
+  @nitroFast
+  void jsonBeginObject(NativeHandle<Void> writer);
+
+  @nitroFast
+  void jsonEndObject(NativeHandle<Void> writer);
+
+  @nitroFast
+  void jsonBeginArray(NativeHandle<Void> writer);
+
+  @nitroFast
+  void jsonEndArray(NativeHandle<Void> writer);
+
+  /// Writes the key held in [bytes] (UTF-8, [length] bytes, escaped natively).
+  @nitroFast
+  void jsonKey(
+    NativeHandle<Void> writer,
+    NativeHandle<Uint8> bytes,
+    int length,
+  );
+
+  @nitroFast
+  void jsonInt(NativeHandle<Void> writer, int value);
+
+  @nitroFast
+  void jsonDouble(NativeHandle<Void> writer, double value);
+
+  /// Writes the string value held in [bytes] (UTF-8, escaped natively).
+  @nitroFast
+  void jsonString(
+    NativeHandle<Void> writer,
+    NativeHandle<Uint8> bytes,
+    int length,
+  );
+
+  @nitroFast
+  void jsonBool(NativeHandle<Void> writer, bool value);
+
+  @nitroFast
+  void jsonNull(NativeHandle<Void> writer);
+
+  /// Appends [length] bytes of pre-encoded JSON verbatim.
+  @nitroFast
+  void jsonRaw(
+    NativeHandle<Void> writer,
+    NativeHandle<Uint8> bytes,
+    int length,
+  );
+
+  /// A JSON array of [records] rows from a template with [columns] numeric
+  /// holes: segment pointers/lengths, column type tags (0 int, 1 double) and
+  /// column data arrays (see `JsonWriter.writeTemplatedArray`).
+  @nitroFast
+  void jsonEmitTemplate(
+    NativeHandle<Void> writer,
+    int records,
+    int columns,
+    NativeHandle<Void> segments,
+    NativeHandle<Void> segmentLengths,
+    NativeHandle<Uint8> columnTypes,
+    NativeHandle<Void> columnData,
+  );
+
+  /// The writer's buffer, valid until its next write or reset.
+  @nitroFast
+  NativeHandle<Uint8> jsonBytes(NativeHandle<Void> writer);
+
+  @nitroFast
+  int jsonLength(NativeHandle<Void> writer);
+
   // ── Server role: 's:<serverId>' ────────────────────────────────────────────
 
   /// Synchronous by design — there is no reason to make users `await` a server

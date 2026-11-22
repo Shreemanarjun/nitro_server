@@ -28,169 +28,23 @@
 library;
 
 import 'dart:convert';
-import 'dart:ffi';
-import 'dart:io';
-import 'dart:typed_data';
 
-import 'native_loader.dart';
+import 'package:nitro/nitro.dart';
 
-// ── FFI bindings, resolved once against the loaded native library ────────────
+import '../nitro_server.native.dart';
 
-typedef _Vp = Pointer<Void>;
+// The writer and every byte buffer are native handles from the engine bridge
+// (`NitroServerNative.json*`): owned handles free themselves on GC, and the
+// per-token calls are `@nitroFast` leaf calls over memory reused across calls.
+final NitroServerNative _n = NitroServerNative.engine;
 
-final class _JwNative {
-  _JwNative._(DynamicLibrary lib)
-    : jwNew = lib.lookupFunction<_Vp Function(), _Vp Function()>(
-        'nitro_server_jw_new',
-      ),
-      reset = lib.lookupFunction<Void Function(_Vp), void Function(_Vp)>(
-        'nitro_server_jw_reset',
-        isLeaf: true,
-      ),
-      alloc = lib
-          .lookupFunction<
-            Pointer<Uint8> Function(Int32),
-            Pointer<Uint8> Function(int)
-          >('nitro_server_jw_alloc'),
-      freeBuf = lib.lookupFunction<Void Function(_Vp), void Function(_Vp)>(
-        'nitro_server_jw_free_buf',
-      ),
-      beginObject = lib.lookupFunction<Void Function(_Vp), void Function(_Vp)>(
-        'nitro_server_jw_begin_object',
-        isLeaf: true,
-      ),
-      endObject = lib.lookupFunction<Void Function(_Vp), void Function(_Vp)>(
-        'nitro_server_jw_end_object',
-        isLeaf: true,
-      ),
-      beginArray = lib.lookupFunction<Void Function(_Vp), void Function(_Vp)>(
-        'nitro_server_jw_begin_array',
-        isLeaf: true,
-      ),
-      endArray = lib.lookupFunction<Void Function(_Vp), void Function(_Vp)>(
-        'nitro_server_jw_end_array',
-        isLeaf: true,
-      ),
-      keyFn = lib
-          .lookupFunction<
-            Void Function(_Vp, Pointer<Uint8>, Int32),
-            void Function(_Vp, Pointer<Uint8>, int)
-          >('nitro_server_jw_key', isLeaf: true),
-      intFn = lib
-          .lookupFunction<Void Function(_Vp, Int64), void Function(_Vp, int)>(
-            'nitro_server_jw_int',
-            isLeaf: true,
-          ),
-      doubleFn = lib
-          .lookupFunction<
-            Void Function(_Vp, Double),
-            void Function(_Vp, double)
-          >('nitro_server_jw_double', isLeaf: true),
-      stringFn = lib
-          .lookupFunction<
-            Void Function(_Vp, Pointer<Uint8>, Int32),
-            void Function(_Vp, Pointer<Uint8>, int)
-          >('nitro_server_jw_string', isLeaf: true),
-      boolFn = lib
-          .lookupFunction<Void Function(_Vp, Int32), void Function(_Vp, int)>(
-            'nitro_server_jw_bool',
-            isLeaf: true,
-          ),
-      nullFn = lib.lookupFunction<Void Function(_Vp), void Function(_Vp)>(
-        'nitro_server_jw_null',
-        isLeaf: true,
-      ),
-      rawFn = lib
-          .lookupFunction<
-            Void Function(_Vp, Pointer<Uint8>, Int32),
-            void Function(_Vp, Pointer<Uint8>, int)
-          >('nitro_server_jw_raw', isLeaf: true),
-      emitTemplate = lib
-          .lookupFunction<
-            Void Function(
-              _Vp,
-              Int32,
-              Int32,
-              Pointer<Pointer<Uint8>>,
-              Pointer<Int32>,
-              Pointer<Uint8>,
-              Pointer<Pointer<Void>>,
-            ),
-            void Function(
-              _Vp,
-              int,
-              int,
-              Pointer<Pointer<Uint8>>,
-              Pointer<Int32>,
-              Pointer<Uint8>,
-              Pointer<Pointer<Void>>,
-            )
-          >('nitro_server_jw_emit_template', isLeaf: true),
-      bytes = lib
-          .lookupFunction<
-            Pointer<Uint8> Function(_Vp),
-            Pointer<Uint8> Function(_Vp)
-          >('nitro_server_jw_bytes', isLeaf: true),
-      len = lib.lookupFunction<Int32 Function(_Vp), int Function(_Vp)>(
-        'nitro_server_jw_len',
-        isLeaf: true,
-      ),
-      freeFinalizer = lib.lookup<NativeFinalizerFunction>(
-        'nitro_server_jw_free',
-      ),
-      freeBufFinalizer = lib.lookup<NativeFinalizerFunction>(
-        'nitro_server_jw_free_buf',
-      );
-
-  final _Vp Function() jwNew;
-  final void Function(_Vp) reset;
-  final Pointer<Uint8> Function(int) alloc;
-  final void Function(_Vp) freeBuf;
-  final void Function(_Vp) beginObject;
-  final void Function(_Vp) endObject;
-  final void Function(_Vp) beginArray;
-  final void Function(_Vp) endArray;
-  final void Function(_Vp, Pointer<Uint8>, int) keyFn;
-  final void Function(_Vp, int) intFn;
-  final void Function(_Vp, double) doubleFn;
-  final void Function(_Vp, Pointer<Uint8>, int) stringFn;
-  final void Function(_Vp, int) boolFn;
-  final void Function(_Vp) nullFn;
-  final void Function(_Vp, Pointer<Uint8>, int) rawFn;
-  final void Function(
-    _Vp,
-    int,
-    int,
-    Pointer<Pointer<Uint8>>,
-    Pointer<Int32>,
-    Pointer<Uint8>,
-    Pointer<Pointer<Void>>,
-  )
-  emitTemplate;
-  final Pointer<Uint8> Function(_Vp) bytes;
-  final int Function(_Vp) len;
-  final Pointer<NativeFinalizerFunction> freeFinalizer;
-  final Pointer<NativeFinalizerFunction> freeBufFinalizer;
-
-  static _JwNative? _instance;
-  static _JwNative get instance => _instance ??= _load();
-  static _JwNative _load() {
-    // A Dart CLI process opened the engine dylib by path (see native_loader);
-    // reopen it for a handle carrying the writer symbols. When it is bundled
-    // (Flutter) there is no path and the symbols are already in the process.
-    final path = loadedNitroServerNativePath;
-    if (path != null) return _JwNative._(DynamicLibrary.open(path));
-    // coverage:ignore-start
-    // Android's linker hides locally-loaded libraries from process-wide
-    // lookup, and Dart loads the bundled engine locally; opening it by name
-    // returns that same already-loaded image (no second copy).
-    if (Platform.isAndroid) {
-      return _JwNative._(DynamicLibrary.open('libnitro_server.so'));
-    }
-    return _JwNative._(DynamicLibrary.process());
-    // coverage:ignore-end
-  }
+void _freeBuffer(NativeHandle<Uint8>? h) {
+  if (h != null) _n.jsonFreeBuffer(h);
 }
+
+// A view of [h]'s memory typed for the untyped (`NativeHandle<Void>`) params.
+NativeHandle<Void> _voidView(NativeHandle<Uint8> h) =>
+    NativeHandle<Void>(h.pointer.cast());
 
 /// A key or string value marshaled to native memory once, so a hot writer can
 /// emit it every request without re-encoding. Create tokens for the fixed
@@ -203,22 +57,24 @@ final class JsonToken implements Finalizable {
   /// is garbage-collected).
   JsonToken(String value) : this._(utf8.encode(value));
 
-  JsonToken._(Uint8List bytes) : length = bytes.length {
-    final n = _JwNative.instance;
-    pointer = n.alloc(bytes.isEmpty ? 1 : bytes.length);
+  JsonToken._(Uint8List bytes)
+    : length = bytes.length,
+      handle = _n.jsonAlloc(bytes.length) {
+    _finalizer.attach(this, handle);
     if (bytes.isNotEmpty) pointer.asTypedList(bytes.length).setAll(0, bytes);
-    _finalizer.attach(this, pointer.cast(), detach: this);
   }
 
+  /// Native handle to the token's bytes (internal to [JsonWriter]); freed when
+  /// the token is garbage-collected.
+  final NativeHandle<Uint8> handle;
+
   /// Native pointer to the token's bytes (internal to [JsonWriter]).
-  late final Pointer<Uint8> pointer;
+  Pointer<Uint8> get pointer => handle.pointer;
 
   /// Byte length of the token.
   final int length;
 
-  static final _finalizer = NativeFinalizer(
-    _JwNative.instance.freeBufFinalizer,
-  );
+  static final _finalizer = Finalizer<NativeHandle<Uint8>>(_n.jsonFreeBuffer);
 }
 
 /// A varying numeric column for [JsonWriter.writeTemplatedArray]. Each row's
@@ -259,42 +115,43 @@ final class DoubleColumn extends JsonColumn {
 /// Call [dispose] to release native memory (a finalizer reclaims it if you
 /// forget).
 final class JsonWriter implements Finalizable {
-  JsonWriter() : _n = _JwNative.instance, _w = _JwNative.instance.jwNew() {
+  JsonWriter() : _w = _n.jsonCreate() {
     _finalizer.attach(this, _w, detach: this);
+    _growScratch(64);
   }
 
-  final _JwNative _n;
-  final _Vp _w;
+  final NativeHandle<Void> _w;
+  NativeHandle<Uint8>? _scratchHandle;
   Pointer<Uint8> _scratch = nullptr;
   int _scratchCap = 0;
   bool _disposed = false;
 
-  static final _finalizer = NativeFinalizer(_JwNative.instance.freeFinalizer);
+  static final _finalizer = Finalizer<NativeHandle<Void>>(_n.jsonFree);
 
   /// Clears the buffer so the writer can serialize the next document.
-  void reset() => _n.reset(_w);
+  void reset() => _n.jsonReset(_w);
 
-  void beginObject() => _n.beginObject(_w);
-  void endObject() => _n.endObject(_w);
-  void beginArray() => _n.beginArray(_w);
-  void endArray() => _n.endArray(_w);
+  void beginObject() => _n.jsonBeginObject(_w);
+  void endObject() => _n.jsonEndObject(_w);
+  void beginArray() => _n.jsonBeginArray(_w);
+  void endArray() => _n.jsonEndArray(_w);
 
   /// Writes an object key (the value follows). UTF-8 and JSON-escaped. Pays a
   /// `utf8.encode` + copy per call; use [keyToken] in hot loops.
   void key(String name) {
-    final (ptr, n) = _marshal(name);
-    _n.keyFn(_w, ptr, n);
+    final n = _marshal(name); // may grow (replace) the scratch
+    _n.jsonKey(_w, _scratchHandle!, n);
   }
 
   /// Writes a pre-marshaled object key (the value follows). No re-encoding.
-  void keyToken(JsonToken name) => _n.keyFn(_w, name.pointer, name.length);
+  void keyToken(JsonToken name) => _n.jsonKey(_w, name.handle, name.length);
 
   /// Writes a pre-marshaled string value. No re-encoding.
   void writeStringToken(JsonToken value) =>
-      _n.stringFn(_w, value.pointer, value.length);
+      _n.jsonString(_w, value.handle, value.length);
 
   /// Writes an integer value.
-  void writeInt(int value) => _n.intFn(_w, value);
+  void writeInt(int value) => _n.jsonInt(_w, value);
 
   /// Writes a double value, rendered natively byte-identically to `jsonEncode`
   /// (Dart's `double.toString()` shape). Throws for non-finite values, as
@@ -303,7 +160,7 @@ final class JsonWriter implements Finalizable {
     if (!value.isFinite) {
       throw ArgumentError.value(value, 'value', 'not a finite JSON number');
     }
-    _n.doubleFn(_w, value);
+    _n.jsonDouble(_w, value);
   }
 
   /// Writes a `num` as an integer or a double, matching its runtime type.
@@ -314,12 +171,12 @@ final class JsonWriter implements Finalizable {
   void writeString(String value) {
     // Win ②: escape+encode in one Dart pass, then memcpy via jw_raw — the
     // native side no longer re-scans every byte to escape (jw_string).
-    final (ptr, n) = _marshalEscaped(value);
-    _n.rawFn(_w, ptr, n);
+    final n = _marshalEscaped(value); // may grow (replace) the scratch
+    _n.jsonRaw(_w, _scratchHandle!, n);
   }
 
-  void writeBool(bool value) => _n.boolFn(_w, value ? 1 : 0);
-  void writeNull() => _n.nullFn(_w);
+  void writeBool(bool value) => _n.jsonBool(_w, value);
+  void writeNull() => _n.jsonNull(_w);
 
   /// Serializes an arbitrary JSON [value] (`Map`, `List`, `String`, `int`,
   /// `double`, `bool`, `null`) by walking it and driving the writer directly —
@@ -366,20 +223,20 @@ final class JsonWriter implements Finalizable {
   /// Writes already-encoded JSON [fragment] verbatim as one value (e.g. a
   /// cached sub-document). The caller guarantees it is valid JSON.
   void writeRaw(String fragment) {
-    final (ptr, n) = _marshal(fragment);
-    _n.rawFn(_w, ptr, n);
+    final n = _marshal(fragment); // may grow (replace) the scratch
+    _n.jsonRaw(_w, _scratchHandle!, n);
   }
 
   // Reused scratch for writeTemplatedArray's native argument arrays: the k+1
   // segment (pointer, length) pairs, the k column type tags and data pointers,
   // and one buffer holding every column's values back to back.
-  Pointer<Pointer<Uint8>> _segPtrs = nullptr;
-  Pointer<Int32> _segLens = nullptr;
+  NativeHandle<Uint8>? _segPtrs;
+  NativeHandle<Uint8>? _segLens;
   int _segCap = 0;
-  Pointer<Uint8> _colTypes = nullptr;
-  Pointer<Pointer<Void>> _colData = nullptr;
+  NativeHandle<Uint8>? _colTypes;
+  NativeHandle<Uint8>? _colData;
   int _colCap = 0;
-  Pointer<Uint8> _colBuf = nullptr;
+  NativeHandle<Uint8>? _colBuf;
   int _colBufCap = 0;
 
   /// Writes a JSON array of records built from a fixed template, in one native
@@ -412,28 +269,33 @@ final class JsonWriter implements Finalizable {
     }
     final n = k == 0 ? 0 : columns.first.length;
     if (k + 1 > _segCap) {
-      if (_segPtrs != nullptr) _n.freeBuf(_segPtrs.cast());
-      if (_segLens != nullptr) _n.freeBuf(_segLens.cast());
-      _segPtrs = _n.alloc((k + 1) * sizeOf<Pointer<Uint8>>()).cast();
-      _segLens = _n.alloc((k + 1) * sizeOf<Int32>()).cast();
+      _freeBuffer(_segPtrs);
+      _freeBuffer(_segLens);
+      _segPtrs = _n.jsonAlloc((k + 1) * sizeOf<Pointer<Uint8>>());
+      _segLens = _n.jsonAlloc((k + 1) * sizeOf<Int32>());
       _segCap = k + 1;
     }
     if (k > _colCap) {
-      if (_colTypes != nullptr) _n.freeBuf(_colTypes.cast());
-      if (_colData != nullptr) _n.freeBuf(_colData.cast());
-      _colTypes = _n.alloc(k);
-      _colData = _n.alloc(k * sizeOf<Pointer<Void>>()).cast();
+      _freeBuffer(_colTypes);
+      _freeBuffer(_colData);
+      _colTypes = _n.jsonAlloc(k);
+      _colData = _n.jsonAlloc(k * sizeOf<Pointer<Void>>());
       _colCap = k;
     }
     final need = k * n * 8;
     if (need > _colBufCap) {
-      if (_colBuf != nullptr) _n.freeBuf(_colBuf.cast());
-      _colBuf = _n.alloc(need);
+      _freeBuffer(_colBuf);
+      _colBuf = _n.jsonAlloc(need);
       _colBufCap = need;
     }
+    final segPtrs = _segPtrs!.pointer.cast<Pointer<Uint8>>();
+    final segLens = _segLens!.pointer.cast<Int32>();
+    final colTypes = _colTypes!.pointer;
+    final colData = _colData!.pointer.cast<Pointer<Void>>();
+    final colBuf = _colBuf!.pointer;
     for (var c = 0; c < k; c++) {
-      _segPtrs[c] = segments[c].pointer;
-      _segLens[c] = segments[c].length;
+      segPtrs[c] = segments[c].pointer;
+      segLens[c] = segments[c].length;
       final col = columns[c];
       if (col.length != n) {
         throw ArgumentError(
@@ -441,26 +303,34 @@ final class JsonWriter implements Finalizable {
           '(column $c has ${col.length}, expected $n)',
         );
       }
-      final slice = Pointer<Uint8>.fromAddress(_colBuf.address + c * n * 8);
-      _colData[c] = slice.cast();
+      final slice = Pointer<Uint8>.fromAddress(colBuf.address + c * n * 8);
+      colData[c] = slice.cast();
       switch (col) {
         case IntColumn():
-          _colTypes[c] = 0;
+          colTypes[c] = 0;
           slice.cast<Int64>().asTypedList(n).setAll(0, col.values);
         case DoubleColumn():
-          _colTypes[c] = 1;
+          colTypes[c] = 1;
           slice.cast<Double>().asTypedList(n).setAll(0, col.values);
       }
     }
-    _segPtrs[k] = segments[k].pointer;
-    _segLens[k] = segments[k].length;
-    _n.emitTemplate(_w, n, k, _segPtrs, _segLens, _colTypes, _colData);
+    segPtrs[k] = segments[k].pointer;
+    segLens[k] = segments[k].length;
+    _n.jsonEmitTemplate(
+      _w,
+      n,
+      k,
+      _voidView(_segPtrs!),
+      _voidView(_segLens!),
+      _colTypes!,
+      _voidView(_colData!),
+    );
   }
 
   /// The bytes written so far, copied into a Dart-owned list.
   Uint8List toBytes() {
-    final n = _n.len(_w);
-    return Uint8List.fromList(_n.bytes(_w).asTypedList(n));
+    final n = _n.jsonLength(_w);
+    return Uint8List.fromList(_n.jsonBytes(_w).pointer.asTypedList(n));
   }
 
   /// The native buffer pointer + byte length, for answering straight from the
@@ -468,21 +338,21 @@ final class JsonWriter implements Finalizable {
   /// skipping [toBytes]'s writer→Dart copy and the answerer's stage copy. Valid
   /// until the next [reset]/[dispose]; the caller must not dispose the writer
   /// before the (synchronous) respond returns.
-  Pointer<Uint8> get nativeBufferPointer => _n.bytes(_w).cast();
-  int get byteLength => _n.len(_w);
+  Pointer<Uint8> get nativeBufferPointer => _n.jsonBytes(_w).pointer;
+  int get byteLength => _n.jsonLength(_w);
 
   /// Releases native memory. Idempotent; the writer must not be used after.
   void dispose() {
     if (_disposed) return;
     _disposed = true;
+    _freeBuffer(_scratchHandle);
+    _freeBuffer(_segPtrs);
+    _freeBuffer(_segLens);
+    _freeBuffer(_colTypes);
+    _freeBuffer(_colData);
+    _freeBuffer(_colBuf);
     _finalizer.detach(this);
-    if (_scratch != nullptr) _n.freeBuf(_scratch.cast());
-    if (_segPtrs != nullptr) _n.freeBuf(_segPtrs.cast());
-    if (_segLens != nullptr) _n.freeBuf(_segLens.cast());
-    if (_colTypes != nullptr) _n.freeBuf(_colTypes.cast());
-    if (_colData != nullptr) _n.freeBuf(_colData.cast());
-    if (_colBuf != nullptr) _n.freeBuf(_colBuf.cast());
-    _n.freeBuf(_w);
+    _n.jsonFree(_w);
   }
 
   // ── Pooling (hot response path) ────────────────────────────────────────────
@@ -521,7 +391,7 @@ final class JsonWriter implements Finalizable {
   }
 
   // Copies [s]'s UTF-8 bytes into a reused native scratch buffer and returns
-  // (pointer, length): the FFI calls take a native pointer, and Dart lists
+  // the length: the native calls read the scratch, and Dart lists
   // have no stable one without a copy.
   // ASCII fast path: 1 byte per code unit, written straight into the native
   // scratch — no intermediate Dart list and no second copy (~3-4x faster than
@@ -529,7 +399,7 @@ final class JsonWriter implements Finalizable {
   // first non-ASCII code unit falls back to full UTF-8; bytes are identical
   // either way. (The native key/string/raw fns escape + append, so _marshal
   // only has to land the UTF-8 bytes in the scratch.)
-  (Pointer<Uint8>, int) _marshal(String s) {
+  int _marshal(String s) {
     final n = s.length;
     if (n > _scratchCap) _growScratch(n);
     if (n != 0) {
@@ -540,19 +410,21 @@ final class JsonWriter implements Finalizable {
         out[i] = c;
       }
     }
-    return (_scratch, n);
+    return n;
   }
 
-  (Pointer<Uint8>, int) _marshalUtf8(String s) {
+  int _marshalUtf8(String s) {
     final bytes = utf8.encode(s);
     if (bytes.length > _scratchCap) _growScratch(bytes.length);
     if (bytes.isNotEmpty) _scratch.asTypedList(bytes.length).setAll(0, bytes);
-    return (_scratch, bytes.length);
+    return bytes.length;
   }
 
   void _growScratch(int need) {
-    if (_scratch != nullptr) _n.freeBuf(_scratch.cast());
-    _scratch = _n.alloc(need);
+    _freeBuffer(_scratchHandle);
+    final handle = _n.jsonAlloc(need);
+    _scratchHandle = handle;
+    _scratch = handle.pointer;
     _scratchCap = need;
   }
 
@@ -564,7 +436,7 @@ final class JsonWriter implements Finalizable {
   // -> writeEscaped). One scalar pass over the data instead of two. ASCII fast
   // path copies a byte per code unit; the first non-ASCII unit re-does it via
   // UTF-8. Bytes are identical to the native escaper either way.
-  (Pointer<Uint8>, int) _marshalEscaped(String s) {
+  int _marshalEscaped(String s) {
     final n = s.length;
     // ponytail: worst case every char -> \u00XX (6B) + 2 quotes; transient and
     // reused, grown only when a longer string arrives. Swap for a per-char
@@ -584,10 +456,10 @@ final class JsonWriter implements Finalizable {
       }
     }
     out[j++] = 0x22; // "
-    return (_scratch, j);
+    return j;
   }
 
-  (Pointer<Uint8>, int) _marshalEscapedUtf8(String s) {
+  int _marshalEscapedUtf8(String s) {
     final bytes = utf8.encode(s);
     final cap = bytes.length * 6 + 2;
     if (cap > _scratchCap) _growScratch(cap);
@@ -603,7 +475,7 @@ final class JsonWriter implements Finalizable {
       }
     }
     out[j++] = 0x22;
-    return (_scratch, j);
+    return j;
   }
 
   int _escapeByte(Uint8List out, int j, int c) {

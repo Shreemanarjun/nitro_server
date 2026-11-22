@@ -1,110 +1,90 @@
-// Tests the native JSON writer's C ABI: framing, escaping and number output.
+// Tests the native JSON writer API: framing, escaping and number output.
 #include <cstdint>
 #include <cstring>
 #include <string>
 
 #include "gtest/gtest.h"
 
-extern "C" {
-void* nitro_server_jw_new();
-void nitro_server_jw_free(void*);
-void nitro_server_jw_reset(void*);
-uint8_t* nitro_server_jw_alloc(int32_t);
-void nitro_server_jw_free_buf(void*);
-void nitro_server_jw_begin_object(void*);
-void nitro_server_jw_end_object(void*);
-void nitro_server_jw_begin_array(void*);
-void nitro_server_jw_end_array(void*);
-void nitro_server_jw_key(void*, const uint8_t*, int32_t);
-void nitro_server_jw_int(void*, int64_t);
-void nitro_server_jw_double(void*, double);
-void nitro_server_jw_string(void*, const uint8_t*, int32_t);
-void nitro_server_jw_bool(void*, int32_t);
-void nitro_server_jw_null(void*);
-void nitro_server_jw_raw(void*, const uint8_t*, int32_t);
-void nitro_server_jw_emit_template(void*, int32_t, int32_t, const uint8_t* const*,
-                                   const int32_t*, const uint8_t*,
-                                   const void* const*);
-const uint8_t* nitro_server_jw_bytes(void*);
-int32_t nitro_server_jw_len(void*);
-}
+#include "../../src/engine/JsonWriter.h"
+
+namespace jw = nitroserver::jw;
 
 namespace {
 
 std::string out(void* w) {
-  return std::string(reinterpret_cast<const char*>(nitro_server_jw_bytes(w)),
-                     (size_t)nitro_server_jw_len(w));
+  return std::string(reinterpret_cast<const char*>(jw::bytes(w)),
+                     (size_t)jw::length(w));
 }
 void key(void* w, const char* k) {
-  nitro_server_jw_key(w, reinterpret_cast<const uint8_t*>(k), (int32_t)strlen(k));
+  jw::key(w, reinterpret_cast<const uint8_t*>(k), (int32_t)strlen(k));
 }
 void str(void* w, const char* s) {
-  nitro_server_jw_string(w, reinterpret_cast<const uint8_t*>(s), (int32_t)strlen(s));
+  jw::writeString(w, reinterpret_cast<const uint8_t*>(s), (int32_t)strlen(s));
 }
 void raw(void* w, const char* r) {
-  nitro_server_jw_raw(w, reinterpret_cast<const uint8_t*>(r), (int32_t)strlen(r));
+  jw::writeRaw(w, reinterpret_cast<const uint8_t*>(r), (int32_t)strlen(r));
 }
 
 }  // namespace
 
 TEST(JsonWriter, ObjectFramesCommasAndTypes) {
-  void* w = nitro_server_jw_new();
-  nitro_server_jw_begin_object(w);
-  key(w, "id"); nitro_server_jw_int(w, 42);
+  void* w = jw::create();
+  jw::beginObject(w);
+  key(w, "id"); jw::writeInt(w, 42);
   key(w, "name"); str(w, "nitro");
-  key(w, "ok"); nitro_server_jw_bool(w, 1);
-  key(w, "no"); nitro_server_jw_bool(w, 0);
-  key(w, "nil"); nitro_server_jw_null(w);
+  key(w, "ok"); jw::writeBool(w, 1);
+  key(w, "no"); jw::writeBool(w, 0);
+  key(w, "nil"); jw::writeNull(w);
   key(w, "score"); raw(w, "1.5");
-  nitro_server_jw_end_object(w);
+  jw::endObject(w);
   EXPECT_EQ(out(w),
             "{\"id\":42,\"name\":\"nitro\",\"ok\":true,\"no\":false,"
             "\"nil\":null,\"score\":1.5}");
-  nitro_server_jw_free(w);
+  jw::destroy(w);
 }
 
 TEST(JsonWriter, NestedArraysAndObjects) {
-  void* w = nitro_server_jw_new();
-  nitro_server_jw_begin_array(w);
-  nitro_server_jw_begin_object(w);
+  void* w = jw::create();
+  jw::beginArray(w);
+  jw::beginObject(w);
   key(w, "tags");
-  nitro_server_jw_begin_array(w);
+  jw::beginArray(w);
   str(w, "a"); str(w, "b");
-  nitro_server_jw_end_array(w);
-  nitro_server_jw_end_object(w);
-  nitro_server_jw_int(w, 7);
-  nitro_server_jw_end_array(w);
+  jw::endArray(w);
+  jw::endObject(w);
+  jw::writeInt(w, 7);
+  jw::endArray(w);
   EXPECT_EQ(out(w), "[{\"tags\":[\"a\",\"b\"]},7]");
-  nitro_server_jw_free(w);
+  jw::destroy(w);
 }
 
 TEST(JsonWriter, EscapesStringsAndKeys) {
-  void* w = nitro_server_jw_new();
-  nitro_server_jw_begin_object(w);
+  void* w = jw::create();
+  jw::beginObject(w);
   key(w, "a\"b");  // a key needing an escape
   str(w, "quote:\" back:\\ tab:\t nl:\n ctrl:\x01 keep:é");
-  nitro_server_jw_end_object(w);
+  jw::endObject(w);
   EXPECT_EQ(out(w),
             "{\"a\\\"b\":\"quote:\\\" back:\\\\ tab:\\t nl:\\n "
             "ctrl:\\u0001 keep:\xC3\xA9\"}");
-  nitro_server_jw_free(w);
+  jw::destroy(w);
 }
 
 TEST(JsonWriter, IntEdgeCasesAndReset) {
-  void* w = nitro_server_jw_new();
-  nitro_server_jw_begin_array(w);
-  nitro_server_jw_int(w, 0);
-  nitro_server_jw_int(w, -1);
-  nitro_server_jw_int(w, 9223372036854775807LL);   // INT64_MAX
-  nitro_server_jw_int(w, -9223372036854775807LL - 1);  // INT64_MIN
-  nitro_server_jw_end_array(w);
+  void* w = jw::create();
+  jw::beginArray(w);
+  jw::writeInt(w, 0);
+  jw::writeInt(w, -1);
+  jw::writeInt(w, 9223372036854775807LL);   // INT64_MAX
+  jw::writeInt(w, -9223372036854775807LL - 1);  // INT64_MIN
+  jw::endArray(w);
   EXPECT_EQ(out(w),
             "[0,-1,9223372036854775807,-9223372036854775808]");
-  nitro_server_jw_reset(w);
-  nitro_server_jw_begin_array(w);
-  nitro_server_jw_end_array(w);
+  jw::reset(w);
+  jw::beginArray(w);
+  jw::endArray(w);
   EXPECT_EQ(out(w), "[]");
-  nitro_server_jw_free(w);
+  jw::destroy(w);
 }
 
 TEST(JsonWriter, DoubleFormatsLikeDart) {
@@ -119,13 +99,13 @@ TEST(JsonWriter, DoubleFormatsLikeDart) {
     {1e-6, "0.000001"}, {1e-7, "1e-7"}, {1e20, "100000000000000000000.0"},
     {1e21, "1e+21"}, {1234.5, "1234.5"}, {-1e21, "-1e+21"},
   };
-  void* w = nitro_server_jw_new();
+  void* w = jw::create();
   for (const auto& c : cases) {
-    nitro_server_jw_reset(w);
-    nitro_server_jw_double(w, c.v);
+    jw::reset(w);
+    jw::writeDouble(w, c.v);
     EXPECT_EQ(out(w), c.want) << "value " << c.v;
   }
-  nitro_server_jw_free(w);
+  jw::destroy(w);
 }
 
 TEST(JsonWriter, EmitTemplateInterleavesSegmentsAndColumns) {
@@ -143,8 +123,8 @@ TEST(JsonWriter, EmitTemplateInterleavesSegmentsAndColumns) {
   const int64_t ids[] = {0, 1, 2};
   const double scores[] = {0.0, 1.5, 3.0};
   const void* data[] = {ids, scores};
-  void* w = nitro_server_jw_new();
-  nitro_server_jw_emit_template(w, 3, 2, segs, lens, types, data);
+  void* w = jw::create();
+  jw::emitTemplate(w, 3, 2, segs, lens, types, data);
   EXPECT_EQ(out(w),
             "[{\"id\":0,\"score\":0.0},{\"id\":1,\"score\":1.5},"
             "{\"id\":2,\"score\":3.0}]");
@@ -158,29 +138,29 @@ TEST(JsonWriter, EmitTemplateInterleavesSegmentsAndColumns) {
   const uint8_t types1[] = {0};
   const int64_t ns[] = {5, 6};
   const void* data1[] = {ns};
-  nitro_server_jw_reset(w);
-  nitro_server_jw_begin_array(w);
-  nitro_server_jw_int(w, 9);
-  nitro_server_jw_emit_template(w, 2, 1, segs1, lens1, types1, data1);
-  nitro_server_jw_end_array(w);
+  jw::reset(w);
+  jw::beginArray(w);
+  jw::writeInt(w, 9);
+  jw::emitTemplate(w, 2, 1, segs1, lens1, types1, data1);
+  jw::endArray(w);
   EXPECT_EQ(out(w), "[9,[{\"n\":5},{\"n\":6}]]");
-  nitro_server_jw_free(w);
+  jw::destroy(w);
 }
 
 TEST(JsonWriter, AllocScratchRoundTrips) {
   // The Dart wrapper copies key/string bytes into scratch from jw_alloc.
-  uint8_t* p = nitro_server_jw_alloc(4);
+  uint8_t* p = jw::alloc(4);
   ASSERT_NE(p, nullptr);
   const char* s = "name";
   for (int i = 0; i < 4; i++) p[i] = (uint8_t)s[i];
-  void* w = nitro_server_jw_new();
-  nitro_server_jw_begin_object(w);
-  nitro_server_jw_key(w, p, 4);
-  nitro_server_jw_int(w, 1);
-  nitro_server_jw_end_object(w);
+  void* w = jw::create();
+  jw::beginObject(w);
+  jw::key(w, p, 4);
+  jw::writeInt(w, 1);
+  jw::endObject(w);
   EXPECT_EQ(out(w), "{\"name\":1}");
-  nitro_server_jw_free(w);
-  nitro_server_jw_free_buf(p);
+  jw::destroy(w);
+  jw::freeBuffer(p);
 }
 
 #include <charconv>

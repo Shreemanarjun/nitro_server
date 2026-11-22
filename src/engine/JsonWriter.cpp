@@ -35,7 +35,7 @@
 #define NITRO_SERVER_PORTABLE_DTOA 1
 #endif
 
-#include "../nitro.h"  // NITRO_EXPORT
+#include "JsonWriter.h"
 #include "Dtoa.h"
 
 namespace {
@@ -197,101 +197,89 @@ inline NitroJsonWriter* cast(void* p) {
 
 }  // namespace
 
-extern "C" {
+namespace nitroserver::jw {
 
-NITRO_EXPORT void* nitro_server_jw_new() {
+void* create() {
   auto* w = new NitroJsonWriter();
   w->grow(256);  // allocate up front so data is never null
   return w;
 }
-NITRO_EXPORT void nitro_server_jw_free(void* p) { delete cast(p); }
-NITRO_EXPORT void nitro_server_jw_reset(void* p) {
+void destroy(void* p) { delete cast(p); }
+void reset(void* p) {
   auto* w = cast(p);
   w->len = 0;  // keep the allocation; reuse across requests
   w->needComma = false;
 }
-// Scratch native memory the Dart wrapper copies key/string bytes into.
-NITRO_EXPORT uint8_t* nitro_server_jw_alloc(int32_t n) {
+// Native memory the Dart wrapper copies key/string bytes into.
+uint8_t* alloc(int64_t n) {
   return static_cast<uint8_t*>(malloc(static_cast<size_t>(n > 0 ? n : 1)));
 }
-NITRO_EXPORT void nitro_server_jw_free_buf(void* p) { free(p); }
-
-NITRO_EXPORT void nitro_server_jw_begin_object(void* p) {
+void freeBuffer(void* p) { free(p); }
+void beginObject(void* p) {
   auto* w = cast(p); sep(w); put(w, '{'); w->needComma = false;
 }
-NITRO_EXPORT void nitro_server_jw_end_object(void* p) {
+void endObject(void* p) {
   auto* w = cast(p); put(w, '}'); w->needComma = true;
 }
-NITRO_EXPORT void nitro_server_jw_begin_array(void* p) {
+void beginArray(void* p) {
   auto* w = cast(p); sep(w); put(w, '['); w->needComma = false;
 }
-NITRO_EXPORT void nitro_server_jw_end_array(void* p) {
+void endArray(void* p) {
   auto* w = cast(p); put(w, ']'); w->needComma = true;
 }
-NITRO_EXPORT void nitro_server_jw_key(void* p, const uint8_t* k, int32_t kl) {
-  auto* w = cast(p); sep(w); writeEscaped(w, k, kl); put(w, ':');
+void key(void* p, const uint8_t* k, int64_t kl) {
+  auto* w = cast(p); sep(w); writeEscaped(w, k, static_cast<int>(kl)); put(w, ':');
   w->needComma = false;
 }
-NITRO_EXPORT void nitro_server_jw_int(void* p, int64_t v) {
-  auto* w = cast(p); sep(w); writeInt(w, v); w->needComma = true;
+void writeInt(void* p, int64_t v) {
+  auto* w = cast(p); sep(w); ::writeInt(w, v); w->needComma = true;
 }
 // Formats and appends a finite double natively (see writeDouble above), so a
 // hot handler skips the Dart-side toString() + utf8.encode allocation.
-NITRO_EXPORT void nitro_server_jw_double(void* p, double v) {
-  auto* w = cast(p); sep(w); writeDouble(w, v); w->needComma = true;
+void writeDouble(void* p, double v) {
+  auto* w = cast(p); sep(w); ::writeDouble(w, v); w->needComma = true;
 }
-NITRO_EXPORT void nitro_server_jw_string(void* p, const uint8_t* s, int32_t n) {
-  auto* w = cast(p); sep(w); writeEscaped(w, s, n); w->needComma = true;
+void writeString(void* p, const uint8_t* s, int64_t n) {
+  auto* w = cast(p); sep(w); writeEscaped(w, s, static_cast<int>(n)); w->needComma = true;
 }
-NITRO_EXPORT void nitro_server_jw_bool(void* p, int32_t b) {
+void writeBool(void* p, bool b) {
   auto* w = cast(p); sep(w);
   if (b) putN(w, "true", 4); else putN(w, "false", 5);
   w->needComma = true;
 }
-NITRO_EXPORT void nitro_server_jw_null(void* p) {
+void writeNull(void* p) {
   auto* w = cast(p); sep(w); putN(w, "null", 4); w->needComma = true;
 }
-// Pre-formatted value bytes (a double already rendered by Dart, or a nested
-// pre-encoded fragment). Written verbatim, framed like any other value.
-NITRO_EXPORT void nitro_server_jw_raw(void* p, const uint8_t* r, int32_t n) {
-  auto* w = cast(p); sep(w); putN(w, reinterpret_cast<const char*>(r), n);
+// Pre-formatted value bytes (a nested pre-encoded fragment). Written
+// verbatim, framed like any other value.
+void writeRaw(void* p, const uint8_t* r, int64_t n) {
+  auto* w = cast(p); sep(w); putN(w, reinterpret_cast<const char*>(r), static_cast<int>(n));
   w->needComma = true;
 }
-// Emit a JSON array of `n` records built from a fixed template, in one FFI
-// call — the engine runs the whole loop, so a hot handler pays no per-token
-// Dart method call or FFI crossing (the residual cost once the JSON is the
-// only work left). Each record interleaves `k` constant segments with `k`
-// numeric columns: seg[0] col[0][row] seg[1] col[1][row] ... seg[k-1]
-// col[k-1][row] seg[k]. So `segPtrs`/`segLens` have k+1 entries and there are
-// k columns; `colTypes[c]` is 0 for an int64 column, 1 for a double column,
-// and `colData[c]` points at that column's n-element array. Framed like any
-// other value (leading comma if needed).
-NITRO_EXPORT void nitro_server_jw_emit_template(
-    void* p, int32_t n, int32_t k,
-    const uint8_t* const* segPtrs, const int32_t* segLens,
-    const uint8_t* colTypes, const void* const* colData) {
+// One call for the whole array: a hot handler pays no per-token Dart call or
+// FFI crossing. Framed like any other value (leading comma if needed).
+void emitTemplate(void* p, int64_t n, int64_t k,
+                  const uint8_t* const* segPtrs, const int32_t* segLens,
+                  const uint8_t* colTypes, const void* const* colData) {
   auto* w = cast(p);
   sep(w);
   put(w, '[');
-  for (int32_t row = 0; row < n; row++) {
+  for (int64_t row = 0; row < n; row++) {
     if (row) put(w, ',');
-    for (int32_t c = 0; c < k; c++) {
+    for (int64_t c = 0; c < k; c++) {
       putN(w, reinterpret_cast<const char*>(segPtrs[c]), segLens[c]);
       if (colTypes[c] == 0)
-        writeInt(w, static_cast<const int64_t*>(colData[c])[row]);
+        ::writeInt(w, static_cast<const int64_t*>(colData[c])[row]);
       else
-        writeDouble(w, static_cast<const double*>(colData[c])[row]);
+        ::writeDouble(w, static_cast<const double*>(colData[c])[row]);
     }
     putN(w, reinterpret_cast<const char*>(segPtrs[k]), segLens[k]);
   }
   put(w, ']');
   w->needComma = true;
 }
-NITRO_EXPORT const uint8_t* nitro_server_jw_bytes(void* p) {
-  return cast(p)->data;
-}
-NITRO_EXPORT int32_t nitro_server_jw_len(void* p) {
-  return static_cast<int32_t>(cast(p)->len);
-}
+const uint8_t* bytes(void* p) { return cast(p)->data; }
+int64_t length(void* p) { return static_cast<int64_t>(cast(p)->len); }
 
-}  // extern "C"
+}  // namespace nitroserver::jw
+

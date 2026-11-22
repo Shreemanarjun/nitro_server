@@ -134,11 +134,11 @@ struct ClientResp {
   std::string body;
   bool closed = false;
   std::vector<std::pair<std::string, std::string>> headers;  // non-:status
+  size_t sent = 0;  // upload cursor: each stream sends the whole body
 };
 struct ClientState {
   std::unordered_map<int32_t, ClientResp> resp;
   const std::string* reqBody = nullptr;  // POST upload source
-  size_t reqOff = 0;
   ClientResp& operator[](int32_t sid) { return resp[sid]; }
 };
 
@@ -165,13 +165,15 @@ int clientOnClose(nghttp2_session*, int32_t streamId, uint32_t, void* ud) {
   (*static_cast<ClientState*>(ud))[streamId].closed = true;
   return 0;
 }
-ssize_t clientReadReq(nghttp2_session*, int32_t, uint8_t* buf, size_t len,
-                            uint32_t* flags, nghttp2_data_source* src, void*) {
+ssize_t clientReadReq(nghttp2_session*, int32_t streamId, uint8_t* buf,
+                      size_t len, uint32_t* flags, nghttp2_data_source* src,
+                      void*) {
   auto* c = static_cast<ClientState*>(src->ptr);
-  const size_t n = std::min(len, c->reqBody->size() - c->reqOff);
-  std::memcpy(buf, c->reqBody->data() + c->reqOff, n);
-  c->reqOff += n;
-  if (c->reqOff == c->reqBody->size()) *flags |= NGHTTP2_DATA_FLAG_EOF;
+  size_t& off = (*c)[streamId].sent;
+  const size_t n = std::min(len, c->reqBody->size() - off);
+  std::memcpy(buf, c->reqBody->data() + off, n);
+  off += n;
+  if (off == c->reqBody->size()) *flags |= NGHTTP2_DATA_FLAG_EOF;
   return static_cast<ssize_t>(n);
 }
 
@@ -933,7 +935,6 @@ TEST(Http2SessionTest, PerRouteBodyCapOverridesTheSessionCap) {
   const int32_t s1 = submitPost(client, &cs, small, 4);
   drive(client, server, fromServer, em, cs);
   EXPECT_EQ(cs[s1].status, 413);  // the route's own cap wins
-  cs.reqOff = 0;
   const nghttp2_nv large[] = {MAKE_NV(":method", "POST"), MAKE_NV(":scheme", "http"),
                               MAKE_NV(":authority", "x"), MAKE_NV(":path", "/big")};
   const int32_t s2 = submitPost(client, &cs, large, 4);
@@ -1068,7 +1069,6 @@ TEST(Http2SessionTest, BodyBudgetRefusesAStreamOverTheRemainder) {
   EXPECT_TRUE(retry);
   ASSERT_EQ(em.seen().size(), 1u);
   // Both streams are closed: the budget is whole again, a third upload fits.
-  cs.reqOff = 0;  // the harness shares one upload cursor across streams
   const int32_t s3 = submitPost(client, &cs, nv, 5);
   drive(client, server, fromServer, em, cs);
   EXPECT_EQ(cs[s3].status, 200);
@@ -1083,7 +1083,9 @@ TEST(Http2SessionTest, BodyBudgetRefuses413WhatCanNeverFit) {
   Http2Session server = budgeted(em, router, fromServer, /*maxBody=*/1000,
                                  /*budget=*/100);
   ClientState cs;
-  const std::string reqBody(10, 'z');
+  // Sends what it declares: a short body under a larger content-length is a
+  // malformed request, a connection error in nghttp2 >= 1.68.
+  const std::string reqBody(200, 'z');
   cs.reqBody = &reqBody;
   nghttp2_session* client = makeClient(&cs);
   // Declared larger than the whole budget: 413 up front, nothing buffered.
@@ -1096,7 +1098,6 @@ TEST(Http2SessionTest, BodyBudgetRefuses413WhatCanNeverFit) {
   EXPECT_EQ(cs[s1].status, 413);
   // Undeclared length reserves the body cap (1000 > 100): also 413 — the
   // budget must be at least the cap for such a route to accept uploads.
-  cs.reqOff = 0;
   const nghttp2_nv undeclared[] = {
       MAKE_NV(":method", "POST"), MAKE_NV(":scheme", "http"),
       MAKE_NV(":authority", "x"), MAKE_NV(":path", "/up")};

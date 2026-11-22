@@ -14,7 +14,7 @@
 # and every ServerConfig.fromEnv variable (see README "From the environment").
 
 # ---- build stage: native engine + AOT bundle -------------------------------
-FROM dart:stable@sha256:efc6116982a4d178babd453b05555b37693316945fd6012a2d10232a940caa19 AS build
+FROM dart:stable@sha256:36176bf7b6400bdc4aa77ba07b733b2eabf22640f71afd1b83eba679a26d5698 AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
       cmake clang make pkg-config \
       libuv1-dev libssl-dev libbrotli-dev libnghttp2-dev \
@@ -47,9 +47,10 @@ RUN cmake -S src -B build/lib -DCMAKE_BUILD_TYPE=Release \
 RUN NITRO_SERVER_NO_DOWNLOAD=1 dart build cli -t bin/server.dart -o /app/out
 
 # ---- runtime stage: slim, non-root ------------------------------------------
-FROM debian:stable-slim@sha256:a717a33469731894e77e912ea7d714e27c2dc38ee6554fd1a3102e92999cfc66 AS runtime
-# The engine's shared deps (Debian 13 names), curl for the HEALTHCHECK.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+FROM debian:stable-slim@sha256:fbfb4059d2127120aa05b6e6064523d2102552f0cf0026ddf0701c12f1f8f3e0 AS runtime
+# The engine's shared deps (Debian 13 names), curl for the HEALTHCHECK. The
+# upgrade pulls security fixes newer than the pinned base (CI's Trivy gate).
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
       ca-certificates libstdc++6 libuv1t64 libssl3t64 libbrotli1 libnghttp2-14 curl \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app

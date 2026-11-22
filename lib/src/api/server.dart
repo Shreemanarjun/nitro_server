@@ -143,29 +143,12 @@ class NitroServer with RouteRegistrar<NitroServer> {
     return server;
   }
 
-  /// Opens the cmake-built native library so [bind] works in a Dart CLI
-  /// program without a manual [loadNitroServerNative] call. On Flutter the
-  /// library is bundled and no cmake output exists, so a not-found is ignored
-  /// and the already-loaded symbols are used; if attaching then fails the
-  /// actionable "build it first" error from the load is raised.
-  static void _ensureNativeLoaded() {
-    StateError? loadError;
-    try {
-      loadNitroServerNative();
-      // coverage:ignore-start
-    } on StateError catch (e) {
-      loadError = e; // cmake output absent: Flutter/bundled, or not built yet
-    }
-    // coverage:ignore-end
-    try {
-      ensureNativeAttached();
-    } catch (_) {
-      // coverage:ignore-start
-      if (loadError != null) throw loadError;
-      rethrow;
-      // coverage:ignore-end
-    }
-  }
+  /// Attaches to the engine. Every binding is `@Native`, resolved against the
+  /// code asset the build hook staged, so nothing is opened by path here: a
+  /// path open (e.g. a stray `build/lib` copy) would map a second engine image
+  /// with its own global state. [loadNitroServerNative] stays for an explicit
+  /// non-default location.
+  static void _ensureNativeLoaded() => ensureNativeAttached();
 
   /// Auto size for [ServerConfig.isolates] == 0 (with a `setup`): the full core
   /// count, so a CPU-bound handler can fan out across every core — nitro's own

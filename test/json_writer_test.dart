@@ -20,12 +20,6 @@ void main() {
   final libPath = _locate();
 
   group('JsonWriter', () {
-    setUpAll(() {
-      // loadNitroServerNative records the path, so JsonWriter's loader takes
-      // the open-by-path branch (the CLI path) rather than process().
-      if (libPath != null) loadNitroServerNative(path: libPath);
-    });
-
     Uint8List enc(void Function(JsonWriter) build) {
       final w = JsonWriter();
       build(w);

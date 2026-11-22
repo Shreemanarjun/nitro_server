@@ -23,10 +23,6 @@ void main() {
   final libPath = _locate();
 
   group('brotli', () {
-    setUpAll(() {
-      if (libPath != null) loadNitroServerNative(path: libPath);
-    });
-
     test('is available once the engine library is loaded', () {
       expect(brotliAvailable(), isTrue);
     });

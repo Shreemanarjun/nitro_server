@@ -2,7 +2,8 @@
 
 - Fix: on Dart 3.14 / Flutter 3.50 handler responses could hang (408) and TLS
   requests stalled — the fast response path opened a second engine copy; it now
-  binds through the package's code asset like the generated bindings.
+  binds through the package's code asset like the generated bindings, and
+  `bind()` no longer opens a `build/lib` engine by path (a second copy).
 - `JsonWriter` binds through the nitro spec (no hand-written FFI); `dispose()`
   now frees the writer with the matching deallocator.
 - nitro / nitro_generator 0.9.1. The bridge changed, so 1.1.0 prebuilts do not

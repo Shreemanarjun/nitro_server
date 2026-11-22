@@ -1,10 +1,9 @@
 /// Dart-only native library loading for `nitro_server`.
 ///
-/// Flutter apps never touch this file: the tooling builds and bundles the
-/// `ffiPlugin` native library automatically. Dart CLI programs (benchmarks,
-/// servers, `dart test`) build it with cmake, and [NitroServer.bind] opens it
-/// for them — so calling this is only needed to load from a non-default
-/// [path]:
+/// Not needed normally: every binding is `@Native`, resolved against the code
+/// asset the build hook stages (wherever the SDK puts it), and
+/// [NitroServer.bind] opens nothing by path. Call this only to load the engine
+/// from a non-default [path]:
 ///
 /// ```dart
 /// loadNitroServerNative(path: 'out/libnitro_server.dylib'); // before bind

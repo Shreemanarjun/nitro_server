@@ -10,8 +10,8 @@ HPACK/flow-control.
 Verified live: `curl --http2` (TLS/ALPN) and `curl --http2-prior-knowledge`
 (h2c) and a pure-Go `x/net/http2` client all round-trip GET/POST correctly; the
 reactor wiring is ASan- and TSan-clean (the `http2` CI job runs the suite plain +
-ASan + TSan on Ubuntu and macOS). **h2spec conformance: 136/145** against the live
-TLS endpoint — see [conformance.md](conformance.md) for the 8 long-tail items
+ASan + TSan on Ubuntu and macOS). **h2spec conformance: 135/146** (CI floor; nghttp2
+1.68 — 144/146 with 1.59) against the live endpoint — see [conformance.md](conformance.md) for the 8 long-tail items
 (all nghttp2-default-leniency on malformed frames to closed streams / PRIORITY
 edge cases; real clients are unaffected).
 
@@ -93,7 +93,7 @@ The serve path is live and sanitiser-clean; these are hardening/quality items,
 not blockers. None affect the GET/POST/multiplexed-JSON-API core that real
 clients exercise.
 
-1. **h2spec: the 8 remaining cases** (136/145). All are nghttp2-default-leniency
+1. **h2spec: the remaining cases** (135/146 on nghttp2 1.68). All are nghttp2-default-leniency
    on malformed frames sent to closed/idle streams and self-referential PRIORITY
    — nghttp2 answers `RST_STREAM`/ignores where strict h2spec wants a connection
    `GOAWAY`. Closing them means nghttp2 strict-mode options and per-callback

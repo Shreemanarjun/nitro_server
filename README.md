@@ -846,7 +846,7 @@ run-clang-tidy -p build/tidy src/engine/*.cpp              # .clang-tidy
   the tree; remove `build/lib` to exercise the download path.
 - CI (`ci.yml`): suites, both coverage gates, ASan/TSan (leak detection on
   Linux), fuzz smoke, clang-tidy, Docker build + `/readyz` + Trivy, h2spec
-  (floor 136/146), Autobahn (0 FAILED). `soak.yml`: nightly 10-minute memory
+  (floor 135/146), Autobahn (0 FAILED). `soak.yml`: nightly 10-minute memory
   soak. `release.yml`: suites → prebuilts with Sigstore provenance, keyless
   cosign bundle, SPDX SBOM → `verify` job locks and re-verifies them
   (`tool/update_prebuilt_lock.sh`, `tool/verify_prebuilt_lock.dart`); commit

@@ -8,6 +8,8 @@
   now frees the writer with the matching deallocator.
 - nitro / nitro_generator 0.9.1. The bridge changed, so 1.1.0 prebuilts do not
   load with this version.
+- macOS prebuilts are built on the latest runner (GitHub retired macOS 14)
+  with every dependency pinned to a macOS 14 floor; still macOS 14+.
 
 ## 1.1.0
 

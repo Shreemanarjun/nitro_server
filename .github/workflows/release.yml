@@ -8,8 +8,9 @@
 # Linux prebuilts are built on Ubuntu 22.04 (glibc 2.35) with libstdc++ linked
 # in, and a gate below refuses one that would need newer glibc or the host's
 # libstdc++: a consumer on Ubuntu 22.04+ / Debian 12+ can always load them.
-# macOS prebuilts need macOS 14+ (the macos-14 builders), Windows x64 needs
-# Windows 10+.
+# macOS prebuilts are built on the latest runner but pinned to macOS 14+
+# (deps and engine alike, tool/vcpkg-triplets), and a gate refuses one whose
+# floor drifted. Windows x64 needs Windows 10+.
 #
 # Asset names MUST match hook/build.dart: <os> in {macos,linux,windows},
 # <arch> in {arm64,x64} (Architecture.name), <ext> in {dylib,so,dll}.
@@ -67,19 +68,18 @@ jobs:
     strategy:
       fail-fast: false
       # `deps` selects how the four dependencies are provisioned as PIC static
-      # archives: Homebrew ships PIC `.a` for the native arch, and apt
-      # (linux-arm64) ships PIC `.a` too — but Ubuntu's x86-64 apt archives are
-      # NOT -fPIC (can't link into a .so), Windows has no system libs, and the
-      # Intel-macOS (macos-13) runner is scarce, so those three use vcpkg static
-      # triplets (always built -fPIC). macos-x64 is therefore cross-compiled on
-      # the always-available Apple-Silicon runner: triplet x64-osx makes the
-      # vcpkg toolchain set CMAKE_OSX_ARCHITECTURES=x86_64. The engine's
+      # archives: apt (linux-arm64) ships PIC `.a` — but Ubuntu's x86-64 apt archives are
+      # NOT -fPIC (can't link into a .so) and Windows has no system libs, so
+      # those use vcpkg static triplets (always built -fPIC). Both macOS builds
+      # use vcpkg too, with overlay triplets pinning the macOS floor (Homebrew's
+      # archives target the runner's own macOS); macos-x64 is cross-compiled on
+      # the Apple-Silicon runner. The engine's
       # pkg-config/CONFIG detection finds whichever, via PKG_CONFIG_PATH +
       # CMAKE_PREFIX_PATH (+ OPENSSL_ROOT_DIR) when vcpkg is used.
       matrix:
         include:
-          - { os: macos-14,        tag: macos-arm64,  deps: brew, lib: libnitro_server.dylib, out: libnitro_server-macos-arm64.dylib }
-          - { os: macos-14,        tag: macos-x64,    deps: vcpkg, triplet: x64-osx,              lib: libnitro_server.dylib, out: libnitro_server-macos-x64.dylib }
+          - { os: macos-latest,    tag: macos-arm64,  deps: vcpkg, triplet: arm64-osx,            lib: libnitro_server.dylib, out: libnitro_server-macos-arm64.dylib }
+          - { os: macos-latest,    tag: macos-x64,    deps: vcpkg, triplet: x64-osx,              lib: libnitro_server.dylib, out: libnitro_server-macos-x64.dylib }
           - { os: ubuntu-22.04-arm, tag: linux-arm64, deps: apt,  lib: libnitro_server.so,    out: libnitro_server-linux-arm64.so }
           - { os: ubuntu-22.04,    tag: linux-x64,    deps: vcpkg, triplet: x64-linux,            lib: libnitro_server.so,  out: libnitro_server-linux-x64.so }
           - { os: windows-latest,  tag: windows-x64,  deps: vcpkg, triplet: x64-windows-static-md, lib: nitro_server.dll,    out: libnitro_server-windows-x64.dll }
@@ -87,15 +87,13 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - if: matrix.deps == 'brew'
-        run: brew install cmake pkg-config openssl@3 libuv brotli nghttp2
       - if: matrix.deps == 'apt'
         run: sudo apt-get update && sudo apt-get install -y cmake pkg-config libssl-dev libuv1-dev libbrotli-dev libnghttp2-dev
       # vcpkg static: all four deps + pkgconf (so the engine's pkg-config lookups
       # for brotli/nghttp2 resolve on Windows too, where there is no system one).
       - if: matrix.deps == 'vcpkg'
         shell: bash
-        run: vcpkg install libuv openssl brotli nghttp2 pkgconf --triplet ${{ matrix.triplet }}
+        run: vcpkg install libuv openssl brotli nghttp2 pkgconf --triplet ${{ matrix.triplet }} --overlay-triplets=tool/vcpkg-triplets
 
       - name: Configure + build (all features, static deps)
         shell: bash
@@ -117,13 +115,19 @@ jobs:
             if [ "${{ matrix.triplet }}" = "x64-osx" ]; then
               EXTRA="$EXTRA -DCMAKE_OSX_ARCHITECTURES=x86_64"
             fi
+            # Same floor as the deps' overlay triplets.
+            if [[ "${{ matrix.triplet }}" == *-osx ]]; then
+              EXTRA="$EXTRA -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0"
+            fi
           fi
           # NATIVE_TUNE=OFF: prebuilts must run on any CPU of their arch, so no
           # -march=native (it would also break the x86_64-on-arm64 cross-build).
           cmake -S src -B build/rel -DCMAKE_BUILD_TYPE=Release \
             -DNITRO_SERVER_HTTP2=ON -DNITRO_SERVER_STATIC_DEPS=ON \
             -DNITRO_SERVER_NATIVE_TUNE=OFF $EXTRA
-          cmake --build build/rel --config Release --parallel
+          cmake --build build/rel --config Release --parallel 2>&1 | tee build.log
+          # A dep built for a newer macOS would silently raise the floor.
+          if grep -q "built for newer" build.log; then echo "a linked object targets a newer macOS"; exit 1; fi
 
       - name: Stage artifact + SHA-256 sidecar
         shell: bash
@@ -143,6 +147,13 @@ jobs:
             [ "$(printf '%s\n' "${maxglibc#GLIBC_}" 2.35 | sort -V | tail -1)" = "2.35" ] || { echo "prebuilt needs glibc > 2.35"; exit 1; }
             if echo "$syms" | grep -qE 'GLIBCXX_|CXXABI_'; then echo "prebuilt still needs the host libstdc++"; exit 1; fi
             readelf -d "dist/${{ matrix.out }}" | grep NEEDED
+          fi
+          # Portability gate (macOS): loads on macOS 14+.
+          if [[ "${{ matrix.tag }}" == macos-* ]]; then
+            minos=$(vtool -show-build "dist/${{ matrix.out }}" | awk '/minos/ {print $2}')
+            echo "minos: $minos"
+            [ "$minos" = "14.0" ] || { echo "prebuilt needs macOS $minos, not 14.0"; exit 1; }
+            otool -L "dist/${{ matrix.out }}"
           fi
           cd dist
           if command -v shasum >/dev/null; then
